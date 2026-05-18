@@ -518,6 +518,12 @@ impl DockerRuntime for NoopDockerRuntime {
         })
     }
 
+    fn list_managed_containers(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::ContainerInspection>, crate::runtime::DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(
         &mut self,
         _container_name: &str,
@@ -556,6 +562,12 @@ impl RoutingRuntime for NoopRoutingRuntime {
             activation_verified: true,
             health_checks_enabled: false,
         })
+    }
+
+    fn list_managed_routes(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::RouteInspection>, crate::runtime::RoutingRuntimeError> {
+        Ok(Vec::new())
     }
 
     fn remove_route(

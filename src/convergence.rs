@@ -7,7 +7,8 @@ use crate::runtime::{
     ContainerInspection, DockerRuntime, ProbeRuntime, RouteUpdateRequest, RoutingRuntime,
 };
 use crate::storage::{
-    EnvironmentPaths, PointerStore, RuntimeHealthState, RuntimeStateStore,
+    CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths,
+    PointerStore, RuntimeHealthState, RuntimeStateStore,
 };
 #[cfg(test)]
 use crate::runtime::RouteInspection;
@@ -109,27 +110,128 @@ pub trait ActiveDeploymentDecider {
 }
 
 pub struct StartupConvergence<'a, D> {
+    storage_root: PathBuf,
     queue: &'a PersistentQueue,
     decider: &'a D,
 }
 
 impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
-    pub fn new(queue: &'a PersistentQueue, decider: &'a D) -> Self {
-        Self { queue, decider }
+    pub fn new(storage_root: impl Into<PathBuf>, queue: &'a PersistentQueue, decider: &'a D) -> Self {
+        Self {
+            storage_root: storage_root.into(),
+            queue,
+            decider,
+        }
     }
 
-    pub fn recover_active_deployment(&self) -> Result<RecoveryOutcome, ConvergenceError> {
+    pub fn recover_active_deployment<RtD, RtR>(
+        &self,
+        docker: &mut RtD,
+        routing: &mut RtR,
+    ) -> Result<RecoveryOutcome, ConvergenceError>
+    where
+        RtD: DockerRuntime,
+        RtR: RoutingRuntime,
+    {
         let state = self.queue.load_state()?;
-        let Some(active) = state.active else {
-            return Ok(RecoveryOutcome::NoActiveDeployment);
+        let active = state.active;
+
+        let outcome = if let Some(active) = active.clone() {
+            if self.decider.should_resume(&active) {
+                RecoveryOutcome::Recovered(active)
+            } else {
+                let failed = self.queue.complete_active()?.expect("active just checked");
+                RecoveryOutcome::Failed(failed)
+            }
+        } else {
+            RecoveryOutcome::NoActiveDeployment
         };
 
-        if self.decider.should_resume(&active) {
-            Ok(RecoveryOutcome::Recovered(active))
-        } else {
-            let failed = self.queue.complete_active()?.expect("active just checked");
-            Ok(RecoveryOutcome::Failed(failed))
+        let resumable_active = match &outcome {
+            RecoveryOutcome::Recovered(active) => Some(active),
+            _ => None,
+        };
+        self.scan_runtime_orphans(resumable_active, docker, routing)?;
+        Ok(outcome)
+    }
+
+    fn scan_runtime_orphans<RtD, RtR>(
+        &self,
+        resumable_active: Option<&DeploymentRecord>,
+        docker: &mut RtD,
+        routing: &mut RtR,
+    ) -> Result<(), ConvergenceError>
+    where
+        RtD: DockerRuntime,
+        RtR: RoutingRuntime,
+    {
+        for container in docker.list_managed_containers()? {
+            let Some((project_id, environment, generation)) = container_identity(&container) else {
+                continue;
+            };
+            if should_preserve_runtime_resource(
+                resumable_active,
+                &project_id,
+                &environment,
+                generation,
+                &self.storage_root,
+            ) {
+                continue;
+            }
+
+            let env = EnvironmentPaths::new(&self.storage_root, &project_id, &environment);
+            let _ = docker.stop_container(&container.container_name);
+            let container_removed = docker.remove_container(&container.container_name).is_ok();
+            persist_cleanup_state(
+                &env,
+                generation,
+                CleanupRecord::new(
+                    "startup orphan container cleanup",
+                    Some(container.container_name.clone()),
+                    None,
+                    container_removed,
+                    true,
+                    !container_removed,
+                ),
+                None,
+            )?;
         }
+
+        for route in routing.list_managed_routes()? {
+            let Some((project_id, environment)) = parse_route_identity(&route.subtree_id) else {
+                continue;
+            };
+            let Some(generation) = parse_generation_from_target(&route.active_target) else {
+                let _ = routing.remove_route(&route.subtree_id);
+                continue;
+            };
+            if should_preserve_runtime_resource(
+                resumable_active,
+                &project_id,
+                &environment,
+                generation,
+                &self.storage_root,
+            ) {
+                continue;
+            }
+
+            let env = EnvironmentPaths::new(&self.storage_root, &project_id, &environment);
+            let route_removed = routing.remove_route(&route.subtree_id).is_ok();
+            persist_cleanup_state(
+                &env,
+                generation,
+                CleanupRecord::new(
+                    "startup orphan route cleanup",
+                    None,
+                    Some(route.subtree_id.clone()),
+                    true,
+                    route_removed,
+                    !route_removed,
+                ),
+                None,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -455,6 +557,77 @@ fn parse_generation_from_target(target: &str) -> Option<u64> {
     generation.parse::<u64>().ok()
 }
 
+fn parse_route_identity(subtree_id: &str) -> Option<(String, String)> {
+    let mut parts = subtree_id.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("forge"), Some(project_id), Some(environment), None) => {
+            Some((project_id.to_string(), environment.to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn container_identity(inspection: &ContainerInspection) -> Option<(String, String, u64)> {
+    let project_id = inspection.labels.get("forge.project_id")?.to_string();
+    let environment = inspection.labels.get("forge.environment")?.to_string();
+    let generation = inspection
+        .labels
+        .get("forge.generation")?
+        .parse::<u64>()
+        .ok()?;
+    Some((project_id, environment, generation))
+}
+
+fn should_preserve_runtime_resource(
+    resumable_active: Option<&DeploymentRecord>,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    storage_root: &std::path::Path,
+) -> bool {
+    if snapshot_is_finalized(&EnvironmentPaths::new(storage_root, project_id, environment), generation) {
+        return true;
+    }
+    resumable_active.is_some_and(|active| {
+        active.project_id == project_id && active.environment == environment
+    })
+}
+
+fn persist_cleanup_state(
+    env: &EnvironmentPaths,
+    generation: u64,
+    new_record: CleanupRecord,
+    deployment_id: Option<String>,
+) -> Result<(), ConvergenceError> {
+    let store = CleanupStore::new(env.clone(), generation);
+    let merged = if let Some(existing) = store.read_record()? {
+        CleanupRecord {
+            timestamp_unix: new_record.timestamp_unix,
+            failure_reason: if existing.failure_reason.is_empty() {
+                new_record.failure_reason.clone()
+            } else {
+                format!("{}, {}", existing.failure_reason, new_record.failure_reason)
+            },
+            container_name: existing.container_name.or(new_record.container_name.clone()),
+            route_subtree_id: existing.route_subtree_id.or(new_record.route_subtree_id.clone()),
+            container_removed: existing.container_removed || new_record.container_removed,
+            route_removed: existing.route_removed || new_record.route_removed,
+            tombstoned: existing.tombstoned || new_record.tombstoned,
+        }
+    } else {
+        new_record
+    };
+    store.write_record(&merged)?;
+    DiagnosticsStore::new(env.clone(), generation).write_summary(&DiagnosticSummary {
+        deployment_id,
+        failure_stage: "startup_recovery".into(),
+        failure_reason: merged.failure_reason.clone(),
+        container_name: merged.container_name.clone().unwrap_or_default(),
+        cleanup_recorded: true,
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 fn test_root(name: &str) -> std::path::PathBuf {
     use std::fs;
@@ -555,6 +728,34 @@ impl DockerRuntime for TestDockerRuntime {
         })
     }
 
+    fn list_managed_containers(
+        &mut self,
+    ) -> Result<Vec<ContainerInspection>, crate::runtime::DockerRuntimeError> {
+        Ok(self
+            .containers
+            .iter()
+            .map(|(container_name, running)| ContainerInspection {
+                container_name: container_name.clone(),
+                running: *running,
+                image_ref: "noop".into(),
+                labels: std::collections::BTreeMap::from([
+                    ("forge.managed".into(), "true".into()),
+                    ("forge.project_id".into(), "api".into()),
+                    ("forge.environment".into(), "production".into()),
+                    (
+                        "forge.generation".into(),
+                        container_name
+                            .rsplit("-gen-")
+                            .next()
+                            .unwrap_or("0")
+                            .to_string(),
+                    ),
+                ]),
+                restart_policy: "no".into(),
+            })
+            .collect())
+    }
+
     fn stop_container(
         &mut self,
         container_name: &str,
@@ -606,6 +807,10 @@ impl RoutingRuntime for TestRoutingRuntime {
         ))
     }
 
+    fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, crate::runtime::RoutingRuntimeError> {
+        Ok(self.route.clone().into_iter().collect())
+    }
+
     fn remove_route(
         &mut self,
         _subtree_id: &str,
@@ -642,8 +847,12 @@ pub mod in_flight_deployment_is_recovered_or_failed_deterministically {
             .unwrap();
         let active = queue.start_next().unwrap().unwrap();
 
-        let convergence = StartupConvergence::new(&queue, &ResumeDecider(true));
-        let recovered = convergence.recover_active_deployment().unwrap();
+        let mut docker = TestDockerRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+        let convergence = StartupConvergence::new(&root, &queue, &ResumeDecider(true));
+        let recovered = convergence
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
 
         assert_eq!(recovered, RecoveryOutcome::Recovered(active));
         assert!(queue.load_state().unwrap().active.is_some());
@@ -662,8 +871,12 @@ pub mod in_flight_deployment_is_recovered_or_failed_deterministically {
             .unwrap();
         let active = queue.start_next().unwrap().unwrap();
 
-        let convergence = StartupConvergence::new(&queue, &ResumeDecider(false));
-        let failed = convergence.recover_active_deployment().unwrap();
+        let mut docker = TestDockerRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+        let convergence = StartupConvergence::new(&root, &queue, &ResumeDecider(false));
+        let failed = convergence
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
 
         assert_eq!(failed, RecoveryOutcome::Failed(active));
         assert!(queue.load_state().unwrap().active.is_none());

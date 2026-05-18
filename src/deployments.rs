@@ -10,8 +10,8 @@ use crate::runtime::{
     RoutingRuntime, RoutingRuntimeError,
 };
 use crate::storage::{
-    DiagnosticsStore, EnvironmentPaths, EventStore, GenerationAllocator, PointerStore,
-    SnapshotState, SnapshotWriter, StorageError,
+    CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths,
+    EventStore, GenerationAllocator, PointerStore, SnapshotState, SnapshotWriter, StorageError,
 };
 
 #[derive(Debug)]
@@ -219,11 +219,31 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 inspection.container_name, inspection.running
             ),
         )?;
-        self.validate_candidate(&container_name, &events, &diagnostics, record, generation)?;
+        self.validate_candidate(
+            &env,
+            &container_name,
+            &events,
+            &diagnostics,
+            record,
+            generation,
+        )?;
 
         writer.finalize(&record.project_id, &record.environment, SnapshotState::Healthy)?;
         append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
-        self.activate_generation(record, &env, generation, &container_name)?;
+        if let Err(err) = self.activate_generation(record, &env, generation, &container_name) {
+            self.record_failed_generation(
+                &env,
+                &events,
+                &diagnostics,
+                record,
+                generation,
+                &container_name,
+                Some(route_subtree_id(record)),
+                "routing",
+                &err.to_string(),
+            )?;
+            return Err(err);
+        }
         append_event(&events, record, generation, "GENERATION_PROMOTED", None)?;
 
         Ok(DeploymentExecution {
@@ -236,6 +256,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
     fn validate_candidate(
         &mut self,
+        env: &EnvironmentPaths,
         container_name: &str,
         events: &EventStore,
         diagnostics: &DiagnosticsStore,
@@ -243,29 +264,33 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         generation: u64,
     ) -> Result<(), DeploymentError> {
         if self.validation.tcp_required && !self.probes.probe_tcp(container_name)? {
-            diagnostics.write_failure_reason("tcp probe failed", &[])?;
-            append_event(
+            self.record_failed_generation(
+                env,
                 events,
+                diagnostics,
                 record,
                 generation,
-                "TCP_PROBE_FAILED",
-                Some("tcp probe failed".into()),
+                container_name,
+                None,
+                "validation",
+                "tcp probe failed",
             )?;
-            self.cleanup_failed_generation(container_name)?;
             return Err(DeploymentError::ValidationFailed("tcp probe failed"));
         }
 
         if let Some(path) = &self.validation.http_health_path {
             if !self.probes.probe_http(container_name, path)? {
-                diagnostics.write_failure_reason("http health probe failed", &[])?;
-                append_event(
+                self.record_failed_generation(
+                    env,
                     events,
+                    diagnostics,
                     record,
                     generation,
-                    "HTTP_PROBE_FAILED",
-                    Some("http health probe failed".into()),
+                    container_name,
+                    None,
+                    "validation",
+                    "http health probe failed",
                 )?;
-                self.cleanup_failed_generation(container_name)?;
                 return Err(DeploymentError::ValidationFailed("http health probe failed"));
             }
         }
@@ -274,10 +299,84 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         Ok(())
     }
 
-    fn cleanup_failed_generation(&mut self, container_name: &str) -> Result<(), DeploymentError> {
-        let _ = self.docker.stop_container(container_name);
-        self.docker.remove_container(container_name)?;
+    #[allow(clippy::too_many_arguments)]
+    fn record_failed_generation(
+        &mut self,
+        env: &EnvironmentPaths,
+        events: &EventStore,
+        diagnostics: &DiagnosticsStore,
+        record: &DeploymentRecord,
+        generation: u64,
+        container_name: &str,
+        route_subtree_id: Option<String>,
+        failure_stage: &str,
+        failure_reason: &str,
+    ) -> Result<(), DeploymentError> {
+        diagnostics.write_failure_reason(failure_reason, &[])?;
+        append_event(
+            events,
+            record,
+            generation,
+            match failure_reason {
+                "tcp probe failed" => "TCP_PROBE_FAILED",
+                "http health probe failed" => "HTTP_PROBE_FAILED",
+                _ => "GENERATION_FAILED",
+            },
+            Some(failure_reason.into()),
+        )?;
+        let cleanup = self.cleanup_failed_generation(
+            env,
+            generation,
+            container_name,
+            route_subtree_id.clone(),
+            failure_reason,
+        )?;
+        diagnostics.write_summary(&DiagnosticSummary {
+            deployment_id: Some(record.deployment_id.clone()),
+            failure_stage: failure_stage.into(),
+            failure_reason: failure_reason.into(),
+            container_name: container_name.into(),
+            cleanup_recorded: true,
+        })?;
+        append_event(
+            events,
+            record,
+            generation,
+            if cleanup.tombstoned {
+                "FAILED_GENERATION_TOMBSTONED"
+            } else {
+                "FAILED_GENERATION_CLEANED"
+            },
+            Some(failure_reason.into()),
+        )?;
         Ok(())
+    }
+
+    fn cleanup_failed_generation(
+        &mut self,
+        env: &EnvironmentPaths,
+        generation: u64,
+        container_name: &str,
+        route_subtree_id: Option<String>,
+        failure_reason: &str,
+    ) -> Result<CleanupRecord, DeploymentError> {
+        let _ = self.docker.stop_container(container_name);
+        let container_removed = self.docker.remove_container(container_name).is_ok();
+        let route_removed = if let Some(subtree_id) = route_subtree_id.clone() {
+            self.routing.remove_route(&subtree_id).is_ok()
+        } else {
+            true
+        };
+        let cleanup = CleanupRecord::new(
+            failure_reason,
+            Some(container_name.into()),
+            route_subtree_id,
+            container_removed,
+            route_removed,
+            !(container_removed && route_removed),
+        );
+        CleanupStore::new(env.clone(), generation).write_record(&cleanup)?;
+        Ok(cleanup)
     }
 
     fn activate_generation(
@@ -521,6 +620,10 @@ impl RoutingRuntime for TestRoutingRuntime {
             ));
         }
         Ok(self.inspections.remove(0))
+    }
+
+    fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
+        Ok(self.inspections.clone())
     }
 
     fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {

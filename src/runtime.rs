@@ -70,6 +70,7 @@ pub trait DockerRuntime {
         &mut self,
         container_name: &str,
     ) -> Result<ContainerInspection, DockerRuntimeError>;
+    fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError>;
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
 }
@@ -115,5 +116,6 @@ impl std::error::Error for RoutingRuntimeError {}
 pub trait RoutingRuntime {
     fn update_route(&mut self, request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError>;
     fn inspect_route(&mut self, subtree_id: &str) -> Result<RouteInspection, RoutingRuntimeError>;
+    fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError>;
     fn remove_route(&mut self, subtree_id: &str) -> Result<(), RoutingRuntimeError>;
 }

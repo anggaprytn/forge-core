@@ -110,6 +110,23 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         parse_inspection_output(&output)
     }
 
+    fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+        let args = vec![
+            "ps".to_string(),
+            "-a".to_string(),
+            "--filter".to_string(),
+            "label=forge.managed=true".to_string(),
+            "--format".to_string(),
+            "{{.Names}}".to_string(),
+        ];
+        let output = self.runner.run("docker", &args)?;
+        let mut containers = Vec::new();
+        for name in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            containers.push(self.inspect_container(name)?);
+        }
+        Ok(containers)
+    }
+
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
         let args = vec!["stop".to_string(), container_name.to_string()];
         self.runner.run("docker", &args).map(|_| ())

@@ -517,6 +517,20 @@ impl DockerRuntime for FakeDockerRuntime {
         })
     }
 
+    fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+        Ok(self
+            .running
+            .iter()
+            .map(|name| ContainerInspection {
+                container_name: name.clone(),
+                running: true,
+                image_ref: "forge:test".into(),
+                labels: BTreeMap::new(),
+                restart_policy: "no".into(),
+            })
+            .collect())
+    }
+
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
         self.running.remove(container_name);
         Ok(())

@@ -1,6 +1,8 @@
 #[path = "integration/common.rs"]
 mod common;
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -13,12 +15,17 @@ use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::{ActiveDeploymentDecider, ActiveTruth, ConvergenceEngine, RecoveryOutcome, TickInput};
 use forge_core::daemon::Daemon;
-use forge_core::deployments::{ActivationMode, DeploymentExecutor, ExecutionConfig, ValidationPolicy};
+use forge_core::deployments::{
+    ActivationMode, DeploymentError, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
+};
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
 use forge_core::http::{router, ControlPlane, HttpState, IdempotencyStore};
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
-use forge_core::runtime::{ContainerInspection, DockerRuntime, DockerRuntimeError, RoutingRuntime};
+use forge_core::runtime::{
+    BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime, DockerRuntimeError,
+    RouteUpdateRequest, RoutingRuntime,
+};
 use forge_core::storage::{EnvironmentPaths, EventStore, PointerStore};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -181,6 +188,121 @@ fn e2e_restart_during_inflight_deploy_fails_or_recovers_deterministically() {
         .is_none());
 }
 
+#[test]
+fn e2e_bad_app_failed_health_does_not_promote_current() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("bad-app-no-promotion") else {
+        return;
+    };
+
+    harness.enqueue_deploy();
+    let result = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
+
+    assert!(matches!(
+        result,
+        Err(DeploymentError::ValidationFailed("http health probe failed"))
+    ));
+    let env = EnvironmentPaths::new(&harness.runtime_root, "api", "production");
+    assert_eq!(PointerStore::new(env.clone()).read_pointer("current").unwrap(), None);
+    assert!(harness.routing.inspect_route("forge:api:production").is_err());
+    assert!(!env.generation_dir(1).join("snapshot.json").exists());
+}
+
+#[test]
+fn e2e_bad_app_failed_generation_is_cleaned() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("bad-app-cleaned") else {
+        return;
+    };
+
+    harness.enqueue_deploy();
+    let _ = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
+
+    assert!(!docker_container_exists("prod-api-gen-1"));
+    let cleanup = fs::read_to_string(
+        harness
+            .generation_dir(1)
+            .join("cleanup.json"),
+    )
+    .expect("cleanup record should exist for failed generation");
+    assert!(cleanup.contains("\"container_removed\": true"));
+    assert!(cleanup.contains("\"tombstoned\": false"));
+}
+
+#[test]
+fn e2e_bad_app_diagnostics_are_visible() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("bad-app-diagnostics") else {
+        return;
+    };
+
+    harness.enqueue_deploy();
+    let _ = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
+
+    let diagnostics_dir = harness.generation_dir(1).join("diagnostics");
+    let reason = fs::read_to_string(diagnostics_dir.join("failure_reason.log"))
+        .expect("failure reason should be persisted");
+    assert!(reason.contains("http health probe failed"));
+
+    let summary = fs::read_to_string(diagnostics_dir.join("summary.json"))
+        .expect("diagnostic summary should be persisted");
+    assert!(summary.contains("\"failure_stage\": \"validation\""));
+    assert!(summary.contains("\"failure_reason\": \"http health probe failed\""));
+}
+
+#[test]
+fn e2e_crash_during_deploy_recovers_without_orphan_container() {
+    let _guard = integration_lock();
+    let Some(harness) = E2eHarness::start("crash-during-deploy") else {
+        return;
+    };
+
+    let deployment_id = "dep-crash-deploy".to_string();
+    harness.stage_inflight_generation(&common::sample_http_app_fixture(), &deployment_id, 1, false);
+
+    let mut daemon = Daemon::new(
+        harness.config.clone(),
+        DockerCliRuntime::new(ProcessCommandRunner),
+        CaddyApiRuntime::new(harness.admin_base_url(), harness.public_base_url()),
+        AllowAllDecider(false),
+    );
+    daemon.start().unwrap();
+
+    assert_eq!(
+        daemon.last_recovery_outcome(),
+        Some(&RecoveryOutcome::Failed(DeploymentRecord {
+            deployment_id,
+            project_id: "api".into(),
+            environment: "production".into(),
+        }))
+    );
+    assert!(!docker_container_exists("prod-api-gen-1"));
+}
+
+#[test]
+fn e2e_crash_during_route_activation_recovers_without_orphan_route() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("crash-during-route") else {
+        return;
+    };
+
+    let deployment_id = "dep-crash-route".to_string();
+    harness.stage_inflight_generation(&common::sample_http_app_fixture(), &deployment_id, 1, true);
+
+    let mut daemon = Daemon::new(
+        harness.config.clone(),
+        DockerCliRuntime::new(ProcessCommandRunner),
+        CaddyApiRuntime::new(harness.admin_base_url(), harness.public_base_url()),
+        AllowAllDecider(false),
+    );
+    daemon.start().unwrap();
+
+    assert!(harness.routing.inspect_route("forge:api:production").is_err());
+    let cleanup = fs::read_to_string(harness.generation_dir(1).join("cleanup.json"))
+        .expect("startup cleanup should be recorded");
+    assert!(cleanup.contains("\"route_removed\": true"));
+}
+
 struct E2eHarness {
     runtime_root: PathBuf,
     network_name: String,
@@ -205,7 +327,6 @@ impl E2eHarness {
         let suffix = unique_suffix();
         let network_name = format!("forge-e2e-net-{test_name}-{suffix}");
         let caddy_container_name = format!("forge-e2e-caddy-{test_name}-{suffix}");
-        let sample_image_tag = format!("forge/e2e-sample:{test_name}-{suffix}");
         let admin_port = common::available_port();
         let public_port = common::available_port();
         let api_port = common::available_port();
@@ -213,13 +334,6 @@ impl E2eHarness {
 
         docker(&["network", "create", &network_name]).expect("docker network should be creatable");
         write_caddy_config(&runtime_root);
-        docker(&[
-            "build",
-            "-t",
-            &sample_image_tag,
-            common::sample_http_app_fixture().to_str().unwrap(),
-        ])
-        .expect("sample app fixture should build");
         docker(&[
             "run",
             "-d",
@@ -275,7 +389,12 @@ impl E2eHarness {
         self.api_port = common::available_port();
         self.config.api_bind = format!("127.0.0.1:{}", self.api_port);
 
-        let mut daemon = Daemon::new(self.config.clone(), NoopDockerRuntime, NoopRoutingRuntime, decider);
+        let mut daemon = Daemon::new(
+            self.config.clone(),
+            DockerCliRuntime::new(ProcessCommandRunner),
+            CaddyApiRuntime::new(self.admin_base_url(), self.public_base_url()),
+            decider,
+        );
         daemon.start().unwrap();
 
         let state = HttpState::new(
@@ -308,6 +427,13 @@ impl E2eHarness {
     fn execute_next_deployment(
         &mut self,
     ) -> Result<forge_core::deployments::DeploymentExecution, forge_core::deployments::DeploymentError> {
+        self.execute_next_deployment_for_fixture(&common::sample_http_app_fixture())
+    }
+
+    fn execute_next_deployment_for_fixture(
+        &mut self,
+        fixture: &Path,
+    ) -> Result<forge_core::deployments::DeploymentExecution, forge_core::deployments::DeploymentError> {
         let queue = PersistentQueue::new(self.runtime_root.join("queue")).unwrap();
         let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
         let mut probes = DockerNetworkProbeRuntime::new(self.network_name.clone(), 3000);
@@ -326,12 +452,85 @@ impl E2eHarness {
             },
         )
         .with_execution_config(ExecutionConfig {
-            context_path: common::sample_http_app_fixture(),
-            dockerfile_path: common::sample_http_app_fixture().join("Dockerfile"),
+            context_path: fixture.to_path_buf(),
+            dockerfile_path: fixture.join("Dockerfile"),
             network_name: Some(self.network_name.clone()),
         })
         .execute_next()
         .map(|value| value.expect("queued deployment should execute"))
+    }
+
+    fn generation_dir(&self, generation: u64) -> PathBuf {
+        EnvironmentPaths::new(&self.runtime_root, "api", "production").generation_dir(generation)
+    }
+
+    fn stage_inflight_generation(
+        &self,
+        fixture: &Path,
+        deployment_id: &str,
+        generation: u64,
+        attach_route: bool,
+    ) {
+        let record = DeploymentRecord {
+            deployment_id: deployment_id.into(),
+            project_id: "api".into(),
+            environment: "production".into(),
+        };
+        let env = EnvironmentPaths::new(&self.runtime_root, "api", "production");
+        env.ensure_exists().unwrap();
+        fs::create_dir_all(env.generation_dir(generation).join("diagnostics")).unwrap();
+        fs::write(
+            env.generation_dir(generation).join("build.json"),
+            format!(
+                "{{\n  \"deployment_id\": \"{}\",\n  \"image_ref\": \"forge/api:gen-{}\"\n}}\n",
+                deployment_id, generation
+            ),
+        )
+        .unwrap();
+        fs::write(
+            env.generation_dir(generation).join("runtime.json"),
+            format!(
+                "{{\n  \"container_name\": \"prod-api-gen-{}\",\n  \"running\": true\n}}\n",
+                generation
+            ),
+        )
+        .unwrap();
+
+        let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
+        let image_ref = docker
+            .build_image(BuildImageRequest {
+                image_tag: format!("forge/e2e-staged:{}-{generation}", deployment_id),
+                context_path: fixture.to_path_buf(),
+                dockerfile_path: fixture.join("Dockerfile"),
+                labels: forge_labels(&record, generation),
+            })
+            .unwrap();
+        docker
+            .create_container(CreateContainerRequest {
+                container_name: format!("prod-api-gen-{generation}"),
+                image_ref,
+                labels: forge_labels(&record, generation),
+                network_name: Some(self.network_name.clone()),
+            })
+            .unwrap();
+        docker.start_container(&format!("prod-api-gen-{generation}")).unwrap();
+
+        if attach_route {
+            let mut routing = CaddyApiRuntime::new(self.admin_base_url(), self.public_base_url());
+            routing
+                .update_route(RouteUpdateRequest {
+                    subtree_id: "forge:api:production".into(),
+                    target: format!("prod-api-gen-{generation}:3000"),
+                    health_checks_enabled: false,
+                    probe_path: Some("/health".into()),
+                })
+                .unwrap();
+        }
+
+        let queue = PersistentQueue::new(self.runtime_root.join("queue")).unwrap();
+        queue.enqueue(record).unwrap();
+        let active = queue.start_next().unwrap().unwrap();
+        assert_eq!(active.deployment_id, deployment_id);
     }
 
     fn get_events(&self) -> Value {
@@ -499,6 +698,10 @@ impl DockerRuntime for NoopDockerRuntime {
         })
     }
 
+    fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
         Ok(())
     }
@@ -529,6 +732,12 @@ impl RoutingRuntime for NoopRoutingRuntime {
             activation_verified: true,
             health_checks_enabled: false,
         })
+    }
+
+    fn list_managed_routes(
+        &mut self,
+    ) -> Result<Vec<forge_core::runtime::RouteInspection>, forge_core::runtime::RoutingRuntimeError> {
+        Ok(Vec::new())
     }
 
     fn remove_route(
@@ -586,6 +795,24 @@ fn write_caddy_config(root: &Path) {
         }
     });
     std::fs::write(root.join("caddy.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
+fn docker_container_exists(name: &str) -> bool {
+    Command::new("docker")
+        .args(["inspect", name])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn forge_labels(record: &DeploymentRecord, generation: u64) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("forge.managed".into(), "true".into()),
+        ("forge.project_id".into(), record.project_id.clone()),
+        ("forge.environment".into(), record.environment.clone()),
+        ("forge.generation".into(), generation.to_string()),
+        ("forge.deployment_id".into(), record.deployment_id.clone()),
+    ])
 }
 
 fn unique_suffix() -> String {

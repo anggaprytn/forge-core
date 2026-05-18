@@ -56,6 +56,14 @@ pub fn sample_http_app_fixture() -> PathBuf {
 }
 
 #[allow(dead_code)]
+pub fn bad_http_app_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("bad-http-app")
+}
+
+#[allow(dead_code)]
 pub fn available_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .expect("ephemeral port should be allocatable")

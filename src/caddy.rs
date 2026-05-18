@@ -149,6 +149,15 @@ impl RoutingRuntime for RecordingRoutingRuntime {
         Ok(self.inspections.remove(0))
     }
 
+    fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
+        Ok(self
+            .inspections
+            .iter()
+            .filter(|route| route.subtree_id.starts_with("forge:"))
+            .cloned()
+            .collect())
+    }
+
     fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {
         Ok(())
     }
@@ -195,6 +204,37 @@ impl RoutingRuntime for CaddyApiRuntime {
             activation_verified: self.activation_verified(subtree_id),
             health_checks_enabled: false,
         })
+    }
+
+    fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
+        let routes = self.read_routes()?;
+        let mut managed = Vec::new();
+        for route in routes {
+            let Some(subtree_id) = route.get("@id").and_then(|id| id.as_str()) else {
+                continue;
+            };
+            if !subtree_id.starts_with("forge:") {
+                continue;
+            }
+            let active_target = route
+                .get("handle")
+                .and_then(|handle| handle.as_array())
+                .and_then(|handle| handle.first())
+                .and_then(|handler| handler.get("upstreams"))
+                .and_then(|upstreams| upstreams.as_array())
+                .and_then(|upstreams| upstreams.first())
+                .and_then(|upstream| upstream.get("dial"))
+                .and_then(|dial| dial.as_str())
+                .unwrap_or_default()
+                .to_string();
+            managed.push(RouteInspection {
+                subtree_id: subtree_id.into(),
+                active_target,
+                activation_verified: self.activation_verified(subtree_id),
+                health_checks_enabled: false,
+            });
+        }
+        Ok(managed)
     }
 
     fn remove_route(&mut self, subtree_id: &str) -> Result<(), RoutingRuntimeError> {

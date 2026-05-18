@@ -79,6 +79,28 @@ pub struct RuntimeState {
     pub last_error_code: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+pub struct CleanupRecord {
+    pub timestamp_unix: u64,
+    pub failure_reason: String,
+    pub container_name: Option<String>,
+    pub route_subtree_id: Option<String>,
+    pub container_removed: bool,
+    pub route_removed: bool,
+    pub tombstoned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+pub struct DiagnosticSummary {
+    pub deployment_id: Option<String>,
+    pub failure_stage: String,
+    pub failure_reason: String,
+    pub container_name: String,
+    pub cleanup_recorded: bool,
+}
+
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
@@ -356,6 +378,22 @@ impl DiagnosticsStore {
         atomic_write(path, bounded.as_bytes())
     }
 
+    pub fn write_summary(&self, summary: &DiagnosticSummary) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("diagnostics")
+            .join("summary.json");
+        let bytes = serde_json::to_vec_pretty(summary).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(path, &bytes)
+    }
+
     pub fn read_failure_reason(&self) -> StorageResult<Option<String>> {
         let path = self
             .env
@@ -366,6 +404,73 @@ impl DiagnosticsStore {
             return Ok(None);
         }
         Ok(Some(fs::read_to_string(path)?))
+    }
+}
+
+impl CleanupRecord {
+    pub fn new(
+        failure_reason: impl Into<String>,
+        container_name: Option<String>,
+        route_subtree_id: Option<String>,
+        container_removed: bool,
+        route_removed: bool,
+        tombstoned: bool,
+    ) -> Self {
+        Self {
+            timestamp_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            failure_reason: failure_reason.into(),
+            container_name,
+            route_subtree_id,
+            container_removed,
+            route_removed,
+            tombstoned,
+        }
+    }
+}
+
+pub struct CleanupStore {
+    env: EnvironmentPaths,
+    generation: u64,
+}
+
+impl CleanupStore {
+    pub fn new(env: EnvironmentPaths, generation: u64) -> Self {
+        Self { env, generation }
+    }
+
+    pub fn write_record(&self, record: &CleanupRecord) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let bytes = serde_json::to_vec_pretty(record).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(self.env.generation_dir(self.generation).join("cleanup.json"), &bytes)?;
+        if record.tombstoned {
+            atomic_write(
+                self.env.generation_dir(self.generation).join("tombstone"),
+                b"cleanup_incomplete\n",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn read_record(&self) -> StorageResult<Option<CleanupRecord>> {
+        let path = self.env.generation_dir(self.generation).join("cleanup.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(path)?;
+        serde_json::from_str(&raw).map(Some).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })
     }
 }
 

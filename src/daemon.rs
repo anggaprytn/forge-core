@@ -115,8 +115,10 @@ where
                 self.startup_steps.push(StartupStep::BootstrapReady);
 
                 let queue = PersistentQueue::new(self.config.storage_root.join("queue"))?;
-                let convergence = StartupConvergence::new(&queue, &self.recovery_decider);
-                let outcome = convergence.recover_active_deployment()?;
+                let convergence =
+                    StartupConvergence::new(self.config.storage_root.clone(), &queue, &self.recovery_decider);
+                let outcome = convergence
+                    .recover_active_deployment(&mut self.docker_runtime, &mut self.routing_runtime)?;
                 self.last_recovery_outcome = Some(outcome);
                 self.startup_steps.push(StartupStep::QueueRecovered);
 
@@ -377,6 +379,12 @@ impl DockerRuntime for NoopDockerRuntime {
         })
     }
 
+    fn list_managed_containers(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::ContainerInspection>, crate::runtime::DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(
         &mut self,
         _container_name: &str,
@@ -415,6 +423,12 @@ impl RoutingRuntime for NoopRoutingRuntime {
             activation_verified: true,
             health_checks_enabled: false,
         })
+    }
+
+    fn list_managed_routes(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::RouteInspection>, crate::runtime::RoutingRuntimeError> {
+        Ok(Vec::new())
     }
 
     fn remove_route(
