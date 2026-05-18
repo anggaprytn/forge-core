@@ -63,6 +63,7 @@ pub fn bad_http_app_fixture() -> PathBuf {
         .join("bad-http-app")
 }
 
+#[allow(dead_code)]
 pub fn secret_http_app_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -70,6 +71,7 @@ pub fn secret_http_app_fixture() -> PathBuf {
         .join("secret-http-app")
 }
 
+#[allow(dead_code)]
 pub fn secret_http_bad_app_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
