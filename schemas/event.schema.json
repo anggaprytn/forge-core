@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge.local/schemas/event.schema.json",
+  "title": "Forge Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "timestamp",
+    "project_id",
+    "environment",
+    "generation",
+    "deployment_id",
+    "correlation_id",
+    "type",
+    "severity",
+    "payload",
+    "redacted"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "project_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$"
+    },
+    "environment": {
+      "enum": [
+        "development",
+        "staging",
+        "production"
+      ]
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "deployment_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "type": {
+      "enum": [
+        "DEPLOYMENT_QUEUED",
+        "DEPLOYMENT_STARTED",
+        "SOURCE_FETCH_STARTED",
+        "IMAGE_BUILD_STARTED",
+        "IMAGE_BUILD_COMPLETED",
+        "CONTAINER_CREATED",
+        "CONTAINER_STARTED",
+        "TCP_PROBE_FAILED",
+        "HTTP_PROBE_FAILED",
+        "CONTRACT_VALIDATION_FAILED",
+        "ROUTE_UPDATED",
+        "ROUTE_ACTIVATION_CONFIRMED",
+        "DEPLOYMENT_CONVERGED",
+        "DEPLOYMENT_DEGRADED",
+        "ROLLBACK_STARTED",
+        "ROLLBACK_COMPLETED",
+        "DEPLOYMENT_FAILED",
+        "CLEANUP_COMPLETED"
+      ]
+    },
+    "severity": {
+      "enum": [
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "redacted": {
+      "type": "boolean"
+    }
+  }
+}

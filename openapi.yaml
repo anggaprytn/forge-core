@@ -1,0 +1,494 @@
+openapi: 3.1.0
+info:
+  title: Forge Control Plane API
+  version: 1.0.0
+  description: Forge v1 single-node runtime convergence control plane API.
+servers:
+  - url: https://forge.local
+security:
+  - bearerAuth: []
+paths:
+  /deployments:
+    post:
+      summary: Enqueue a deployment operation
+      operationId: createDeployment
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentRequest'
+      responses:
+        '202':
+          description: Deployment accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentAccepted'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: List deployments
+      operationId: listDeployments
+      parameters:
+        - in: query
+          name: project_id
+          schema:
+            type: string
+        - in: query
+          name: environment
+          schema:
+            $ref: '#/components/schemas/Environment'
+      responses:
+        '200':
+          description: Deployments
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - deployments
+                properties:
+                  deployments:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Deployment'
+  /deployments/{id}:
+    get:
+      summary: Get deployment details
+      operationId: getDeployment
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deployment details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '404':
+          description: Deployment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /projects:
+    get:
+      summary: List projects
+      operationId: listProjects
+      responses:
+        '200':
+          description: Projects
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - projects
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Project'
+  /projects/{id}:
+    get:
+      summary: Get project details
+      operationId: getProject
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Project details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /projects/{id}/environments/{env}:
+    get:
+      summary: Get environment state
+      operationId: getProjectEnvironment
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: env
+          required: true
+          schema:
+            $ref: '#/components/schemas/Environment'
+      responses:
+        '200':
+          description: Environment state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvironmentState'
+        '404':
+          description: Project or environment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /events:
+    get:
+      summary: List events
+      operationId: listEvents
+      parameters:
+        - in: query
+          name: project_id
+          schema:
+            type: string
+        - in: query
+          name: environment
+          schema:
+            $ref: '#/components/schemas/Environment'
+        - in: query
+          name: deployment_id
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - events
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Event'
+  /logs/{deployment_id}/stream:
+    get:
+      summary: Stream logs for a deployment
+      operationId: streamDeploymentLogs
+      parameters:
+        - in: path
+          name: deployment_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Log stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404':
+          description: Deployment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /secrets:
+    post:
+      summary: Create or update a secret
+      operationId: putSecret
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecretWriteRequest'
+      responses:
+        '201':
+          description: Secret stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - secret_id
+                properties:
+                  secret_id:
+                    type: string
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  schemas:
+    Environment:
+      type: string
+      enum:
+        - development
+        - staging
+        - production
+    DeploymentRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - project_id
+        - environment
+        - intent
+      properties:
+        project_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'
+        environment:
+          $ref: '#/components/schemas/Environment'
+        commit_sha:
+          type: string
+          pattern: '^[A-Fa-f0-9]{7,64}$'
+        image_digest:
+          type: string
+          pattern: '^sha256:[A-Fa-f0-9]{64}$'
+        intent:
+          type: string
+          enum:
+            - deploy
+            - redeploy
+            - rollback
+        runtime_override:
+          type: object
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: false
+          properties:
+            reason:
+              type: string
+              maxLength: 512
+      allOf:
+        - not:
+            required:
+              - commit_sha
+              - image_digest
+        - if:
+            properties:
+              intent:
+                const: rollback
+          then:
+            not:
+              anyOf:
+                - required:
+                    - commit_sha
+                - required:
+                    - image_digest
+        - if:
+            properties:
+              intent:
+                enum:
+                  - deploy
+                  - redeploy
+          then:
+            anyOf:
+              - required:
+                  - commit_sha
+              - required:
+                  - image_digest
+    DeploymentAccepted:
+      type: object
+      required:
+        - deployment_id
+        - state
+        - queue_position
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum:
+            - queued
+        queue_position:
+          type: integer
+          minimum: 1
+    Deployment:
+      type: object
+      required:
+        - deployment_id
+        - project_id
+        - environment
+        - generation
+        - intent
+        - state
+        - created_at
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+        environment:
+          $ref: '#/components/schemas/Environment'
+        generation:
+          type: integer
+          minimum: 1
+        intent:
+          type: string
+        state:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Project:
+      type: object
+      required:
+        - project_id
+        - subdomain
+        - environments
+      properties:
+        project_id:
+          type: string
+        subdomain:
+          type: string
+        environments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Environment'
+    EnvironmentState:
+      type: object
+      required:
+        - project_id
+        - environment
+        - current_generation
+      properties:
+        project_id:
+          type: string
+        environment:
+          $ref: '#/components/schemas/Environment'
+        current_generation:
+          type: integer
+          minimum: 1
+        previous_generation:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+        route_target:
+          type: string
+    Event:
+      type: object
+      required:
+        - event_id
+        - timestamp
+        - project_id
+        - environment
+        - generation
+        - deployment_id
+        - correlation_id
+        - type
+        - severity
+        - payload
+        - redacted
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        project_id:
+          type: string
+        environment:
+          $ref: '#/components/schemas/Environment'
+        generation:
+          type: integer
+          minimum: 1
+        deployment_id:
+          type: string
+          format: uuid
+        correlation_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+        severity:
+          type: string
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+        payload:
+          type: object
+          additionalProperties: true
+        redacted:
+          type: boolean
+    SecretWriteRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - scope
+        - key
+        - value
+      properties:
+        scope:
+          type: string
+          enum:
+            - global
+            - project
+            - environment
+            - deployment
+        project_id:
+          type: string
+        environment:
+          $ref: '#/components/schemas/Environment'
+        key:
+          type: string
+          minLength: 1
+        value:
+          type: string
+          minLength: 1
+        sensitive:
+          type: boolean
+          default: false
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string

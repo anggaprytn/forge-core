@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge.local/schemas/forge.project.schema.json",
+  "title": "Forge Project Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "forge_schema_version",
+    "project_id",
+    "repository",
+    "environments",
+    "build",
+    "runtime",
+    "health",
+    "contract",
+    "secrets"
+  ],
+  "properties": {
+    "forge_schema_version": {
+      "const": 1
+    },
+    "project_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$"
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider"
+      ],
+      "properties": {
+        "provider": {
+          "const": "github"
+        }
+      }
+    },
+    "environments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "development",
+        "staging",
+        "production"
+      ],
+      "properties": {
+        "development": {
+          "$ref": "#/$defs/environment"
+        },
+        "staging": {
+          "$ref": "#/$defs/environment"
+        },
+        "production": {
+          "$ref": "#/$defs/environment"
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dockerfile_path",
+        "context_path"
+      ],
+      "properties": {
+        "dockerfile_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service_type",
+        "internal_port",
+        "subdomain",
+        "resources"
+      ],
+      "properties": {
+        "service_type": {
+          "enum": [
+            "http",
+            "tcp"
+          ]
+        },
+        "internal_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "subdomain": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
+        }
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tcp_required",
+        "http",
+        "startup_grace_seconds"
+      ],
+      "properties": {
+        "tcp_required": {
+          "const": true
+        },
+        "http": {
+          "$ref": "#/$defs/httpHealth"
+        },
+        "startup_grace_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 30
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "spec"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "spec": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment_variables"
+      ],
+      "properties": {
+        "environment_variables": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/secretReference"
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "runtime": {
+            "properties": {
+              "service_type": {
+                "const": "http"
+              }
+            },
+            "required": [
+              "service_type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "health": {
+            "properties": {
+              "http": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "enabled"
+                ]
+              }
+            },
+            "required": [
+              "http"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch"
+      ],
+      "properties": {
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "memory_limit_mb",
+        "cpu_shares"
+      ],
+      "properties": {
+        "memory_limit_mb": {
+          "type": "integer",
+          "minimum": 64
+        },
+        "cpu_shares": {
+          "type": "integer",
+          "minimum": 2
+        }
+      }
+    },
+    "httpHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "path",
+        "expected_status",
+        "timeout_ms"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_status": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          }
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "secretReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "key"
+      ],
+      "properties": {
+        "scope": {
+          "enum": [
+            "global",
+            "project",
+            "environment",
+            "deployment"
+          ]
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sensitive": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  }
+}
