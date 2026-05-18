@@ -74,12 +74,8 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         }
         args.push(request.image_ref.clone());
 
-        let output = self.runner.run("docker", &args)?;
-        Ok(if output.is_empty() {
-            request.container_name
-        } else {
-            output
-        })
+        let _ = self.runner.run("docker", &args)?;
+        Ok(request.container_name)
     }
 
     fn start_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
@@ -91,7 +87,21 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         &mut self,
         container_name: &str,
     ) -> Result<ContainerInspection, DockerRuntimeError> {
-        let args = vec!["inspect".to_string(), container_name.to_string()];
+        let args = vec![
+            "inspect".to_string(),
+            "--format".to_string(),
+            [
+                "name={{.Name}}",
+                "running={{.State.Running}}",
+                "image={{.Config.Image}}",
+                "restart_policy={{.HostConfig.RestartPolicy.Name}}",
+                "{{range $key, $value := .Config.Labels}}",
+                "label:{{$key}}={{$value}}",
+                "{{end}}",
+            ]
+            .join("\n"),
+            container_name.to_string(),
+        ];
         let output = self.runner.run("docker", &args)?;
         parse_inspection_output(&output)
     }
@@ -127,7 +137,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             continue;
         };
         match key {
-            "name" => container_name = Some(value.to_string()),
+            "name" => container_name = Some(value.trim_start_matches('/').to_string()),
             "running" => running = Some(value == "true"),
             "image" => image_ref = Some(value.to_string()),
             "restart_policy" => restart_policy = Some(value.to_string()),
@@ -281,7 +291,7 @@ pub mod docker_adapter_inspects_running_state {
     #[test]
     fn inspect_parses_running_state_and_labels() {
         let output = [
-            "name=prod-api-gen-42",
+            "name=/prod-api-gen-42",
             "running=true",
             "image=forge:test",
             "restart_policy=no",
@@ -298,6 +308,9 @@ pub mod docker_adapter_inspects_running_state {
         assert_eq!(inspection.container_name, "prod-api-gen-42");
         assert_eq!(inspection.restart_policy, "no");
         assert_eq!(inspection.labels.get("forge.project_id"), Some(&"api".to_string()));
+        let args = &docker.runner.commands[0].args;
+        assert_eq!(args[0], "inspect");
+        assert_eq!(args[1], "--format");
     }
 }
 
