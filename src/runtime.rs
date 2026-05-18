@@ -43,6 +43,21 @@ impl Display for DockerRuntimeError {
 
 impl std::error::Error for DockerRuntimeError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeError {
+    Failed(String),
+}
+
+impl Display for ProbeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {}
+
 pub trait DockerRuntime {
     fn build_image(&mut self, request: BuildImageRequest) -> Result<String, DockerRuntimeError>;
     fn create_container(
@@ -56,6 +71,11 @@ pub trait DockerRuntime {
     ) -> Result<ContainerInspection, DockerRuntimeError>;
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
+}
+
+pub trait ProbeRuntime {
+    fn probe_tcp(&mut self, container_name: &str) -> Result<bool, ProbeError>;
+    fn probe_http(&mut self, container_name: &str, path: &str) -> Result<bool, ProbeError>;
 }
 
 pub trait RoutingRuntime {}

@@ -29,7 +29,7 @@ impl CommandRunner for ProcessCommandRunner {
 }
 
 pub struct DockerCliRuntime<R> {
-    runner: R,
+    pub(crate) runner: R,
 }
 
 impl<R> DockerCliRuntime<R> {
