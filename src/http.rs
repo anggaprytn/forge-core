@@ -557,6 +557,13 @@ impl RoutingRuntime for NoopRoutingRuntime {
             health_checks_enabled: false,
         })
     }
+
+    fn remove_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

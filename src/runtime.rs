@@ -83,6 +83,7 @@ pub struct RouteUpdateRequest {
     pub subtree_id: String,
     pub target: String,
     pub health_checks_enabled: bool,
+    pub probe_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,4 +114,5 @@ impl std::error::Error for RoutingRuntimeError {}
 pub trait RoutingRuntime {
     fn update_route(&mut self, request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError>;
     fn inspect_route(&mut self, subtree_id: &str) -> Result<RouteInspection, RoutingRuntimeError>;
+    fn remove_route(&mut self, subtree_id: &str) -> Result<(), RoutingRuntimeError>;
 }

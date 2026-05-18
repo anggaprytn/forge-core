@@ -245,11 +245,8 @@ where
 
                 if !tcp_ok {
                     if let ActiveTruth::HttpRouted { .. } = input.truth {
-                        self.routing.update_route(RouteUpdateRequest {
-                            subtree_id: route_subtree_id(&input.project_id, &input.environment),
-                            target: String::new(),
-                            health_checks_enabled: false,
-                        })?;
+                        self.routing
+                            .remove_route(&route_subtree_id(&input.project_id, &input.environment))?;
                     }
                     runtime_state.health_state = RuntimeHealthState::Unavailable;
                     runtime_state.last_transition = "service_unavailable".into();
@@ -342,6 +339,7 @@ where
                             subtree_id: route_subtree_id(&input.project_id, &input.environment),
                             target,
                             health_checks_enabled: false,
+                            probe_path: input.http_health_path.clone(),
                         })?;
                         Ok(Some(current_generation))
                     }
@@ -360,6 +358,7 @@ where
                             subtree_id: route_subtree_id(&input.project_id, &input.environment),
                             target,
                             health_checks_enabled: false,
+                            probe_path: input.http_health_path.clone(),
                         })?;
                         Ok(Some(current_generation))
                     }
@@ -410,6 +409,7 @@ where
                     subtree_id: route_subtree_id(&input.project_id, &input.environment),
                     target: target.clone(),
                     health_checks_enabled: false,
+                    probe_path: input.http_health_path.clone(),
                 })?;
                 let inspection = self
                     .routing
@@ -604,6 +604,14 @@ impl RoutingRuntime for TestRoutingRuntime {
         self.route.clone().ok_or(crate::runtime::RoutingRuntimeError::InspectionFailed(
             "missing route".into(),
         ))
+    }
+
+    fn remove_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        self.route = None;
+        Ok(())
     }
 }
 

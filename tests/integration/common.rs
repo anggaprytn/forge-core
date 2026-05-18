@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +53,15 @@ pub fn sample_http_app_fixture() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("sample-http-app")
+}
+
+#[allow(dead_code)]
+pub fn available_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("ephemeral port should be allocatable")
+        .local_addr()
+        .expect("ephemeral port should expose local addr")
+        .port()
 }
 
 fn unique_suffix() -> String {

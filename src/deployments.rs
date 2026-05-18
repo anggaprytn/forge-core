@@ -274,6 +274,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     subtree_id: subtree_id.clone(),
                     target: target.clone(),
                     health_checks_enabled: false,
+                    probe_path: self.validation.http_health_path.clone(),
                 })?;
                 let inspection = self.routing.inspect_route(&subtree_id)?;
                 validate_route_activation(&inspection, &subtree_id, &target)?;
@@ -495,6 +496,10 @@ impl RoutingRuntime for TestRoutingRuntime {
             ));
         }
         Ok(self.inspections.remove(0))
+    }
+
+    fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {
+        Ok(())
     }
 }
 
