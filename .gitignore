@@ -1,0 +1,66 @@
+# ==========================================
+# Rust / Cargo Dependencies & Artifacts
+# ==========================================
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Hapus Cargo.lock dari atas JIKA Forge berupa aplikasi biner/executable 
+# (Direkomendasikan untuk tetap commit Cargo.lock pada aplikasi, 
+# tapi abaikan jika ini murni library/crates)
+
+# ==========================================
+# Frontend (Node / Vite / React / TanStack)
+# ==========================================
+node_modules/
+/dist/
+/.output/
+/.build/
+.next/
+.html/
+
+# TanStack Start / Meta-framework specific
+.vinxi/
+.output/
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==========================================
+# Forge Platform Runtime & Local Ledger (CRITICAL)
+# ==========================================
+# Jangan pernah commit state lokal, snapshot, atau data kontainer ke Git.
+/var/lib/forge/
+data/
+snapshots/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ==========================================
+# Security, Secrets & Local Environments
+# ==========================================
+# Kunci enkripsi Forge dan environment variables lokal wajib masuk ignore.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+FORGE_MASTER_KEY
+
+# ==========================================
+# IDEs & System Garbage
+# ==========================================
+.DS_Store
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
