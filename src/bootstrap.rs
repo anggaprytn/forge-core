@@ -104,6 +104,8 @@ pub mod startup_blocks_until_storage_roots_are_valid {
             storage_root: root.clone(),
             api_bind: "127.0.0.1:8080".into(),
             bearer_token: "test-token".into(),
+            github_webhook_secret: None,
+            repository_cache_root: None,
             sqlite_path: None,
         });
 
@@ -118,6 +120,8 @@ pub mod startup_blocks_until_storage_roots_are_valid {
             storage_root: root.clone(),
             api_bind: "127.0.0.1:8080".into(),
             bearer_token: "test-token".into(),
+            github_webhook_secret: None,
+            repository_cache_root: None,
             sqlite_path: None,
         });
 

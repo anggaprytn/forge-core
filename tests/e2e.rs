@@ -19,6 +19,7 @@ use forge_core::deployments::{
     ActivationMode, DeploymentError, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
 };
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
+use forge_core::github::GitHubWebhookConfig;
 use forge_core::http::{router, ControlPlane, HttpState, IdempotencyStore};
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
@@ -27,10 +28,14 @@ use forge_core::runtime::{
     RouteUpdateRequest, RoutingRuntime,
 };
 use forge_core::storage::{EnvironmentPaths, EventStore, PointerStore};
+use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
+use sha2::Sha256;
 use serde_json::Value;
 use tokio::net::TcpListener;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[test]
 fn e2e_sample_app_deploys_public_route() {
@@ -303,6 +308,67 @@ fn e2e_crash_during_route_activation_recovers_without_orphan_route() {
     assert!(cleanup.contains("\"route_removed\": true"));
 }
 
+#[test]
+fn e2e_github_webhook_push_enqueues_and_deploys() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("github-webhook") else {
+        return;
+    };
+
+    let repo = harness.create_manifest_repo(
+        "main",
+        r#"{
+  "forge_schema_version": 1,
+  "project_id": "api",
+  "repository": { "provider": "github" },
+  "environments": {
+    "development": { "branch": "dev" },
+    "staging": { "branch": "release" },
+    "production": { "branch": "main" }
+  },
+  "build": { "dockerfile_path": "./Dockerfile", "context_path": "." },
+  "runtime": {
+    "service_type": "http",
+    "internal_port": 3000,
+    "subdomain": "api",
+    "resources": { "memory_limit_mb": 512, "cpu_shares": 1024 }
+  },
+  "health": {
+    "tcp_required": true,
+    "http": { "enabled": true, "path": "/health", "expected_status": [200], "timeout_ms": 5000 },
+    "startup_grace_seconds": 30
+  },
+  "contract": { "version": 1, "spec": {} },
+  "secrets": { "environment_variables": {} }
+}"#,
+    );
+    let commit_sha = git_output(&repo, &["rev-parse", "HEAD"]);
+
+    let response = harness.post_github_webhook(
+        "delivery-1",
+        "push",
+        &format!(
+            r#"{{
+  "ref": "refs/heads/main",
+  "after": "{commit_sha}",
+  "repository": {{ "clone_url": "{}" }}
+}}"#,
+            repo.to_str().unwrap()
+        ),
+    );
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = response.json::<Value>().unwrap();
+    assert_eq!(json["data"]["status"], "accepted");
+
+    let deployment_id = json["data"]["deployment_id"].as_str().unwrap().to_string();
+    let execution = harness.execute_next_deployment().unwrap();
+    assert_eq!(execution.deployment_id, deployment_id);
+
+    let deployment = harness.get_deployment(&deployment_id);
+    assert_eq!(deployment["project_id"], "api");
+    assert_eq!(deployment["environment"], "production");
+}
+
 struct E2eHarness {
     runtime_root: PathBuf,
     network_name: String,
@@ -359,6 +425,8 @@ impl E2eHarness {
             storage_root: runtime_root.clone(),
             api_bind: format!("127.0.0.1:{api_port}"),
             bearer_token: token.clone(),
+            github_webhook_secret: Some("github-test-secret".into()),
+            repository_cache_root: Some(runtime_root.join("repo-cache")),
             sqlite_path: None,
         };
 
@@ -401,6 +469,7 @@ impl E2eHarness {
             Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>)),
             self.token.clone(),
             IdempotencyStore::new(self.runtime_root.join("idempotency")).unwrap(),
+            self.github_webhook_state(),
         );
         let app = router(state);
         self.api_threads.push(spawn_http_server(self.api_port, app));
@@ -462,6 +531,65 @@ impl E2eHarness {
 
     fn generation_dir(&self, generation: u64) -> PathBuf {
         EnvironmentPaths::new(&self.runtime_root, "api", "production").generation_dir(generation)
+    }
+
+    fn github_webhook_state(&self) -> Option<forge_core::http::GitHubWebhookState> {
+        Some(forge_core::http::GitHubWebhookState::new(
+            GitHubWebhookConfig {
+                secret: self
+                    .config
+                    .github_webhook_secret
+                    .clone()
+                    .expect("github webhook secret should be configured"),
+                repository_cache_root: self
+                    .config
+                    .repository_cache_root
+                    .clone()
+                    .expect("repository cache root should be configured"),
+            },
+            forge_core::http::DeliveryStore::new(self.runtime_root.join("github-deliveries")).unwrap(),
+        ))
+    }
+
+    fn create_manifest_repo(&self, branch: &str, manifest: &str) -> PathBuf {
+        let repo = self.runtime_root.join("webhook-repo");
+        fs::create_dir_all(&repo).unwrap();
+        git_in(&self.runtime_root, &["init", repo.to_str().unwrap()]);
+        git_in(&self.runtime_root, &["-C", repo.to_str().unwrap(), "checkout", "-b", branch]);
+        fs::write(repo.join("forge.project.json"), manifest).unwrap();
+        git_in(&self.runtime_root, &["-C", repo.to_str().unwrap(), "add", "forge.project.json"]);
+        git_in(
+            &self.runtime_root,
+            &[
+                "-C",
+                repo.to_str().unwrap(),
+                "-c",
+                "user.name=Forge Test",
+                "-c",
+                "user.email=forge@example.com",
+                "commit",
+                "-m",
+                "manifest",
+            ],
+        );
+        repo
+    }
+
+    fn post_github_webhook(
+        &self,
+        delivery_id: &str,
+        event: &str,
+        body: &str,
+    ) -> reqwest::blocking::Response {
+        self.http_client
+            .post(self.api_url("webhooks/github"))
+            .header("x-github-delivery", delivery_id)
+            .header("x-github-event", event)
+            .header("x-hub-signature-256", github_signature("github-test-secret", body.as_bytes()))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .expect("github webhook request should reach api")
     }
 
     fn stage_inflight_generation(
@@ -813,6 +941,31 @@ fn forge_labels(record: &DeploymentRecord, generation: u64) -> BTreeMap<String, 
         ("forge.generation".into(), generation.to_string()),
         ("forge.deployment_id".into(), record.deployment_id.clone()),
     ])
+}
+
+fn github_signature(secret: &str, body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn git_in(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git").current_dir(repo).args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn unique_suffix() -> String {

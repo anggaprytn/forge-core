@@ -8,6 +8,8 @@ pub struct DaemonConfig {
     pub storage_root: PathBuf,
     pub api_bind: String,
     pub bearer_token: String,
+    pub github_webhook_secret: Option<String>,
+    pub repository_cache_root: Option<PathBuf>,
     pub sqlite_path: Option<PathBuf>,
 }
 
@@ -64,12 +66,16 @@ impl DaemonConfig {
         let bearer_token = values
             .get("bearer_token")
             .ok_or(ConfigError::MissingKey("bearer_token"))?;
+        let github_webhook_secret = values.get("github_webhook_secret").cloned();
+        let repository_cache_root = values.get("repository_cache_root").map(PathBuf::from);
         let sqlite_path = values.get("sqlite_path").map(PathBuf::from);
 
         Ok(Self {
             storage_root: PathBuf::from(storage_root),
             api_bind: api_bind.clone(),
             bearer_token: bearer_token.clone(),
+            github_webhook_secret,
+            repository_cache_root,
             sqlite_path,
         })
     }
@@ -89,6 +95,8 @@ mod tests {
         assert_eq!(config.storage_root, PathBuf::from("/tmp/forge"));
         assert_eq!(config.api_bind, "127.0.0.1:8080");
         assert_eq!(config.bearer_token, "test-token");
+        assert_eq!(config.github_webhook_secret, None);
+        assert_eq!(config.repository_cache_root, None);
         assert_eq!(config.sqlite_path, None);
     }
 }

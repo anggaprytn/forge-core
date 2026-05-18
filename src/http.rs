@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -12,11 +13,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList};
 use crate::daemon::{Daemon, DaemonState};
+use crate::github::{resolve_webhook, verify_signature, GitHubError, GitHubWebhookConfig, WebhookResolution};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::storage::atomic_write;
 
 const AUTHORIZATION: &str = "authorization";
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
+const X_GITHUB_DELIVERY: &str = "x-github-delivery";
+const X_GITHUB_EVENT: &str = "x-github-event";
+const X_HUB_SIGNATURE_256: &str = "x-hub-signature-256";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const CORRELATION_ID_HEADER: &str = "x-correlation-id";
 
@@ -61,6 +66,7 @@ pub struct HttpState {
     daemon: Arc<Mutex<Box<dyn ControlPlane>>>,
     bearer_token: String,
     idempotency: IdempotencyStore,
+    github_webhooks: Option<GitHubWebhookState>,
 }
 
 impl HttpState {
@@ -68,12 +74,26 @@ impl HttpState {
         daemon: Arc<Mutex<Box<dyn ControlPlane>>>,
         bearer_token: String,
         idempotency: IdempotencyStore,
+        github_webhooks: Option<GitHubWebhookState>,
     ) -> Self {
         Self {
             daemon,
             bearer_token,
             idempotency,
+            github_webhooks,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GitHubWebhookState {
+    config: GitHubWebhookConfig,
+    deliveries: DeliveryStore,
+}
+
+impl GitHubWebhookState {
+    pub fn new(config: GitHubWebhookConfig, deliveries: DeliveryStore) -> Self {
+        Self { config, deliveries }
     }
 }
 
@@ -131,6 +151,22 @@ struct IdempotencyRecord {
     accepted: DeploymentAccepted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+struct DeliveryRecord {
+    request_id: String,
+    result: WebhookResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+struct WebhookResult {
+    status: String,
+    deployment_id: Option<String>,
+    queue_position: Option<usize>,
+    reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IdempotencyStore {
     root: PathBuf,
@@ -170,11 +206,51 @@ impl IdempotencyStore {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DeliveryStore {
+    root: PathBuf,
+}
+
+impl DeliveryStore {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    fn read(&self, delivery_id: &str) -> Result<Option<DeliveryRecord>, std::io::Error> {
+        let path = self.path_for(delivery_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(path)?;
+        let record = serde_json::from_str(&raw)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+        Ok(Some(record))
+    }
+
+    fn write(&self, delivery_id: &str, record: &DeliveryRecord) -> Result<(), std::io::Error> {
+        let bytes = serde_json::to_vec(record)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+        atomic_write(self.path_for(delivery_id), &bytes)
+            .map_err(|err| std::io::Error::other(err.to_string()))
+    }
+
+    fn path_for(&self, delivery_id: &str) -> PathBuf {
+        let sanitized = delivery_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>();
+        self.root.join(format!("{sanitized}.json"))
+    }
+}
+
 pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
         .route("/deployments", post(post_deployments))
+        .route("/webhooks/github", post(post_github_webhook))
         .route("/deployments/{id}", get(get_deployment))
         .route("/events", get(get_events))
         .with_state(state)
@@ -317,6 +393,155 @@ async fn post_deployments(
     json_response(StatusCode::ACCEPTED, &request_id, Json(envelope))
 }
 
+async fn post_github_webhook(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request_id = next_request_id();
+    let Some(github) = state.github_webhooks.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            ErrorResponse {
+                code: "github_webhook_not_configured".into(),
+                message: "github webhook integration is not configured".into(),
+            },
+        );
+    };
+
+    let Some(delivery_id) = header_value(&headers, X_GITHUB_DELIVERY) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &request_id,
+            ErrorResponse {
+                code: "missing_github_delivery".into(),
+                message: "missing x-github-delivery header".into(),
+            },
+        );
+    };
+    let Some(event) = header_value(&headers, X_GITHUB_EVENT) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &request_id,
+            ErrorResponse {
+                code: "missing_github_event".into(),
+                message: "missing x-github-event header".into(),
+            },
+        );
+    };
+    let Some(signature) = header_value(&headers, X_HUB_SIGNATURE_256) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &request_id,
+            ErrorResponse {
+                code: "missing_github_signature".into(),
+                message: "missing x-hub-signature-256 header".into(),
+            },
+        );
+    };
+
+    match github.deliveries.read(&delivery_id) {
+        Ok(Some(record)) => {
+            return json_response(
+                StatusCode::ACCEPTED,
+                &record.request_id,
+                Json(SuccessEnvelope {
+                    request_id: record.request_id.clone(),
+                    correlation_id: record.request_id.clone(),
+                    data: record.result,
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "delivery_store_error".into(),
+                    message: err.to_string(),
+                },
+            );
+        }
+    }
+
+    if let Err(err) = verify_signature(&github.config.secret, &body, &signature) {
+        return github_error_response(&request_id, err);
+    }
+
+    let result = match resolve_webhook(&github.config, &event, &body) {
+        Ok(WebhookResolution::Ignore { reason }) => WebhookResult {
+            status: "ignored".into(),
+            deployment_id: None,
+            queue_position: None,
+            reason: Some(reason),
+        },
+        Ok(WebhookResolution::Enqueue(request)) => {
+            let accepted = {
+                let mut daemon = match state.daemon.lock() {
+                    Ok(daemon) => daemon,
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &request_id,
+                            ErrorResponse {
+                                code: "daemon_lock_error".into(),
+                                message: "daemon lock poisoned".into(),
+                            },
+                        );
+                    }
+                };
+                match daemon.handle_post_deployments(request) {
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        let status = if err.code == "daemon_not_ready" {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        };
+                        return error_response(status, &request_id, err);
+                    }
+                }
+            };
+            WebhookResult {
+                status: "accepted".into(),
+                deployment_id: Some(accepted.deployment_id),
+                queue_position: Some(accepted.queue_position),
+                reason: None,
+            }
+        }
+        Err(err) => return github_error_response(&request_id, err),
+    };
+
+    if let Err(err) = github.deliveries.write(
+        &delivery_id,
+        &DeliveryRecord {
+            request_id: request_id.clone(),
+            result: result.clone(),
+        },
+    ) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "delivery_store_error".into(),
+                message: err.to_string(),
+            },
+        );
+    }
+
+    json_response(
+        StatusCode::ACCEPTED,
+        &request_id,
+        Json(SuccessEnvelope {
+            request_id: request_id.clone(),
+            correlation_id: request_id.clone(),
+            data: result,
+        }),
+    )
+}
+
 async fn get_deployment(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -422,6 +647,43 @@ fn ensure_authorized(state: &HttpState, headers: &HeaderMap, request_id: &str) -
     }
 
     Ok(())
+}
+
+fn github_error_response(request_id: &str, err: GitHubError) -> Response {
+    match err {
+        GitHubError::InvalidSignature => error_response(
+            StatusCode::UNAUTHORIZED,
+            request_id,
+            ErrorResponse {
+                code: "invalid_github_signature".into(),
+                message: "invalid github signature".into(),
+            },
+        ),
+        GitHubError::UnsupportedEvent(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            ErrorResponse {
+                code: "unsupported_github_event".into(),
+                message: err.to_string(),
+            },
+        ),
+        GitHubError::InvalidPayload(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            ErrorResponse {
+                code: "invalid_github_payload".into(),
+                message: err.to_string(),
+            },
+        ),
+        GitHubError::GitCommand(_) | GitHubError::Manifest(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            ErrorResponse {
+                code: "github_manifest_resolution_failed".into(),
+                message: err.to_string(),
+            },
+        ),
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -600,6 +862,8 @@ fn build_state(ready: bool) -> HttpState {
         storage_root: root.clone(),
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
+        github_webhook_secret: None,
+        repository_cache_root: None,
         sqlite_path: None,
     };
     let mut daemon = Daemon::new(config.clone(), NoopDockerRuntime, NoopRoutingRuntime, StaticDecider(true));
@@ -610,6 +874,7 @@ fn build_state(ready: bool) -> HttpState {
         Arc::new(Mutex::new(Box::new(daemon))),
         config.bearer_token,
         IdempotencyStore::new(root.join("idempotency")).unwrap(),
+        None,
     )
 }
 

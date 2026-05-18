@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod deployments;
 pub mod docker;
 pub mod events;
+pub mod github;
 pub mod http;
 pub mod invariants;
 pub mod queue;

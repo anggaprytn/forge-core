@@ -456,6 +456,8 @@ fn config_with_root(root: PathBuf) -> DaemonConfig {
         storage_root: root,
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
+        github_webhook_secret: None,
+        repository_cache_root: None,
         sqlite_path: None,
     }
 }
