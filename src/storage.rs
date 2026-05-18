@@ -241,7 +241,7 @@ impl Drop for FileLock {
     }
 }
 
-fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> StorageResult<()> {
+pub(crate) fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> StorageResult<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
