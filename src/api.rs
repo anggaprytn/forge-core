@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::events::EventRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[derive(Serialize, Deserialize)]
@@ -29,6 +30,12 @@ pub struct DeploymentStatus {
     pub project_id: String,
     pub environment: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+pub struct EventList {
+    pub events: Vec<EventRecord>,
 }
 
 pub fn validate_deployment_request(request: &DeploymentRequest) -> Result<(), ErrorResponse> {

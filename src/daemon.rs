@@ -4,12 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    validate_deployment_request, DeploymentAccepted, DeploymentRequest, DeploymentStatus,
+    validate_deployment_request, DeploymentAccepted, DeploymentRequest, DeploymentStatus, EventList,
     ErrorResponse,
 };
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
 use crate::convergence::{ActiveDeploymentDecider, ConvergenceError, RecoveryOutcome, StartupConvergence};
+use crate::storage::{EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore};
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 
@@ -164,20 +165,59 @@ where
         &self,
         deployment_id: &str,
     ) -> Result<Option<DeploymentStatus>, ErrorResponse> {
-        let queue = self.queue.as_ref().ok_or_else(|| ErrorResponse {
-            code: "queue_unavailable".into(),
-            message: "queue is unavailable".into(),
-        })?;
-        let found = queue
-            .find_deployment(deployment_id)
-            .map_err(queue_error_to_response)?;
+        if let Some(queue) = self.queue.as_ref() {
+            let found = queue
+                .find_deployment(deployment_id)
+                .map_err(queue_error_to_response)?;
 
-        Ok(found.map(|item| DeploymentStatus {
-            deployment_id: item.record.deployment_id,
-            project_id: item.record.project_id,
-            environment: item.record.environment,
-            state: item.state,
-        }))
+            if let Some(item) = found {
+                return Ok(Some(DeploymentStatus {
+                    deployment_id: item.record.deployment_id,
+                    project_id: item.record.project_id,
+                    environment: item.record.environment,
+                    state: item.state,
+                }));
+            }
+        }
+
+        for entry in persisted_deployments(&self.config.storage_root).map_err(|err| ErrorResponse {
+            code: "status_lookup_failed".into(),
+            message: err.to_string(),
+        })? {
+            if entry.deployment_id == deployment_id {
+                let runtime_state = RuntimeStateStore::new(EnvironmentPaths::new(
+                    &self.config.storage_root,
+                    &entry.project_id,
+                    &entry.environment,
+                ))
+                .load()
+                .map_err(|err| ErrorResponse {
+                    code: "status_lookup_failed".into(),
+                    message: err.to_string(),
+                })?;
+                let state = match runtime_state.health_state {
+                    RuntimeHealthState::Healthy => "healthy",
+                    RuntimeHealthState::Degraded => "degraded",
+                    RuntimeHealthState::Unavailable => "unavailable",
+                };
+                return Ok(Some(DeploymentStatus {
+                    deployment_id: entry.deployment_id,
+                    project_id: entry.project_id,
+                    environment: entry.environment,
+                    state: state.into(),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn list_events(&self) -> Result<EventList, ErrorResponse> {
+        let events = EventStore::list_all(&self.config.storage_root).map_err(|err| ErrorResponse {
+            code: "events_unavailable".into(),
+            message: err.to_string(),
+        })?;
+        Ok(EventList { events })
     }
 
     pub fn graceful_shutdown(&mut self) {
@@ -226,6 +266,63 @@ fn next_deployment_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("dep-{now}-{seq}")
+}
+
+struct PersistedDeployment {
+    deployment_id: String,
+    project_id: String,
+    environment: String,
+}
+
+fn persisted_deployments(root: &std::path::Path) -> Result<Vec<PersistedDeployment>, std::io::Error> {
+    let projects_root = root.join("projects");
+    let mut deployments = Vec::new();
+    if !projects_root.exists() {
+        return Ok(deployments);
+    }
+    for project in std::fs::read_dir(projects_root)? {
+        let project = project?;
+        if !project.file_type()?.is_dir() {
+            continue;
+        }
+        let project_id = project.file_name().to_string_lossy().to_string();
+        let envs = project.path().join("environments");
+        if !envs.exists() {
+            continue;
+        }
+        for env in std::fs::read_dir(envs)? {
+            let env = env?;
+            let environment = env.file_name().to_string_lossy().to_string();
+            let generations = env.path().join("generations");
+            if !generations.exists() {
+                continue;
+            }
+            for generation in std::fs::read_dir(generations)? {
+                let generation = generation?;
+                let build = generation.path().join("build.json");
+                if !build.exists() {
+                    continue;
+                }
+                let raw = std::fs::read_to_string(build)?;
+                if let Some(deployment_id) = extract_json_string(&raw, "deployment_id") {
+                    deployments.push(PersistedDeployment {
+                        deployment_id,
+                        project_id: project_id.clone(),
+                        environment: environment.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(deployments)
+}
+
+fn extract_json_string(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\": \"");
+    let start = raw.find(&needle)? + needle.len();
+    let tail = &raw[start..];
+    let end = tail.find('"')?;
+    Some(tail[..end].to_string())
 }
 
 #[cfg(test)]
@@ -565,5 +662,52 @@ pub mod post_deployments_enqueues_job_and_persists_across_restart {
         let state = restarted.queue().unwrap().load_state().unwrap();
         assert_eq!(state.queued.len(), 1);
         assert_eq!(state.queued[0].deployment_id, accepted.deployment_id);
+    }
+}
+
+#[cfg(test)]
+pub mod deployment_status_reflects_runtime_state {
+    use super::*;
+    use crate::storage::{
+        EnvironmentPaths, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
+        SnapshotWriter,
+    };
+
+    #[test]
+    fn persisted_runtime_state_drives_status_lookup() {
+        let root = test_root("deployment-status-runtime-state");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-persisted\",\n  \"image_ref\": \"forge:test\"\n}\n",
+            )
+            .unwrap();
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
+        RuntimeStateStore::new(env).save(&RuntimeState {
+            active_generation: Some(1),
+            health_state: RuntimeHealthState::Degraded,
+            failed_probe_count: 3,
+            successful_probe_count: 0,
+            restart_attempted: true,
+            degraded_since_unix: Some(100),
+            last_transition: "degraded".into(),
+            last_error_code: Some("tcp_unreachable".into()),
+        }).unwrap();
+
+        let daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+
+        let status = daemon.get_deployment("dep-persisted").unwrap().unwrap();
+        assert_eq!(status.state, "degraded");
+        assert_eq!(status.project_id, "api");
     }
 }

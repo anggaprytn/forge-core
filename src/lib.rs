@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod deployments;
 pub mod docker;
+pub mod events;
 pub mod http;
 pub mod invariants;
 pub mod queue;

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
+use crate::events::EventRecord;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
@@ -9,8 +10,8 @@ use crate::runtime::{
     RoutingRuntime, RoutingRuntimeError,
 };
 use crate::storage::{
-    EnvironmentPaths, GenerationAllocator, PointerStore, SnapshotState, SnapshotWriter,
-    StorageError,
+    DiagnosticsStore, EnvironmentPaths, EventStore, GenerationAllocator, PointerStore,
+    SnapshotState, SnapshotWriter, StorageError,
 };
 
 #[derive(Debug)]
@@ -154,10 +155,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
     ) -> Result<DeploymentExecution, DeploymentError> {
         let env = EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
         let generation = GenerationAllocator::new(env.clone()).allocate()?;
+        let events = EventStore::new(env.clone(), generation);
+        let diagnostics = DiagnosticsStore::new(env.clone(), generation);
         let labels = forge_labels(record, generation);
         let container_name = generation_container_name(record, generation);
         let image_tag = format!("forge/{}:{}-gen-{}", record.project_id, record.environment, generation);
         let writer = SnapshotWriter::new(env.clone(), generation)?;
+        append_event(&events, record, generation, "DEPLOYMENT_STARTED", None)?;
 
         let image_ref = self.docker.build_image(BuildImageRequest {
             image_tag: image_tag.clone(),
@@ -165,6 +169,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             dockerfile_path: PathBuf::from("./Dockerfile"),
             labels: labels.clone(),
         })?;
+        append_event(&events, record, generation, "IMAGE_BUILT", None)?;
 
         self.docker.create_container(CreateContainerRequest {
             container_name: container_name.clone(),
@@ -172,6 +177,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             labels: labels.clone(),
         })?;
         self.docker.start_container(&container_name)?;
+        append_event(&events, record, generation, "CONTAINER_STARTED", None)?;
         let inspection = self.docker.inspect_container(&container_name)?;
         validate_inspection(&inspection, &container_name)?;
         writer.write_artifact(
@@ -188,10 +194,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 inspection.container_name, inspection.running
             ),
         )?;
-        self.validate_candidate(&container_name)?;
+        self.validate_candidate(&container_name, &events, &diagnostics, record, generation)?;
 
         writer.finalize(&record.project_id, &record.environment, SnapshotState::Healthy)?;
+        append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
         self.activate_generation(record, &env, generation, &container_name)?;
+        append_event(&events, record, generation, "GENERATION_PROMOTED", None)?;
 
         Ok(DeploymentExecution {
             deployment_id: record.deployment_id.clone(),
@@ -201,19 +209,43 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         })
     }
 
-    fn validate_candidate(&mut self, container_name: &str) -> Result<(), DeploymentError> {
+    fn validate_candidate(
+        &mut self,
+        container_name: &str,
+        events: &EventStore,
+        diagnostics: &DiagnosticsStore,
+        record: &DeploymentRecord,
+        generation: u64,
+    ) -> Result<(), DeploymentError> {
         if self.validation.tcp_required && !self.probes.probe_tcp(container_name)? {
+            diagnostics.write_failure_reason("tcp probe failed", &[])?;
+            append_event(
+                events,
+                record,
+                generation,
+                "TCP_PROBE_FAILED",
+                Some("tcp probe failed".into()),
+            )?;
             self.cleanup_failed_generation(container_name)?;
             return Err(DeploymentError::ValidationFailed("tcp probe failed"));
         }
 
         if let Some(path) = &self.validation.http_health_path {
             if !self.probes.probe_http(container_name, path)? {
+                diagnostics.write_failure_reason("http health probe failed", &[])?;
+                append_event(
+                    events,
+                    record,
+                    generation,
+                    "HTTP_PROBE_FAILED",
+                    Some("http health probe failed".into()),
+                )?;
                 self.cleanup_failed_generation(container_name)?;
                 return Err(DeploymentError::ValidationFailed("http health probe failed"));
             }
         }
 
+        append_event(events, record, generation, "VALIDATION_PASSED", None)?;
         Ok(())
     }
 
@@ -279,8 +311,60 @@ impl RollbackExecutor {
             return Err(DeploymentError::RollbackUnavailable);
         }
         pointers.swap_current(target)?;
+        append_simple_event(
+            &EventStore::new(env.clone(), target),
+            project_id,
+            environment,
+            target,
+            None,
+            "ROLLBACK_COMPLETED",
+            None,
+        )?;
         Ok(target)
     }
+}
+
+fn append_event(
+    store: &EventStore,
+    record: &DeploymentRecord,
+    generation: u64,
+    event_type: &str,
+    reason: Option<String>,
+) -> Result<(), DeploymentError> {
+    append_simple_event(
+        store,
+        &record.project_id,
+        &record.environment,
+        generation,
+        Some(record.deployment_id.clone()),
+        event_type,
+        reason.as_deref(),
+    )
+}
+
+fn append_simple_event(
+    store: &EventStore,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    deployment_id: Option<String>,
+    event_type: &str,
+    reason: Option<&str>,
+) -> Result<(), DeploymentError> {
+    let timestamp_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    store.append(&EventRecord {
+        timestamp_unix,
+        project_id: project_id.into(),
+        environment: environment.into(),
+        generation: Some(generation),
+        deployment_id,
+        event_type: event_type.into(),
+        reason: reason.map(|value| value.to_string()),
+    })?;
+    Ok(())
 }
 
 fn validate_inspection(
@@ -554,6 +638,69 @@ pub mod failed_generation_is_cleaned_up {
 }
 
 #[cfg(test)]
+pub mod events_are_appended_for_state_transitions {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::EventStore;
+
+    #[test]
+    fn transition_events_are_persisted() {
+        let root = test_root("transition-events");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime { tcp_ok: true, http_ok: true };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy { tcp_required: true, http_health_path: Some("/health".into()), activation: ActivationMode::Direct },
+        ).execute_next().unwrap();
+
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(events.iter().any(|event| event.event_type == "DEPLOYMENT_STARTED"));
+        assert!(events.iter().any(|event| event.event_type == "VALIDATION_PASSED"));
+        assert!(events.iter().any(|event| event.event_type == "GENERATION_PROMOTED"));
+    }
+}
+
+#[cfg(test)]
+pub mod failed_probe_records_diagnostic_reason {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::DiagnosticsStore;
+
+    #[test]
+    fn diagnostic_reason_is_persisted_for_failed_probe() {
+        let root = test_root("failed-probe-diagnostic");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime { tcp_ok: false, http_ok: true };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        ).execute_next();
+
+        let diagnostics = DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1);
+        let reason = diagnostics.read_failure_reason().unwrap().unwrap();
+        assert!(reason.contains("tcp probe failed"));
+    }
+}
+
+#[cfg(test)]
 pub mod snapshot_not_finalized_before_validation {
     use super::*;
     use crate::docker::DockerCliRuntime;
@@ -591,6 +738,7 @@ pub mod snapshot_not_finalized_before_validation {
 #[cfg(test)]
 pub mod rollback_restores_previous_generation {
     use super::*;
+    use crate::storage::EventStore;
 
     #[test]
     fn rollback_moves_current_pointer_back_to_previous() {
@@ -610,6 +758,8 @@ pub mod rollback_restores_previous_generation {
 
         assert_eq!(restored, 1);
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(events.iter().any(|event| event.event_type == "ROLLBACK_COMPLETED"));
     }
 }
 

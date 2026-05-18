@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorResponse};
+use crate::api::{DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList};
 use crate::daemon::{Daemon, DaemonState};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::storage::atomic_write;
@@ -27,6 +27,7 @@ pub trait ControlPlane: Send {
         request: DeploymentRequest,
     ) -> Result<DeploymentAccepted, ErrorResponse>;
     fn get_deployment(&self, deployment_id: &str) -> Result<Option<DeploymentStatus>, ErrorResponse>;
+    fn list_events(&self) -> Result<EventList, ErrorResponse>;
 }
 
 impl<D, R, A> ControlPlane for Daemon<D, R, A>
@@ -48,6 +49,10 @@ where
 
     fn get_deployment(&self, deployment_id: &str) -> Result<Option<DeploymentStatus>, ErrorResponse> {
         Daemon::get_deployment(self, deployment_id)
+    }
+
+    fn list_events(&self) -> Result<EventList, ErrorResponse> {
+        Daemon::list_events(self)
     }
 }
 
@@ -171,6 +176,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/readyz", get(get_readyz))
         .route("/deployments", post(post_deployments))
         .route("/deployments/{id}", get(get_deployment))
+        .route("/events", get(get_events))
         .with_state(state)
 }
 
@@ -352,6 +358,40 @@ async fn get_deployment(
                 code: "deployment_not_found".into(),
                 message: "deployment not found".into(),
             },
+        ),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+    }
+}
+
+async fn get_events(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let daemon = match state.daemon.lock() {
+        Ok(daemon) => daemon,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "daemon_lock_error".into(),
+                    message: "daemon lock poisoned".into(),
+                },
+            );
+        }
+    };
+
+    match daemon.list_events() {
+        Ok(events) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: events,
+            }),
         ),
         Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
     }

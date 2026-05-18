@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::events::{redact_text, EventRecord};
 use serde::{Deserialize, Serialize};
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -221,6 +222,16 @@ pub struct RuntimeStateStore {
     env: EnvironmentPaths,
 }
 
+pub struct EventStore {
+    env: EnvironmentPaths,
+    generation: u64,
+}
+
+pub struct DiagnosticsStore {
+    env: EnvironmentPaths,
+    generation: u64,
+}
+
 impl RuntimeStateStore {
     pub fn new(env: EnvironmentPaths) -> Self {
         Self { env }
@@ -250,6 +261,111 @@ impl RuntimeStateStore {
             ))
         })?;
         atomic_write(self.env.runtime_state_file(), &bytes)
+    }
+}
+
+impl EventStore {
+    pub fn new(env: EnvironmentPaths, generation: u64) -> Self {
+        Self { env, generation }
+    }
+
+    pub fn append(&self, event: &EventRecord) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let path = self.env.generation_dir(self.generation).join("events.jsonl");
+        let mut existing = if path.exists() {
+            fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+        let line = serde_json::to_string(event).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        existing.push_str(&line);
+        existing.push('\n');
+        atomic_write(path, existing.as_bytes())
+    }
+
+    pub fn list_all(root: impl AsRef<Path>) -> StorageResult<Vec<EventRecord>> {
+        let root = root.as_ref().join("projects");
+        let mut events = Vec::new();
+        if !root.exists() {
+            return Ok(events);
+        }
+        for project in fs::read_dir(root)? {
+            let project = project?;
+            if !project.file_type()?.is_dir() {
+                continue;
+            }
+            let envs = project.path().join("environments");
+            if !envs.exists() {
+                continue;
+            }
+            for env in fs::read_dir(envs)? {
+                let env = env?;
+                let generations = env.path().join("generations");
+                if !generations.exists() {
+                    continue;
+                }
+                for generation in fs::read_dir(generations)? {
+                    let generation = generation?;
+                    let path = generation.path().join("events.jsonl");
+                    if !path.exists() {
+                        continue;
+                    }
+                    let raw = fs::read_to_string(path)?;
+                    for line in raw.lines() {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let event = serde_json::from_str::<EventRecord>(line).map_err(|err| {
+                            StorageError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                err.to_string(),
+                            ))
+                        })?;
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        Ok(events)
+    }
+}
+
+impl DiagnosticsStore {
+    pub fn new(env: EnvironmentPaths, generation: u64) -> Self {
+        Self { env, generation }
+    }
+
+    pub fn write_failure_reason(&self, reason: &str, secrets: &[String]) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("diagnostics")
+            .join("failure_reason.log");
+        let redacted = redact_text(reason, secrets);
+        let bounded = if redacted.len() > 4096 {
+            redacted[..4096].to_string()
+        } else {
+            redacted
+        };
+        atomic_write(path, bounded.as_bytes())
+    }
+
+    pub fn read_failure_reason(&self) -> StorageResult<Option<String>> {
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("diagnostics")
+            .join("failure_reason.log");
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read_to_string(path)?))
     }
 }
 
