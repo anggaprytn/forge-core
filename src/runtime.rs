@@ -78,4 +78,39 @@ pub trait ProbeRuntime {
     fn probe_http(&mut self, container_name: &str, path: &str) -> Result<bool, ProbeError>;
 }
 
-pub trait RoutingRuntime {}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteUpdateRequest {
+    pub subtree_id: String,
+    pub target: String,
+    pub health_checks_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteInspection {
+    pub subtree_id: String,
+    pub active_target: String,
+    pub activation_verified: bool,
+    pub health_checks_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingRuntimeError {
+    UpdateFailed(String),
+    InspectionFailed(String),
+}
+
+impl Display for RoutingRuntimeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UpdateFailed(message) => write!(f, "{message}"),
+            Self::InspectionFailed(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for RoutingRuntimeError {}
+
+pub trait RoutingRuntime {
+    fn update_route(&mut self, request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError>;
+    fn inspect_route(&mut self, subtree_id: &str) -> Result<RouteInspection, RoutingRuntimeError>;
+}

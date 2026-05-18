@@ -1,5 +1,6 @@
 pub mod api;
 pub mod bootstrap;
+pub mod caddy;
 pub mod config;
 pub mod daemon;
 pub mod deployments;

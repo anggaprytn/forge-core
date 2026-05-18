@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
-    DockerRuntimeError, ProbeError, ProbeRuntime,
+    DockerRuntimeError, ProbeError, ProbeRuntime, RouteInspection, RouteUpdateRequest,
+    RoutingRuntime, RoutingRuntimeError,
 };
 use crate::storage::{
     EnvironmentPaths, GenerationAllocator, PointerStore, SnapshotState, SnapshotWriter,
@@ -18,6 +19,7 @@ pub enum DeploymentError {
     Storage(StorageError),
     Docker(DockerRuntimeError),
     Probe(ProbeError),
+    Routing(RoutingRuntimeError),
     InvalidInspection(String),
     ValidationFailed(&'static str),
     RollbackUnavailable,
@@ -30,6 +32,7 @@ impl Display for DeploymentError {
             Self::Storage(err) => write!(f, "{err}"),
             Self::Docker(err) => write!(f, "{err}"),
             Self::Probe(err) => write!(f, "{err}"),
+            Self::Routing(err) => write!(f, "{err}"),
             Self::InvalidInspection(err) => write!(f, "{err}"),
             Self::ValidationFailed(err) => write!(f, "{err}"),
             Self::RollbackUnavailable => write!(f, "rollback target unavailable"),
@@ -63,6 +66,12 @@ impl From<ProbeError> for DeploymentError {
     }
 }
 
+impl From<RoutingRuntimeError> for DeploymentError {
+    fn from(value: RoutingRuntimeError) -> Self {
+        Self::Routing(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentExecution {
     pub deployment_id: String,
@@ -75,6 +84,7 @@ pub struct DeploymentExecution {
 pub struct ValidationPolicy {
     pub tcp_required: bool,
     pub http_health_path: Option<String>,
+    pub activation: ActivationMode,
 }
 
 impl Default for ValidationPolicy {
@@ -82,24 +92,33 @@ impl Default for ValidationPolicy {
         Self {
             tcp_required: true,
             http_health_path: None,
+            activation: ActivationMode::Direct,
         }
     }
 }
 
-pub struct DeploymentExecutor<'a, D, P> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationMode {
+    Direct,
+    Http { internal_port: u16 },
+}
+
+pub struct DeploymentExecutor<'a, D, P, R> {
     storage_root: PathBuf,
     queue: &'a PersistentQueue,
     docker: &'a mut D,
     probes: &'a mut P,
+    routing: &'a mut R,
     validation: ValidationPolicy,
 }
 
-impl<'a, D: DockerRuntime, P: ProbeRuntime> DeploymentExecutor<'a, D, P> {
+impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecutor<'a, D, P, R> {
     pub fn new(
         storage_root: impl Into<PathBuf>,
         queue: &'a PersistentQueue,
         docker: &'a mut D,
         probes: &'a mut P,
+        routing: &'a mut R,
         validation: ValidationPolicy,
     ) -> Self {
         Self {
@@ -107,6 +126,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime> DeploymentExecutor<'a, D, P> {
             queue,
             docker,
             probes,
+            routing,
             validation,
         }
     }
@@ -171,7 +191,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime> DeploymentExecutor<'a, D, P> {
         self.validate_candidate(&container_name)?;
 
         writer.finalize(&record.project_id, &record.environment, SnapshotState::Healthy)?;
-        PointerStore::new(env).swap_current(generation)?;
+        self.activate_generation(record, &env, generation, &container_name)?;
 
         Ok(DeploymentExecution {
             deployment_id: record.deployment_id.clone(),
@@ -201,6 +221,34 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime> DeploymentExecutor<'a, D, P> {
         let _ = self.docker.stop_container(container_name);
         self.docker.remove_container(container_name)?;
         Ok(())
+    }
+
+    fn activate_generation(
+        &mut self,
+        record: &DeploymentRecord,
+        env: &EnvironmentPaths,
+        generation: u64,
+        container_name: &str,
+    ) -> Result<(), DeploymentError> {
+        match self.validation.activation {
+            ActivationMode::Direct => {
+                PointerStore::new(env.clone()).swap_current(generation)?;
+                Ok(())
+            }
+            ActivationMode::Http { internal_port } => {
+                let subtree_id = route_subtree_id(record);
+                let target = format!("{container_name}:{internal_port}");
+                self.routing.update_route(RouteUpdateRequest {
+                    subtree_id: subtree_id.clone(),
+                    target: target.clone(),
+                    health_checks_enabled: false,
+                })?;
+                let inspection = self.routing.inspect_route(&subtree_id)?;
+                validate_route_activation(&inspection, &subtree_id, &target)?;
+                PointerStore::new(env.clone()).swap_current(generation)?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -277,6 +325,38 @@ fn generation_container_name(record: &DeploymentRecord, generation: u64) -> Stri
     format!("{env}-{}-gen-{generation}", record.project_id)
 }
 
+fn route_subtree_id(record: &DeploymentRecord) -> String {
+    format!("forge:{}:{}", record.project_id, record.environment)
+}
+
+fn validate_route_activation(
+    inspection: &RouteInspection,
+    expected_subtree_id: &str,
+    expected_target: &str,
+) -> Result<(), DeploymentError> {
+    if inspection.subtree_id != expected_subtree_id {
+        return Err(DeploymentError::InvalidInspection(
+            "route subtree mismatch".into(),
+        ));
+    }
+    if !inspection.activation_verified {
+        return Err(DeploymentError::ValidationFailed(
+            "route activation verification failed",
+        ));
+    }
+    if inspection.active_target != expected_target {
+        return Err(DeploymentError::ValidationFailed(
+            "route target mismatch",
+        ));
+    }
+    if inspection.health_checks_enabled {
+        return Err(DeploymentError::ValidationFailed(
+            "routing health checks must remain disabled",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn test_root(name: &str) -> PathBuf {
     use std::fs;
@@ -307,6 +387,30 @@ impl ProbeRuntime for TestProbeRuntime {
 
     fn probe_http(&mut self, _container_name: &str, _path: &str) -> Result<bool, ProbeError> {
         Ok(self.http_ok)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRoutingRuntime {
+    updates: Vec<RouteUpdateRequest>,
+    inspections: Vec<RouteInspection>,
+}
+
+#[cfg(test)]
+impl RoutingRuntime for TestRoutingRuntime {
+    fn update_route(&mut self, request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError> {
+        self.updates.push(request);
+        Ok(())
+    }
+
+    fn inspect_route(&mut self, _subtree_id: &str) -> Result<RouteInspection, RoutingRuntimeError> {
+        if self.inspections.is_empty() {
+            return Err(RoutingRuntimeError::InspectionFailed(
+                "missing inspection".into(),
+            ));
+        }
+        Ok(self.inspections.remove(0))
     }
 }
 
@@ -353,12 +457,14 @@ pub mod deployment_fails_if_tcp_unreachable {
             tcp_ok: false,
             http_ok: true,
         };
+        let mut routing = TestRoutingRuntime::default();
 
         let result = DeploymentExecutor::new(
             &root,
             &queue,
             &mut docker,
             &mut probes,
+            &mut routing,
             ValidationPolicy::default(),
         )
         .execute_next();
@@ -386,15 +492,18 @@ pub mod deployment_fails_if_http_health_invalid {
             tcp_ok: true,
             http_ok: false,
         };
+        let mut routing = TestRoutingRuntime::default();
 
         let result = DeploymentExecutor::new(
             &root,
             &queue,
             &mut docker,
             &mut probes,
+            &mut routing,
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
+                activation: ActivationMode::Direct,
             },
         )
         .execute_next();
@@ -426,12 +535,14 @@ pub mod failed_generation_is_cleaned_up {
             tcp_ok: false,
             http_ok: true,
         };
+        let mut routing = TestRoutingRuntime::default();
 
         let _ = DeploymentExecutor::new(
             &root,
             &queue,
             &mut docker,
             &mut probes,
+            &mut routing,
             ValidationPolicy::default(),
         )
         .execute_next();
@@ -458,12 +569,14 @@ pub mod snapshot_not_finalized_before_validation {
             tcp_ok: false,
             http_ok: true,
         };
+        let mut routing = TestRoutingRuntime::default();
 
         let _ = DeploymentExecutor::new(
             &root,
             &queue,
             &mut docker,
             &mut probes,
+            &mut routing,
             ValidationPolicy::default(),
         )
         .execute_next();
@@ -516,12 +629,14 @@ pub mod current_pointer_never_advances_before_validation {
             tcp_ok: false,
             http_ok: true,
         };
+        let mut routing = TestRoutingRuntime::default();
 
         let _ = DeploymentExecutor::new(
             &root,
             &queue,
             &mut docker,
             &mut probes,
+            &mut routing,
             ValidationPolicy::default(),
         )
         .execute_next();
@@ -548,15 +663,18 @@ pub mod queued_deployment_builds_starts_validates_and_writes_snapshot {
             tcp_ok: true,
             http_ok: true,
         };
+        let mut routing = TestRoutingRuntime::default();
 
         let execution = DeploymentExecutor::new(
             &root,
             &queue,
             &mut docker,
             &mut probes,
+            &mut routing,
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
+                activation: ActivationMode::Direct,
             },
         )
         .execute_next()
@@ -570,5 +688,245 @@ pub mod queued_deployment_builds_starts_validates_and_writes_snapshot {
         let pointers =
             PointerStore::new(EnvironmentPaths::new(&root, "api", "production"));
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+pub mod route_updates_only_after_snapshot_finalized {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn route_update_happens_after_snapshot_exists() {
+        let root = test_root("route-after-finalize");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-1:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http { internal_port: 3000 },
+            },
+        )
+        .execute_next()
+        .unwrap();
+
+        assert!(root
+            .join("projects/api/environments/production/generations/1/snapshot.json")
+            .exists());
+        assert_eq!(routing.updates.len(), 1);
+    }
+}
+
+#[cfg(test)]
+pub mod route_targets_generation_specific_container {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn route_target_points_to_generation_specific_container() {
+        let root = test_root("route-target");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-1:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http { internal_port: 3000 },
+            },
+        )
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(routing.updates[0].target, "prod-api-gen-1:3000");
+    }
+}
+
+#[cfg(test)]
+pub mod route_activation_failure_rolls_back_pointer {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn current_pointer_remains_on_previous_generation_if_activation_fails() {
+        let root = test_root("route-activation-failure");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let writer1 = SnapshotWriter::new(env.clone(), 1).unwrap();
+        writer1.finalize("api", "production", SnapshotState::Healthy).unwrap();
+        crate::storage::atomic_write(env.generation_counter(), b"1\n").unwrap();
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(2)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-2:3000".into(),
+                activation_verified: false,
+                health_checks_enabled: false,
+            }],
+        };
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http { internal_port: 3000 },
+            },
+        )
+        .execute_next();
+
+        assert!(matches!(
+            result,
+            Err(DeploymentError::ValidationFailed(
+                "route activation verification failed"
+            ))
+        ));
+        assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+pub mod caddy_health_checks_are_not_enabled {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn route_update_disables_caddy_health_checks() {
+        let root = test_root("route-health-disabled");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-1:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http { internal_port: 3000 },
+            },
+        )
+        .execute_next()
+        .unwrap();
+
+        assert!(!routing.updates[0].health_checks_enabled);
+    }
+}
+
+#[cfg(test)]
+pub mod forge_owns_only_dedicated_route_subtree {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn route_update_uses_forge_owned_subtree_id() {
+        let root = test_root("route-subtree");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-1:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http { internal_port: 3000 },
+            },
+        )
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(routing.updates[0].subtree_id, "forge:api:production");
     }
 }

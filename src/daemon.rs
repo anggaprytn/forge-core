@@ -300,7 +300,26 @@ impl DockerRuntime for NoopDockerRuntime {
 struct NoopRoutingRuntime;
 
 #[cfg(test)]
-impl RoutingRuntime for NoopRoutingRuntime {}
+impl RoutingRuntime for NoopRoutingRuntime {
+    fn update_route(
+        &mut self,
+        _request: crate::runtime::RouteUpdateRequest,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        Ok(())
+    }
+
+    fn inspect_route(
+        &mut self,
+        subtree_id: &str,
+    ) -> Result<crate::runtime::RouteInspection, crate::runtime::RoutingRuntimeError> {
+        Ok(crate::runtime::RouteInspection {
+            subtree_id: subtree_id.to_string(),
+            active_target: String::new(),
+            activation_verified: true,
+            health_checks_enabled: false,
+        })
+    }
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
