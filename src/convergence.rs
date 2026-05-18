@@ -1,6 +1,18 @@
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::PathBuf;
 
 use crate::queue::{DeploymentRecord, PersistentQueue};
+use crate::runtime::{
+    ContainerInspection, DockerRuntime, ProbeRuntime, RouteUpdateRequest, RoutingRuntime,
+};
+use crate::storage::{
+    EnvironmentPaths, PointerStore, RuntimeHealthState, RuntimeStateStore,
+};
+#[cfg(test)]
+use crate::runtime::RouteInspection;
+#[cfg(test)]
+use crate::storage::SnapshotState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
@@ -9,15 +21,47 @@ pub enum RecoveryOutcome {
     NoActiveDeployment,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveTruth {
+    HttpRouted { internal_port: u16 },
+    Direct,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickInput {
+    pub project_id: String,
+    pub environment: String,
+    pub now_unix: u64,
+    pub truth: ActiveTruth,
+    pub http_health_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TickOutcome {
+    Healthy(u64),
+    Degraded(u64),
+    RolledBack(u64),
+    Unavailable,
+    NoActiveGeneration,
+}
+
 #[derive(Debug)]
 pub enum ConvergenceError {
     Queue(crate::queue::QueueError),
+    Storage(crate::storage::StorageError),
+    Docker(crate::runtime::DockerRuntimeError),
+    Probe(crate::runtime::ProbeError),
+    Routing(crate::runtime::RoutingRuntimeError),
 }
 
 impl Display for ConvergenceError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Queue(err) => write!(f, "{err}"),
+            Self::Storage(err) => write!(f, "{err}"),
+            Self::Docker(err) => write!(f, "{err}"),
+            Self::Probe(err) => write!(f, "{err}"),
+            Self::Routing(err) => write!(f, "{err}"),
         }
     }
 }
@@ -27,6 +71,36 @@ impl std::error::Error for ConvergenceError {}
 impl From<crate::queue::QueueError> for ConvergenceError {
     fn from(value: crate::queue::QueueError) -> Self {
         Self::Queue(value)
+    }
+}
+
+impl From<crate::storage::StorageError> for ConvergenceError {
+    fn from(value: crate::storage::StorageError) -> Self {
+        Self::Storage(value)
+    }
+}
+
+impl From<crate::runtime::DockerRuntimeError> for ConvergenceError {
+    fn from(value: crate::runtime::DockerRuntimeError) -> Self {
+        Self::Docker(value)
+    }
+}
+
+impl From<crate::runtime::ProbeError> for ConvergenceError {
+    fn from(value: crate::runtime::ProbeError) -> Self {
+        Self::Probe(value)
+    }
+}
+
+impl From<crate::runtime::RoutingRuntimeError> for ConvergenceError {
+    fn from(value: crate::runtime::RoutingRuntimeError) -> Self {
+        Self::Routing(value)
+    }
+}
+
+impl From<std::io::Error> for ConvergenceError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Storage(crate::storage::StorageError::Io(value))
     }
 }
 
@@ -59,6 +133,328 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
     }
 }
 
+pub struct ConvergenceEngine<'a, D, P, R> {
+    storage_root: PathBuf,
+    queue: &'a PersistentQueue,
+    docker: &'a mut D,
+    probes: &'a mut P,
+    routing: &'a mut R,
+}
+
+impl<'a, D, P, R> ConvergenceEngine<'a, D, P, R>
+where
+    D: DockerRuntime,
+    P: ProbeRuntime,
+    R: RoutingRuntime,
+{
+    pub fn new(
+        storage_root: impl Into<PathBuf>,
+        queue: &'a PersistentQueue,
+        docker: &'a mut D,
+        probes: &'a mut P,
+        routing: &'a mut R,
+    ) -> Self {
+        Self {
+            storage_root: storage_root.into(),
+            queue,
+            docker,
+            probes,
+            routing,
+        }
+    }
+
+    pub fn tick(&mut self, input: TickInput) -> Result<TickOutcome, ConvergenceError> {
+        let env = EnvironmentPaths::new(&self.storage_root, &input.project_id, &input.environment);
+        env.ensure_exists()?;
+        self.reconcile_orphans(&input, &env)?;
+
+        let active_generation = self.reconstruct_active_generation(&input, &env)?;
+        let mut runtime_state = RuntimeStateStore::new(env.clone()).load()?;
+        runtime_state.active_generation = active_generation;
+
+        let Some(active_generation) = active_generation else {
+            runtime_state.health_state = RuntimeHealthState::Unavailable;
+            runtime_state.last_transition = "no_active_generation".into();
+            RuntimeStateStore::new(env).save(&runtime_state)?;
+            return Ok(TickOutcome::NoActiveGeneration);
+        };
+
+        let container_name = generation_container_name(&input.environment, &input.project_id, active_generation);
+        let tcp_ok = self.probes.probe_tcp(&container_name)?;
+        let http_ok = if let Some(path) = &input.http_health_path {
+            self.probes.probe_http(&container_name, path)?
+        } else {
+            true
+        };
+
+        if tcp_ok && http_ok {
+            runtime_state.failed_probe_count = 0;
+            runtime_state.successful_probe_count += 1;
+            if runtime_state.successful_probe_count >= 2 {
+                runtime_state.restart_attempted = false;
+                runtime_state.degraded_since_unix = None;
+                runtime_state.health_state = RuntimeHealthState::Healthy;
+                runtime_state.last_transition = "healthy".into();
+                runtime_state.last_error_code = None;
+            }
+            RuntimeStateStore::new(env).save(&runtime_state)?;
+            return Ok(TickOutcome::Healthy(active_generation));
+        }
+
+        runtime_state.successful_probe_count = 0;
+        runtime_state.failed_probe_count += 1;
+
+        if runtime_state.failed_probe_count >= 3 {
+            runtime_state.health_state = RuntimeHealthState::Degraded;
+            runtime_state.last_transition = "degraded".into();
+            runtime_state.last_error_code = Some(if !tcp_ok {
+                "tcp_unreachable".into()
+            } else {
+                "http_unhealthy".into()
+            });
+            runtime_state.degraded_since_unix.get_or_insert(input.now_unix);
+
+            if !runtime_state.restart_attempted {
+                let _ = self.docker.stop_container(&container_name);
+                self.docker.start_container(&container_name)?;
+                runtime_state.restart_attempted = true;
+                runtime_state.last_transition = "restart_attempted".into();
+                RuntimeStateStore::new(env).save(&runtime_state)?;
+                return Ok(TickOutcome::Degraded(active_generation));
+            }
+
+            if input
+                .now_unix
+                .saturating_sub(runtime_state.degraded_since_unix.unwrap_or(input.now_unix))
+                >= 30
+            {
+                if let Some(previous) = PointerStore::new(env.clone()).read_pointer("previous")? {
+                    if self.rollback_to_previous(&input, &env, previous)? {
+                        runtime_state.active_generation = Some(previous);
+                        runtime_state.health_state = RuntimeHealthState::Healthy;
+                        runtime_state.failed_probe_count = 0;
+                        runtime_state.successful_probe_count = 0;
+                        runtime_state.restart_attempted = false;
+                        runtime_state.degraded_since_unix = None;
+                        runtime_state.last_transition = "rollback_completed".into();
+                        runtime_state.last_error_code = None;
+                        RuntimeStateStore::new(env).save(&runtime_state)?;
+                        return Ok(TickOutcome::RolledBack(previous));
+                    }
+                }
+
+                if !tcp_ok {
+                    if let ActiveTruth::HttpRouted { .. } = input.truth {
+                        self.routing.update_route(RouteUpdateRequest {
+                            subtree_id: route_subtree_id(&input.project_id, &input.environment),
+                            target: String::new(),
+                            health_checks_enabled: false,
+                        })?;
+                    }
+                    runtime_state.health_state = RuntimeHealthState::Unavailable;
+                    runtime_state.last_transition = "service_unavailable".into();
+                    RuntimeStateStore::new(env).save(&runtime_state)?;
+                    return Ok(TickOutcome::Unavailable);
+                }
+            }
+        }
+
+        RuntimeStateStore::new(env).save(&runtime_state)?;
+        Ok(TickOutcome::Degraded(active_generation))
+    }
+
+    fn reconcile_orphans(
+        &mut self,
+        input: &TickInput,
+        env: &EnvironmentPaths,
+    ) -> Result<(), ConvergenceError> {
+        let current = PointerStore::new(env.clone()).read_pointer("current")?;
+        let previous = PointerStore::new(env.clone()).read_pointer("previous")?;
+        let queue_state = self.queue.load_state()?;
+        let route_generation = match input.truth {
+            ActiveTruth::HttpRouted { .. } => self.route_generation(input)?,
+            ActiveTruth::Direct => None,
+        };
+
+        if !env.generations_dir().exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(env.generations_dir())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let generation_name = entry.file_name();
+            let generation_name = generation_name.to_string_lossy();
+            let Ok(generation) = generation_name.parse::<u64>() else {
+                continue;
+            };
+            let generation_dir = env.generation_dir(generation);
+            if generation_dir.join("snapshot.json").exists() {
+                continue;
+            }
+            if Some(generation) == current || Some(generation) == previous || Some(generation) == route_generation {
+                continue;
+            }
+            let active_queue_refs = queue_state.active.as_ref().map(|record| record.project_id == input.project_id && record.environment == input.environment).unwrap_or(false);
+            if active_queue_refs {
+                continue;
+            }
+            let container_name =
+                generation_container_name(&input.environment, &input.project_id, generation);
+            if self.docker.inspect_container(&container_name).is_ok() {
+                let _ = self.docker.stop_container(&container_name);
+                let _ = self.docker.remove_container(&container_name);
+            }
+        }
+        Ok(())
+    }
+
+    fn reconstruct_active_generation(
+        &mut self,
+        input: &TickInput,
+        env: &EnvironmentPaths,
+    ) -> Result<Option<u64>, ConvergenceError> {
+        match input.truth {
+            ActiveTruth::HttpRouted { internal_port } => {
+                let current = PointerStore::new(env.clone()).read_pointer("current")?;
+                let route_generation = self.route_generation(input)?;
+                match (route_generation, current) {
+                    (Some(route_generation), _) if snapshot_is_finalized(env, route_generation) => {
+                        if current != Some(route_generation) {
+                            PointerStore::new(env.clone()).swap_current(route_generation)?;
+                        }
+                        Ok(Some(route_generation))
+                    }
+                    (Some(_), Some(current_generation))
+                        if snapshot_is_finalized(env, current_generation) =>
+                    {
+                        let target = format!(
+                            "{}:{internal_port}",
+                            generation_container_name(
+                                &input.environment,
+                                &input.project_id,
+                                current_generation
+                            )
+                        );
+                        self.routing.update_route(RouteUpdateRequest {
+                            subtree_id: route_subtree_id(&input.project_id, &input.environment),
+                            target,
+                            health_checks_enabled: false,
+                        })?;
+                        Ok(Some(current_generation))
+                    }
+                    (None, Some(current_generation))
+                        if snapshot_is_finalized(env, current_generation) =>
+                    {
+                        let target = format!(
+                            "{}:{internal_port}",
+                            generation_container_name(
+                                &input.environment,
+                                &input.project_id,
+                                current_generation
+                            )
+                        );
+                        self.routing.update_route(RouteUpdateRequest {
+                            subtree_id: route_subtree_id(&input.project_id, &input.environment),
+                            target,
+                            health_checks_enabled: false,
+                        })?;
+                        Ok(Some(current_generation))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            ActiveTruth::Direct => {
+                let current = PointerStore::new(env.clone()).read_pointer("current")?;
+                let Some(current_generation) = current else {
+                    return Ok(None);
+                };
+                if !snapshot_is_finalized(env, current_generation) {
+                    return Ok(None);
+                }
+                let container_name =
+                    generation_container_name(&input.environment, &input.project_id, current_generation);
+                match self.docker.inspect_container(&container_name) {
+                    Ok(ContainerInspection { running: true, .. }) => Ok(Some(current_generation)),
+                    _ => Ok(None),
+                }
+            }
+        }
+    }
+
+    fn route_generation(&mut self, input: &TickInput) -> Result<Option<u64>, ConvergenceError> {
+        let inspection = self
+            .routing
+            .inspect_route(&route_subtree_id(&input.project_id, &input.environment))?;
+        Ok(parse_generation_from_target(&inspection.active_target))
+    }
+
+    fn rollback_to_previous(
+        &mut self,
+        input: &TickInput,
+        env: &EnvironmentPaths,
+        previous: u64,
+    ) -> Result<bool, ConvergenceError> {
+        if !snapshot_is_finalized(env, previous) {
+            return Ok(false);
+        }
+        match input.truth {
+            ActiveTruth::HttpRouted { internal_port } => {
+                let target = format!(
+                    "{}:{internal_port}",
+                    generation_container_name(&input.environment, &input.project_id, previous)
+                );
+                self.routing.update_route(RouteUpdateRequest {
+                    subtree_id: route_subtree_id(&input.project_id, &input.environment),
+                    target: target.clone(),
+                    health_checks_enabled: false,
+                })?;
+                let inspection = self
+                    .routing
+                    .inspect_route(&route_subtree_id(&input.project_id, &input.environment))?;
+                if inspection.activation_verified
+                    && inspection.active_target == target
+                    && !inspection.health_checks_enabled
+                {
+                    PointerStore::new(env.clone()).swap_current(previous)?;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            ActiveTruth::Direct => {
+                PointerStore::new(env.clone()).swap_current(previous)?;
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn snapshot_is_finalized(env: &EnvironmentPaths, generation: u64) -> bool {
+    env.generation_dir(generation).join("snapshot.json").exists()
+}
+
+fn generation_container_name(environment: &str, project_id: &str, generation: u64) -> String {
+    let env = match environment {
+        "production" => "prod",
+        "staging" => "staging",
+        "development" => "dev",
+        other => other,
+    };
+    format!("{env}-{project_id}-gen-{generation}")
+}
+
+fn route_subtree_id(project_id: &str, environment: &str) -> String {
+    format!("forge:{project_id}:{environment}")
+}
+
+fn parse_generation_from_target(target: &str) -> Option<u64> {
+    let container = target.split(':').next()?;
+    let generation = container.rsplit("-gen-").next()?;
+    generation.parse::<u64>().ok()
+}
+
 #[cfg(test)]
 fn test_root(name: &str) -> std::path::PathBuf {
     use std::fs;
@@ -85,9 +481,145 @@ impl ActiveDeploymentDecider for ResumeDecider {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct TestProbeRuntime {
+    tcp_ok: bool,
+    http_ok: bool,
+}
+
+#[cfg(test)]
+impl ProbeRuntime for TestProbeRuntime {
+    fn probe_tcp(&mut self, _container_name: &str) -> Result<bool, crate::runtime::ProbeError> {
+        Ok(self.tcp_ok)
+    }
+
+    fn probe_http(
+        &mut self,
+        _container_name: &str,
+        _path: &str,
+    ) -> Result<bool, crate::runtime::ProbeError> {
+        Ok(self.http_ok)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestDockerRuntime {
+    containers: std::collections::BTreeMap<String, bool>,
+    start_calls: Vec<String>,
+    stop_calls: Vec<String>,
+    remove_calls: Vec<String>,
+}
+
+#[cfg(test)]
+impl DockerRuntime for TestDockerRuntime {
+    fn build_image(
+        &mut self,
+        _request: crate::runtime::BuildImageRequest,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        Ok("noop".into())
+    }
+
+    fn create_container(
+        &mut self,
+        request: crate::runtime::CreateContainerRequest,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        self.containers.insert(request.container_name.clone(), true);
+        Ok(request.container_name)
+    }
+
+    fn start_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        self.start_calls.push(container_name.into());
+        self.containers.insert(container_name.into(), true);
+        Ok(())
+    }
+
+    fn inspect_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<ContainerInspection, crate::runtime::DockerRuntimeError> {
+        let Some(running) = self.containers.get(container_name).copied() else {
+            return Err(crate::runtime::DockerRuntimeError::InvalidResponse(
+                "missing container".into(),
+            ));
+        };
+        Ok(ContainerInspection {
+            container_name: container_name.into(),
+            running,
+            image_ref: "noop".into(),
+            labels: Default::default(),
+            restart_policy: "no".into(),
+        })
+    }
+
+    fn stop_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        self.stop_calls.push(container_name.into());
+        self.containers.insert(container_name.into(), false);
+        Ok(())
+    }
+
+    fn remove_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        self.remove_calls.push(container_name.into());
+        self.containers.remove(container_name);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRoutingRuntime {
+    route: Option<RouteInspection>,
+    updates: Vec<RouteUpdateRequest>,
+}
+
+#[cfg(test)]
+impl RoutingRuntime for TestRoutingRuntime {
+    fn update_route(
+        &mut self,
+        request: RouteUpdateRequest,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        self.route = Some(RouteInspection {
+            subtree_id: request.subtree_id.clone(),
+            active_target: request.target.clone(),
+            activation_verified: true,
+            health_checks_enabled: request.health_checks_enabled,
+        });
+        self.updates.push(request);
+        Ok(())
+    }
+
+    fn inspect_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<RouteInspection, crate::runtime::RoutingRuntimeError> {
+        self.route.clone().ok_or(crate::runtime::RoutingRuntimeError::InspectionFailed(
+            "missing route".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+fn setup_active_generation(root: &std::path::Path, generation: u64) {
+    let env = EnvironmentPaths::new(root, "api", "production");
+    let writer = crate::storage::SnapshotWriter::new(env.clone(), generation).unwrap();
+    writer
+        .finalize("api", "production", SnapshotState::Healthy)
+        .unwrap();
+    crate::storage::atomic_write(env.generation_counter(), format!("{generation}\n").as_bytes()).unwrap();
+}
+
+#[cfg(test)]
 pub mod in_flight_deployment_is_recovered_or_failed_deterministically {
     use super::*;
-    use crate::queue::DeploymentRecord;
 
     #[test]
     fn resumable_active_deployment_is_preserved() {
@@ -127,5 +659,220 @@ pub mod in_flight_deployment_is_recovered_or_failed_deterministically {
 
         assert_eq!(failed, RecoveryOutcome::Failed(active));
         assert!(queue.load_state().unwrap().active.is_none());
+    }
+}
+
+#[cfg(test)]
+pub mod steady_state_marks_generation_degraded {
+    use super::*;
+
+    #[test]
+    fn three_failed_probes_mark_runtime_degraded() {
+        let root = test_root("steady-degraded");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine = ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let result = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+        assert_eq!(result, TickOutcome::Degraded(1));
+        engine.tick(TickInput { project_id: "api".into(), environment: "production".into(), now_unix: 101, truth: ActiveTruth::Direct, http_health_path: None }).unwrap();
+        engine.tick(TickInput { project_id: "api".into(), environment: "production".into(), now_unix: 102, truth: ActiveTruth::Direct, http_health_path: None }).unwrap();
+
+        let state = RuntimeStateStore::new(env).load().unwrap();
+        assert_eq!(state.health_state, RuntimeHealthState::Degraded);
+    }
+}
+
+#[cfg(test)]
+pub mod steady_state_restart_attempt_occurs_once {
+    use super::*;
+
+    #[test]
+    fn restart_is_attempted_only_once_per_degradation_episode() {
+        let root = test_root("steady-restart-once");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine = ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        for now in 100..105 {
+            let _ = engine.tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: now,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            });
+        }
+
+        assert_eq!(docker.start_calls.iter().filter(|name| *name == "prod-api-gen-1").count(), 1);
+    }
+}
+
+#[cfg(test)]
+pub mod steady_state_rollback_restores_previous_generation {
+    use super::*;
+
+    #[test]
+    fn rollback_restores_previous_after_failed_restart_window() {
+        let root = test_root("steady-rollback");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine = ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        for now in [100, 101, 102, 133] {
+            let outcome = engine.tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: now,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            }).unwrap();
+            if now == 133 {
+                assert_eq!(outcome, TickOutcome::RolledBack(1));
+            }
+        }
+
+        assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+pub mod orphaned_candidate_generation_is_cleaned {
+    use super::*;
+
+    #[test]
+    fn nonfinalized_orphan_container_is_removed() {
+        let root = test_root("orphan-cleanup");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let orphan_dir = env.generation_dir(2);
+        fs::create_dir_all(&orphan_dir).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        let mut probes = TestProbeRuntime { tcp_ok: true, http_ok: true };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine = ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine.tick(TickInput {
+            project_id: "api".into(),
+            environment: "production".into(),
+            now_unix: 100,
+            truth: ActiveTruth::Direct,
+            http_health_path: None,
+        }).unwrap();
+
+        assert!(docker.remove_calls.iter().any(|name| name == "prod-api-gen-2"));
+    }
+}
+
+#[cfg(test)]
+pub mod daemon_restart_reconstructs_active_generation {
+    use super::*;
+
+    #[test]
+    fn runtime_state_is_reconstructed_from_current_for_direct_services() {
+        let root = test_root("restart-reconstruct-direct");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime { tcp_ok: true, http_ok: true };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine = ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine.tick(TickInput {
+            project_id: "api".into(),
+            environment: "production".into(),
+            now_unix: 100,
+            truth: ActiveTruth::Direct,
+            http_health_path: None,
+        }).unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        let state = RuntimeStateStore::new(env).load().unwrap();
+        assert_eq!(state.active_generation, Some(1));
+    }
+}
+
+#[cfg(test)]
+pub mod current_pointer_matches_active_route_after_restart {
+    use super::*;
+
+    #[test]
+    fn route_truth_repairs_current_pointer_for_http_services() {
+        let root = test_root("restart-repair-http");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        let mut probes = TestProbeRuntime { tcp_ok: true, http_ok: true };
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-2:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }),
+            updates: Vec::new(),
+        };
+        let mut engine = ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine.tick(TickInput {
+            project_id: "api".into(),
+            environment: "production".into(),
+            now_unix: 100,
+            truth: ActiveTruth::HttpRouted { internal_port: 3000 },
+            http_health_path: Some("/health".into()),
+        }).unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(2));
+        assert_eq!(pointers.read_pointer("current").unwrap(), Some(2));
     }
 }

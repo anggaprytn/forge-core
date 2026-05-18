@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_RETRY_LIMIT: usize = 200;
@@ -56,6 +57,42 @@ impl From<std::io::Error> for StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+pub enum RuntimeHealthState {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+pub struct RuntimeState {
+    pub active_generation: Option<u64>,
+    pub health_state: RuntimeHealthState,
+    pub failed_probe_count: u32,
+    pub successful_probe_count: u32,
+    pub restart_attempted: bool,
+    pub degraded_since_unix: Option<u64>,
+    pub last_transition: String,
+    pub last_error_code: Option<String>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            active_generation: None,
+            health_state: RuntimeHealthState::Healthy,
+            failed_probe_count: 0,
+            successful_probe_count: 0,
+            restart_attempted: false,
+            degraded_since_unix: None,
+            last_transition: "initialized".into(),
+            last_error_code: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EnvironmentPaths {
     pub root: PathBuf,
@@ -101,6 +138,10 @@ impl EnvironmentPaths {
 
     pub fn previous_pointer(&self) -> PathBuf {
         self.root.join("previous")
+    }
+
+    pub fn runtime_state_file(&self) -> PathBuf {
+        self.root.join("runtime_state.json")
     }
 
     fn ensure_pointer_file(&self, name: &str) -> StorageResult<()> {
@@ -174,6 +215,42 @@ impl SnapshotWriter {
 
 pub struct PointerStore {
     env: EnvironmentPaths,
+}
+
+pub struct RuntimeStateStore {
+    env: EnvironmentPaths,
+}
+
+impl RuntimeStateStore {
+    pub fn new(env: EnvironmentPaths) -> Self {
+        Self { env }
+    }
+
+    pub fn load(&self) -> StorageResult<RuntimeState> {
+        self.env.ensure_exists()?;
+        let path = self.env.runtime_state_file();
+        if !path.exists() {
+            return Ok(RuntimeState::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        serde_json::from_str(&raw).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })
+    }
+
+    pub fn save(&self, state: &RuntimeState) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let bytes = serde_json::to_vec_pretty(state).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(self.env.runtime_state_file(), &bytes)
+    }
 }
 
 impl PointerStore {
