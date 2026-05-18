@@ -245,7 +245,55 @@ fn test_root(name: &str) -> PathBuf {
 struct NoopDockerRuntime;
 
 #[cfg(test)]
-impl DockerRuntime for NoopDockerRuntime {}
+impl DockerRuntime for NoopDockerRuntime {
+    fn build_image(
+        &mut self,
+        request: crate::runtime::BuildImageRequest,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        Ok(request.image_tag)
+    }
+
+    fn create_container(
+        &mut self,
+        request: crate::runtime::CreateContainerRequest,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        Ok(request.container_name)
+    }
+
+    fn start_container(
+        &mut self,
+        _container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
+
+    fn inspect_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<crate::runtime::ContainerInspection, crate::runtime::DockerRuntimeError> {
+        Ok(crate::runtime::ContainerInspection {
+            container_name: container_name.to_string(),
+            running: true,
+            image_ref: "noop".into(),
+            labels: Default::default(),
+            restart_policy: "no".into(),
+        })
+    }
+
+    fn stop_container(
+        &mut self,
+        _container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
+
+    fn remove_container(
+        &mut self,
+        _container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 #[derive(Default)]

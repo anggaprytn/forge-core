@@ -2,6 +2,8 @@ pub mod api;
 pub mod bootstrap;
 pub mod config;
 pub mod daemon;
+pub mod deployments;
+pub mod docker;
 pub mod http;
 pub mod invariants;
 pub mod queue;
