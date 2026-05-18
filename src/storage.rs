@@ -99,6 +99,8 @@ pub struct DiagnosticSummary {
     pub failure_reason: String,
     pub container_name: String,
     pub cleanup_recorded: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_env_preview: Vec<String>,
 }
 
 impl Default for RuntimeState {

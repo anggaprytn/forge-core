@@ -15,6 +15,7 @@ pub struct CreateContainerRequest {
     pub container_name: String,
     pub image_ref: String,
     pub labels: BTreeMap<String, String>,
+    pub environment: BTreeMap<String, String>,
     pub network_name: Option<String>,
 }
 

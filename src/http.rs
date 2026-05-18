@@ -15,6 +15,7 @@ use crate::api::{DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorR
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{resolve_webhook, verify_signature, GitHubError, GitHubWebhookConfig, WebhookResolution};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
+use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::storage::atomic_write;
 
 const AUTHORIZATION: &str = "authorization";
@@ -67,6 +68,7 @@ pub struct HttpState {
     bearer_token: String,
     idempotency: IdempotencyStore,
     github_webhooks: Option<GitHubWebhookState>,
+    secret_store: SecretStore,
 }
 
 impl HttpState {
@@ -75,12 +77,14 @@ impl HttpState {
         bearer_token: String,
         idempotency: IdempotencyStore,
         github_webhooks: Option<GitHubWebhookState>,
+        secret_store: SecretStore,
     ) -> Self {
         Self {
             daemon,
             bearer_token,
             idempotency,
             github_webhooks,
+            secret_store,
         }
     }
 }
@@ -250,6 +254,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
         .route("/deployments", post(post_deployments))
+        .route("/secrets", post(post_secrets))
         .route("/webhooks/github", post(post_github_webhook))
         .route("/deployments/{id}", get(get_deployment))
         .route("/events", get(get_events))
@@ -542,6 +547,30 @@ async fn post_github_webhook(
     )
 }
 
+async fn post_secrets(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<SecretWriteRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state.secret_store.write_environment_secret(&request) {
+        Ok(result) => json_response(
+            StatusCode::CREATED,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: result,
+            }),
+        ),
+        Err(err) => secret_error_response(&request_id, err),
+    }
+}
+
 async fn get_deployment(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -680,6 +709,35 @@ fn github_error_response(request_id: &str, err: GitHubError) -> Response {
             request_id,
             ErrorResponse {
                 code: "github_manifest_resolution_failed".into(),
+                message: err.to_string(),
+            },
+        ),
+    }
+}
+
+fn secret_error_response(request_id: &str, err: SecretError) -> Response {
+    match err {
+        SecretError::MissingMasterKey | SecretError::InvalidMasterKey => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            request_id,
+            ErrorResponse {
+                code: "secret_store_unavailable".into(),
+                message: err.to_string(),
+            },
+        ),
+        SecretError::InvalidRequest(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            ErrorResponse {
+                code: "invalid_secret_request".into(),
+                message: err.to_string(),
+            },
+        ),
+        SecretError::MissingSecret(_) | SecretError::Crypto(_) | SecretError::Io(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            ErrorResponse {
+                code: "secret_store_error".into(),
                 message: err.to_string(),
             },
         ),
@@ -875,6 +933,7 @@ fn build_state(ready: bool) -> HttpState {
         config.bearer_token,
         IdempotencyStore::new(root.join("idempotency")).unwrap(),
         None,
+        SecretStore::new(root.join("secrets")).unwrap(),
     )
 }
 

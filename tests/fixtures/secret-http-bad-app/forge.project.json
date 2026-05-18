@@ -1,0 +1,32 @@
+{
+  "forge_schema_version": 1,
+  "project_id": "api",
+  "repository": { "provider": "github" },
+  "environments": {
+    "development": { "branch": "dev" },
+    "staging": { "branch": "staging" },
+    "production": { "branch": "main" }
+  },
+  "build": { "dockerfile_path": "./Dockerfile", "context_path": "." },
+  "runtime": {
+    "service_type": "http",
+    "internal_port": 3000,
+    "subdomain": "api",
+    "resources": { "memory_limit_mb": 512, "cpu_shares": 1024 }
+  },
+  "health": {
+    "tcp_required": true,
+    "http": { "enabled": true, "path": "/health", "expected_status": [200], "timeout_ms": 5000 },
+    "startup_grace_seconds": 30
+  },
+  "contract": { "version": 1, "spec": {} },
+  "secrets": {
+    "environment_variables": {
+      "DATABASE_URL": {
+        "scope": "environment",
+        "key": "DATABASE_URL",
+        "sensitive": true
+      }
+    }
+  }
+}

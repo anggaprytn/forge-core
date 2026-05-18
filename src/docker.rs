@@ -9,13 +9,29 @@ use crate::runtime::{
 
 pub trait CommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<String, DockerRuntimeError>;
+    fn run_with_env(
+        &mut self,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<String, DockerRuntimeError>;
 }
 
 pub struct ProcessCommandRunner;
 
 impl CommandRunner for ProcessCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<String, DockerRuntimeError> {
+        self.run_with_env(program, args, &BTreeMap::new())
+    }
+
+    fn run_with_env(
+        &mut self,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<String, DockerRuntimeError> {
         let output = Command::new(program)
+            .envs(env)
             .args(args)
             .output()
             .map_err(|err| DockerRuntimeError::CommandFailed(err.to_string()))?;
@@ -76,9 +92,13 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
             args.push("--label".to_string());
             args.push(format!("{key}={value}"));
         }
+        for key in request.environment.keys() {
+            args.push("-e".to_string());
+            args.push(key.clone());
+        }
         args.push(request.image_ref.clone());
 
-        let _ = self.runner.run("docker", &args)?;
+        let _ = self.runner.run_with_env("docker", &args, &request.environment)?;
         Ok(request.container_name)
     }
 
@@ -203,6 +223,15 @@ impl RecordingCommandRunner {
 
 impl CommandRunner for RecordingCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<String, DockerRuntimeError> {
+        self.run_with_env(program, args, &BTreeMap::new())
+    }
+
+    fn run_with_env(
+        &mut self,
+        program: &str,
+        args: &[String],
+        _env: &BTreeMap<String, String>,
+    ) -> Result<String, DockerRuntimeError> {
         self.commands.push(RecordedCommand {
             program: program.to_string(),
             args: args.to_vec(),
@@ -274,6 +303,7 @@ pub mod docker_adapter_starts_generation_named_container {
                 container_name: name.clone(),
                 image_ref: "forge:test".into(),
                 labels: labels("api", "production", 42),
+                environment: Default::default(),
                 network_name: None,
             })
             .unwrap();
@@ -298,6 +328,7 @@ pub mod docker_adapter_disables_restart_policy {
                 container_name: "prod-api-gen-42".into(),
                 image_ref: "forge:test".into(),
                 labels: labels("api", "production", 42),
+                environment: Default::default(),
                 network_name: None,
             })
             .unwrap();

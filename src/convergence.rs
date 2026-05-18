@@ -624,6 +624,7 @@ fn persist_cleanup_state(
         failure_reason: merged.failure_reason.clone(),
         container_name: merged.container_name.clone().unwrap_or_default(),
         cleanup_recorded: true,
+        runtime_env_preview: Vec::new(),
     })?;
     Ok(())
 }

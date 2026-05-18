@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-use crate::events::EventRecord;
+use crate::events::{redact_text, EventRecord};
+use crate::manifest::{load_optional_manifest, ManifestError, SecretReference};
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
     DockerRuntimeError, ProbeError, ProbeRuntime, RouteInspection, RouteUpdateRequest,
     RoutingRuntime, RoutingRuntimeError,
 };
+use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths,
     EventStore, GenerationAllocator, PointerStore, SnapshotState, SnapshotWriter, StorageError,
@@ -21,8 +23,10 @@ pub enum DeploymentError {
     Docker(DockerRuntimeError),
     Probe(ProbeError),
     Routing(RoutingRuntimeError),
+    Secret(SecretError),
     InvalidInspection(String),
     ValidationFailed(&'static str),
+    MissingSecret(String),
     RollbackUnavailable,
 }
 
@@ -34,8 +38,10 @@ impl Display for DeploymentError {
             Self::Docker(err) => write!(f, "{err}"),
             Self::Probe(err) => write!(f, "{err}"),
             Self::Routing(err) => write!(f, "{err}"),
+            Self::Secret(err) => write!(f, "{err}"),
             Self::InvalidInspection(err) => write!(f, "{err}"),
             Self::ValidationFailed(err) => write!(f, "{err}"),
+            Self::MissingSecret(err) => write!(f, "{err}"),
             Self::RollbackUnavailable => write!(f, "rollback target unavailable"),
         }
     }
@@ -70,6 +76,18 @@ impl From<ProbeError> for DeploymentError {
 impl From<RoutingRuntimeError> for DeploymentError {
     fn from(value: RoutingRuntimeError) -> Self {
         Self::Routing(value)
+    }
+}
+
+impl From<SecretError> for DeploymentError {
+    fn from(value: SecretError) -> Self {
+        Self::Secret(value)
+    }
+}
+
+impl From<ManifestError> for DeploymentError {
+    fn from(value: ManifestError) -> Self {
+        Self::InvalidInspection(value.to_string())
     }
 }
 
@@ -185,6 +203,34 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let container_name = generation_container_name(record, generation);
         let image_tag = format!("forge/{}:{}-gen-{}", record.project_id, record.environment, generation);
         let writer = SnapshotWriter::new(env.clone(), generation)?;
+        let runtime_secrets = match self.resolve_runtime_secrets(record) {
+            Ok(secrets) => secrets,
+            Err(DeploymentError::MissingSecret(message)) => {
+                diagnostics.write_failure_reason(&message, &[])?;
+                diagnostics.write_summary(&DiagnosticSummary {
+                    deployment_id: Some(record.deployment_id.clone()),
+                    failure_stage: "preparing".into(),
+                    failure_reason: message.clone(),
+                    container_name: container_name.clone(),
+                    cleanup_recorded: false,
+                    runtime_env_preview: Vec::new(),
+                })?;
+                append_event(
+                    &events,
+                    record,
+                    generation,
+                    "REQUIRED_SECRET_MISSING",
+                    Some(message.clone()),
+                )?;
+                return Err(DeploymentError::MissingSecret(message));
+            }
+            Err(err) => return Err(err),
+        };
+        let secret_values = runtime_secrets
+            .iter()
+            .map(|secret| secret.value.clone())
+            .collect::<Vec<_>>();
+        let redacted_env_preview = runtime_env_preview(&runtime_secrets);
         append_event(&events, record, generation, "DEPLOYMENT_STARTED", None)?;
 
         let image_ref = self.docker.build_image(BuildImageRequest {
@@ -199,8 +245,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             container_name: container_name.clone(),
             image_ref: image_ref.clone(),
             labels: labels.clone(),
+            environment: runtime_environment(&runtime_secrets),
             network_name: self.execution.network_name.clone(),
         })?;
+        append_redacted_event(
+            &events,
+            record,
+            generation,
+            "RUNTIME_ENV_PREPARED",
+            Some(redacted_env_preview.join(", ")),
+            &secret_values,
+        )?;
         self.docker.start_container(&container_name)?;
         append_event(&events, record, generation, "CONTAINER_STARTED", None)?;
         let inspection = self.docker.inspect_container(&container_name)?;
@@ -226,6 +281,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &diagnostics,
             record,
             generation,
+            &redacted_env_preview,
+            &secret_values,
         )?;
 
         writer.finalize(&record.project_id, &record.environment, SnapshotState::Healthy)?;
@@ -241,6 +298,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 Some(route_subtree_id(record)),
                 "routing",
                 &err.to_string(),
+                &redacted_env_preview,
+                &secret_values,
             )?;
             return Err(err);
         }
@@ -262,6 +321,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         diagnostics: &DiagnosticsStore,
         record: &DeploymentRecord,
         generation: u64,
+        redacted_env_preview: &[String],
+        secret_values: &[String],
     ) -> Result<(), DeploymentError> {
         if self.validation.tcp_required && !self.probes.probe_tcp(container_name)? {
             self.record_failed_generation(
@@ -274,6 +335,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 None,
                 "validation",
                 "tcp probe failed",
+                redacted_env_preview,
+                secret_values,
             )?;
             return Err(DeploymentError::ValidationFailed("tcp probe failed"));
         }
@@ -290,6 +353,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     None,
                     "validation",
                     "http health probe failed",
+                    redacted_env_preview,
+                    secret_values,
                 )?;
                 return Err(DeploymentError::ValidationFailed("http health probe failed"));
             }
@@ -311,9 +376,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         route_subtree_id: Option<String>,
         failure_stage: &str,
         failure_reason: &str,
+        redacted_env_preview: &[String],
+        secret_values: &[String],
     ) -> Result<(), DeploymentError> {
-        diagnostics.write_failure_reason(failure_reason, &[])?;
-        append_event(
+        diagnostics.write_failure_reason(failure_reason, secret_values)?;
+        append_redacted_event(
             events,
             record,
             generation,
@@ -323,6 +390,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 _ => "GENERATION_FAILED",
             },
             Some(failure_reason.into()),
+            secret_values,
         )?;
         let cleanup = self.cleanup_failed_generation(
             env,
@@ -337,8 +405,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             failure_reason: failure_reason.into(),
             container_name: container_name.into(),
             cleanup_recorded: true,
+            runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
-        append_event(
+        append_redacted_event(
             events,
             record,
             generation,
@@ -348,6 +417,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "FAILED_GENERATION_CLEANED"
             },
             Some(failure_reason.into()),
+            secret_values,
         )?;
         Ok(())
     }
@@ -406,6 +476,21 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 Ok(())
             }
         }
+    }
+
+    fn resolve_runtime_secrets(
+        &self,
+        record: &DeploymentRecord,
+    ) -> Result<Vec<SecretResolution>, DeploymentError> {
+        let Some(manifest) = load_optional_manifest(&self.execution.context_path)? else {
+            return Ok(Vec::new());
+        };
+        let store = SecretStore::new(self.storage_root.join("secrets"))?;
+        let mut resolved = Vec::new();
+        for (env_name, reference) in manifest.environment_variables {
+            resolved.push(resolve_secret_reference(&store, record, env_name, reference)?);
+        }
+        Ok(resolved)
     }
 }
 
@@ -467,6 +552,26 @@ fn append_event(
     )
 }
 
+fn append_redacted_event(
+    store: &EventStore,
+    record: &DeploymentRecord,
+    generation: u64,
+    event_type: &str,
+    reason: Option<String>,
+    secrets: &[String],
+) -> Result<(), DeploymentError> {
+    let redacted = reason.map(|value| redact_text(&value, secrets));
+    append_simple_event(
+        store,
+        &record.project_id,
+        &record.environment,
+        generation,
+        Some(record.deployment_id.clone()),
+        event_type,
+        redacted.as_deref(),
+    )
+}
+
 fn append_simple_event(
     store: &EventStore,
     project_id: &str,
@@ -522,6 +627,55 @@ fn forge_labels(record: &DeploymentRecord, generation: u64) -> BTreeMap<String, 
         ("forge.generation".into(), generation.to_string()),
         ("forge.deployment_id".into(), record.deployment_id.clone()),
     ])
+}
+
+fn runtime_environment(secrets: &[SecretResolution]) -> BTreeMap<String, String> {
+    secrets
+        .iter()
+        .map(|secret| (secret.key.clone(), secret.value.clone()))
+        .collect()
+}
+
+fn runtime_env_preview(secrets: &[SecretResolution]) -> Vec<String> {
+    secrets
+        .iter()
+        .map(|secret| {
+            let value = if secret.sensitive || secret.value.len() >= 8 {
+                "[REDACTED]".to_string()
+            } else {
+                secret.value.clone()
+            };
+            format!("{}={value}", secret.key)
+        })
+        .collect()
+}
+
+fn resolve_secret_reference(
+    store: &SecretStore,
+    record: &DeploymentRecord,
+    env_name: String,
+    reference: SecretReference,
+) -> Result<SecretResolution, DeploymentError> {
+    match reference.scope.as_str() {
+        "environment" => match store.read_environment_secret(
+            &record.project_id,
+            &record.environment,
+            &reference.key,
+        ) {
+            Ok(value) => Ok(SecretResolution {
+                key: env_name,
+                value,
+                sensitive: reference.sensitive,
+            }),
+            Err(SecretError::MissingSecret(key)) => {
+                Err(DeploymentError::MissingSecret(format!("missing required secret {key}")))
+            }
+            Err(err) => Err(DeploymentError::Secret(err)),
+        },
+        other => Err(DeploymentError::InvalidInspection(format!(
+            "unsupported secret scope {other}"
+        ))),
+    }
 }
 
 fn generation_container_name(record: &DeploymentRecord, generation: u64) -> String {

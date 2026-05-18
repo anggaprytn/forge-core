@@ -28,6 +28,7 @@ use forge_core::runtime::{
     RouteUpdateRequest, RoutingRuntime,
 };
 use forge_core::storage::{EnvironmentPaths, EventStore, PointerStore};
+use forge_core::secrets::SecretStore;
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
@@ -369,6 +370,92 @@ fn e2e_github_webhook_push_enqueues_and_deploys() {
     assert_eq!(deployment["environment"], "production");
 }
 
+#[test]
+fn runtime_secret_is_injected_into_container() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("secret-injection") else {
+        return;
+    };
+
+    harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
+    harness.enqueue_deploy();
+    harness
+        .execute_next_deployment_for_fixture(&common::secret_http_app_fixture())
+        .unwrap();
+
+    let response = harness
+        .http_client
+        .get(harness.public_url("secret-present"))
+        .send()
+        .expect("secret presence marker should be reachable");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().unwrap();
+    assert_eq!(body.trim(), "present");
+    assert!(!body.contains("postgres://alpha-secret-value"));
+}
+
+#[test]
+fn secret_value_is_redacted_from_events() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("secret-redacted-events") else {
+        return;
+    };
+
+    harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
+    harness.enqueue_deploy();
+    harness
+        .execute_next_deployment_for_fixture(&common::secret_http_app_fixture())
+        .unwrap();
+
+    let events = harness.get_events();
+    let runtime_event = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event_type"] == "RUNTIME_ENV_PREPARED")
+        .expect("runtime env event should exist");
+    let reason = runtime_event["reason"].as_str().unwrap();
+    assert!(reason.contains("DATABASE_URL=[REDACTED]"));
+    assert!(!reason.contains("postgres://alpha-secret-value"));
+}
+
+#[test]
+fn secret_value_is_redacted_from_diagnostics() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("secret-redacted-diagnostics") else {
+        return;
+    };
+
+    harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
+    harness.enqueue_deploy();
+    let result = harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
+    assert!(matches!(
+        result,
+        Err(DeploymentError::ValidationFailed("http health probe failed"))
+    ));
+
+    let summary = fs::read_to_string(harness.generation_dir(1).join("diagnostics/summary.json"))
+        .expect("summary should be present");
+    assert!(summary.contains("DATABASE_URL=[REDACTED]"));
+    assert!(!summary.contains("postgres://alpha-secret-value"));
+}
+
+#[test]
+fn missing_required_secret_fails_before_container_start() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("missing-required-secret") else {
+        return;
+    };
+
+    harness.enqueue_deploy();
+    let result = harness.execute_next_deployment_for_fixture(&common::secret_http_app_fixture());
+    assert!(matches!(result, Err(DeploymentError::MissingSecret(_))));
+    assert!(!docker_container_exists("prod-api-gen-1"));
+    let reason = fs::read_to_string(harness.generation_dir(1).join("diagnostics/failure_reason.log"))
+        .expect("failure reason should be present");
+    assert!(reason.contains("missing required secret DATABASE_URL"));
+}
+
 struct E2eHarness {
     runtime_root: PathBuf,
     network_name: String,
@@ -388,6 +475,7 @@ impl E2eHarness {
         if !common::ensure_integration_enabled() || !common::ensure_docker_available() {
             return None;
         }
+        ensure_test_master_key();
 
         let runtime_root = common::runtime_root("e2e");
         let suffix = unique_suffix();
@@ -470,6 +558,7 @@ impl E2eHarness {
             self.token.clone(),
             IdempotencyStore::new(self.runtime_root.join("idempotency")).unwrap(),
             self.github_webhook_state(),
+            SecretStore::new(self.runtime_root.join("secrets")).unwrap(),
         );
         let app = router(state);
         self.api_threads.push(spawn_http_server(self.api_port, app));
@@ -592,6 +681,22 @@ impl E2eHarness {
             .expect("github webhook request should reach api")
     }
 
+    fn put_secret(&self, key: &str, value: &str) {
+        let response = self
+            .http_client
+            .post(self.api_url("secrets"))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "project_id": "api",
+                "environment": "production",
+                "key": key,
+                "value": value,
+            }))
+            .send()
+            .expect("secret write should reach api");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
     fn stage_inflight_generation(
         &self,
         fixture: &Path,
@@ -638,6 +743,7 @@ impl E2eHarness {
                 container_name: format!("prod-api-gen-{generation}"),
                 image_ref,
                 labels: forge_labels(&record, generation),
+                environment: Default::default(),
                 network_name: Some(self.network_name.clone()),
             })
             .unwrap();
@@ -947,6 +1053,16 @@ fn github_signature(secret: &str, body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn ensure_test_master_key() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| unsafe {
+        std::env::set_var(
+            "FORGE_MASTER_KEY",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        );
+    });
 }
 
 fn git_in(cwd: &Path, args: &[&str]) {
