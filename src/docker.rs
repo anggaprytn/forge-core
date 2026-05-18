@@ -68,6 +68,10 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
             "--restart".to_string(),
             "no".to_string(),
         ];
+        if let Some(network_name) = &request.network_name {
+            args.push("--network".to_string());
+            args.push(network_name.clone());
+        }
         for (key, value) in &request.labels {
             args.push("--label".to_string());
             args.push(format!("{key}={value}"));
@@ -253,6 +257,7 @@ pub mod docker_adapter_starts_generation_named_container {
                 container_name: name.clone(),
                 image_ref: "forge:test".into(),
                 labels: labels("api", "production", 42),
+                network_name: None,
             })
             .unwrap();
         docker.start_container(&name).unwrap();
@@ -276,6 +281,7 @@ pub mod docker_adapter_disables_restart_policy {
                 container_name: "prod-api-gen-42".into(),
                 image_ref: "forge:test".into(),
                 labels: labels("api", "production", 42),
+                network_name: None,
             })
             .unwrap();
 

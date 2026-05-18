@@ -12,3 +12,4 @@ pub mod queue;
 pub mod runtime;
 pub mod storage;
 pub mod convergence;
+pub mod probes;

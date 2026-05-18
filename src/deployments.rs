@@ -104,6 +104,23 @@ pub enum ActivationMode {
     Http { internal_port: u16 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionConfig {
+    pub context_path: PathBuf,
+    pub dockerfile_path: PathBuf,
+    pub network_name: Option<String>,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            context_path: PathBuf::from("."),
+            dockerfile_path: PathBuf::from("./Dockerfile"),
+            network_name: None,
+        }
+    }
+}
+
 pub struct DeploymentExecutor<'a, D, P, R> {
     storage_root: PathBuf,
     queue: &'a PersistentQueue,
@@ -111,6 +128,7 @@ pub struct DeploymentExecutor<'a, D, P, R> {
     probes: &'a mut P,
     routing: &'a mut R,
     validation: ValidationPolicy,
+    execution: ExecutionConfig,
 }
 
 impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecutor<'a, D, P, R> {
@@ -129,7 +147,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             probes,
             routing,
             validation,
+            execution: ExecutionConfig::default(),
         }
+    }
+
+    pub fn with_execution_config(mut self, execution: ExecutionConfig) -> Self {
+        self.execution = execution;
+        self
     }
 
     pub fn execute_next(&mut self) -> Result<Option<DeploymentExecution>, DeploymentError> {
@@ -165,8 +189,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
         let image_ref = self.docker.build_image(BuildImageRequest {
             image_tag: image_tag.clone(),
-            context_path: PathBuf::from("."),
-            dockerfile_path: PathBuf::from("./Dockerfile"),
+            context_path: self.execution.context_path.clone(),
+            dockerfile_path: self.execution.dockerfile_path.clone(),
             labels: labels.clone(),
         })?;
         append_event(&events, record, generation, "IMAGE_BUILT", None)?;
@@ -175,6 +199,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             container_name: container_name.clone(),
             image_ref: image_ref.clone(),
             labels: labels.clone(),
+            network_name: self.execution.network_name.clone(),
         })?;
         self.docker.start_container(&container_name)?;
         append_event(&events, record, generation, "CONTAINER_STARTED", None)?;
