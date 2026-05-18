@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub struct DaemonConfig {
     pub storage_root: PathBuf,
     pub api_bind: String,
+    pub bearer_token: String,
     pub sqlite_path: Option<PathBuf>,
 }
 
@@ -60,11 +61,15 @@ impl DaemonConfig {
         let api_bind = values
             .get("api_bind")
             .ok_or(ConfigError::MissingKey("api_bind"))?;
+        let bearer_token = values
+            .get("bearer_token")
+            .ok_or(ConfigError::MissingKey("bearer_token"))?;
         let sqlite_path = values.get("sqlite_path").map(PathBuf::from);
 
         Ok(Self {
             storage_root: PathBuf::from(storage_root),
             api_bind: api_bind.clone(),
+            bearer_token: bearer_token.clone(),
             sqlite_path,
         })
     }
@@ -77,12 +82,13 @@ mod tests {
     #[test]
     fn loads_minimal_config() {
         let config = DaemonConfig::load_from_str(
-            "storage_root=/tmp/forge\napi_bind=127.0.0.1:8080\n",
+            "storage_root=/tmp/forge\napi_bind=127.0.0.1:8080\nbearer_token=test-token\n",
         )
         .unwrap();
 
         assert_eq!(config.storage_root, PathBuf::from("/tmp/forge"));
         assert_eq!(config.api_bind, "127.0.0.1:8080");
+        assert_eq!(config.bearer_token, "test-token");
         assert_eq!(config.sqlite_path, None);
     }
 }

@@ -1,4 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 pub struct DeploymentRequest {
     pub project_id: String,
     pub environment: String,
@@ -6,15 +9,26 @@ pub struct DeploymentRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 pub struct DeploymentAccepted {
     pub deployment_id: String,
     pub queue_position: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+pub struct DeploymentStatus {
+    pub deployment_id: String,
+    pub project_id: String,
+    pub environment: String,
+    pub state: String,
 }
 
 pub fn validate_deployment_request(request: &DeploymentRequest) -> Result<(), ErrorResponse> {

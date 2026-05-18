@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::{validate_deployment_request, DeploymentAccepted, DeploymentRequest, ErrorResponse};
+use crate::api::{
+    validate_deployment_request, DeploymentAccepted, DeploymentRequest, DeploymentStatus,
+    ErrorResponse,
+};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
 use crate::convergence::{ActiveDeploymentDecider, ConvergenceError, RecoveryOutcome, StartupConvergence};
@@ -157,6 +160,26 @@ where
         })
     }
 
+    pub fn get_deployment(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<DeploymentStatus>, ErrorResponse> {
+        let queue = self.queue.as_ref().ok_or_else(|| ErrorResponse {
+            code: "queue_unavailable".into(),
+            message: "queue is unavailable".into(),
+        })?;
+        let found = queue
+            .find_deployment(deployment_id)
+            .map_err(queue_error_to_response)?;
+
+        Ok(found.map(|item| DeploymentStatus {
+            deployment_id: item.record.deployment_id,
+            project_id: item.record.project_id,
+            environment: item.record.environment,
+            state: item.state,
+        }))
+    }
+
     pub fn graceful_shutdown(&mut self) {
         self.state = DaemonState::ShuttingDown;
         self.health_loops_started = false;
@@ -247,6 +270,7 @@ fn config_with_root(root: PathBuf) -> DaemonConfig {
     DaemonConfig {
         storage_root: root,
         api_bind: "127.0.0.1:8080".into(),
+        bearer_token: "test-token".into(),
         sqlite_path: None,
     }
 }

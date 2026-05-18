@@ -16,6 +16,12 @@ pub struct QueueState {
     pub active: Option<DeploymentRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRecordWithState {
+    pub record: DeploymentRecord,
+    pub state: String,
+}
+
 #[derive(Debug)]
 pub enum QueueError {
     Io(std::io::Error),
@@ -113,6 +119,32 @@ impl PersistentQueue {
 
     pub fn queued_len(&self) -> Result<usize, QueueError> {
         Ok(self.load_state()?.queued.len())
+    }
+
+    pub fn find_deployment(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<DeploymentRecordWithState>, QueueError> {
+        let state = self.load_state()?;
+        if let Some(active) = state.active {
+            if active.deployment_id == deployment_id {
+                return Ok(Some(DeploymentRecordWithState {
+                    record: active,
+                    state: "active".into(),
+                }));
+            }
+        }
+
+        for queued in state.queued {
+            if queued.deployment_id == deployment_id {
+                return Ok(Some(DeploymentRecordWithState {
+                    record: queued,
+                    state: "queued".into(),
+                }));
+            }
+        }
+
+        Ok(None)
     }
 
     fn persist_state(&self, state: &QueueState) -> Result<(), QueueError> {

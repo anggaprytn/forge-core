@@ -73,6 +73,7 @@ impl BootstrapContext {
         fs::create_dir_all(self.config.storage_root.join("events"))?;
         fs::create_dir_all(self.config.storage_root.join("secrets"))?;
         fs::create_dir_all(self.config.storage_root.join("indexes"))?;
+        fs::create_dir_all(self.config.storage_root.join("idempotency"))?;
         PersistentQueue::new(self.config.storage_root.join("queue"))?;
         Ok(BootstrapState::Ready)
     }
@@ -102,6 +103,7 @@ pub mod startup_blocks_until_storage_roots_are_valid {
         let ctx = BootstrapContext::new(DaemonConfig {
             storage_root: root.clone(),
             api_bind: "127.0.0.1:8080".into(),
+            bearer_token: "test-token".into(),
             sqlite_path: None,
         });
 
@@ -115,6 +117,7 @@ pub mod startup_blocks_until_storage_roots_are_valid {
         let ctx = BootstrapContext::new(DaemonConfig {
             storage_root: root.clone(),
             api_bind: "127.0.0.1:8080".into(),
+            bearer_token: "test-token".into(),
             sqlite_path: None,
         });
 
