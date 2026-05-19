@@ -18,23 +18,42 @@ pub fn ensure_integration_enabled() -> bool {
     }
 }
 
+#[allow(dead_code)]
+pub fn require_docker_available() {
+    if let Err(reason) = docker_unavailable_reason() {
+        panic!(
+            "integration test requested with FORGE_INTEGRATION=1, but docker is unavailable: {reason}"
+        );
+    }
+}
+
+#[allow(dead_code)]
 pub fn ensure_docker_available() -> bool {
-    let Ok(output) = Command::new("docker").args(["ps", "-q"]).output() else {
-        eprintln!("skipping integration test: docker executable unavailable");
-        return false;
-    };
+    match docker_unavailable_reason() {
+        Ok(()) => true,
+        Err(reason) => {
+            eprintln!("skipping integration test: docker unavailable: {reason}");
+            false
+        }
+    }
+}
+
+fn docker_unavailable_reason() -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(["ps", "-q"])
+        .output()
+        .map_err(|_| "docker executable unavailable".to_string())?;
 
     if output.status.success() {
-        true
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr.trim();
+    if reason.is_empty() {
+        Err("docker daemon unavailable".to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let reason = stderr.trim();
-        if reason.is_empty() {
-            eprintln!("skipping integration test: docker daemon unavailable");
-        } else {
-            eprintln!("skipping integration test: docker daemon unavailable: {reason}");
-        }
-        false
+        Err(format!("docker daemon unavailable: {reason}"))
     }
 }
 

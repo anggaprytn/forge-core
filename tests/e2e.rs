@@ -472,9 +472,10 @@ struct E2eHarness {
 
 impl E2eHarness {
     fn start(test_name: &str) -> Option<Self> {
-        if !common::ensure_integration_enabled() || !common::ensure_docker_available() {
+        if !common::ensure_integration_enabled() {
             return None;
         }
+        common::require_docker_available();
         ensure_test_master_key();
 
         let runtime_root = common::runtime_root("e2e");
