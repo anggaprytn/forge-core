@@ -22,14 +22,14 @@ Assumptions:
 
 Forge is not:
 
-```txt id="k0p0m7"
+```txt
 start container
 → hope it works
 ```
 
 Forge is:
 
-```txt id="n7s4ql"
+```txt
 converge runtime toward correctness
 ```
 
@@ -52,7 +52,7 @@ Forge manages:
 
 Responsibilities:
 
-```txt id="xukmcv"
+```txt
 Forge  = orchestration authority
 Docker = execution runtime
 Caddy  = traffic routing
@@ -66,7 +66,7 @@ Forge owns orchestration truth.
 
 Example layout:
 
-```txt id="vme1z5"
+```txt
 /forge
   /projects
     /api
@@ -101,7 +101,7 @@ Example layout:
 
 Forge deploys in strict order:
 
-```txt id="s6moyv"
+```txt
 candidate
 → validated
 → finalized
@@ -122,13 +122,13 @@ Rules:
 
 CLI:
 
-```bash id="t2yy5d"
+```bash
 forge daemon
 ```
 
 systemd:
 
-```bash id="v0lmlm"
+```bash
 systemctl start forge
 ```
 
@@ -136,7 +136,7 @@ systemctl start forge
 
 ## Check Health
 
-```bash id="8q7l5d"
+```bash
 curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
 ```
@@ -147,13 +147,13 @@ curl http://localhost:8080/readyz
 
 CLI:
 
-```bash id="t7yepp"
+```bash
 forge deploy api production
 ```
 
 GitHub webhook flow:
 
-```txt id="ux5jq5"
+```txt
 git push
 → webhook
 → deploy
@@ -163,7 +163,7 @@ git push
 
 ## Check Deployment Status
 
-```bash id="mnktw6"
+```bash
 forge status <deployment_id>
 ```
 
@@ -171,7 +171,7 @@ forge status <deployment_id>
 
 ## View Events
 
-```bash id="8hbd5n"
+```bash
 forge events
 ```
 
@@ -179,7 +179,7 @@ forge events
 
 ## Manual Rollback
 
-```bash id="f7pn1l"
+```bash
 forge rollback api production
 ```
 
@@ -200,7 +200,7 @@ Expected behavior:
 
 Inspect:
 
-```txt id="j8ywpa"
+```txt
 diagnostics/
 events.jsonl
 cleanup.json
@@ -235,7 +235,7 @@ Never place secret values in:
 
 ## Set Secret
 
-```bash id="97t7aj"
+```bash
 forge secrets set api production DATABASE_URL postgres://...
 ```
 
@@ -270,13 +270,13 @@ On startup, Forge reconstructs runtime state from:
 
 If deployment was in-flight, Forge must either:
 
-```txt id="jlwmrr"
+```txt
 resume safely
 ```
 
 or:
 
-```txt id="8zhgxh"
+```txt
 fail
 → cleanup deterministically
 ```
@@ -326,7 +326,7 @@ Forge continuously reconciles runtime state.
 
 ## Steady-State Lifecycle
 
-```txt id="k9qfct"
+```txt
 healthy
 → degraded
 → restart_attempt
@@ -351,7 +351,7 @@ Expected behavior:
 
 Forge owns only routes matching:
 
-```txt id="vq2meq"
+```txt
 forge:{project_id}:{environment}
 ```
 
@@ -375,7 +375,7 @@ These should converge.
 
 Forge-managed containers must contain labels:
 
-```txt id="xylwtf"
+```txt
 forge.managed=true
 forge.project_id=<project>
 forge.environment=<environment>
@@ -386,7 +386,7 @@ forge.generation=<generation>
 
 ## Inspect Containers
 
-```bash id="sjx6cn"
+```bash
 docker ps
 docker inspect <container>
 ```
@@ -413,7 +413,7 @@ Never replace full Caddy config manually while Forge is running.
 
 Inspect:
 
-```bash id="k8u57q"
+```bash
 curl localhost:2019/config/
 ```
 
@@ -456,7 +456,7 @@ Verify:
 
 Then:
 
-```bash id="1zdyfg"
+```bash
 docker rm -f <container>
 ```
 
@@ -474,7 +474,7 @@ Remove only the specific Forge subtree route.
 
 Back up:
 
-```txt id="3zcxd4"
+```txt
 /forge/projects
 ```
 
@@ -518,7 +518,7 @@ Forge can reconstruct convergence state from these.
 
 ## Unit Tests
 
-```bash id="1k3svk"
+```bash
 cargo test -q
 ```
 
@@ -526,7 +526,7 @@ cargo test -q
 
 ## Integration Tests
 
-```bash id="hoy6uo"
+```bash
 FORGE_INTEGRATION=1 cargo test -- --nocapture
 ```
 
@@ -534,7 +534,7 @@ FORGE_INTEGRATION=1 cargo test -- --nocapture
 
 ## Dogfood E2E
 
-```bash id="mk09t4"
+```bash
 FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
 ```
 
@@ -551,7 +551,7 @@ These validate:
 
 Before accepting AI-agent-generated patches:
 
-```bash id="l4mxgw"
+```bash
 git diff --stat
 git diff
 cargo test -q
@@ -596,7 +596,7 @@ Forge intentionally does not optimize for:
 
 Forge optimizes for:
 
-```txt id="gkq2wz"
+```txt
 single-node operational correctness
 ```
 
@@ -608,7 +608,7 @@ first.
 
 Never violate:
 
-```txt id="x6hz8r"
+```txt
 candidate
 → validated
 → finalized
