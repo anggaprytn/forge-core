@@ -1,0 +1,9 @@
+# Required
+storage_root=/var/lib/forge
+api_bind=127.0.0.1:8080
+bearer_token=replace-with-a-long-random-token
+
+# Optional
+# repository_cache_root=/var/cache/forge/repositories
+# github_webhook_secret=replace-with-a-webhook-secret
+# sqlite_path=/var/lib/forge/forge.sqlite

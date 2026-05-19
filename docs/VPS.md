@@ -18,7 +18,56 @@ For a fresh VPS sample deployment, point the systemd unit `WorkingDirectory` at 
 
 GitHub webhook deployments do not rely on the daemon working directory, but they do require `repository_cache_root` and webhook configuration.
 
-## 1. Install Runtime Dependencies
+## 1. Install Docker
+
+This guide uses Debian or Ubuntu package names. If your VPS uses another distro, install equivalent packages and keep the same service names and paths.
+
+```bash
+apt-get update
+apt-get install -y docker.io
+systemctl enable --now docker
+```
+
+Confirm Docker is available:
+
+```bash
+docker version
+```
+
+## 2. Install Caddy
+
+```bash
+apt-get update
+apt-get install -y caddy
+systemctl enable --now caddy
+```
+
+## 3. Configure the Caddy Admin API
+
+Forge expects the Caddy admin API at `http://127.0.0.1:2019`.
+
+Example `/etc/caddy/Caddyfile`:
+
+```caddyfile
+{
+	admin 127.0.0.1:2019
+}
+
+:80 {
+	respond "caddy ready" 200
+}
+```
+
+Restart Caddy after updating the config:
+
+```bash
+systemctl restart caddy
+curl http://127.0.0.1:2019/config/
+```
+
+Forge only manages its dedicated subtree through the admin API. Do not disable the admin listener.
+
+## 4. Install Runtime Dependencies
 
 Forge currently assumes:
 
@@ -32,7 +81,7 @@ Example binary install from a local release build:
 install -m 0755 target/release/forge /usr/local/bin/forge
 ```
 
-## 2. Create Host Directories
+## 5. Create Host Directories
 
 ```bash
 useradd --system --home /srv/forge --shell /usr/sbin/nologin forge
@@ -42,7 +91,7 @@ chown -R forge:forge /var/lib/forge /srv/forge
 
 `/var/lib/forge` must exist before startup. Forge bootstrap waits when the configured storage root is missing.
 
-## 3. Install the Sample App
+## 6. Install the Sample App
 
 The repository already includes a minimal Docker-backed sample app image definition:
 
@@ -78,12 +127,12 @@ Create `/srv/forge/sample-http-app/forge.project.json`:
 }
 ```
 
-## 4. Install Forge Config
+## 7. Configure `forge.conf`
 
 Copy the example config:
 
 ```bash
-install -m 0644 examples/forge.conf /etc/forge/forge.conf
+install -m 0644 deploy/forge.conf.example /etc/forge/forge.conf
 ```
 
 Then update `/etc/forge/forge.conf` with production values:
@@ -91,8 +140,9 @@ Then update `/etc/forge/forge.conf` with production values:
 - set `bearer_token` to a long random token
 - keep `storage_root=/var/lib/forge` unless you have a different data path
 - add `repository_cache_root` only if you will use GitHub webhook deploys
+- keep `api_bind=127.0.0.1:8080` unless you intentionally want the API bound elsewhere
 
-## 5. Install Forge Environment Variables
+## 8. Install Forge Environment Variables
 
 Create `/etc/forge/forge.env`:
 
@@ -104,7 +154,25 @@ FORGE_CADDY_PUBLIC_URL=http://127.0.0.1
 
 `FORGE_MASTER_KEY` is required for secrets support and checked by `forge doctor`.
 
-## 6. Install systemd Unit
+## 9. Run `forge doctor`
+
+Use the same config and Caddy URL the service will use:
+
+```bash
+FORGE_CONFIG=/etc/forge/forge.conf \
+FORGE_CADDY_ADMIN_URL=http://127.0.0.1:2019 \
+FORGE_MASTER_KEY=<64 hex characters> \
+forge doctor
+```
+
+Expected checks include:
+
+- Docker reachable
+- Caddy admin API reachable
+- storage root exists and is writable
+- `FORGE_MASTER_KEY` present
+
+## 10. Start the Forge Daemon with systemd
 
 ```bash
 install -D -m 0644 deploy/forge.service /etc/systemd/system/forge.service
@@ -121,16 +189,7 @@ The provided unit sets:
 
 If you move the sample app checkout, update the unit `WorkingDirectory` to match.
 
-## 7. Verify Readiness
-
-Use the same config and Caddy URL the service uses:
-
-```bash
-FORGE_CONFIG=/etc/forge/forge.conf \
-FORGE_CADDY_ADMIN_URL=http://127.0.0.1:2019 \
-FORGE_MASTER_KEY=<64 hex characters> \
-forge doctor
-```
+## 11. Verify Readiness
 
 You should also be able to confirm the API surface directly:
 
@@ -140,7 +199,7 @@ curl http://127.0.0.1:8080/readyz
 curl http://127.0.0.1:8080/metrics
 ```
 
-## 8. Deploy the Sample App
+## 12. Deploy the Sample App
 
 Manual deploys go through the HTTP API. Set the CLI client environment first:
 
