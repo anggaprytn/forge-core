@@ -1,6 +1,6 @@
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::queue::{DeploymentRecord, PersistentQueue};
@@ -15,8 +15,9 @@ use crate::secrets::SecretStore;
 use crate::storage::SnapshotState;
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths,
-    PersistedActivationMode, PersistedSecretReference, PointerStore, RuntimeHealthState,
-    RuntimeStateStore, load_generation_build_info, load_generation_runtime_info,
+    PersistedActivationMode, PersistedRouteTargetSource, PersistedRuntimeInfo,
+    PersistedSecretReference, PointerStore, RuntimeHealthState, RuntimeStateStore,
+    load_generation_build_info, load_generation_runtime_info,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,14 +298,17 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
                 docker,
             )?;
 
-            if let Some(PersistedActivationMode::Http { internal_port }) = runtime_info.activation {
+            if let Some(route_recovery) =
+                persisted_http_route_recovery(&runtime_info, &project_id, &environment)
+            {
                 ensure_http_route_matches_generation(
                     routing,
-                    &project_id,
-                    &environment,
+                    &route_recovery.subtree_id,
                     &inspection,
-                    internal_port,
-                    runtime_info.probe_path.clone(),
+                    route_recovery.internal_port,
+                    runtime_info.network_name.as_deref(),
+                    &route_recovery.target_source,
+                    route_recovery.probe_path,
                 )?;
             }
         }
@@ -520,51 +524,63 @@ where
                     (Some(_), Some(current_generation))
                         if snapshot_is_finalized(env, current_generation) =>
                     {
+                        let runtime_info = load_generation_runtime_info(env, current_generation)?;
+                        let route_recovery = http_route_recovery_input(
+                            runtime_info.as_ref(),
+                            &input.project_id,
+                            &input.environment,
+                            internal_port,
+                            input.http_health_path.clone(),
+                        );
+                        let preferred_network = runtime_info
+                            .as_ref()
+                            .and_then(|info| info.network_name.as_deref());
                         let container_name = generation_container_name(
                             &input.environment,
                             &input.project_id,
                             current_generation,
                         );
                         let inspection = self.docker.inspect_container(&container_name)?;
-                        let target =
-                            resolve_route_target(&inspection, internal_port).ok_or_else(|| {
-                                ConvergenceError::Docker(
-                                    crate::runtime::DockerRuntimeError::InvalidResponse(
-                                        "container missing network IP".into(),
-                                    ),
-                                )
-                            })?;
-                        self.routing.update_route(RouteUpdateRequest {
-                            subtree_id: route_subtree_id(&input.project_id, &input.environment),
-                            target,
-                            health_checks_enabled: false,
-                            probe_path: input.http_health_path.clone(),
-                        })?;
+                        ensure_http_route_matches_generation(
+                            self.routing,
+                            &route_recovery.subtree_id,
+                            &inspection,
+                            route_recovery.internal_port,
+                            preferred_network,
+                            &route_recovery.target_source,
+                            route_recovery.probe_path,
+                        )?;
                         Ok(Some(current_generation))
                     }
                     (None, Some(current_generation))
                         if snapshot_is_finalized(env, current_generation) =>
                     {
+                        let runtime_info = load_generation_runtime_info(env, current_generation)?;
+                        let route_recovery = http_route_recovery_input(
+                            runtime_info.as_ref(),
+                            &input.project_id,
+                            &input.environment,
+                            internal_port,
+                            input.http_health_path.clone(),
+                        );
+                        let preferred_network = runtime_info
+                            .as_ref()
+                            .and_then(|info| info.network_name.as_deref());
                         let container_name = generation_container_name(
                             &input.environment,
                             &input.project_id,
                             current_generation,
                         );
                         let inspection = self.docker.inspect_container(&container_name)?;
-                        let target =
-                            resolve_route_target(&inspection, internal_port).ok_or_else(|| {
-                                ConvergenceError::Docker(
-                                    crate::runtime::DockerRuntimeError::InvalidResponse(
-                                        "container missing network IP".into(),
-                                    ),
-                                )
-                            })?;
-                        self.routing.update_route(RouteUpdateRequest {
-                            subtree_id: route_subtree_id(&input.project_id, &input.environment),
-                            target,
-                            health_checks_enabled: false,
-                            probe_path: input.http_health_path.clone(),
-                        })?;
+                        ensure_http_route_matches_generation(
+                            self.routing,
+                            &route_recovery.subtree_id,
+                            &inspection,
+                            route_recovery.internal_port,
+                            preferred_network,
+                            &route_recovery.target_source,
+                            route_recovery.probe_path,
+                        )?;
                         Ok(Some(current_generation))
                     }
                     _ => Ok(None),
@@ -619,6 +635,13 @@ where
                 let Some(build_info) = load_generation_build_info(env, previous)? else {
                     return Ok(false);
                 };
+                let route_recovery = http_route_recovery_input(
+                    Some(&runtime_info),
+                    &input.project_id,
+                    &input.environment,
+                    internal_port,
+                    input.http_health_path.clone(),
+                );
                 let inspection = ensure_generation_container_running(
                     &self.storage_root,
                     &input.project_id,
@@ -631,28 +654,17 @@ where
                     &runtime_info.environment_variables,
                     self.docker,
                 )?;
-                let target = resolve_route_target(&inspection, internal_port).ok_or_else(|| {
-                    ConvergenceError::Docker(crate::runtime::DockerRuntimeError::InvalidResponse(
-                        "container missing network IP".into(),
-                    ))
-                })?;
-                self.routing.update_route(RouteUpdateRequest {
-                    subtree_id: route_subtree_id(&input.project_id, &input.environment),
-                    target: target.clone(),
-                    health_checks_enabled: false,
-                    probe_path: input.http_health_path.clone(),
-                })?;
-                let inspection = self
-                    .routing
-                    .inspect_route(&route_subtree_id(&input.project_id, &input.environment))?;
-                if inspection.activation_verified
-                    && inspection.active_target == target
-                    && !inspection.health_checks_enabled
-                {
-                    PointerStore::new(env.clone()).swap_current(previous)?;
-                    return Ok(true);
-                }
-                Ok(false)
+                ensure_http_route_matches_generation(
+                    self.routing,
+                    &route_recovery.subtree_id,
+                    &inspection,
+                    route_recovery.internal_port,
+                    runtime_info.network_name.as_deref(),
+                    &route_recovery.target_source,
+                    route_recovery.probe_path,
+                )?;
+                PointerStore::new(env.clone()).swap_current(previous)?;
+                Ok(true)
             }
             ActiveTruth::Direct => {
                 let Some(runtime_info) = load_generation_runtime_info(env, previous)? else {
@@ -700,6 +712,69 @@ fn route_subtree_id(project_id: &str, environment: &str) -> String {
     format!("forge:{project_id}:{environment}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpRouteRecoveryInput {
+    subtree_id: String,
+    internal_port: u16,
+    probe_path: Option<String>,
+    target_source: PersistedRouteTargetSource,
+}
+
+fn persisted_http_route_recovery(
+    runtime_info: &PersistedRuntimeInfo,
+    project_id: &str,
+    environment: &str,
+) -> Option<HttpRouteRecoveryInput> {
+    match &runtime_info.activation {
+        Some(PersistedActivationMode::Http {
+            internal_port,
+            route_subtree_id: persisted_subtree_id,
+            target_source,
+        }) => Some(HttpRouteRecoveryInput {
+            subtree_id: persisted_subtree_id
+                .clone()
+                .unwrap_or_else(|| route_subtree_id(project_id, environment)),
+            internal_port: *internal_port,
+            probe_path: runtime_info.probe_path.clone(),
+            target_source: target_source.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn http_route_recovery_input(
+    runtime_info: Option<&PersistedRuntimeInfo>,
+    project_id: &str,
+    environment: &str,
+    internal_port: u16,
+    probe_path: Option<String>,
+) -> HttpRouteRecoveryInput {
+    if let Some(runtime_info) = runtime_info {
+        if let Some(mut persisted) =
+            persisted_http_route_recovery(runtime_info, project_id, environment)
+        {
+            if persisted.probe_path.is_none() {
+                persisted.probe_path = probe_path;
+            }
+            return persisted;
+        }
+
+        return HttpRouteRecoveryInput {
+            subtree_id: route_subtree_id(project_id, environment),
+            internal_port,
+            probe_path: runtime_info.probe_path.clone().or(probe_path),
+            target_source: PersistedRouteTargetSource::ContainerIp,
+        };
+    }
+
+    HttpRouteRecoveryInput {
+        subtree_id: route_subtree_id(project_id, environment),
+        internal_port,
+        probe_path,
+        target_source: PersistedRouteTargetSource::ContainerIp,
+    }
+}
+
 fn parse_generation_from_target(target: &str) -> Option<u64> {
     let container = target.split(':').next()?;
     let generation = container.rsplit("-gen-").next()?;
@@ -719,12 +794,29 @@ fn resolve_generation_from_target(target: &str, containers: &[ContainerInspectio
         .map(|(_, _, generation)| generation)
 }
 
-fn resolve_route_target(inspection: &ContainerInspection, internal_port: u16) -> Option<String> {
-    inspection
-        .network_ips
-        .values()
-        .find(|ip| !ip.is_empty())
-        .map(|ip| format!("{ip}:{internal_port}"))
+fn resolve_route_target(
+    inspection: &ContainerInspection,
+    internal_port: u16,
+    preferred_network: Option<&str>,
+    target_source: &PersistedRouteTargetSource,
+) -> Option<String> {
+    match target_source {
+        PersistedRouteTargetSource::ContainerIp => {
+            if let Some(network_name) = preferred_network {
+                return inspection
+                    .network_ips
+                    .get(network_name)
+                    .filter(|ip| !ip.is_empty())
+                    .map(|ip| format!("{ip}:{internal_port}"));
+            }
+
+            inspection
+                .network_ips
+                .values()
+                .find(|ip| !ip.is_empty())
+                .map(|ip| format!("{ip}:{internal_port}"))
+        }
+    }
 }
 
 fn parse_route_identity(subtree_id: &str) -> Option<(String, String)> {
@@ -869,12 +961,8 @@ fn ensure_generation_container_running<RtD: DockerRuntime>(
         ("forge.generation".into(), generation.to_string()),
         ("forge.deployment_id".into(), deployment_id.to_string()),
     ]);
-    let environment = resolve_recovery_environment(
-        storage_root,
-        project_id,
-        environment,
-        environment_variables,
-    )?;
+    let environment =
+        resolve_recovery_environment(storage_root, project_id, environment, environment_variables)?;
     docker.create_container(CreateContainerRequest {
         container_name: container_name.to_string(),
         image_ref: image_ref.to_string(),
@@ -902,12 +990,12 @@ fn resolve_recovery_environment(
                 resolved.insert(env_name.clone(), value);
             }
             other => {
-                return Err(ConvergenceError::Storage(
-                    crate::storage::StorageError::Io(std::io::Error::new(
+                return Err(ConvergenceError::Storage(crate::storage::StorageError::Io(
+                    std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("unsupported secret scope {other}"),
-                    )),
-                ));
+                    ),
+                )));
             }
         }
     }
@@ -916,22 +1004,27 @@ fn resolve_recovery_environment(
 
 fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
     routing: &mut RtR,
-    project_id: &str,
-    environment: &str,
+    subtree_id: &str,
     inspection: &ContainerInspection,
     internal_port: u16,
+    preferred_network: Option<&str>,
+    target_source: &PersistedRouteTargetSource,
     probe_path: Option<String>,
 ) -> Result<(), ConvergenceError> {
-    let target = resolve_route_target(inspection, internal_port).ok_or_else(|| {
-        ConvergenceError::Docker(crate::runtime::DockerRuntimeError::InvalidResponse(
-            "container missing network IP".into(),
-        ))
-    })?;
-    let subtree_id = route_subtree_id(project_id, environment);
+    let target = resolve_route_target(inspection, internal_port, preferred_network, target_source)
+        .ok_or_else(|| {
+            let message = preferred_network.map_or_else(
+                || "container missing network IP".to_string(),
+                |network_name| format!("container missing IP on docker network {network_name}"),
+            );
+            ConvergenceError::Docker(crate::runtime::DockerRuntimeError::InvalidResponse(message))
+        })?;
     let route_matches = routing
-        .inspect_route(&subtree_id)
+        .inspect_route(subtree_id)
         .map(|route| {
-            route.active_target == target && route.activation_verified && !route.health_checks_enabled
+            route.active_target == target
+                && route.activation_verified
+                && !route.health_checks_enabled
         })
         .unwrap_or(false);
     if route_matches {
@@ -939,12 +1032,12 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
     }
 
     routing.update_route(RouteUpdateRequest {
-        subtree_id: subtree_id.clone(),
+        subtree_id: subtree_id.to_string(),
         target: target.clone(),
         health_checks_enabled: false,
         probe_path,
     })?;
-    let route = routing.inspect_route(&subtree_id)?;
+    let route = routing.inspect_route(subtree_id)?;
     if route.active_target != target || !route.activation_verified || route.health_checks_enabled {
         return Err(ConvergenceError::Routing(
             crate::runtime::RoutingRuntimeError::UpdateFailed(
@@ -1006,11 +1099,30 @@ impl ProbeRuntime for TestProbeRuntime {
 #[derive(Default)]
 struct TestDockerRuntime {
     containers: std::collections::BTreeMap<String, bool>,
+    network_ips: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     build_calls: Vec<String>,
     create_calls: Vec<String>,
     start_calls: Vec<String>,
     stop_calls: Vec<String>,
     remove_calls: Vec<String>,
+}
+
+#[cfg(test)]
+impl TestDockerRuntime {
+    fn inspection_network_ips(
+        &self,
+        container_name: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        self.network_ips
+            .get(container_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                std::collections::BTreeMap::from([(
+                    "forge-test".into(),
+                    test_container_ip(container_name),
+                )])
+            })
+    }
 }
 
 #[cfg(test)]
@@ -1055,10 +1167,7 @@ impl DockerRuntime for TestDockerRuntime {
             running,
             image_ref: "noop".into(),
             labels: Default::default(),
-            network_ips: std::collections::BTreeMap::from([(
-                "forge-test".into(),
-                test_container_ip(container_name),
-            )]),
+            network_ips: self.inspection_network_ips(container_name),
             restart_policy: "no".into(),
         })
     }
@@ -1086,10 +1195,7 @@ impl DockerRuntime for TestDockerRuntime {
                             .to_string(),
                     ),
                 ]),
-                network_ips: std::collections::BTreeMap::from([(
-                    "forge-test".into(),
-                    test_container_ip(container_name),
-                )]),
+                network_ips: self.inspection_network_ips(container_name),
                 restart_policy: "no".into(),
             })
             .collect())
@@ -1210,7 +1316,7 @@ fn setup_recoverable_http_generation(root: &std::path::Path, generation: u64) {
     crate::storage::atomic_write(
         env.generation_dir(generation).join("runtime.json"),
         format!(
-            "{{\n  \"container_name\": \"prod-api-gen-{generation}\",\n  \"running\": true,\n  \"network_name\": \"forge-test\",\n  \"probe_path\": \"/health\",\n  \"activation\": {{ \"Http\": {{ \"internal_port\": 3000 }} }},\n  \"environment_variables\": {{}}\n}}\n"
+            "{{\n  \"container_name\": \"prod-api-gen-{generation}\",\n  \"running\": true,\n  \"network_name\": \"forge-test\",\n  \"probe_path\": \"/health\",\n  \"activation\": {{ \"Http\": {{ \"internal_port\": 3000, \"route_subtree_id\": \"forge:api:production\", \"target_source\": \"ContainerIp\" }} }},\n  \"environment_variables\": {{}}\n}}\n"
         )
         .as_bytes(),
     )
@@ -1559,6 +1665,36 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
         assert!(docker.build_calls.is_empty());
         assert_eq!(docker.create_calls, vec!["prod-api-gen-1".to_string()]);
         assert_eq!(docker.start_calls, vec!["prod-api-gen-1".to_string()]);
+        assert_eq!(
+            routing
+                .route
+                .as_ref()
+                .map(|route| route.active_target.clone()),
+            Some("172.19.0.11:3000".into())
+        );
+    }
+
+    #[test]
+    fn startup_recovery_uses_persisted_execution_network_for_ip_route_targets() {
+        let root = test_root("startup-recover-current-http-network");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.network_ips.insert(
+            "prod-api-gen-1".into(),
+            std::collections::BTreeMap::from([
+                ("bridge".into(), "172.17.0.5".into()),
+                ("forge-test".into(), "172.19.0.11".into()),
+            ]),
+        );
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
         assert_eq!(
             routing
                 .route

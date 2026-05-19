@@ -86,10 +86,22 @@ pub struct PersistedBuildInfo {
     pub image_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PersistedRouteTargetSource {
+    #[default]
+    ContainerIp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedActivationMode {
     Direct,
-    Http { internal_port: u16 },
+    Http {
+        internal_port: u16,
+        #[serde(default)]
+        route_subtree_id: Option<String>,
+        #[serde(default)]
+        target_source: PersistedRouteTargetSource,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

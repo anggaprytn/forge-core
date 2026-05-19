@@ -14,8 +14,9 @@ use crate::runtime::{
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
-    GenerationAllocator, PersistedActivationMode, PersistedBuildInfo, PersistedRuntimeInfo,
-    PersistedSecretReference, PointerStore, SnapshotState, SnapshotWriter, StorageError,
+    GenerationAllocator, PersistedActivationMode, PersistedBuildInfo, PersistedRouteTargetSource,
+    PersistedRuntimeInfo, PersistedSecretReference, PointerStore, SnapshotState, SnapshotWriter,
+    StorageError,
 };
 
 #[derive(Debug)]
@@ -415,6 +416,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 ActivationMode::Direct => PersistedActivationMode::Direct,
                 ActivationMode::Http { internal_port } => PersistedActivationMode::Http {
                     internal_port: *internal_port,
+                    route_subtree_id: Some(route_subtree_id(record)),
+                    target_source: PersistedRouteTargetSource::ContainerIp,
                 },
             }),
             environment_variables: runtime_secret_references(&runtime_secrets),
@@ -1375,6 +1378,72 @@ pub mod snapshot_not_finalized_before_validation {
         assert!(generation_dir.join("build.json").exists());
         assert!(generation_dir.join("runtime.json").exists());
         assert!(!generation_dir.join("snapshot.json").exists());
+    }
+}
+
+#[cfg(test)]
+pub mod finalized_runtime_persists_http_recovery_metadata {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::load_generation_runtime_info;
+
+    #[test]
+    fn runtime_artifact_contains_restart_safe_http_route_metadata() {
+        let root = test_root("persist-http-runtime-metadata");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: ".".into(),
+            dockerfile_path: "Dockerfile".into(),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        assert_eq!(runtime.network_name.as_deref(), Some("forge-net"));
+        assert_eq!(runtime.probe_path.as_deref(), Some("/health"));
+        assert_eq!(
+            runtime.activation,
+            Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                route_subtree_id: Some("forge:api:production".into()),
+                target_source: PersistedRouteTargetSource::ContainerIp,
+            })
+        );
     }
 }
 

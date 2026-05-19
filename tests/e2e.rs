@@ -233,6 +233,35 @@ fn dogfood_reboot_recovery_restores_container_and_route() {
 }
 
 #[test]
+fn dogfood_finalized_runtime_persists_http_route_recovery_metadata() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("persist-runtime-route-metadata") else {
+        return;
+    };
+
+    harness.enqueue_deploy();
+    harness.execute_next_deployment().unwrap();
+
+    let runtime: Value = serde_json::from_str(
+        &fs::read_to_string(harness.generation_dir(1).join("runtime.json"))
+            .expect("runtime.json should exist for finalized generation"),
+    )
+    .expect("runtime.json should be valid json");
+
+    assert_eq!(runtime["network_name"], harness.network_name.as_str());
+    assert_eq!(runtime["probe_path"], "/health");
+    assert_eq!(runtime["activation"]["Http"]["internal_port"], 3000);
+    assert_eq!(
+        runtime["activation"]["Http"]["route_subtree_id"],
+        "forge:api:production"
+    );
+    assert_eq!(
+        runtime["activation"]["Http"]["target_source"],
+        "ContainerIp"
+    );
+}
+
+#[test]
 fn dogfood_restart_during_inflight_deploy_fails_or_recovers_deterministically() {
     let _guard = integration_lock();
     let Some(harness) = E2eHarness::start("restart-inflight") else {
