@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use forge_core::api::{
     DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
@@ -8,7 +9,8 @@ use forge_core::api::{
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
-use forge_core::daemon::Daemon;
+use forge_core::daemon::{Daemon, DeploymentWorkerSettings, run_deployment_worker_loop};
+use forge_core::deployments::{ActivationMode, ValidationPolicy};
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
 use forge_core::doctor::{DoctorOptions, run as run_doctor};
 use forge_core::events::EventRecord;
@@ -16,6 +18,8 @@ use forge_core::github::GitHubWebhookConfig;
 use forge_core::http::{
     ControlPlane, DeliveryStore, GitHubWebhookState, HttpState, IdempotencyStore, router,
 };
+use forge_core::probes::DockerNetworkProbeRuntime;
+use forge_core::queue::PersistentQueue;
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
@@ -439,6 +443,8 @@ struct _EventList {
 fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
     let config = DaemonConfig::load_from_file(&command.config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
+    let worker_caddy_admin_url = command.caddy_admin_url.clone();
+    let worker_caddy_public_url = command.caddy_public_url.clone();
     let mut daemon = Daemon::new(
         config.clone(),
         DockerCliRuntime::new(ProcessCommandRunner),
@@ -448,6 +454,29 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
     daemon
         .start()
         .map_err(|err| CliError::Usage(err.to_string()))?;
+    let worker_queue = PersistentQueue::new(config.storage_root.join("queue"))
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let worker_settings = DeploymentWorkerSettings {
+        validation: ValidationPolicy {
+            tcp_required: true,
+            http_health_path: Some("/health".into()),
+            activation: ActivationMode::Http {
+                internal_port: 3000,
+            },
+        },
+        ..DeploymentWorkerSettings::default()
+    };
+    let worker_storage_root = config.storage_root.clone();
+    thread::spawn(move || {
+        run_deployment_worker_loop(
+            worker_storage_root,
+            worker_queue,
+            DockerCliRuntime::new(ProcessCommandRunner),
+            DockerNetworkProbeRuntime::new("bridge", 3000),
+            CaddyApiRuntime::new(worker_caddy_admin_url, worker_caddy_public_url),
+            worker_settings,
+        )
+    });
 
     let github_webhooks = build_github_webhook_state(&config)?;
     let state = HttpState::new(

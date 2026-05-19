@@ -1,6 +1,8 @@
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
@@ -12,9 +14,12 @@ use crate::config::DaemonConfig;
 use crate::convergence::{
     ActiveDeploymentDecider, ConvergenceError, RecoveryOutcome, StartupConvergence,
 };
+use crate::deployments::{
+    DeploymentError, DeploymentExecution, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
+};
 use crate::events::EventRecord;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
-use crate::runtime::{DockerRuntime, RoutingRuntime};
+use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
 };
@@ -316,6 +321,85 @@ where
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentWorkerSettings {
+    pub validation: ValidationPolicy,
+    pub execution: ExecutionConfig,
+    pub idle_sleep: Duration,
+}
+
+impl Default for DeploymentWorkerSettings {
+    fn default() -> Self {
+        Self {
+            validation: ValidationPolicy::default(),
+            execution: ExecutionConfig::default(),
+            idle_sleep: Duration::from_millis(200),
+        }
+    }
+}
+
+pub fn execute_next_queued_deployment<D, P, R>(
+    storage_root: impl Into<PathBuf>,
+    queue: &PersistentQueue,
+    docker: &mut D,
+    probes: &mut P,
+    routing: &mut R,
+    settings: &DeploymentWorkerSettings,
+) -> Result<Option<DeploymentExecution>, DeploymentError>
+where
+    D: DockerRuntime,
+    P: ProbeRuntime,
+    R: RoutingRuntime,
+{
+    DeploymentExecutor::new(
+        storage_root,
+        queue,
+        docker,
+        probes,
+        routing,
+        settings.validation.clone(),
+    )
+    .with_execution_config(settings.execution.clone())
+    .execute_next()
+}
+
+pub fn run_deployment_worker_loop<D, P, R>(
+    storage_root: impl Into<PathBuf>,
+    queue: PersistentQueue,
+    mut docker: D,
+    mut probes: P,
+    mut routing: R,
+    settings: DeploymentWorkerSettings,
+) -> !
+where
+    D: DockerRuntime,
+    P: ProbeRuntime,
+    R: RoutingRuntime,
+{
+    let storage_root = storage_root.into();
+    loop {
+        let did_work = match execute_next_queued_deployment(
+            storage_root.clone(),
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            &settings,
+        ) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                eprintln!("forge daemon worker deployment failed: {err}");
+                true
+            }
+        };
+
+        if !did_work {
+            thread::sleep(settings.idle_sleep);
+        }
+    }
+}
+
 fn queue_error_to_response(error: QueueError) -> ErrorResponse {
     ErrorResponse {
         code: "queue_error".into(),
@@ -527,6 +611,27 @@ impl RoutingRuntime for NoopRoutingRuntime {
         _subtree_id: &str,
     ) -> Result<(), crate::runtime::RoutingRuntimeError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+struct StaticProbeRuntime {
+    tcp_ok: bool,
+    http_ok: bool,
+}
+
+#[cfg(test)]
+impl ProbeRuntime for StaticProbeRuntime {
+    fn probe_tcp(&mut self, _container_name: &str) -> Result<bool, crate::runtime::ProbeError> {
+        Ok(self.tcp_ok)
+    }
+
+    fn probe_http(
+        &mut self,
+        _container_name: &str,
+        _path: &str,
+    ) -> Result<bool, crate::runtime::ProbeError> {
+        Ok(self.http_ok)
     }
 }
 
@@ -776,6 +881,111 @@ pub mod post_deployments_enqueues_job_and_persists_across_restart {
         let state = restarted.queue().unwrap().load_state().unwrap();
         assert_eq!(state.queued.len(), 1);
         assert_eq!(state.queued[0].deployment_id, accepted.deployment_id);
+    }
+}
+
+#[cfg(test)]
+pub mod daemon_consumes_queued_deployment {
+    use super::*;
+    use crate::storage::PointerStore;
+
+    #[test]
+    fn queued_deployment_executes_through_worker_helper() {
+        let root = test_root("daemon-consumes-queued-deployment");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+            })
+            .unwrap();
+
+        let execution = execute_next_queued_deployment(
+            root.clone(),
+            &queue,
+            &mut NoopDockerRuntime,
+            &mut StaticProbeRuntime {
+                tcp_ok: true,
+                http_ok: true,
+            },
+            &mut NoopRoutingRuntime,
+            &DeploymentWorkerSettings::default(),
+        )
+        .unwrap()
+        .expect("queued deployment should execute");
+
+        assert_eq!(execution.deployment_id, "dep-1");
+        assert_eq!(queue.load_state().unwrap().active, None);
+        assert!(queue.load_state().unwrap().queued.is_empty());
+        assert_eq!(
+            PointerStore::new(EnvironmentPaths::new(&root, "api", "production"))
+                .read_pointer("current")
+                .unwrap(),
+            Some(1)
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod daemon_worker_leaves_no_active_queue_item_after_success_or_failure {
+    use super::*;
+
+    #[test]
+    fn active_queue_item_is_cleared_after_success_and_failure() {
+        let success_root = test_root("daemon-worker-clears-active-success");
+        let success_queue = PersistentQueue::new(success_root.join("queue")).unwrap();
+        success_queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-success".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+            })
+            .unwrap();
+
+        let success = execute_next_queued_deployment(
+            success_root,
+            &success_queue,
+            &mut NoopDockerRuntime,
+            &mut StaticProbeRuntime {
+                tcp_ok: true,
+                http_ok: true,
+            },
+            &mut NoopRoutingRuntime,
+            &DeploymentWorkerSettings::default(),
+        )
+        .unwrap();
+        assert!(success.is_some());
+        assert!(success_queue.load_state().unwrap().active.is_none());
+
+        let failure_root = test_root("daemon-worker-clears-active-failure");
+        let failure_queue = PersistentQueue::new(failure_root.join("queue")).unwrap();
+        failure_queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-failure".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+            })
+            .unwrap();
+
+        let failure = execute_next_queued_deployment(
+            failure_root,
+            &failure_queue,
+            &mut NoopDockerRuntime,
+            &mut StaticProbeRuntime {
+                tcp_ok: false,
+                http_ok: false,
+            },
+            &mut NoopRoutingRuntime,
+            &DeploymentWorkerSettings::default(),
+        );
+        assert!(matches!(
+            failure,
+            Err(DeploymentError::ValidationFailed("tcp probe failed"))
+        ));
+        let state = failure_queue.load_state().unwrap();
+        assert!(state.active.is_none());
+        assert!(state.queued.is_empty());
     }
 }
 

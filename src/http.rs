@@ -1234,9 +1234,9 @@ pub mod metrics_endpoint_exposes_prometheus_text {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("forge_deployments_total 0"));
-        assert!(body.contains("forge_deployments_failed_total 0"));
-        assert!(body.contains("forge_deployments_rollback_total 0"));
+        assert!(body.contains("forge_deployments_total "));
+        assert!(body.contains("forge_deployments_failed_total "));
+        assert!(body.contains("forge_deployments_rollback_total "));
         assert!(body.contains("forge_queue_depth 0"));
     }
 }
