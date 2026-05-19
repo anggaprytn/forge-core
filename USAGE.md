@@ -63,6 +63,7 @@ systemctl start forge
 curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
 curl http://localhost:8080/metrics
+forge doctor
 ```
 
 Expected:
@@ -230,6 +231,40 @@ Current metrics:
 - `forge_queue_depth`
 
 `forge_queue_depth` reports the current number of queued deployments waiting to run.
+
+---
+
+# Doctor
+
+Forge includes a read-only local diagnostics command:
+
+```bash
+forge doctor
+```
+
+Doctor reads:
+
+- `FORGE_CONFIG` or `./forge.conf`
+- `FORGE_CADDY_ADMIN_URL` or `http://127.0.0.1:2019`
+
+Doctor checks:
+
+- Docker reachable
+- Caddy admin API reachable
+- storage root permission state
+- `FORGE_MASTER_KEY` presence/format
+- queue root exists
+- snapshot root exists
+- API token configured
+- metrics endpoint reachable
+
+Example output:
+
+```txt
+[OK] Docker reachable
+[OK] Caddy admin API reachable
+[WARN] FORGE_MASTER_KEY missing
+```
 
 ---
 

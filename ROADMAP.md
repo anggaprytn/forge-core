@@ -210,11 +210,11 @@ Explicitly deferred:
 
 Planned:
 
-- [ ] `forge doctor`
-- [ ] Docker diagnostics
-- [ ] Caddy diagnostics
-- [ ] storage diagnostics
-- [ ] environment validation
+- [x] `forge doctor`
+- [x] Docker diagnostics
+- [x] Caddy diagnostics
+- [x] storage diagnostics
+- [x] environment validation
 - [ ] recovery recommendations
 
 Goal achieved:

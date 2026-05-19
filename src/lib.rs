@@ -4,6 +4,7 @@ pub mod caddy;
 pub mod config;
 pub mod daemon;
 pub mod deployments;
+pub mod doctor;
 pub mod docker;
 pub mod events;
 pub mod github;

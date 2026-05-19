@@ -104,18 +104,18 @@ Track:
 
 ## 2.3 Doctor Command
 
-- [ ] Add `forge doctor`
-- [ ] Check Docker availability
-- [ ] Check Caddy availability
-- [ ] Check storage root
-- [ ] Check `FORGE_MASTER_KEY`
-- [ ] Return clear diagnostic output
+- [x] Add `forge doctor`
+- [x] Check Docker availability
+- [x] Check Caddy availability
+- [x] Check storage root
+- [x] Check `FORGE_MASTER_KEY`
+- [x] Return clear diagnostic output
 
 ### Tests
 
-- [ ] `doctor_reports_docker_unavailable`
-- [ ] `doctor_reports_caddy_unavailable`
-- [ ] `doctor_reports_missing_master_key`
+- [x] `doctor_reports_docker_unavailable`
+- [x] `doctor_reports_caddy_unavailable`
+- [x] `doctor_reports_missing_master_key`
 
 ---
 

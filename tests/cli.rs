@@ -3,6 +3,7 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::{env, fs};
 
 use serde_json::Value;
 
@@ -122,6 +123,47 @@ fn cli_secrets_set_writes_secret_without_echoing_value() {
     assert_eq!(json["value"], "postgres://supersecretvalue");
 }
 
+#[test]
+fn cli_doctor_reports_local_diagnostics() {
+    let root = test_root("cli-doctor");
+    fs::create_dir_all(root.join("queue")).unwrap();
+    fs::create_dir_all(root.join("projects")).unwrap();
+    let config_path = root.join("forge.conf");
+    fs::write(
+        &config_path,
+        format!(
+            "storage_root={}\napi_bind=127.0.0.1:1\nbearer_token=test-token\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+
+    unsafe {
+        env::set_var(
+            "FORGE_MASTER_KEY",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        );
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--caddy-admin-url",
+            "http://127.0.0.1:1",
+            "doctor",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[OK] Storage root writable"));
+    assert!(stdout.contains("[OK] Queue root exists"));
+    assert!(stdout.contains("[OK] Snapshot root exists"));
+    assert!(stdout.contains("[OK] API token configured"));
+}
+
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)
@@ -187,6 +229,19 @@ fn spawn_server(
         stream.write_all(response.as_bytes()).unwrap();
     });
     (url, handle)
+}
+
+fn test_root(name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let base = std::env::temp_dir().join(format!(
+        "forge-core-tests-{name}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&base).unwrap();
+    base
 }
 
 fn parse_request(buffer: &[u8]) -> CapturedRequest {
