@@ -16,13 +16,13 @@ Forge is runtime convergence software.
 
 Core invariant:
 
-```txt id="zgm0q5"
+```txt
 running container != successful deployment
 ```
 
 A deployment succeeds only after:
 
-```txt id="n8crfq"
+```txt
 candidate
 → validated
 → finalized
@@ -58,7 +58,7 @@ Implemented:
 
 Current focus:
 
-```txt id="jlwmzo"
+```txt
 operational visibility
 runtime hardening
 dogfood validation
@@ -79,23 +79,23 @@ Before modifying code, read:
 
 Do not violate:
 
-```txt id="rw8gkt"
+```txt
 candidate → validated → finalized → activated → promoted
 ```
 
-```txt id="55dy75"
+```txt
 current pointer expresses intended active generation
 ```
 
-```txt id="g68lmq"
+```txt
 routes reconcile toward current
 ```
 
-```txt id="h9kltv"
+```txt
 failed generations never become active
 ```
 
-```txt id="aq13gy"
+```txt
 secrets are never persisted or delivered plaintext
 ```
 
@@ -139,25 +139,25 @@ Do not:
 
 Before claiming completion:
 
-```bash id="nyv9r2"
+```bash
 cargo test -q
 ```
 
 For runtime-sensitive changes:
 
-```bash id="tgmwzw"
+```bash
 FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
 ```
 
 If touching Docker/Caddy integration:
 
-```bash id="1zajhd"
+```bash
 FORGE_INTEGRATION=1 cargo test -- --nocapture
 ```
 
 If tests fail:
 
-```txt id="t6l3je"
+```txt
 stop and report the failure
 ```
 
@@ -171,7 +171,7 @@ Prefer small patches.
 
 Good tasks:
 
-```txt id="c8gv9q"
+```txt
 Add GET /metrics only
 Add forge doctor only
 Add bounded log endpoint only
@@ -180,7 +180,7 @@ Fix one invariant test
 
 Bad tasks:
 
-```txt id="1jlqdr"
+```txt
 Improve observability
 Refactor runtime
 Clean up architecture
@@ -189,7 +189,7 @@ Overhaul deployment flow
 
 Rule:
 
-```txt id="j67ylg"
+```txt
 one concern per patch
 ```
 
@@ -206,14 +206,14 @@ Before editing:
 
 After editing:
 
-```bash id="v9lqyk"
+```bash
 git diff --stat
 cargo test -q
 ```
 
 For dogfood-sensitive work:
 
-```bash id="tb6o38"
+```bash
 FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
 ```
 
@@ -274,7 +274,7 @@ Forbidden:
 
 Rule:
 
-```txt id="p4k4cw"
+```txt
 logs are observability only
 ```
 
@@ -284,13 +284,13 @@ logs are observability only
 
 Deploy-time answers:
 
-```txt id="vh17jo"
+```txt
 can this generation become active?
 ```
 
 Steady-state answers:
 
-```txt id="c1os3k"
+```txt
 should this generation remain active?
 ```
 
@@ -314,14 +314,14 @@ Never:
 
 Definitions:
 
-```txt id="s9g0gz"
+```txt
 current  = intended active generation
 previous = most recent superseded healthy generation
 ```
 
 If route and current diverge:
 
-```txt id="pjlwmw"
+```txt
 reconcile route toward current when current is valid
 ```
 
@@ -350,7 +350,7 @@ Always redact before persistence or delivery.
 
 Rollback order:
 
-```txt id="egv7m1"
+```txt
 resolve target
 → verify target
 → activate target route
@@ -375,7 +375,7 @@ Failed deployments must:
 
 Rule:
 
-```txt id="4lkz6t"
+```txt
 failure handling is part of convergence
 ```
 
@@ -387,12 +387,12 @@ Forge is already a validated alpha core.
 
 At this stage:
 
-```txt id="4fg7hj"
+```txt
 preserving correctness > shipping broad features
 ```
 
 If uncertain:
 
-```txt id="gppjzk"
+```txt
 choose the smaller change
 ```
