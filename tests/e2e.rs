@@ -137,7 +137,13 @@ fn dogfood_rollback_restores_previous_generation() {
         .routing
         .inspect_route("forge:api:production")
         .unwrap();
-    assert_eq!(route.active_target, "prod-api-gen-1:3000");
+    assert_eq!(
+        route.active_target,
+        format!(
+            "{}:3000",
+            docker_container_ip("prod-api-gen-1", &harness.network_name)
+        )
+    );
     assert!(route.activation_verified);
     assert_eq!(
         PointerStore::new(EnvironmentPaths::new(
@@ -173,7 +179,13 @@ fn dogfood_daemon_restart_reconstructs_current_route() {
         .routing
         .inspect_route("forge:api:production")
         .unwrap();
-    assert_eq!(route.active_target, "prod-api-gen-1:3000");
+    assert_eq!(
+        route.active_target,
+        format!(
+            "{}:3000",
+            docker_container_ip("prod-api-gen-1", &harness.network_name)
+        )
+    );
 }
 
 #[test]
@@ -1142,6 +1154,24 @@ fn docker(args: &[&str]) -> Result<(), String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+fn docker_container_ip(name: &str, network_name: &str) -> String {
+    let output = Command::new("docker")
+        .args(["inspect", name])
+        .output()
+        .expect("docker inspect should return container IP");
+    assert!(
+        output.status.success(),
+        "docker inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let inspections: Vec<Value> =
+        serde_json::from_slice(&output.stdout).expect("docker inspect should return json");
+    inspections[0]["NetworkSettings"]["Networks"][network_name]["IPAddress"]
+        .as_str()
+        .expect("container should have an IP on the test network")
+        .to_string()
 }
 
 fn cleanup_forge_containers() -> Result<(), String> {

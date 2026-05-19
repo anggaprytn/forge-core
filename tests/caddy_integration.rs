@@ -233,7 +233,7 @@ fn caddy_integration_route_rollback_restores_previous_generation() {
     }
 
     let inspection = routing.inspect_route("forge:api:production").unwrap();
-    assert_eq!(inspection.active_target, "prod-api-gen-1:3000");
+    assert_eq!(inspection.active_target, "172.30.0.11:3000");
     assert!(inspection.activation_verified);
     assert_eq!(
         PointerStore::new(env).read_pointer("current").unwrap(),
@@ -551,8 +551,8 @@ impl DockerRuntime for FakeDockerRuntime {
             container_name: container_name.to_string(),
             running: true,
             image_ref: "forge:test".into(),
-            labels: BTreeMap::new(),
-            network_ips: BTreeMap::new(),
+            labels: fake_container_labels(container_name),
+            network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(container_name))]),
             restart_policy: "no".into(),
         })
     }
@@ -565,8 +565,8 @@ impl DockerRuntime for FakeDockerRuntime {
                 container_name: name.clone(),
                 running: true,
                 image_ref: "forge:test".into(),
-                labels: BTreeMap::new(),
-                network_ips: BTreeMap::new(),
+                labels: fake_container_labels(name),
+                network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(name))]),
                 restart_policy: "no".into(),
             })
             .collect())
@@ -581,4 +581,29 @@ impl DockerRuntime for FakeDockerRuntime {
         self.running.remove(container_name);
         Ok(())
     }
+}
+
+fn fake_container_labels(container_name: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("forge.managed".into(), "true".into()),
+        ("forge.project_id".into(), "api".into()),
+        ("forge.environment".into(), "production".into()),
+        (
+            "forge.generation".into(),
+            container_name
+                .rsplit("-gen-")
+                .next()
+                .unwrap_or("0")
+                .to_string(),
+        ),
+    ])
+}
+
+fn fake_container_ip(container_name: &str) -> String {
+    let generation = container_name
+        .rsplit("-gen-")
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    format!("172.30.0.{}", generation + 10)
 }

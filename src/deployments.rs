@@ -428,7 +428,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         )?;
         append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
         diagnostics.append_log_line("snapshot finalized", &secret_values)?;
-        if let Err(err) = self.activate_generation(record, &env, generation, &container_name) {
+        if let Err(err) =
+            self.activate_generation(record, &env, generation, &container_name, &inspection)
+        {
             self.record_failed_generation(
                 &env,
                 &events,
@@ -635,7 +637,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         record: &DeploymentRecord,
         env: &EnvironmentPaths,
         generation: u64,
-        container_name: &str,
+        _container_name: &str,
+        inspection: &ContainerInspection,
     ) -> Result<(), DeploymentError> {
         match self.validation.activation {
             ActivationMode::Direct => {
@@ -644,7 +647,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             }
             ActivationMode::Http { internal_port } => {
                 let subtree_id = route_subtree_id(record);
-                let target = format!("{container_name}:{internal_port}");
+                let target_host =
+                    resolve_route_target_host(inspection, self.execution.network_name.as_deref())?;
+                let target = format!("{target_host}:{internal_port}");
                 self.routing.update_route(RouteUpdateRequest {
                     subtree_id: subtree_id.clone(),
                     target: target.clone(),
@@ -826,6 +831,31 @@ fn resolve_validation_probe_host(
         .find(|ip| !ip.is_empty())
         .cloned()
         .or_else(|| Some(inspection.container_name.clone()))
+        .ok_or_else(|| DeploymentError::InvalidInspection("container missing network IP".into()))
+}
+
+fn resolve_route_target_host(
+    inspection: &ContainerInspection,
+    network_name: Option<&str>,
+) -> Result<String, DeploymentError> {
+    if let Some(network_name) = network_name {
+        return inspection
+            .network_ips
+            .get(network_name)
+            .filter(|ip| !ip.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                DeploymentError::InvalidInspection(format!(
+                    "container missing IP on docker network {network_name}"
+                ))
+            });
+    }
+
+    inspection
+        .network_ips
+        .values()
+        .find(|ip| !ip.is_empty())
+        .cloned()
         .ok_or_else(|| DeploymentError::InvalidInspection("container missing network IP".into()))
 }
 
@@ -1499,7 +1529,7 @@ pub mod route_updates_only_after_snapshot_finalized {
             updates: Vec::new(),
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
-                active_target: "prod-api-gen-1:3000".into(),
+                active_target: "172.18.0.2:3000".into(),
                 activation_verified: true,
                 health_checks_enabled: false,
             }],
@@ -1531,13 +1561,13 @@ pub mod route_updates_only_after_snapshot_finalized {
 }
 
 #[cfg(test)]
-pub mod route_targets_generation_specific_container {
+pub mod route_targets_inspected_container_ip {
     use super::*;
     use crate::docker::DockerCliRuntime;
     use crate::docker::RecordingCommandRunner;
 
     #[test]
-    fn route_target_points_to_generation_specific_container() {
+    fn route_target_points_to_inspected_container_ip() {
         let root = test_root("route-target");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
@@ -1551,7 +1581,7 @@ pub mod route_targets_generation_specific_container {
             updates: Vec::new(),
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
-                active_target: "prod-api-gen-1:3000".into(),
+                active_target: "172.18.0.2:3000".into(),
                 activation_verified: true,
                 health_checks_enabled: false,
             }],
@@ -1574,7 +1604,7 @@ pub mod route_targets_generation_specific_container {
         .execute_next()
         .unwrap();
 
-        assert_eq!(routing.updates[0].target, "prod-api-gen-1:3000");
+        assert_eq!(routing.updates[0].target, "172.18.0.2:3000");
     }
 }
 
@@ -1608,7 +1638,7 @@ pub mod route_activation_failure_rolls_back_pointer {
             updates: Vec::new(),
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
-                active_target: "prod-api-gen-2:3000".into(),
+                active_target: "172.18.0.2:3000".into(),
                 activation_verified: false,
                 health_checks_enabled: false,
             }],
@@ -1661,7 +1691,7 @@ pub mod caddy_health_checks_are_not_enabled {
             updates: Vec::new(),
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
-                active_target: "prod-api-gen-1:3000".into(),
+                active_target: "172.18.0.2:3000".into(),
                 activation_verified: true,
                 health_checks_enabled: false,
             }],
@@ -1709,7 +1739,7 @@ pub mod forge_owns_only_dedicated_route_subtree {
             updates: Vec::new(),
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
-                active_target: "prod-api-gen-1:3000".into(),
+                active_target: "172.18.0.2:3000".into(),
                 activation_verified: true,
                 health_checks_enabled: false,
             }],

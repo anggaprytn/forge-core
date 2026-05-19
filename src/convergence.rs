@@ -169,7 +169,9 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
         RtD: DockerRuntime,
         RtR: RoutingRuntime,
     {
-        for container in docker.list_managed_containers()? {
+        let managed_containers = docker.list_managed_containers()?;
+
+        for container in &managed_containers {
             let Some((project_id, environment, generation)) = container_identity(&container) else {
                 continue;
             };
@@ -205,7 +207,9 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
             let Some((project_id, environment)) = parse_route_identity(&route.subtree_id) else {
                 continue;
             };
-            let Some(generation) = parse_generation_from_target(&route.active_target) else {
+            let Some(generation) =
+                resolve_generation_from_target(&route.active_target, &managed_containers)
+            else {
                 let _ = routing.remove_route(&route.subtree_id);
                 continue;
             };
@@ -447,14 +451,20 @@ where
                     (Some(_), Some(current_generation))
                         if snapshot_is_finalized(env, current_generation) =>
                     {
-                        let target = format!(
-                            "{}:{internal_port}",
-                            generation_container_name(
-                                &input.environment,
-                                &input.project_id,
-                                current_generation
-                            )
+                        let container_name = generation_container_name(
+                            &input.environment,
+                            &input.project_id,
+                            current_generation,
                         );
+                        let inspection = self.docker.inspect_container(&container_name)?;
+                        let target =
+                            resolve_route_target(&inspection, internal_port).ok_or_else(|| {
+                                ConvergenceError::Docker(
+                                    crate::runtime::DockerRuntimeError::InvalidResponse(
+                                        "container missing network IP".into(),
+                                    ),
+                                )
+                            })?;
                         self.routing.update_route(RouteUpdateRequest {
                             subtree_id: route_subtree_id(&input.project_id, &input.environment),
                             target,
@@ -466,14 +476,20 @@ where
                     (None, Some(current_generation))
                         if snapshot_is_finalized(env, current_generation) =>
                     {
-                        let target = format!(
-                            "{}:{internal_port}",
-                            generation_container_name(
-                                &input.environment,
-                                &input.project_id,
-                                current_generation
-                            )
+                        let container_name = generation_container_name(
+                            &input.environment,
+                            &input.project_id,
+                            current_generation,
                         );
+                        let inspection = self.docker.inspect_container(&container_name)?;
+                        let target =
+                            resolve_route_target(&inspection, internal_port).ok_or_else(|| {
+                                ConvergenceError::Docker(
+                                    crate::runtime::DockerRuntimeError::InvalidResponse(
+                                        "container missing network IP".into(),
+                                    ),
+                                )
+                            })?;
                         self.routing.update_route(RouteUpdateRequest {
                             subtree_id: route_subtree_id(&input.project_id, &input.environment),
                             target,
@@ -510,7 +526,11 @@ where
         let inspection = self
             .routing
             .inspect_route(&route_subtree_id(&input.project_id, &input.environment))?;
-        Ok(parse_generation_from_target(&inspection.active_target))
+        let containers = self.docker.list_managed_containers()?;
+        Ok(resolve_generation_from_target(
+            &inspection.active_target,
+            &containers,
+        ))
     }
 
     fn rollback_to_previous(
@@ -524,10 +544,14 @@ where
         }
         match input.truth {
             ActiveTruth::HttpRouted { internal_port } => {
-                let target = format!(
-                    "{}:{internal_port}",
-                    generation_container_name(&input.environment, &input.project_id, previous)
-                );
+                let container_name =
+                    generation_container_name(&input.environment, &input.project_id, previous);
+                let inspection = self.docker.inspect_container(&container_name)?;
+                let target = resolve_route_target(&inspection, internal_port).ok_or_else(|| {
+                    ConvergenceError::Docker(crate::runtime::DockerRuntimeError::InvalidResponse(
+                        "container missing network IP".into(),
+                    ))
+                })?;
                 self.routing.update_route(RouteUpdateRequest {
                     subtree_id: route_subtree_id(&input.project_id, &input.environment),
                     target: target.clone(),
@@ -578,6 +602,27 @@ fn parse_generation_from_target(target: &str) -> Option<u64> {
     let container = target.split(':').next()?;
     let generation = container.rsplit("-gen-").next()?;
     generation.parse::<u64>().ok()
+}
+
+fn resolve_generation_from_target(target: &str, containers: &[ContainerInspection]) -> Option<u64> {
+    if let Some(generation) = parse_generation_from_target(target) {
+        return Some(generation);
+    }
+
+    let target_host = target.rsplit_once(':')?.0;
+    containers
+        .iter()
+        .find(|inspection| inspection.network_ips.values().any(|ip| ip == target_host))
+        .and_then(container_identity)
+        .map(|(_, _, generation)| generation)
+}
+
+fn resolve_route_target(inspection: &ContainerInspection, internal_port: u16) -> Option<String> {
+    inspection
+        .network_ips
+        .values()
+        .find(|ip| !ip.is_empty())
+        .map(|ip| format!("{ip}:{internal_port}"))
 }
 
 fn parse_route_identity(subtree_id: &str) -> Option<(String, String)> {
@@ -754,7 +799,10 @@ impl DockerRuntime for TestDockerRuntime {
             running,
             image_ref: "noop".into(),
             labels: Default::default(),
-            network_ips: Default::default(),
+            network_ips: std::collections::BTreeMap::from([(
+                "forge-test".into(),
+                test_container_ip(container_name),
+            )]),
             restart_policy: "no".into(),
         })
     }
@@ -782,7 +830,10 @@ impl DockerRuntime for TestDockerRuntime {
                             .to_string(),
                     ),
                 ]),
-                network_ips: Default::default(),
+                network_ips: std::collections::BTreeMap::from([(
+                    "forge-test".into(),
+                    test_container_ip(container_name),
+                )]),
                 restart_policy: "no".into(),
             })
             .collect())
@@ -805,6 +856,16 @@ impl DockerRuntime for TestDockerRuntime {
         self.containers.remove(container_name);
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn test_container_ip(container_name: &str) -> String {
+    let generation = container_name
+        .rsplit("-gen-")
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    format!("172.19.0.{}", generation + 10)
 }
 
 #[cfg(test)]
@@ -1165,7 +1226,7 @@ pub mod current_pointer_matches_active_route_after_restart {
         let mut routing = TestRoutingRuntime {
             route: Some(RouteInspection {
                 subtree_id: "forge:api:production".into(),
-                active_target: "prod-api-gen-2:3000".into(),
+                active_target: "172.19.0.12:3000".into(),
                 activation_verified: true,
                 health_checks_enabled: false,
             }),
