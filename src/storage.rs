@@ -1,5 +1,6 @@
 use crate::events::{EventRecord, redact_text};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -77,6 +78,39 @@ pub struct RuntimeState {
     pub degraded_since_unix: Option<u64>,
     pub last_transition: String,
     pub last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBuildInfo {
+    pub deployment_id: String,
+    pub image_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedActivationMode {
+    Direct,
+    Http { internal_port: u16 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSecretReference {
+    pub scope: String,
+    pub key: String,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRuntimeInfo {
+    pub container_name: String,
+    pub running: bool,
+    #[serde(default)]
+    pub network_name: Option<String>,
+    #[serde(default)]
+    pub probe_path: Option<String>,
+    #[serde(default)]
+    pub activation: Option<PersistedActivationMode>,
+    #[serde(default)]
+    pub environment_variables: BTreeMap<String, PersistedSecretReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +329,20 @@ impl RuntimeStateStore {
         })?;
         atomic_write(self.env.runtime_state_file(), &bytes)
     }
+}
+
+pub fn load_generation_build_info(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> StorageResult<Option<PersistedBuildInfo>> {
+    load_generation_json(env, generation, "build.json")
+}
+
+pub fn load_generation_runtime_info(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> StorageResult<Option<PersistedRuntimeInfo>> {
+    load_generation_json(env, generation, "runtime.json")
 }
 
 impl EventStore {
@@ -641,6 +689,24 @@ pub(crate) fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> StorageRe
     fs::rename(&temp_path, path)?;
     sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
     Ok(())
+}
+
+fn load_generation_json<T: for<'de> Deserialize<'de>>(
+    env: &EnvironmentPaths,
+    generation: u64,
+    file_name: &str,
+) -> StorageResult<Option<T>> {
+    let path = env.generation_dir(generation).join(file_name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map(Some).map_err(|err| {
+        StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            err.to_string(),
+        ))
+    })
 }
 
 fn unique_suffix() -> u128 {

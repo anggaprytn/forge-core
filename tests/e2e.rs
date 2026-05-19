@@ -189,6 +189,44 @@ fn dogfood_daemon_restart_reconstructs_current_route() {
 }
 
 #[test]
+fn dogfood_reboot_recovery_reconstructs_current_container_and_route() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("reboot-recovery") else {
+        return;
+    };
+
+    harness.enqueue_deploy();
+    harness.execute_next_deployment().unwrap();
+
+    docker(&["rm", "-f", "prod-api-gen-1"]).expect("active generation should be removable");
+    harness
+        .routing
+        .remove_route("forge:api:production")
+        .expect("managed route should be removable");
+
+    harness.restart_api_server(AllowAllDecider(true));
+
+    assert!(docker_container_exists("prod-api-gen-1"));
+    let route = harness
+        .routing
+        .inspect_route("forge:api:production")
+        .unwrap();
+    assert_eq!(
+        route.active_target,
+        format!(
+            "{}:3000",
+            docker_container_ip("prod-api-gen-1", &harness.network_name)
+        )
+    );
+    let response = harness
+        .http_client
+        .get(harness.public_url("health"))
+        .send()
+        .expect("public route should be reachable after startup recovery");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
 fn dogfood_restart_during_inflight_deploy_fails_or_recovers_deterministically() {
     let _guard = integration_lock();
     let Some(harness) = E2eHarness::start("restart-inflight") else {

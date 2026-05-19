@@ -28,6 +28,7 @@ pub struct SecretWriteResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretResolution {
     pub key: String,
+    pub source_key: String,
     pub value: String,
     pub sensitive: bool,
 }

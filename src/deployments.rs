@@ -14,7 +14,8 @@ use crate::runtime::{
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
-    GenerationAllocator, PointerStore, SnapshotState, SnapshotWriter, StorageError,
+    GenerationAllocator, PersistedActivationMode, PersistedBuildInfo, PersistedRuntimeInfo,
+    PersistedSecretReference, PointerStore, SnapshotState, SnapshotWriter, StorageError,
 };
 
 #[derive(Debug)]
@@ -394,20 +395,37 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 return Err(err);
             }
         };
-        writer.write_artifact(
-            "build.json",
-            &format!(
-                "{{\n  \"deployment_id\": \"{}\",\n  \"image_ref\": \"{}\"\n}}\n",
-                record.deployment_id, image_ref
-            ),
-        )?;
-        writer.write_artifact(
-            "runtime.json",
-            &format!(
-                "{{\n  \"container_name\": \"{}\",\n  \"running\": {}\n}}\n",
-                inspection.container_name, inspection.running
-            ),
-        )?;
+        let build_json = serde_json::to_string_pretty(&PersistedBuildInfo {
+            deployment_id: record.deployment_id.clone(),
+            image_ref: image_ref.clone(),
+        })
+        .map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        writer.write_artifact("build.json", &format!("{build_json}\n"))?;
+        let runtime_json = serde_json::to_string_pretty(&PersistedRuntimeInfo {
+            container_name: inspection.container_name.clone(),
+            running: inspection.running,
+            network_name: self.execution.network_name.clone(),
+            probe_path: self.validation.http_health_path.clone(),
+            activation: Some(match &self.validation.activation {
+                ActivationMode::Direct => PersistedActivationMode::Direct,
+                ActivationMode::Http { internal_port } => PersistedActivationMode::Http {
+                    internal_port: *internal_port,
+                },
+            }),
+            environment_variables: runtime_secret_references(&runtime_secrets),
+        })
+        .map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        writer.write_artifact("runtime.json", &format!("{runtime_json}\n"))?;
         diagnostics.append_log_line("runtime inspection passed", &secret_values)?;
         self.validate_candidate(
             &env,
@@ -876,6 +894,24 @@ fn runtime_environment(secrets: &[SecretResolution]) -> BTreeMap<String, String>
         .collect()
 }
 
+fn runtime_secret_references(
+    secrets: &[SecretResolution],
+) -> BTreeMap<String, PersistedSecretReference> {
+    secrets
+        .iter()
+        .map(|secret| {
+            (
+                secret.key.clone(),
+                PersistedSecretReference {
+                    scope: "environment".into(),
+                    key: secret.source_key.clone(),
+                    sensitive: secret.sensitive,
+                },
+            )
+        })
+        .collect()
+}
+
 fn runtime_env_preview(secrets: &[SecretResolution]) -> Vec<String> {
     secrets
         .iter()
@@ -904,6 +940,7 @@ fn resolve_secret_reference(
         ) {
             Ok(value) => Ok(SecretResolution {
                 key: env_name,
+                source_key: reference.key.clone(),
                 value,
                 sensitive: reference.sensitive,
             }),
