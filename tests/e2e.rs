@@ -39,7 +39,7 @@ use tokio::net::TcpListener;
 type HmacSha256 = Hmac<Sha256>;
 
 #[test]
-fn e2e_sample_app_deploys_public_route() {
+fn dogfood_sample_app_deploys_public_route() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("sample-deploy") else {
         return;
@@ -69,7 +69,7 @@ fn e2e_sample_app_deploys_public_route() {
 }
 
 #[test]
-fn e2e_events_visible_after_deploy() {
+fn dogfood_events_visible_after_deploy() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("events-after-deploy") else {
         return;
@@ -101,7 +101,7 @@ fn e2e_events_visible_after_deploy() {
 }
 
 #[test]
-fn e2e_rollback_restores_previous_generation() {
+fn dogfood_rollback_restores_previous_generation() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("rollback") else {
         return;
@@ -137,7 +137,7 @@ fn e2e_rollback_restores_previous_generation() {
 }
 
 #[test]
-fn e2e_daemon_restart_reconstructs_current_route() {
+fn dogfood_daemon_restart_reconstructs_current_route() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("restart-reconstruct") else {
         return;
@@ -159,7 +159,7 @@ fn e2e_daemon_restart_reconstructs_current_route() {
 }
 
 #[test]
-fn e2e_restart_during_inflight_deploy_fails_or_recovers_deterministically() {
+fn dogfood_restart_during_inflight_deploy_fails_or_recovers_deterministically() {
     let _guard = integration_lock();
     let Some(harness) = E2eHarness::start("restart-inflight") else {
         return;
@@ -195,7 +195,7 @@ fn e2e_restart_during_inflight_deploy_fails_or_recovers_deterministically() {
 }
 
 #[test]
-fn e2e_bad_app_failed_health_does_not_promote_current() {
+fn dogfood_bad_app_failed_health_does_not_promote_current() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("bad-app-no-promotion") else {
         return;
@@ -215,7 +215,7 @@ fn e2e_bad_app_failed_health_does_not_promote_current() {
 }
 
 #[test]
-fn e2e_bad_app_failed_generation_is_cleaned() {
+fn dogfood_bad_app_failed_generation_is_cleaned() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("bad-app-cleaned") else {
         return;
@@ -236,7 +236,7 @@ fn e2e_bad_app_failed_generation_is_cleaned() {
 }
 
 #[test]
-fn e2e_bad_app_diagnostics_are_visible() {
+fn dogfood_bad_app_diagnostics_are_visible() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("bad-app-diagnostics") else {
         return;
@@ -257,7 +257,7 @@ fn e2e_bad_app_diagnostics_are_visible() {
 }
 
 #[test]
-fn e2e_crash_during_deploy_recovers_without_orphan_container() {
+fn dogfood_crash_during_deploy_recovers_without_orphan_container() {
     let _guard = integration_lock();
     let Some(harness) = E2eHarness::start("crash-during-deploy") else {
         return;
@@ -286,7 +286,7 @@ fn e2e_crash_during_deploy_recovers_without_orphan_container() {
 }
 
 #[test]
-fn e2e_crash_during_route_activation_recovers_without_orphan_route() {
+fn dogfood_crash_during_route_activation_recovers_without_orphan_route() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("crash-during-route") else {
         return;
@@ -310,7 +310,7 @@ fn e2e_crash_during_route_activation_recovers_without_orphan_route() {
 }
 
 #[test]
-fn e2e_github_webhook_push_enqueues_and_deploys() {
+fn dogfood_github_webhook_push_enqueues_and_deploys() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("github-webhook") else {
         return;
