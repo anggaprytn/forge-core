@@ -41,6 +41,12 @@ cargo test -q
 FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
 ```
 
+Current blocker:
+
+- `FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture` currently fails in `dogfood_daemon_restart_reconstructs_current_route`
+- `FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture` currently fails in `dogfood_bad_app_failed_generation_is_cleaned`
+- `FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture` currently fails in `dogfood_github_webhook_push_enqueues_and_deploys`
+
 - [ ] Remove or silence harmless warnings
 - [ ] Ensure `README.md` matches actual current state
 - [ ] Ensure `ARCHITECTURE.md` matches actual current state
@@ -171,10 +177,10 @@ Track:
 - [x] Wire `forge daemon` to the existing HTTP/daemon runtime path
 - [ ] Add `forge init`
 - [ ] Generate basic `forge.project.json`
-- [ ] Generate local example config
+- [x] Generate local example config
 - [ ] Add install instructions
 - [ ] Add local development quickstart
-- [ ] Add VPS setup guide
+- [x] Add VPS setup guide
 - [ ] Add GitHub webhook setup guide
 - [ ] Add Caddy setup guide
 

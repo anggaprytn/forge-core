@@ -72,6 +72,10 @@ Or via systemd:
 systemctl start forge
 ```
 
+Current implementation note:
+
+manual `forge deploy <project> <environment>` builds from the daemon process working directory. For a VPS quickstart, point the service `WorkingDirectory` at the application checkout you want Forge to deploy.
+
 ---
 
 ## Verify Readiness
@@ -301,6 +305,15 @@ Example output:
 [OK] Docker reachable
 [OK] Caddy admin API reachable
 [WARN] FORGE_MASTER_KEY missing
+```
+
+For systemd installs, run doctor with the same config path and Caddy admin URL used by the service:
+
+```bash
+FORGE_CONFIG=/etc/forge/forge.conf \
+FORGE_CADDY_ADMIN_URL=http://127.0.0.1:2019 \
+FORGE_MASTER_KEY=<64 hex characters> \
+forge doctor
 ```
 
 ---

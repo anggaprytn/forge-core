@@ -1,0 +1,18 @@
+[Unit]
+Description=Forge daemon
+After=network-online.target docker.service caddy.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=forge
+Group=forge
+WorkingDirectory=/srv/forge/sample-http-app
+EnvironmentFile=-/etc/forge/forge.env
+ExecStart=/usr/local/bin/forge --config /etc/forge/forge.conf daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

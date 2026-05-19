@@ -219,6 +219,36 @@ Planned:
 
 Goal achieved:
 
+---
+
+# Phase 3.4 — Installation And VPS Packaging
+
+Status:
+
+```txt
+in progress
+```
+
+Completed in this slice:
+
+- [x] example `forge.conf`
+- [x] systemd service unit
+- [x] VPS operator runbook for daemon/API deploy flow
+
+Current limitation documented explicitly:
+
+- [x] manual CLI deploys currently build from the daemon working directory
+
+Still needed:
+
+- [ ] installer/package distribution
+- [ ] multi-project deploy source selection
+- [ ] webhook-first VPS onboarding guide
+
+Acceptance blocker:
+
+- [ ] dogfood integration suite is not yet green on daemon/VPS startup validation
+
 ```txt
 operators can diagnose runtime failures quickly and deterministically
 ```

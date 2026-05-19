@@ -81,6 +81,14 @@ Core Components
 
 The control-plane entrypoint.
 
+Operator path:
+
+```txt
+forge daemon
+→ HTTP API
+→ CLI/API deploy flow
+```
+
 Responsibilities:
 • deployment requests
 • rollback requests
@@ -93,6 +101,10 @@ Responsibilities:
 The API is intentionally thin.
 
 Business logic lives in the executor and convergence engine.
+
+Current implementation note:
+
+manual deploy requests execute against the daemon process working directory unless the deploy source is provided through the GitHub webhook path.
 
 ⸻
 
