@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::events::{redact_text, EventRecord};
 use crate::manifest::{load_optional_manifest, ManifestError, SecretReference};
+use crate::metrics::registry as metrics_registry;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
@@ -181,10 +182,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
         match self.execute_record(&record) {
             Ok(execution) => {
+                metrics_registry().record_deployment_success();
                 self.queue.complete_active()?;
                 Ok(Some(execution))
             }
             Err(err) => {
+                metrics_registry().record_deployment_failure();
                 let _ = self.queue.complete_active();
                 Err(err)
             }
@@ -530,6 +533,7 @@ impl RollbackExecutor {
             "ROLLBACK_COMPLETED",
             None,
         )?;
+        metrics_registry().record_rollback();
         Ok(target)
     }
 }

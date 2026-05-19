@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList};
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{resolve_webhook, verify_signature, GitHubError, GitHubWebhookConfig, WebhookResolution};
+use crate::metrics::render_prometheus;
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::storage::atomic_write;
@@ -34,6 +35,7 @@ pub trait ControlPlane: Send {
     ) -> Result<DeploymentAccepted, ErrorResponse>;
     fn get_deployment(&self, deployment_id: &str) -> Result<Option<DeploymentStatus>, ErrorResponse>;
     fn list_events(&self) -> Result<EventList, ErrorResponse>;
+    fn queue_depth(&self) -> Result<usize, ErrorResponse>;
 }
 
 impl<D, R, A> ControlPlane for Daemon<D, R, A>
@@ -59,6 +61,10 @@ where
 
     fn list_events(&self) -> Result<EventList, ErrorResponse> {
         Daemon::list_events(self)
+    }
+
+    fn queue_depth(&self) -> Result<usize, ErrorResponse> {
+        Daemon::queue_depth(self)
     }
 }
 
@@ -253,6 +259,7 @@ pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
+        .route("/metrics", get(get_metrics))
         .route("/deployments", post(post_deployments))
         .route("/secrets", post(post_secrets))
         .route("/webhooks/github", post(post_github_webhook))
@@ -285,6 +292,40 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
             status: if ready { "ready".into() } else { "not_ready".into() },
         }),
     )
+}
+
+async fn get_metrics(State(state): State<HttpState>) -> Response {
+    let request_id = next_request_id();
+    let queue_depth = match state.daemon.lock() {
+        Ok(daemon) => match daemon.queue_depth() {
+            Ok(queue_depth) => queue_depth,
+            Err(err) => return error_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, err),
+        },
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "daemon_lock_error".into(),
+                    message: "daemon lock poisoned".into(),
+                },
+            );
+        }
+    };
+
+    let mut response = (StatusCode::OK, render_prometheus(queue_depth)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    response
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, HeaderValue::from_str(&request_id).unwrap());
+    response.headers_mut().insert(
+        CORRELATION_ID_HEADER,
+        HeaderValue::from_str(&request_id).unwrap(),
+    );
+    response
 }
 
 async fn post_deployments(
@@ -911,6 +952,7 @@ impl crate::convergence::ActiveDeploymentDecider for StaticDecider {
 
 #[cfg(test)]
 fn build_state(ready: bool) -> HttpState {
+    crate::metrics::reset_for_tests();
     let root = if ready {
         test_root("http-ready")
     } else {
@@ -1067,5 +1109,73 @@ pub mod http_error_response_is_machine_readable {
         assert!(json.get("code").is_some());
         assert!(json.get("message").is_some());
         assert!(json.get("request_id").is_some());
+    }
+}
+
+#[cfg(test)]
+pub mod metrics_endpoint_exposes_prometheus_text {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_prometheus_text() {
+        let app = router(build_state(true));
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("forge_deployments_total 0"));
+        assert!(body.contains("forge_deployments_failed_total 0"));
+        assert!(body.contains("forge_deployments_rollback_total 0"));
+        assert!(body.contains("forge_queue_depth 0"));
+    }
+}
+
+#[cfg(test)]
+pub mod metrics_report_queue_depth {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn metrics_report_queue_depth() {
+        let app = router(build_state(true));
+        let deploy_request = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/deployments")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-token")
+            .body(Body::from(
+                r#"{"project_id":"api","environment":"production","intent":"deploy"}"#,
+            ))
+            .unwrap();
+        let deploy_response = app.clone().oneshot(deploy_request).await.unwrap();
+        assert_eq!(deploy_response.status(), StatusCode::ACCEPTED);
+
+        let metrics_request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(metrics_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("forge_queue_depth 1"));
     }
 }

@@ -10,6 +10,7 @@ pub mod github;
 pub mod http;
 pub mod invariants;
 pub mod manifest;
+pub mod metrics;
 pub mod queue;
 pub mod runtime;
 pub mod secrets;

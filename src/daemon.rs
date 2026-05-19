@@ -222,6 +222,16 @@ where
         Ok(EventList { events })
     }
 
+    pub fn queue_depth(&self) -> Result<usize, ErrorResponse> {
+        let Some(queue) = self.queue.as_ref() else {
+            return Err(ErrorResponse {
+                code: "queue_unavailable".into(),
+                message: "queue is unavailable".into(),
+            });
+        };
+        queue.queued_len().map_err(queue_error_to_response)
+    }
+
     pub fn graceful_shutdown(&mut self) {
         self.state = DaemonState::ShuttingDown;
         self.health_loops_started = false;

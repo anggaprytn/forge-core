@@ -62,6 +62,7 @@ systemctl start forge
 ```bash
 curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
+curl http://localhost:8080/metrics
 ```
 
 Expected:
@@ -70,6 +71,8 @@ Expected:
 ok
 ready
 ```
+
+`/metrics` returns Prometheus text exposition for operational visibility.
 
 ---
 
@@ -208,6 +211,25 @@ forge events
 ```bash
 curl http://localhost:8080/events
 ```
+
+---
+
+# Metrics
+
+Forge exposes a minimal Prometheus-compatible metrics endpoint:
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+Current metrics:
+
+- `forge_deployments_total`
+- `forge_deployments_failed_total`
+- `forge_deployments_rollback_total`
+- `forge_queue_depth`
+
+`forge_queue_depth` reports the current number of queued deployments waiting to run.
 
 ---
 

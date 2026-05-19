@@ -159,7 +159,7 @@ with minimal manual infrastructure repair.
 Status:
 
 ```txt
-next
+in progress
 ```
 
 Goal:
@@ -174,10 +174,10 @@ increase operator trust and runtime observability
 
 Planned:
 
-- [ ] Prometheus metrics endpoint
-- [ ] deployment counters
-- [ ] rollback counters
-- [ ] queue depth metrics
+- [x] Prometheus metrics endpoint
+- [x] deployment counters
+- [x] rollback counters
+- [x] queue depth metrics
 - [ ] convergence duration metrics
 - [ ] probe failure metrics
 

@@ -54,24 +54,24 @@ Do this in narrow slices.
 
 ## 2.1 Metrics
 
-- [ ] Add minimal metrics registry
-- [ ] Expose `GET /metrics`
-- [ ] Output Prometheus text format
+- [x] Add minimal metrics registry
+- [x] Expose `GET /metrics`
+- [x] Output Prometheus text format
 
 Track:
 
-- [ ] `deployments_total`
-- [ ] `failed_deployments_total`
-- [ ] `rollback_total`
-- [ ] `queue_depth`
+- [x] `deployments_total`
+- [x] `failed_deployments_total`
+- [x] `rollback_total`
+- [x] `queue_depth`
 - [ ] `probe_failures`
 - [ ] `convergence_transitions`
 
 ### Tests
 
-- [ ] `metrics_endpoint_exposes_prometheus_text`
+- [x] `metrics_endpoint_exposes_prometheus_text`
 - [ ] `metrics_increment_on_deploy_failure`
-- [ ] `metrics_report_queue_depth`
+- [x] `metrics_report_queue_depth`
 
 ### Rules
 
