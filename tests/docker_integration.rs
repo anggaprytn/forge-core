@@ -3,9 +3,19 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use forge_core::deployments::{
+    ActivationMode, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
+};
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
-use forge_core::runtime::{BuildImageRequest, CreateContainerRequest, DockerRuntime};
+use forge_core::probes::DockerNetworkProbeRuntime;
+use forge_core::queue::{DeploymentRecord, PersistentQueue};
+use forge_core::runtime::{
+    BuildImageRequest, CreateContainerRequest, DockerRuntime, RouteInspection, RouteUpdateRequest,
+    RoutingRuntime, RoutingRuntimeError,
+};
+use forge_core::storage::{EnvironmentPaths, PointerStore};
 
 fn forge_labels(project_id: &str, environment: &str, generation: u64) -> BTreeMap<String, String> {
     BTreeMap::from([
@@ -88,6 +98,10 @@ fn docker_integration_real_adapter_honors_runtime_invariants() {
         inspection.labels.get("forge.generation"),
         Some(&generation.to_string())
     );
+    assert!(
+        inspection.network_ips.values().any(|ip| !ip.is_empty()),
+        "real adapter should surface at least one container network IP"
+    );
 
     docker
         .remove_container(&container_name)
@@ -96,6 +110,71 @@ fn docker_integration_real_adapter_honors_runtime_invariants() {
     let artifact = runtime_root.join("docker_integration.ok");
     std::fs::write(&artifact, built_image).expect("integration artifact should be writable");
     assert!(artifact.exists());
+}
+
+#[test]
+fn docker_integration_executor_validates_candidate_over_container_ip() {
+    if !common::ensure_integration_enabled() || !common::ensure_docker_available() {
+        return;
+    }
+
+    let runtime_root = common::runtime_root("docker-validation");
+    let fixture = common::sample_http_app_fixture();
+    let network_name = format!("forge-docker-validation-{}", unique_suffix());
+    let container_name = "prod-api-gen-1".to_string();
+    let _guard = ValidationCleanupGuard {
+        container_name: container_name.clone(),
+        network_name: network_name.clone(),
+    };
+
+    docker(&["network", "create", &network_name]).expect("docker network should be creatable");
+
+    let queue = PersistentQueue::new(runtime_root.join("queue")).unwrap();
+    queue
+        .enqueue(DeploymentRecord {
+            deployment_id: "dep-1".into(),
+            project_id: "api".into(),
+            environment: "production".into(),
+        })
+        .unwrap();
+
+    let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
+    let mut probes = DockerNetworkProbeRuntime::new(network_name.clone(), 3000);
+    let mut routing = NoopRoutingRuntime;
+
+    let execution = DeploymentExecutor::new(
+        &runtime_root,
+        &queue,
+        &mut docker,
+        &mut probes,
+        &mut routing,
+        ValidationPolicy {
+            tcp_required: true,
+            http_health_path: Some("/health".into()),
+            activation: ActivationMode::Direct,
+        },
+    )
+    .with_execution_config(ExecutionConfig {
+        context_path: fixture.clone(),
+        dockerfile_path: fixture.join("Dockerfile"),
+        network_name: Some(network_name.clone()),
+    })
+    .execute_next()
+    .expect("deployment execution should succeed")
+    .expect("queued deployment should execute");
+
+    assert_eq!(execution.container_name, container_name);
+    assert!(
+        runtime_root
+            .join("projects/api/environments/production/generations/1/snapshot.json")
+            .exists()
+    );
+    assert_eq!(
+        PointerStore::new(EnvironmentPaths::new(&runtime_root, "api", "production"))
+            .read_pointer("current")
+            .unwrap(),
+        Some(1)
+    );
 }
 
 struct CleanupGuard {
@@ -111,4 +190,65 @@ impl Drop for CleanupGuard {
             .args(["rm", "-f", self.container_name.as_str()])
             .output();
     }
+}
+
+struct ValidationCleanupGuard {
+    container_name: String,
+    network_name: String,
+}
+
+impl Drop for ValidationCleanupGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", self.container_name.as_str()])
+            .output();
+        let _ = Command::new("docker")
+            .args(["network", "rm", self.network_name.as_str()])
+            .output();
+    }
+}
+
+struct NoopRoutingRuntime;
+
+impl RoutingRuntime for NoopRoutingRuntime {
+    fn update_route(&mut self, _request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError> {
+        Ok(())
+    }
+
+    fn inspect_route(&mut self, subtree_id: &str) -> Result<RouteInspection, RoutingRuntimeError> {
+        Ok(RouteInspection {
+            subtree_id: subtree_id.to_string(),
+            active_target: String::new(),
+            activation_verified: true,
+            health_checks_enabled: false,
+        })
+    }
+
+    fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
+        Ok(Vec::new())
+    }
+
+    fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {
+        Ok(())
+    }
+}
+
+fn docker(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be valid")
+        .as_nanos();
+    format!("pid-{}-{nanos}", std::process::id())
 }

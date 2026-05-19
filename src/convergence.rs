@@ -754,6 +754,7 @@ impl DockerRuntime for TestDockerRuntime {
             running,
             image_ref: "noop".into(),
             labels: Default::default(),
+            network_ips: Default::default(),
             restart_policy: "no".into(),
         })
     }
@@ -781,6 +782,7 @@ impl DockerRuntime for TestDockerRuntime {
                             .to_string(),
                     ),
                 ]),
+                network_ips: Default::default(),
                 restart_policy: "no".into(),
             })
             .collect())

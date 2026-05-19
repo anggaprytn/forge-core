@@ -956,6 +956,7 @@ impl DockerRuntime for NoopDockerRuntime {
             running: true,
             image_ref: "noop".into(),
             labels: Default::default(),
+            network_ips: Default::default(),
             restart_policy: "no".into(),
         })
     }

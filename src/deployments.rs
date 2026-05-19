@@ -371,6 +371,29 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             )?;
             return Err(err);
         }
+        let probe_host = match resolve_validation_probe_host(
+            &inspection,
+            self.execution.network_name.as_deref(),
+        ) {
+            Ok(probe_host) => probe_host,
+            Err(err) => {
+                let failure_reason = err.to_string();
+                self.record_failed_generation(
+                    &env,
+                    &events,
+                    &diagnostics,
+                    record,
+                    generation,
+                    &container_name,
+                    None,
+                    "validating_runtime",
+                    &failure_reason,
+                    &redacted_env_preview,
+                    &secret_values,
+                )?;
+                return Err(err);
+            }
+        };
         writer.write_artifact(
             "build.json",
             &format!(
@@ -389,6 +412,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         self.validate_candidate(
             &env,
             &container_name,
+            &probe_host,
             &events,
             &diagnostics,
             record,
@@ -435,6 +459,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         &mut self,
         env: &EnvironmentPaths,
         container_name: &str,
+        probe_host: &str,
         events: &EventStore,
         diagnostics: &DiagnosticsStore,
         record: &DeploymentRecord,
@@ -442,7 +467,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         redacted_env_preview: &[String],
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
-        if self.validation.tcp_required && !self.probes.probe_tcp(container_name)? {
+        if self.validation.tcp_required && !self.probes.probe_tcp(probe_host)? {
             self.record_failed_generation(
                 env,
                 events,
@@ -461,7 +486,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         diagnostics.append_log_line("tcp validation passed", secret_values)?;
 
         if let Some(path) = &self.validation.http_health_path {
-            if !self.probes.probe_http(container_name, path)? {
+            if !self.probes.probe_http(probe_host, path)? {
                 self.record_failed_generation(
                     env,
                     events,
@@ -778,6 +803,32 @@ fn validate_inspection(
     Ok(())
 }
 
+fn resolve_validation_probe_host(
+    inspection: &ContainerInspection,
+    network_name: Option<&str>,
+) -> Result<String, DeploymentError> {
+    if let Some(network_name) = network_name {
+        return inspection
+            .network_ips
+            .get(network_name)
+            .filter(|ip| !ip.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                DeploymentError::InvalidInspection(format!(
+                    "container missing IP on docker network {network_name}"
+                ))
+            });
+    }
+
+    inspection
+        .network_ips
+        .values()
+        .find(|ip| !ip.is_empty())
+        .cloned()
+        .or_else(|| Some(inspection.container_name.clone()))
+        .ok_or_else(|| DeploymentError::InvalidInspection("container missing network IP".into()))
+}
+
 fn forge_labels(record: &DeploymentRecord, generation: u64) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("forge.managed".into(), "true".into()),
@@ -912,6 +963,28 @@ impl ProbeRuntime for TestProbeRuntime {
 
 #[cfg(test)]
 #[derive(Default)]
+struct RecordingProbeRuntime {
+    tcp_ok: bool,
+    http_ok: bool,
+    tcp_hosts: Vec<String>,
+    http_hosts: Vec<(String, String)>,
+}
+
+#[cfg(test)]
+impl ProbeRuntime for RecordingProbeRuntime {
+    fn probe_tcp(&mut self, host: &str) -> Result<bool, ProbeError> {
+        self.tcp_hosts.push(host.to_string());
+        Ok(self.tcp_ok)
+    }
+
+    fn probe_http(&mut self, host: &str, path: &str) -> Result<bool, ProbeError> {
+        self.http_hosts.push((host.to_string(), path.to_string()));
+        Ok(self.http_ok)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
 struct TestRoutingRuntime {
     updates: Vec<RouteUpdateRequest>,
     inspections: Vec<RouteInspection>,
@@ -955,17 +1028,28 @@ fn queued_record(queue: &PersistentQueue) {
 
 #[cfg(test)]
 fn success_outputs(generation: u64) -> Vec<String> {
+    success_outputs_with_network(generation, &[("forge-test", "172.18.0.2")])
+}
+
+#[cfg(test)]
+fn success_outputs_with_network(generation: u64, networks: &[(&str, &str)]) -> Vec<String> {
     vec![
         format!("image_ref=forge/api:production-gen-{generation}"),
         format!("prod-api-gen-{generation}"),
         String::new(),
-        [
-            format!("name=prod-api-gen-{generation}"),
-            format!("running=true"),
-            format!("image=forge/api:production-gen-{generation}"),
-            "restart_policy=no".into(),
-        ]
-        .join("\n"),
+        std::iter::once(format!("name=prod-api-gen-{generation}"))
+            .chain(std::iter::once("running=true".into()))
+            .chain(std::iter::once(format!(
+                "image=forge/api:production-gen-{generation}"
+            )))
+            .chain(std::iter::once("restart_policy=no".into()))
+            .chain(
+                networks
+                    .iter()
+                    .map(|(name, ip)| format!("network:{name}={ip}")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n"),
     ]
 }
 
@@ -1339,6 +1423,58 @@ pub mod queued_deployment_builds_starts_validates_and_writes_snapshot {
         );
         let pointers = PointerStore::new(EnvironmentPaths::new(&root, "api", "production"));
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+pub mod validation_probes_configured_network_ip {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn deployment_validation_uses_inspected_ip_from_execution_network() {
+        let root = test_root("validation-probe-ip");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_network(
+                1,
+                &[("bridge", "172.17.0.2"), ("forge-net", "172.19.0.5")],
+            ),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Direct,
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: PathBuf::from("."),
+            dockerfile_path: PathBuf::from("./Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(probes.tcp_hosts, vec!["172.19.0.5".to_string()]);
+        assert_eq!(
+            probes.http_hosts,
+            vec![("172.19.0.5".to_string(), "/health".to_string())]
+        );
     }
 }
 

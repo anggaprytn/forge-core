@@ -552,6 +552,7 @@ impl DockerRuntime for FakeDockerRuntime {
             running: true,
             image_ref: "forge:test".into(),
             labels: BTreeMap::new(),
+            network_ips: BTreeMap::new(),
             restart_policy: "no".into(),
         })
     }
@@ -565,6 +566,7 @@ impl DockerRuntime for FakeDockerRuntime {
                 running: true,
                 image_ref: "forge:test".into(),
                 labels: BTreeMap::new(),
+                network_ips: BTreeMap::new(),
                 restart_policy: "no".into(),
             })
             .collect())

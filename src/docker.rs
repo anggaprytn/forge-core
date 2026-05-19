@@ -124,6 +124,9 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
                 "{{range $key, $value := .Config.Labels}}",
                 "label:{{$key}}={{$value}}",
                 "{{end}}",
+                "{{range $name, $settings := .NetworkSettings.Networks}}",
+                "network:{{$name}}={{$settings.IPAddress}}",
+                "{{end}}",
             ]
             .join("\n"),
             container_name.to_string(),
@@ -182,6 +185,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
     let mut image_ref = None;
     let mut restart_policy = None;
     let mut labels = BTreeMap::new();
+    let mut network_ips = BTreeMap::new();
 
     for line in output.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -198,6 +202,12 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
                     value.to_string(),
                 );
             }
+            _ if key.starts_with("network:") => {
+                network_ips.insert(
+                    key.trim_start_matches("network:").to_string(),
+                    value.to_string(),
+                );
+            }
             _ => {}
         }
     }
@@ -210,6 +220,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
         image_ref: image_ref
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,
         labels,
+        network_ips,
         restart_policy: restart_policy
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing restart policy".into()))?,
     })
@@ -367,6 +378,7 @@ pub mod docker_adapter_inspects_running_state {
             "restart_policy=no",
             "label:forge.managed=true",
             "label:forge.project_id=api",
+            "network:forge-test=172.19.0.5",
         ]
         .join("\n");
         let runner = RecordingCommandRunner::with_outputs(vec![output]);
@@ -380,6 +392,10 @@ pub mod docker_adapter_inspects_running_state {
         assert_eq!(
             inspection.labels.get("forge.project_id"),
             Some(&"api".to_string())
+        );
+        assert_eq!(
+            inspection.network_ips.get("forge-test"),
+            Some(&"172.19.0.5".to_string())
         );
         let args = &docker.runner.commands[0].args;
         assert_eq!(args[0], "inspect");
