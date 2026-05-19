@@ -1543,7 +1543,7 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
     use super::*;
 
     #[test]
-    fn startup_recovers_missing_current_container_and_route_without_rebuild() {
+    fn startup_recovery_restores_missing_route_for_current_generation() {
         let root = test_root("startup-recover-current-http");
         setup_recoverable_http_generation(&root, 1);
         let env = EnvironmentPaths::new(&root, "api", "production");

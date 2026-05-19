@@ -189,7 +189,7 @@ fn dogfood_daemon_restart_reconstructs_current_route() {
 }
 
 #[test]
-fn dogfood_reboot_recovery_reconstructs_current_container_and_route() {
+fn dogfood_reboot_recovery_restores_container_and_route() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("reboot-recovery") else {
         return;
@@ -203,6 +203,7 @@ fn dogfood_reboot_recovery_reconstructs_current_container_and_route() {
         .routing
         .remove_route("forge:api:production")
         .expect("managed route should be removable");
+    harness.install_ready_placeholder();
 
     harness.restart_api_server(AllowAllDecider(true));
 
@@ -224,6 +225,11 @@ fn dogfood_reboot_recovery_reconstructs_current_container_and_route() {
         .send()
         .expect("public route should be reachable after startup recovery");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().unwrap(),
+        "ok\n",
+        "startup recovery must override the forge:ready placeholder"
+    );
 }
 
 #[test]
@@ -1062,6 +1068,40 @@ impl E2eHarness {
             thread::sleep(Duration::from_millis(100));
         }
         panic!("api readyz did not become ready");
+    }
+
+    fn install_ready_placeholder(&self) {
+        let mut config = self
+            .http_client
+            .get(format!("{}/config/", self.admin_base_url()))
+            .send()
+            .expect("caddy config inspection should succeed")
+            .json::<Value>()
+            .expect("caddy config should decode as json");
+        let routes = config["apps"]["http"]["servers"]["forge"]["routes"]
+            .as_array_mut()
+            .expect("forge routes should be an array");
+        routes.push(serde_json::json!({
+            "@id": "forge:ready",
+            "terminal": true,
+            "handle": [{
+                "handler": "static_response",
+                "status_code": 200,
+                "body": "forge caddy ready"
+            }]
+        }));
+
+        let response = self
+            .http_client
+            .post(format!("{}/load", self.admin_base_url()))
+            .json(&config)
+            .send()
+            .expect("caddy config load should succeed");
+        assert!(
+            response.status().is_success(),
+            "ready placeholder install failed: {}",
+            response.status()
+        );
     }
 }
 

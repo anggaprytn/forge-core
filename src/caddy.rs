@@ -9,6 +9,10 @@ pub struct CaddyApiRuntime {
 }
 
 impl CaddyApiRuntime {
+    fn ready_subtree_id() -> &'static str {
+        "forge:ready"
+    }
+
     pub fn new(admin_base_url: impl Into<String>, public_base_url: impl Into<String>) -> Self {
         Self {
             admin_base_url: admin_base_url.into().trim_end_matches('/').to_string(),
@@ -103,6 +107,27 @@ impl CaddyApiRuntime {
         })
     }
 
+    fn order_updated_routes(
+        mut routes: Vec<serde_json::Value>,
+        updated_subtree_id: &str,
+    ) -> Vec<serde_json::Value> {
+        if updated_subtree_id == Self::ready_subtree_id() {
+            return routes;
+        }
+
+        let mut ready_routes = Vec::new();
+        routes.retain(|route| {
+            if route.get("@id").and_then(|id| id.as_str()) == Some(Self::ready_subtree_id()) {
+                ready_routes.push(route.clone());
+                false
+            } else {
+                true
+            }
+        });
+        routes.extend(ready_routes);
+        routes
+    }
+
     fn activation_verified(&self, subtree_id: &str) -> bool {
         let path = self
             .probe_paths
@@ -174,6 +199,7 @@ impl RoutingRuntime for CaddyApiRuntime {
             route.get("@id").and_then(|id| id.as_str()) != Some(request.subtree_id.as_str())
         });
         routes.push(Self::route_json(&request));
+        routes = Self::order_updated_routes(routes, &request.subtree_id);
         self.write_routes(&routes)?;
         self.probe_paths.insert(
             request.subtree_id,

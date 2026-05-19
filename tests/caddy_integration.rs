@@ -129,6 +129,45 @@ fn caddy_integration_route_activation_probe_succeeds() {
 }
 
 #[test]
+fn caddy_integration_active_route_overrides_ready_placeholder() {
+    let _guard = integration_lock();
+    let Some(mut harness) = CaddyHarness::start("ready-placeholder-override") else {
+        return;
+    };
+    harness.start_sample_app("prod-api-gen-44");
+    harness.install_ready_placeholder();
+    let mut routing = harness.routing();
+
+    routing
+        .update_route(RouteUpdateRequest {
+            subtree_id: "forge:api:production".into(),
+            target: "prod-api-gen-44:3000".into(),
+            health_checks_enabled: false,
+            probe_path: Some("/health".into()),
+        })
+        .unwrap();
+
+    let inspection = routing.inspect_route("forge:api:production").unwrap();
+    assert_eq!(inspection.active_target, "prod-api-gen-44:3000");
+
+    let response = reqwest::blocking::get(harness.public_url("health"))
+        .expect("public caddy probe should reach active generation");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.text().unwrap(),
+        "ok\n",
+        "active application route must take precedence over forge:ready"
+    );
+
+    let route_order = harness.route_order();
+    assert_eq!(
+        route_order.last().map(String::as_str),
+        Some("forge:ready"),
+        "forge:ready must remain behind active forge routes"
+    );
+}
+
+#[test]
 fn caddy_integration_failed_route_activation_does_not_advance_current() {
     let _guard = integration_lock();
     let Some(mut harness) = CaddyHarness::start("activation-failure") else {
@@ -397,6 +436,57 @@ impl CaddyHarness {
                     .map(ToOwned::to_owned)
             })
             .collect()
+    }
+
+    fn route_order(&self) -> Vec<String> {
+        let routes = reqwest::blocking::get(format!(
+            "{}/config/apps/http/servers/forge/routes",
+            self.admin_base_url()
+        ))
+        .expect("caddy admin route listing should succeed")
+        .json::<Vec<serde_json::Value>>()
+        .expect("caddy routes should decode as json");
+
+        routes
+            .into_iter()
+            .filter_map(|route| {
+                route
+                    .get("@id")
+                    .and_then(|id| id.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
+
+    fn install_ready_placeholder(&self) {
+        let mut config = reqwest::blocking::get(format!("{}/config/", self.admin_base_url()))
+            .expect("caddy config inspection should succeed")
+            .json::<serde_json::Value>()
+            .expect("caddy config should decode as json");
+        let routes = config["apps"]["http"]["servers"]["forge"]["routes"]
+            .as_array_mut()
+            .expect("forge routes should be an array");
+        routes.push(serde_json::json!({
+            "@id": "forge:ready",
+            "terminal": true,
+            "handle": [{
+                "handler": "static_response",
+                "status_code": 200,
+                "body": "forge caddy ready"
+            }]
+        }));
+
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .post(format!("{}/load", self.admin_base_url()))
+            .json(&config)
+            .send()
+            .expect("caddy config load should succeed");
+        assert!(
+            response.status().is_success(),
+            "ready placeholder install failed: {}",
+            response.status()
+        );
     }
 
     fn wait_until_ready(&self) {
