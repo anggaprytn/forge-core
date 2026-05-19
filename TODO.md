@@ -34,18 +34,12 @@ Goal: reach usable alpha without scope creep.
 # Phase 1: Stabilize Current Alpha Baseline
 
 - [ ] Commit clean CLI baseline
-- [ ] Verify all tests pass
+- [x] Verify all tests pass
 
 ```bash
 cargo test -q
 FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
 ```
-
-Current blocker:
-
-- `FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture` currently fails in `dogfood_daemon_restart_reconstructs_current_route`
-- `FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture` currently fails in `dogfood_bad_app_failed_generation_is_cleaned`
-- `FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture` currently fails in `dogfood_github_webhook_push_enqueues_and_deploys`
 
 - [ ] Remove or silence harmless warnings
 - [ ] Ensure `README.md` matches actual current state

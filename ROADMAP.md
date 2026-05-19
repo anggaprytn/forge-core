@@ -245,9 +245,9 @@ Still needed:
 - [ ] multi-project deploy source selection
 - [ ] webhook-first VPS onboarding guide
 
-Acceptance blocker:
+Acceptance status:
 
-- [ ] dogfood integration suite is not yet green on daemon/VPS startup validation
+- [x] dogfood integration suite is green on daemon/VPS startup validation
 
 ```txt
 operators can diagnose runtime failures quickly and deterministically
