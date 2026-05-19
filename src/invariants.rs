@@ -18,10 +18,18 @@ impl Display for InvariantError {
         match self {
             Self::CurrentPointerMissing => write!(f, "current pointer missing"),
             Self::CurrentPointerDangling(path) => {
-                write!(f, "current pointer references non-finalized generation at {}", path.display())
+                write!(
+                    f,
+                    "current pointer references non-finalized generation at {}",
+                    path.display()
+                )
             }
             Self::DuplicateGeneration(path) => {
-                write!(f, "duplicate or reused generation state detected at {}", path.display())
+                write!(
+                    f,
+                    "duplicate or reused generation state detected at {}",
+                    path.display()
+                )
             }
             Self::Storage(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "{err}"),
@@ -43,7 +51,11 @@ impl From<crate::storage::StorageError> for InvariantError {
     }
 }
 
-pub fn assert_current_pointer_valid(root: impl AsRef<Path>, project_id: &str, environment: &str) -> Result<(), InvariantError> {
+pub fn assert_current_pointer_valid(
+    root: impl AsRef<Path>,
+    project_id: &str,
+    environment: &str,
+) -> Result<(), InvariantError> {
     let env = EnvironmentPaths::new(root, project_id, environment);
     let pointer_store = PointerStore::new(env.clone());
     let current = pointer_store
@@ -56,7 +68,11 @@ pub fn assert_current_pointer_valid(root: impl AsRef<Path>, project_id: &str, en
     Ok(())
 }
 
-pub fn assert_generation_never_reused(root: impl AsRef<Path>, project_id: &str, environment: &str) -> Result<(), InvariantError> {
+pub fn assert_generation_never_reused(
+    root: impl AsRef<Path>,
+    project_id: &str,
+    environment: &str,
+) -> Result<(), InvariantError> {
     let env = EnvironmentPaths::new(root, project_id, environment);
     env.ensure_exists()?;
 

@@ -338,8 +338,10 @@ mod tests {
             &http,
         );
 
-        assert!(messages_with_status(&report, DoctorStatus::Error)
-            .contains("Docker reachable: docker daemon unavailable"));
+        assert!(
+            messages_with_status(&report, DoctorStatus::Error)
+                .contains("Docker reachable: docker daemon unavailable")
+        );
     }
 
     #[test]
@@ -356,16 +358,13 @@ mod tests {
             )]),
         };
 
-        let report = run_with_dependencies(
-            &config,
-            "http://127.0.0.1:2019",
-            None,
-            &mut docker,
-            &http,
-        );
+        let report =
+            run_with_dependencies(&config, "http://127.0.0.1:2019", None, &mut docker, &http);
 
-        assert!(messages_with_status(&report, DoctorStatus::Error)
-            .contains("Caddy admin API reachable: connection refused"));
+        assert!(
+            messages_with_status(&report, DoctorStatus::Error)
+                .contains("Caddy admin API reachable: connection refused")
+        );
     }
 
     #[test]
@@ -379,21 +378,14 @@ mod tests {
         let config = test_config(&root);
         let mut docker = StubDocker { result: Ok(()) };
         let http = StubHttp {
-            results: BTreeMap::from([(
-                "http://127.0.0.1:2019/config/".into(),
-                Ok(()),
-            )]),
+            results: BTreeMap::from([("http://127.0.0.1:2019/config/".into(), Ok(()))]),
         };
 
-        let report = run_with_dependencies(
-            &config,
-            "http://127.0.0.1:2019",
-            None,
-            &mut docker,
-            &http,
-        );
+        let report =
+            run_with_dependencies(&config, "http://127.0.0.1:2019", None, &mut docker, &http);
 
-        assert!(messages_with_status(&report, DoctorStatus::Warn)
-            .contains("FORGE_MASTER_KEY missing"));
+        assert!(
+            messages_with_status(&report, DoctorStatus::Warn).contains("FORGE_MASTER_KEY missing")
+        );
     }
 }

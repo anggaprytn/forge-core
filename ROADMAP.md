@@ -264,6 +264,7 @@ reduce operational friction
 
 Planned:
 
+- [x] daemon CLI entrypoint
 - [ ] `forge init`
 - [ ] local development setup
 - [ ] VPS installation guides

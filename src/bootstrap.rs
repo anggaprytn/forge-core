@@ -36,9 +36,10 @@ impl From<crate::queue::QueueError> for BootstrapError {
     fn from(value: crate::queue::QueueError) -> Self {
         match value {
             crate::queue::QueueError::Io(err) => Self::Io(err),
-            crate::queue::QueueError::CorruptState(path) => {
-                Self::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, path.display().to_string()))
-            }
+            crate::queue::QueueError::CorruptState(path) => Self::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                path.display().to_string(),
+            )),
             crate::queue::QueueError::ActiveDeploymentAlreadyRunning => {
                 Self::Io(std::io::Error::other("active deployment already running"))
             }

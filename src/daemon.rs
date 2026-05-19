@@ -4,16 +4,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    validate_deployment_request, DeploymentAccepted, DeploymentLogs, DeploymentRequest,
-    DeploymentStatus, EventList, ErrorResponse,
+    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse,
+    EventList, validate_deployment_request,
 };
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
-use crate::convergence::{ActiveDeploymentDecider, ConvergenceError, RecoveryOutcome, StartupConvergence};
+use crate::convergence::{
+    ActiveDeploymentDecider, ConvergenceError, RecoveryOutcome, StartupConvergence,
+};
 use crate::events::EventRecord;
-use crate::storage::{DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore};
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
+use crate::storage::{
+    DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonState {
@@ -88,7 +92,12 @@ where
     R: RoutingRuntime,
     A: ActiveDeploymentDecider,
 {
-    pub fn new(config: DaemonConfig, docker_runtime: D, routing_runtime: R, recovery_decider: A) -> Self {
+    pub fn new(
+        config: DaemonConfig,
+        docker_runtime: D,
+        routing_runtime: R,
+        recovery_decider: A,
+    ) -> Self {
         let startup_steps = vec![StartupStep::ConfigLoaded];
         Self {
             config,
@@ -116,10 +125,15 @@ where
                 self.startup_steps.push(StartupStep::BootstrapReady);
 
                 let queue = PersistentQueue::new(self.config.storage_root.join("queue"))?;
-                let convergence =
-                    StartupConvergence::new(self.config.storage_root.clone(), &queue, &self.recovery_decider);
-                let outcome = convergence
-                    .recover_active_deployment(&mut self.docker_runtime, &mut self.routing_runtime)?;
+                let convergence = StartupConvergence::new(
+                    self.config.storage_root.clone(),
+                    &queue,
+                    &self.recovery_decider,
+                );
+                let outcome = convergence.recover_active_deployment(
+                    &mut self.docker_runtime,
+                    &mut self.routing_runtime,
+                )?;
                 self.last_recovery_outcome = Some(outcome);
                 self.startup_steps.push(StartupStep::QueueRecovered);
 
@@ -183,10 +197,12 @@ where
             }
         }
 
-        for entry in persisted_deployments(&self.config.storage_root).map_err(|err| ErrorResponse {
-            code: "status_lookup_failed".into(),
-            message: err.to_string(),
-        })? {
+        for entry in
+            persisted_deployments(&self.config.storage_root).map_err(|err| ErrorResponse {
+                code: "status_lookup_failed".into(),
+                message: err.to_string(),
+            })?
+        {
             if entry.deployment_id == deployment_id {
                 let runtime_state = RuntimeStateStore::new(EnvironmentPaths::new(
                     &self.config.storage_root,
@@ -216,14 +232,18 @@ where
     }
 
     pub fn list_events(&self) -> Result<EventList, ErrorResponse> {
-        let events = EventStore::list_all(&self.config.storage_root).map_err(|err| ErrorResponse {
-            code: "events_unavailable".into(),
-            message: err.to_string(),
-        })?;
+        let events =
+            EventStore::list_all(&self.config.storage_root).map_err(|err| ErrorResponse {
+                code: "events_unavailable".into(),
+                message: err.to_string(),
+            })?;
         Ok(EventList { events })
     }
 
-    pub fn get_deployment_logs(&self, deployment_id: &str) -> Result<Option<DeploymentLogs>, ErrorResponse> {
+    pub fn get_deployment_logs(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<DeploymentLogs>, ErrorResponse> {
         let Some(entry) = persisted_deployments(&self.config.storage_root)
             .map_err(|err| ErrorResponse {
                 code: "logs_unavailable".into(),
@@ -236,7 +256,11 @@ where
         };
 
         let lines = DiagnosticsStore::new(
-            EnvironmentPaths::new(&self.config.storage_root, &entry.project_id, &entry.environment),
+            EnvironmentPaths::new(
+                &self.config.storage_root,
+                &entry.project_id,
+                &entry.environment,
+            ),
             entry.generation,
         )
         .read_log_lines()
@@ -316,7 +340,9 @@ struct PersistedDeployment {
     generation: u64,
 }
 
-fn persisted_deployments(root: &std::path::Path) -> Result<Vec<PersistedDeployment>, std::io::Error> {
+fn persisted_deployments(
+    root: &std::path::Path,
+) -> Result<Vec<PersistedDeployment>, std::io::Error> {
     let projects_root = root.join("projects");
     let mut deployments = Vec::new();
     if !projects_root.exists() {
@@ -341,11 +367,7 @@ fn persisted_deployments(root: &std::path::Path) -> Result<Vec<PersistedDeployme
             }
             for generation in std::fs::read_dir(generations)? {
                 let generation = generation?;
-                let generation_id = generation
-                    .file_name()
-                    .to_string_lossy()
-                    .parse::<u64>()
-                    .ok();
+                let generation_id = generation.file_name().to_string_lossy().parse::<u64>().ok();
                 let deployment_id = read_generation_deployment_id(&generation.path())?;
                 if let (Some(generation), Some(deployment_id)) = (generation_id, deployment_id) {
                     deployments.push(PersistedDeployment {
@@ -780,16 +802,18 @@ pub mod deployment_status_reflects_runtime_state {
             .unwrap()
             .finalize("api", "production", SnapshotState::Healthy)
             .unwrap();
-        RuntimeStateStore::new(env).save(&RuntimeState {
-            active_generation: Some(1),
-            health_state: RuntimeHealthState::Degraded,
-            failed_probe_count: 3,
-            successful_probe_count: 0,
-            restart_attempted: true,
-            degraded_since_unix: Some(100),
-            last_transition: "degraded".into(),
-            last_error_code: Some("tcp_unreachable".into()),
-        }).unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Degraded,
+                failed_probe_count: 3,
+                successful_probe_count: 0,
+                restart_attempted: true,
+                degraded_since_unix: Some(100),
+                last_transition: "degraded".into(),
+                last_error_code: Some("tcp_unreachable".into()),
+            })
+            .unwrap();
 
         let daemon = Daemon::new(
             config_with_root(root),

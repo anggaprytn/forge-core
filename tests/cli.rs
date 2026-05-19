@@ -100,14 +100,17 @@ fn cli_secrets_set_writes_secret_without_echoing_value() {
         r#"{"data":{"secret_id":"api:production:DATABASE_URL"}}"#,
     );
 
-    let output = run_cli(&url, &[
-        "secrets",
-        "set",
-        "api",
-        "production",
-        "DATABASE_URL",
-        "postgres://supersecretvalue",
-    ]);
+    let output = run_cli(
+        &url,
+        &[
+            "secrets",
+            "set",
+            "api",
+            "production",
+            "DATABASE_URL",
+            "postgres://supersecretvalue",
+        ],
+    );
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

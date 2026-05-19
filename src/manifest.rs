@@ -72,9 +72,7 @@ fn parse_manifest(json: Value) -> Result<ProjectManifest, ManifestError> {
     let mut environment_variables = BTreeMap::new();
     for (env_name, value) in secret_root {
         let reference = value.as_object().ok_or_else(|| {
-            ManifestError::Invalid(format!(
-                "secret reference for {env_name} must be an object"
-            ))
+            ManifestError::Invalid(format!("secret reference for {env_name} must be an object"))
         })?;
         for key in reference.keys() {
             if !matches!(key.as_str(), "scope" | "key" | "sensitive") {
@@ -139,7 +137,10 @@ mod tests {
         .unwrap();
 
         let err = load_optional_manifest(&root).unwrap_err();
-        assert!(err.to_string().contains("secret values must not be loaded from manifest"));
+        assert!(
+            err.to_string()
+                .contains("secret values must not be loaded from manifest")
+        );
     }
 
     fn test_root(name: &str) -> std::path::PathBuf {

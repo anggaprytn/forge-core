@@ -1,11 +1,11 @@
+use crate::events::{EventRecord, redact_text};
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::events::{redact_text, EventRecord};
-use serde::{Deserialize, Serialize};
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_RETRY_LIMIT: usize = 200;
@@ -60,16 +60,14 @@ impl From<std::io::Error> for StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeHealthState {
     Healthy,
     Degraded,
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeState {
     pub active_generation: Option<u64>,
     pub health_state: RuntimeHealthState,
@@ -81,8 +79,7 @@ pub struct RuntimeState {
     pub last_error_code: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupRecord {
     pub timestamp_unix: u64,
     pub failure_reason: String,
@@ -93,8 +90,7 @@ pub struct CleanupRecord {
     pub tombstoned: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticSummary {
     pub deployment_id: Option<String>,
     pub failure_stage: String,
@@ -194,7 +190,10 @@ impl GenerationAllocator {
         let _guard = FileLock::acquire(self.env.generation_counter().with_extension("lock"))?;
         let current = fs::read_to_string(self.env.generation_counter())?;
         let next = current.trim().parse::<u64>().unwrap_or(0) + 1;
-        atomic_write(self.env.generation_counter(), format!("{next}\n").as_bytes())?;
+        atomic_write(
+            self.env.generation_counter(),
+            format!("{next}\n").as_bytes(),
+        )?;
         Ok(next)
     }
 }
@@ -223,7 +222,12 @@ impl SnapshotWriter {
         atomic_write(self.generation_dir().join(name), contents.as_bytes())
     }
 
-    pub fn finalize(&self, project_id: &str, environment: &str, state: SnapshotState) -> StorageResult<()> {
+    pub fn finalize(
+        &self,
+        project_id: &str,
+        environment: &str,
+        state: SnapshotState,
+    ) -> StorageResult<()> {
         let finalized_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -236,7 +240,10 @@ impl SnapshotWriter {
             state.as_str(),
             finalized_at,
         );
-        atomic_write(self.generation_dir().join("snapshot.json"), snapshot_json.as_bytes())
+        atomic_write(
+            self.generation_dir().join("snapshot.json"),
+            snapshot_json.as_bytes(),
+        )
     }
 }
 
@@ -297,7 +304,10 @@ impl EventStore {
 
     pub fn append(&self, event: &EventRecord) -> StorageResult<()> {
         self.env.ensure_exists()?;
-        let path = self.env.generation_dir(self.generation).join("events.jsonl");
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("events.jsonl");
         let mut existing = if path.exists() {
             fs::read_to_string(&path)?
         } else {
@@ -503,7 +513,12 @@ impl CleanupStore {
                 err.to_string(),
             ))
         })?;
-        atomic_write(self.env.generation_dir(self.generation).join("cleanup.json"), &bytes)?;
+        atomic_write(
+            self.env
+                .generation_dir(self.generation)
+                .join("cleanup.json"),
+            &bytes,
+        )?;
         if record.tombstoned {
             atomic_write(
                 self.env.generation_dir(self.generation).join("tombstone"),
@@ -514,7 +529,10 @@ impl CleanupStore {
     }
 
     pub fn read_record(&self) -> StorageResult<Option<CleanupRecord>> {
-        let path = self.env.generation_dir(self.generation).join("cleanup.json");
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("cleanup.json");
         if !path.exists() {
             return Ok(None);
         }
@@ -547,7 +565,10 @@ impl PointerStore {
             )?;
         }
 
-        atomic_write(self.env.current_pointer(), format!("{generation}\n").as_bytes())
+        atomic_write(
+            self.env.current_pointer(),
+            format!("{generation}\n").as_bytes(),
+        )
     }
 
     pub fn read_pointer(&self, name: &str) -> StorageResult<Option<u64>> {

@@ -12,10 +12,13 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
-    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
+    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse,
+    EventList,
 };
 use crate::daemon::{Daemon, DaemonState};
-use crate::github::{resolve_webhook, verify_signature, GitHubError, GitHubWebhookConfig, WebhookResolution};
+use crate::github::{
+    GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
+};
 use crate::metrics::render_prometheus;
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
@@ -35,8 +38,14 @@ pub trait ControlPlane: Send {
         &mut self,
         request: DeploymentRequest,
     ) -> Result<DeploymentAccepted, ErrorResponse>;
-    fn get_deployment(&self, deployment_id: &str) -> Result<Option<DeploymentStatus>, ErrorResponse>;
-    fn get_deployment_logs(&self, deployment_id: &str) -> Result<Option<DeploymentLogs>, ErrorResponse>;
+    fn get_deployment(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<DeploymentStatus>, ErrorResponse>;
+    fn get_deployment_logs(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<DeploymentLogs>, ErrorResponse>;
     fn list_events(&self) -> Result<EventList, ErrorResponse>;
     fn queue_depth(&self) -> Result<usize, ErrorResponse>;
 }
@@ -58,11 +67,17 @@ where
         Daemon::handle_post_deployments(self, request)
     }
 
-    fn get_deployment(&self, deployment_id: &str) -> Result<Option<DeploymentStatus>, ErrorResponse> {
+    fn get_deployment(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<DeploymentStatus>, ErrorResponse> {
         Daemon::get_deployment(self, deployment_id)
     }
 
-    fn get_deployment_logs(&self, deployment_id: &str) -> Result<Option<DeploymentLogs>, ErrorResponse> {
+    fn get_deployment_logs(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<DeploymentLogs>, ErrorResponse> {
         Daemon::get_deployment_logs(self, deployment_id)
     }
 
@@ -137,16 +152,14 @@ impl Display for HttpError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SuccessEnvelope<T> {
     request_id: String,
     correlation_id: String,
     data: T,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ErrorEnvelope {
     request_id: String,
     correlation_id: String,
@@ -154,29 +167,25 @@ struct ErrorEnvelope {
     message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HealthEnvelope {
     status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IdempotencyRecord {
     fingerprint: String,
     request_id: String,
     accepted: DeploymentAccepted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DeliveryRecord {
     request_id: String,
     result: WebhookResult,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WebhookResult {
     status: String,
     deployment_id: Option<String>,
@@ -277,7 +286,12 @@ pub fn router(state: HttpState) -> Router {
 }
 
 async fn get_healthz() -> impl IntoResponse {
-    (StatusCode::OK, Json(HealthEnvelope { status: "ok".into() }))
+    (
+        StatusCode::OK,
+        Json(HealthEnvelope {
+            status: "ok".into(),
+        }),
+    )
 }
 
 async fn get_readyz(State(state): State<HttpState>) -> Response {
@@ -297,7 +311,11 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
         status,
         &request_id,
         Json(HealthEnvelope {
-            status: if ready { "ready".into() } else { "not_ready".into() },
+            status: if ready {
+                "ready".into()
+            } else {
+                "not_ready".into()
+            },
         }),
     )
 }
@@ -326,9 +344,10 @@ async fn get_metrics(State(state): State<HttpState>) -> Response {
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4"),
     );
-    response
-        .headers_mut()
-        .insert(REQUEST_ID_HEADER, HeaderValue::from_str(&request_id).unwrap());
+    response.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_str(&request_id).unwrap(),
+    );
     response.headers_mut().insert(
         CORRELATION_ID_HEADER,
         HeaderValue::from_str(&request_id).unwrap(),
@@ -746,7 +765,11 @@ async fn get_logs(
     }
 }
 
-fn ensure_authorized(state: &HttpState, headers: &HeaderMap, request_id: &str) -> Result<(), Response> {
+fn ensure_authorized(
+    state: &HttpState,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<(), Response> {
     let Some(value) = header_value(headers, AUTHORIZATION) else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
@@ -828,14 +851,16 @@ fn secret_error_response(request_id: &str, err: SecretError) -> Response {
                 message: err.to_string(),
             },
         ),
-        SecretError::MissingSecret(_) | SecretError::Crypto(_) | SecretError::Io(_) => error_response(
-            StatusCode::BAD_REQUEST,
-            request_id,
-            ErrorResponse {
-                code: "secret_store_error".into(),
-                message: err.to_string(),
-            },
-        ),
+        SecretError::MissingSecret(_) | SecretError::Crypto(_) | SecretError::Io(_) => {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                request_id,
+                ErrorResponse {
+                    code: "secret_store_error".into(),
+                    message: err.to_string(),
+                },
+            )
+        }
     }
 }
 
@@ -851,12 +876,14 @@ where
     T: Serialize,
 {
     let mut response = (status, body).into_response();
-    response
-        .headers_mut()
-        .insert(REQUEST_ID_HEADER, HeaderValue::from_str(request_id).unwrap());
-    response
-        .headers_mut()
-        .insert(CORRELATION_ID_HEADER, HeaderValue::from_str(request_id).unwrap());
+    response.headers_mut().insert(
+        REQUEST_ID_HEADER,
+        HeaderValue::from_str(request_id).unwrap(),
+    );
+    response.headers_mut().insert(
+        CORRELATION_ID_HEADER,
+        HeaderValue::from_str(request_id).unwrap(),
+    );
     response
 }
 
@@ -1020,7 +1047,12 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
         repository_cache_root: None,
         sqlite_path: None,
     };
-    let mut daemon = Daemon::new(config.clone(), NoopDockerRuntime, NoopRoutingRuntime, StaticDecider(true));
+    let mut daemon = Daemon::new(
+        config.clone(),
+        NoopDockerRuntime,
+        NoopRoutingRuntime,
+        StaticDecider(true),
+    );
     if ready {
         daemon.start().unwrap();
     }
@@ -1093,7 +1125,7 @@ pub mod http_post_deployments_enqueues_job {
 #[cfg(test)]
 pub mod http_idempotency_key_replays_same_response {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
@@ -1147,7 +1179,7 @@ pub mod http_readyz_false_before_daemon_ready {
 #[cfg(test)]
 pub mod http_error_response_is_machine_readable {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use serde_json::Value;
     use tower::util::ServiceExt;
@@ -1177,7 +1209,7 @@ pub mod http_error_response_is_machine_readable {
 #[cfg(test)]
 pub mod metrics_endpoint_exposes_prometheus_text {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
@@ -1193,7 +1225,10 @@ pub mod metrics_endpoint_exposes_prometheus_text {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
             "text/plain; version=0.0.4"
         );
 
@@ -1209,7 +1244,7 @@ pub mod metrics_endpoint_exposes_prometheus_text {
 #[cfg(test)]
 pub mod metrics_report_queue_depth {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
@@ -1247,7 +1282,7 @@ pub mod logs_endpoint_is_bounded {
     use super::*;
     use crate::events::EventRecord;
     use crate::storage::{DiagnosticsStore, EnvironmentPaths, EventStore};
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use serde_json::Value;
     use tower::util::ServiceExt;
@@ -1270,7 +1305,9 @@ pub mod logs_endpoint_is_bounded {
             .unwrap();
         let diagnostics = DiagnosticsStore::new(env, 1);
         for idx in 0..200 {
-            diagnostics.append_log_line(&format!("line-{idx}"), &[]).unwrap();
+            diagnostics
+                .append_log_line(&format!("line-{idx}"), &[])
+                .unwrap();
         }
 
         let app = router(state);

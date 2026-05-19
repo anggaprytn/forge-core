@@ -28,7 +28,10 @@ impl CaddyApiRuntime {
     }
 
     fn routes_url(&self) -> String {
-        format!("{}/config/apps/http/servers/forge/routes", self.admin_base_url)
+        format!(
+            "{}/config/apps/http/servers/forge/routes",
+            self.admin_base_url
+        )
     }
 
     fn load_url(&self) -> String {
@@ -65,8 +68,8 @@ impl CaddyApiRuntime {
 
     fn write_routes(&self, routes: &[serde_json::Value]) -> Result<(), RoutingRuntimeError> {
         let mut config = self.read_full_config()?;
-        let route_value =
-            serde_json::to_value(routes).map_err(|err| RoutingRuntimeError::UpdateFailed(err.to_string()))?;
+        let route_value = serde_json::to_value(routes)
+            .map_err(|err| RoutingRuntimeError::UpdateFailed(err.to_string()))?;
         config["apps"]["http"]["servers"]["forge"]["routes"] = route_value;
 
         let client = reqwest::blocking::Client::new();

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-use crate::events::{redact_text, EventRecord};
-use crate::manifest::{load_optional_manifest, ManifestError, SecretReference};
+use crate::events::{EventRecord, redact_text};
+use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{
@@ -13,8 +13,8 @@ use crate::runtime::{
 };
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::storage::{
-    CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths,
-    EventStore, GenerationAllocator, PointerStore, SnapshotState, SnapshotWriter, StorageError,
+    CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
+    GenerationAllocator, PointerStore, SnapshotState, SnapshotWriter, StorageError,
 };
 
 #[derive(Debug)]
@@ -198,13 +198,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         &mut self,
         record: &DeploymentRecord,
     ) -> Result<DeploymentExecution, DeploymentError> {
-        let env = EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
+        let env =
+            EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
         let generation = GenerationAllocator::new(env.clone()).allocate()?;
         let events = EventStore::new(env.clone(), generation);
         let diagnostics = DiagnosticsStore::new(env.clone(), generation);
         let labels = forge_labels(record, generation);
         let container_name = generation_container_name(record, generation);
-        let image_tag = format!("forge/{}:{}-gen-{}", record.project_id, record.environment, generation);
+        let image_tag = format!(
+            "forge/{}:{}-gen-{}",
+            record.project_id, record.environment, generation
+        );
         let writer = SnapshotWriter::new(env.clone(), generation)?;
         let runtime_secrets = match self.resolve_runtime_secrets(record) {
             Ok(secrets) => secrets,
@@ -302,7 +306,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &secret_values,
         )?;
         diagnostics.append_log_line(
-            &format!("runtime environment prepared: {}", redacted_env_preview.join(", ")),
+            &format!(
+                "runtime environment prepared: {}",
+                redacted_env_preview.join(", ")
+            ),
             &secret_values,
         )?;
         if let Err(err) = self.docker.start_container(&container_name) {
@@ -323,7 +330,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             return Err(err.into());
         }
         append_event(&events, record, generation, "CONTAINER_STARTED", None)?;
-        diagnostics.append_log_line(&format!("container started: {container_name}"), &secret_values)?;
+        diagnostics.append_log_line(
+            &format!("container started: {container_name}"),
+            &secret_values,
+        )?;
         let inspection = match self.docker.inspect_container(&container_name) {
             Ok(inspection) => inspection,
             Err(err) => {
@@ -387,7 +397,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &secret_values,
         )?;
 
-        writer.finalize(&record.project_id, &record.environment, SnapshotState::Healthy)?;
+        writer.finalize(
+            &record.project_id,
+            &record.environment,
+            SnapshotState::Healthy,
+        )?;
         append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
         diagnostics.append_log_line("snapshot finalized", &secret_values)?;
         if let Err(err) = self.activate_generation(record, &env, generation, &container_name) {
@@ -461,9 +475,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     redacted_env_preview,
                     secret_values,
                 )?;
-                return Err(DeploymentError::ValidationFailed("http health probe failed"));
+                return Err(DeploymentError::ValidationFailed(
+                    "http health probe failed",
+                ));
             }
-            diagnostics.append_log_line(&format!("http validation passed: {path}"), secret_values)?;
+            diagnostics
+                .append_log_line(&format!("http validation passed: {path}"), secret_values)?;
         }
 
         append_event(events, record, generation, "VALIDATION_PASSED", None)?;
@@ -627,7 +644,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let store = SecretStore::new(self.storage_root.join("secrets"))?;
         let mut resolved = Vec::new();
         for (env_name, reference) in manifest.environment_variables {
-            resolved.push(resolve_secret_reference(&store, record, env_name, reference)?);
+            resolved.push(resolve_secret_reference(
+                &store, record, env_name, reference,
+            )?);
         }
         Ok(resolved)
     }
@@ -807,9 +826,9 @@ fn resolve_secret_reference(
                 value,
                 sensitive: reference.sensitive,
             }),
-            Err(SecretError::MissingSecret(key)) => {
-                Err(DeploymentError::MissingSecret(format!("missing required secret {key}")))
-            }
+            Err(SecretError::MissingSecret(key)) => Err(DeploymentError::MissingSecret(format!(
+                "missing required secret {key}"
+            ))),
             Err(err) => Err(DeploymentError::Secret(err)),
         },
         other => Err(DeploymentError::InvalidInspection(format!(
@@ -848,9 +867,7 @@ fn validate_route_activation(
         ));
     }
     if inspection.active_target != expected_target {
-        return Err(DeploymentError::ValidationFailed(
-            "route target mismatch",
-        ));
+        return Err(DeploymentError::ValidationFailed("route target mismatch"));
     }
     if inspection.health_checks_enabled {
         return Err(DeploymentError::ValidationFailed(
@@ -955,15 +972,16 @@ fn success_outputs(generation: u64) -> Vec<String> {
 #[cfg(test)]
 pub mod deployment_fails_if_tcp_unreachable {
     use super::*;
-    use crate::docker::RecordingCommandRunner;
     use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
 
     #[test]
     fn tcp_probe_failure_rejects_deployment() {
         let root = test_root("tcp-unreachable");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: false,
             http_ok: true,
@@ -980,10 +998,15 @@ pub mod deployment_fails_if_tcp_unreachable {
         )
         .execute_next();
 
-        assert!(matches!(result, Err(DeploymentError::ValidationFailed("tcp probe failed"))));
-        assert!(!root
-            .join("projects/api/environments/production/generations/1/snapshot.json")
-            .exists());
+        assert!(matches!(
+            result,
+            Err(DeploymentError::ValidationFailed("tcp probe failed"))
+        ));
+        assert!(
+            !root
+                .join("projects/api/environments/production/generations/1/snapshot.json")
+                .exists()
+        );
     }
 }
 
@@ -998,7 +1021,8 @@ pub mod deployment_fails_if_http_health_invalid {
         let root = test_root("http-invalid");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: false,
@@ -1021,11 +1045,15 @@ pub mod deployment_fails_if_http_health_invalid {
 
         assert!(matches!(
             result,
-            Err(DeploymentError::ValidationFailed("http health probe failed"))
+            Err(DeploymentError::ValidationFailed(
+                "http health probe failed"
+            ))
         ));
-        assert!(!root
-            .join("projects/api/environments/production/generations/1/snapshot.json")
-            .exists());
+        assert!(
+            !root
+                .join("projects/api/environments/production/generations/1/snapshot.json")
+                .exists()
+        );
     }
 }
 
@@ -1059,8 +1087,16 @@ pub mod failed_generation_is_cleaned_up {
         .execute_next();
 
         let commands = &docker.runner.commands;
-        assert!(commands.iter().any(|cmd| cmd.args.first() == Some(&"stop".to_string())));
-        assert!(commands.iter().any(|cmd| cmd.args.first() == Some(&"rm".to_string())));
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.args.first() == Some(&"stop".to_string()))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.args.first() == Some(&"rm".to_string()))
+        );
     }
 }
 
@@ -1076,8 +1112,12 @@ pub mod events_are_appended_for_state_transitions {
         let root = test_root("transition-events");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
-        let mut probes = TestProbeRuntime { tcp_ok: true, http_ok: true };
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
         let mut routing = TestRoutingRuntime::default();
 
         DeploymentExecutor::new(
@@ -1086,13 +1126,31 @@ pub mod events_are_appended_for_state_transitions {
             &mut docker,
             &mut probes,
             &mut routing,
-            ValidationPolicy { tcp_required: true, http_health_path: Some("/health".into()), activation: ActivationMode::Direct },
-        ).execute_next().unwrap();
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Direct,
+            },
+        )
+        .execute_next()
+        .unwrap();
 
         let events = EventStore::list_all(&root).unwrap();
-        assert!(events.iter().any(|event| event.event_type == "DEPLOYMENT_STARTED"));
-        assert!(events.iter().any(|event| event.event_type == "VALIDATION_PASSED"));
-        assert!(events.iter().any(|event| event.event_type == "GENERATION_PROMOTED"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "DEPLOYMENT_STARTED")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "VALIDATION_PASSED")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "GENERATION_PROMOTED")
+        );
     }
 }
 
@@ -1108,8 +1166,12 @@ pub mod failed_probe_records_diagnostic_reason {
         let root = test_root("failed-probe-diagnostic");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
-        let mut probes = TestProbeRuntime { tcp_ok: false, http_ok: true };
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
         let mut routing = TestRoutingRuntime::default();
 
         let _ = DeploymentExecutor::new(
@@ -1119,9 +1181,11 @@ pub mod failed_probe_records_diagnostic_reason {
             &mut probes,
             &mut routing,
             ValidationPolicy::default(),
-        ).execute_next();
+        )
+        .execute_next();
 
-        let diagnostics = DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1);
+        let diagnostics =
+            DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1);
         let reason = diagnostics.read_failure_reason().unwrap().unwrap();
         assert!(reason.contains("tcp probe failed"));
     }
@@ -1138,7 +1202,8 @@ pub mod snapshot_not_finalized_before_validation {
         let root = test_root("snapshot-before-validation");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: false,
             http_ok: true,
@@ -1172,9 +1237,13 @@ pub mod rollback_restores_previous_generation {
         let root = test_root("rollback-previous");
         let env = EnvironmentPaths::new(&root, "api", "production");
         let writer1 = SnapshotWriter::new(env.clone(), 1).unwrap();
-        writer1.finalize("api", "production", SnapshotState::Healthy).unwrap();
+        writer1
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
         let writer2 = SnapshotWriter::new(env.clone(), 2).unwrap();
-        writer2.finalize("api", "production", SnapshotState::Healthy).unwrap();
+        writer2
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
         let pointers = PointerStore::new(env.clone());
         pointers.swap_current(1).unwrap();
         pointers.swap_current(2).unwrap();
@@ -1186,7 +1255,11 @@ pub mod rollback_restores_previous_generation {
         assert_eq!(restored, 1);
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
         let events = EventStore::list_all(&root).unwrap();
-        assert!(events.iter().any(|event| event.event_type == "ROLLBACK_COMPLETED"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "ROLLBACK_COMPLETED")
+        );
     }
 }
 
@@ -1201,7 +1274,8 @@ pub mod current_pointer_never_advances_before_validation {
         let root = test_root("pointer-before-validation");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: false,
             http_ok: true,
@@ -1218,8 +1292,7 @@ pub mod current_pointer_never_advances_before_validation {
         )
         .execute_next();
 
-        let pointers =
-            PointerStore::new(EnvironmentPaths::new(&root, "api", "production"));
+        let pointers = PointerStore::new(EnvironmentPaths::new(&root, "api", "production"));
         assert_eq!(pointers.read_pointer("current").unwrap(), None);
     }
 }
@@ -1235,7 +1308,8 @@ pub mod queued_deployment_builds_starts_validates_and_writes_snapshot {
         let root = test_root("deployment-executor-success");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,
@@ -1259,11 +1333,11 @@ pub mod queued_deployment_builds_starts_validates_and_writes_snapshot {
         .unwrap();
 
         assert_eq!(execution.generation, 1);
-        assert!(root
-            .join("projects/api/environments/production/generations/1/snapshot.json")
-            .exists());
-        let pointers =
-            PointerStore::new(EnvironmentPaths::new(&root, "api", "production"));
+        assert!(
+            root.join("projects/api/environments/production/generations/1/snapshot.json")
+                .exists()
+        );
+        let pointers = PointerStore::new(EnvironmentPaths::new(&root, "api", "production"));
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
     }
 }
@@ -1279,7 +1353,8 @@ pub mod route_updates_only_after_snapshot_finalized {
         let root = test_root("route-after-finalize");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,
@@ -1303,15 +1378,18 @@ pub mod route_updates_only_after_snapshot_finalized {
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
-                activation: ActivationMode::Http { internal_port: 3000 },
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
             },
         )
         .execute_next()
         .unwrap();
 
-        assert!(root
-            .join("projects/api/environments/production/generations/1/snapshot.json")
-            .exists());
+        assert!(
+            root.join("projects/api/environments/production/generations/1/snapshot.json")
+                .exists()
+        );
         assert_eq!(routing.updates.len(), 1);
     }
 }
@@ -1327,7 +1405,8 @@ pub mod route_targets_generation_specific_container {
         let root = test_root("route-target");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,
@@ -1351,7 +1430,9 @@ pub mod route_targets_generation_specific_container {
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
-                activation: ActivationMode::Http { internal_port: 3000 },
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
             },
         )
         .execute_next()
@@ -1372,14 +1453,17 @@ pub mod route_activation_failure_rolls_back_pointer {
         let root = test_root("route-activation-failure");
         let env = EnvironmentPaths::new(&root, "api", "production");
         let writer1 = SnapshotWriter::new(env.clone(), 1).unwrap();
-        writer1.finalize("api", "production", SnapshotState::Healthy).unwrap();
+        writer1
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
         crate::storage::atomic_write(env.generation_counter(), b"1\n").unwrap();
         let pointers = PointerStore::new(env.clone());
         pointers.swap_current(1).unwrap();
 
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(2)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(2)));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,
@@ -1403,7 +1487,9 @@ pub mod route_activation_failure_rolls_back_pointer {
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
-                activation: ActivationMode::Http { internal_port: 3000 },
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
             },
         )
         .execute_next();
@@ -1429,7 +1515,8 @@ pub mod caddy_health_checks_are_not_enabled {
         let root = test_root("route-health-disabled");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,
@@ -1453,7 +1540,9 @@ pub mod caddy_health_checks_are_not_enabled {
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
-                activation: ActivationMode::Http { internal_port: 3000 },
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
             },
         )
         .execute_next()
@@ -1474,7 +1563,8 @@ pub mod forge_owns_only_dedicated_route_subtree {
         let root = test_root("route-subtree");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,
@@ -1498,7 +1588,9 @@ pub mod forge_owns_only_dedicated_route_subtree {
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
-                activation: ActivationMode::Http { internal_port: 3000 },
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
             },
         )
         .execute_next()

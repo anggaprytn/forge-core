@@ -49,6 +49,23 @@ Minimum runtime requirements:
 forge daemon
 ```
 
+Daemon startup reads:
+
+- `FORGE_CONFIG` or `./forge.conf`
+- `FORGE_CADDY_ADMIN_URL` or `http://127.0.0.1:2019`
+- `FORGE_CADDY_PUBLIC_URL` or `http://127.0.0.1`
+
+Optional flags:
+
+```bash
+forge --config /etc/forge/forge.conf \
+  --caddy-admin-url http://127.0.0.1:2019 \
+  --caddy-public-url https://app.example.com \
+  daemon
+```
+
+Use `FORGE_CADDY_PUBLIC_URL` or `--caddy-public-url` when route activation must be verified through a non-localhost public address.
+
 Or via systemd:
 
 ```bash

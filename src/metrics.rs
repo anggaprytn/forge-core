@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
@@ -27,11 +27,13 @@ impl MetricsRegistry {
     }
 
     pub fn record_deployment_failure(&self) {
-        self.deployments_failed_total.fetch_add(1, Ordering::Relaxed);
+        self.deployments_failed_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_rollback(&self) {
-        self.deployments_rollback_total.fetch_add(1, Ordering::Relaxed);
+        self.deployments_rollback_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {

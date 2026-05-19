@@ -10,7 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::convergence::{ActiveTruth, ConvergenceEngine, TickInput};
-use forge_core::deployments::{ActivationMode, DeploymentError, DeploymentExecutor, ValidationPolicy};
+use forge_core::deployments::{
+    ActivationMode, DeploymentError, DeploymentExecutor, ValidationPolicy,
+};
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
 use forge_core::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
@@ -69,7 +71,9 @@ fn caddy_integration_forge_only_mutates_owned_caddy_subtree() {
     assert!(ids.contains("external:preserve"));
     assert!(ids.contains("forge:api:production"));
     assert_eq!(
-        ids.iter().filter(|id| id.as_str() == "forge:api:production").count(),
+        ids.iter()
+            .filter(|id| id.as_str() == "forge:api:production")
+            .count(),
         1,
         "idempotent updates must not duplicate route entries"
     );
@@ -146,9 +150,14 @@ fn caddy_integration_failed_route_activation_does_not_advance_current() {
         .unwrap();
 
     let mut docker = FakeDockerRuntime::running(["prod-api-gen-2"]);
-    let mut probes = FixedProbeRuntime { tcp_ok: true, http_ok: true };
-    let mut routing =
-        CaddyApiRuntime::new(harness.admin_base_url(), format!("http://127.0.0.1:{}", common::available_port()));
+    let mut probes = FixedProbeRuntime {
+        tcp_ok: true,
+        http_ok: true,
+    };
+    let mut routing = CaddyApiRuntime::new(
+        harness.admin_base_url(),
+        format!("http://127.0.0.1:{}", common::available_port()),
+    );
 
     let result = DeploymentExecutor::new(
         &root,
@@ -159,13 +168,21 @@ fn caddy_integration_failed_route_activation_does_not_advance_current() {
         ValidationPolicy {
             tcp_required: true,
             http_health_path: Some("/health".into()),
-            activation: ActivationMode::Http { internal_port: 3000 },
+            activation: ActivationMode::Http {
+                internal_port: 3000,
+            },
         },
     )
     .execute_next();
 
-    assert!(matches!(result, Err(DeploymentError::ValidationFailed(_)) | Err(DeploymentError::Routing(_))));
-    assert_eq!(PointerStore::new(env).read_pointer("current").unwrap(), Some(1));
+    assert!(matches!(
+        result,
+        Err(DeploymentError::ValidationFailed(_)) | Err(DeploymentError::Routing(_))
+    ));
+    assert_eq!(
+        PointerStore::new(env).read_pointer("current").unwrap(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -197,7 +214,10 @@ fn caddy_integration_route_rollback_restores_previous_generation() {
 
     let queue = PersistentQueue::new(root.join("queue")).unwrap();
     let mut docker = FakeDockerRuntime::running(["prod-api-gen-2"]);
-    let mut probes = FixedProbeRuntime { tcp_ok: false, http_ok: true };
+    let mut probes = FixedProbeRuntime {
+        tcp_ok: false,
+        http_ok: true,
+    };
     let mut engine = ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
 
     for now in [100, 101, 102, 133] {
@@ -205,7 +225,9 @@ fn caddy_integration_route_rollback_restores_previous_generation() {
             project_id: "api".into(),
             environment: "production".into(),
             now_unix: now,
-            truth: ActiveTruth::HttpRouted { internal_port: 3000 },
+            truth: ActiveTruth::HttpRouted {
+                internal_port: 3000,
+            },
             http_health_path: Some("/health".into()),
         });
     }
@@ -213,7 +235,10 @@ fn caddy_integration_route_rollback_restores_previous_generation() {
     let inspection = routing.inspect_route("forge:api:production").unwrap();
     assert_eq!(inspection.active_target, "prod-api-gen-1:3000");
     assert!(inspection.activation_verified);
-    assert_eq!(PointerStore::new(env).read_pointer("current").unwrap(), Some(1));
+    assert_eq!(
+        PointerStore::new(env).read_pointer("current").unwrap(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -333,7 +358,11 @@ impl CaddyHarness {
     }
 
     fn public_url(&self, path: &str) -> String {
-        format!("{}/{}", self.public_base_url(), path.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            self.public_base_url(),
+            path.trim_start_matches('/')
+        )
     }
 
     fn start_sample_app(&mut self, container_name: &str) {
@@ -361,7 +390,12 @@ impl CaddyHarness {
 
         routes
             .into_iter()
-            .filter_map(|route| route.get("@id").and_then(|id| id.as_str()).map(ToOwned::to_owned))
+            .filter_map(|route| {
+                route
+                    .get("@id")
+                    .and_then(|id| id.as_str())
+                    .map(ToOwned::to_owned)
+            })
             .collect()
     }
 
@@ -429,8 +463,11 @@ fn write_caddy_config(root: &Path) {
             }
         }
     });
-    std::fs::write(root.join("caddy.json"), serde_json::to_vec_pretty(&config).unwrap())
-        .expect("caddy config should be writable");
+    std::fs::write(
+        root.join("caddy.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .expect("caddy config should be writable");
 }
 
 fn setup_finalized_generation(root: &Path, generation: u64, project_id: &str, environment: &str) {
@@ -506,7 +543,9 @@ impl DockerRuntime for FakeDockerRuntime {
         container_name: &str,
     ) -> Result<ContainerInspection, DockerRuntimeError> {
         if !self.running.contains(container_name) {
-            return Err(DockerRuntimeError::InvalidResponse("missing container".into()));
+            return Err(DockerRuntimeError::InvalidResponse(
+                "missing container".into(),
+            ));
         }
         Ok(ContainerInspection {
             container_name: container_name.to_string(),

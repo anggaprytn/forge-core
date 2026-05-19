@@ -100,10 +100,16 @@ impl SecretStore {
         };
         let bytes = serde_json::to_vec_pretty(&record)
             .map_err(|err| SecretError::Crypto(err.to_string()))?;
-        atomic_write(self.path_for(&request.project_id, &request.environment, &request.key), &bytes)
-            .map_err(|err| SecretError::Io(std::io::Error::other(err.to_string())))?;
+        atomic_write(
+            self.path_for(&request.project_id, &request.environment, &request.key),
+            &bytes,
+        )
+        .map_err(|err| SecretError::Io(std::io::Error::other(err.to_string())))?;
         Ok(SecretWriteResult {
-            secret_id: format!("{}:{}:{}", request.project_id, request.environment, request.key),
+            secret_id: format!(
+                "{}:{}:{}",
+                request.project_id, request.environment, request.key
+            ),
         })
     }
 
@@ -151,7 +157,9 @@ fn validate_secret_request(request: &SecretWriteRequest) -> Result<(), SecretErr
         return Err(SecretError::InvalidRequest("key must not be empty".into()));
     }
     if request.value.is_empty() {
-        return Err(SecretError::InvalidRequest("value must not be empty".into()));
+        return Err(SecretError::InvalidRequest(
+            "value must not be empty".into(),
+        ));
     }
     Ok(())
 }
@@ -190,7 +198,8 @@ mod tests {
         let result = store.write_environment_secret(&request).unwrap();
         assert_eq!(result.secret_id, "api:production:DATABASE_URL");
 
-        let raw = fs::read_to_string(root.join("secrets/api/production/DATABASE_URL.json")).unwrap();
+        let raw =
+            fs::read_to_string(root.join("secrets/api/production/DATABASE_URL.json")).unwrap();
         assert!(!raw.contains("postgres://secret-value"));
         assert_eq!(
             store

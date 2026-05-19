@@ -98,7 +98,9 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         }
         args.push(request.image_ref.clone());
 
-        let _ = self.runner.run_with_env("docker", &args, &request.environment)?;
+        let _ = self
+            .runner
+            .run_with_env("docker", &args, &request.environment)?;
         Ok(request.container_name)
     }
 
@@ -141,7 +143,11 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         ];
         let output = self.runner.run("docker", &args)?;
         let mut containers = Vec::new();
-        for name in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for name in output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             containers.push(self.inspect_container(name)?);
         }
         Ok(containers)
@@ -153,7 +159,11 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
     }
 
     fn remove_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
-        let args = vec!["rm".to_string(), "-f".to_string(), container_name.to_string()];
+        let args = vec![
+            "rm".to_string(),
+            "-f".to_string(),
+            container_name.to_string(),
+        ];
         self.runner.run("docker", &args).map(|_| ())
     }
 }
@@ -183,7 +193,10 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             "image" => image_ref = Some(value.to_string()),
             "restart_policy" => restart_policy = Some(value.to_string()),
             _ if key.starts_with("label:") => {
-                labels.insert(key.trim_start_matches("label:").to_string(), value.to_string());
+                labels.insert(
+                    key.trim_start_matches("label:").to_string(),
+                    value.to_string(),
+                );
             }
             _ => {}
         }
@@ -192,8 +205,10 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
     Ok(ContainerInspection {
         container_name: container_name
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing container name".into()))?,
-        running: running.ok_or_else(|| DockerRuntimeError::InvalidResponse("missing running state".into()))?,
-        image_ref: image_ref.ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,
+        running: running
+            .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing running state".into()))?,
+        image_ref: image_ref
+            .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,
         labels,
         restart_policy: restart_policy
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing restart policy".into()))?,
@@ -294,7 +309,8 @@ pub mod docker_adapter_starts_generation_named_container {
 
     #[test]
     fn create_and_start_use_generation_container_name() {
-        let runner = RecordingCommandRunner::with_outputs(vec!["prod-api-gen-42".into(), String::new()]);
+        let runner =
+            RecordingCommandRunner::with_outputs(vec!["prod-api-gen-42".into(), String::new()]);
         let mut docker = DockerCliRuntime::new(runner);
         let name = "prod-api-gen-42".to_string();
 
@@ -361,7 +377,10 @@ pub mod docker_adapter_inspects_running_state {
         assert!(inspection.running);
         assert_eq!(inspection.container_name, "prod-api-gen-42");
         assert_eq!(inspection.restart_policy, "no");
-        assert_eq!(inspection.labels.get("forge.project_id"), Some(&"api".to_string()));
+        assert_eq!(
+            inspection.labels.get("forge.project_id"),
+            Some(&"api".to_string())
+        );
         let args = &docker.runner.commands[0].args;
         assert_eq!(args[0], "inspect");
         assert_eq!(args[1], "--format");
@@ -381,7 +400,11 @@ pub mod docker_adapter_removes_failed_generation {
 
         assert_eq!(
             docker.runner.commands[0].args,
-            vec!["rm".to_string(), "-f".to_string(), "prod-api-gen-42".to_string()]
+            vec![
+                "rm".to_string(),
+                "-f".to_string(),
+                "prod-api-gen-42".to_string()
+            ]
         );
     }
 }

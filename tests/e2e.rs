@@ -13,27 +13,29 @@ use axum::Router;
 use forge_core::api::DeploymentRequest;
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
-use forge_core::convergence::{ActiveDeploymentDecider, ActiveTruth, ConvergenceEngine, RecoveryOutcome, TickInput};
+use forge_core::convergence::{
+    ActiveDeploymentDecider, ActiveTruth, ConvergenceEngine, RecoveryOutcome, TickInput,
+};
 use forge_core::daemon::Daemon;
 use forge_core::deployments::{
     ActivationMode, DeploymentError, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
 };
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
 use forge_core::github::GitHubWebhookConfig;
-use forge_core::http::{router, ControlPlane, HttpState, IdempotencyStore};
+use forge_core::http::{ControlPlane, HttpState, IdempotencyStore, router};
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
 use forge_core::runtime::{
-    BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime, DockerRuntimeError,
-    RouteUpdateRequest, RoutingRuntime,
+    BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
+    DockerRuntimeError, RouteUpdateRequest, RoutingRuntime,
 };
-use forge_core::storage::{EnvironmentPaths, EventStore, PointerStore};
 use forge_core::secrets::SecretStore;
+use forge_core::storage::{EnvironmentPaths, EventStore, PointerStore};
 use hmac::{Hmac, Mac};
-use reqwest::blocking::Client;
 use reqwest::StatusCode;
-use sha2::Sha256;
+use reqwest::blocking::Client;
 use serde_json::Value;
+use sha2::Sha256;
 use tokio::net::TcpListener;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -61,9 +63,13 @@ fn dogfood_sample_app_deploys_public_route() {
     let deployment = harness.get_deployment(&deployment_id);
     assert_eq!(deployment["state"], "healthy");
     assert_eq!(
-        PointerStore::new(EnvironmentPaths::new(&harness.runtime_root, "api", "production"))
-            .read_pointer("current")
-            .unwrap(),
+        PointerStore::new(EnvironmentPaths::new(
+            &harness.runtime_root,
+            "api",
+            "production"
+        ))
+        .read_pointer("current")
+        .unwrap(),
         Some(1)
     );
 }
@@ -123,15 +129,24 @@ fn dogfood_rollback_restores_previous_generation() {
     ])
     .expect("active generation health endpoint should be removable for rollback test");
 
-    harness.run_convergence_ticks(&[100, 101, 102, 133]).unwrap();
+    harness
+        .run_convergence_ticks(&[100, 101, 102, 133])
+        .unwrap();
 
-    let route = harness.routing.inspect_route("forge:api:production").unwrap();
+    let route = harness
+        .routing
+        .inspect_route("forge:api:production")
+        .unwrap();
     assert_eq!(route.active_target, "prod-api-gen-1:3000");
     assert!(route.activation_verified);
     assert_eq!(
-        PointerStore::new(EnvironmentPaths::new(&harness.runtime_root, "api", "production"))
-            .read_pointer("current")
-            .unwrap(),
+        PointerStore::new(EnvironmentPaths::new(
+            &harness.runtime_root,
+            "api",
+            "production"
+        ))
+        .read_pointer("current")
+        .unwrap(),
         Some(1)
     );
 }
@@ -154,7 +169,10 @@ fn dogfood_daemon_restart_reconstructs_current_route() {
 
     let current = PointerStore::new(env).read_pointer("current").unwrap();
     assert_eq!(current, Some(1));
-    let route = harness.routing.inspect_route("forge:api:production").unwrap();
+    let route = harness
+        .routing
+        .inspect_route("forge:api:production")
+        .unwrap();
     assert_eq!(route.active_target, "prod-api-gen-1:3000");
 }
 
@@ -186,12 +204,14 @@ fn dogfood_restart_during_inflight_deploy_fails_or_recovers_deterministically() 
             environment: "production".into(),
         }))
     );
-    assert!(PersistentQueue::new(harness.runtime_root.join("queue"))
-        .unwrap()
-        .load_state()
-        .unwrap()
-        .active
-        .is_none());
+    assert!(
+        PersistentQueue::new(harness.runtime_root.join("queue"))
+            .unwrap()
+            .load_state()
+            .unwrap()
+            .active
+            .is_none()
+    );
 }
 
 #[test]
@@ -206,11 +226,23 @@ fn dogfood_bad_app_failed_health_does_not_promote_current() {
 
     assert!(matches!(
         result,
-        Err(DeploymentError::ValidationFailed("http health probe failed"))
+        Err(DeploymentError::ValidationFailed(
+            "http health probe failed"
+        ))
     ));
     let env = EnvironmentPaths::new(&harness.runtime_root, "api", "production");
-    assert_eq!(PointerStore::new(env.clone()).read_pointer("current").unwrap(), None);
-    assert!(harness.routing.inspect_route("forge:api:production").is_err());
+    assert_eq!(
+        PointerStore::new(env.clone())
+            .read_pointer("current")
+            .unwrap(),
+        None
+    );
+    assert!(
+        harness
+            .routing
+            .inspect_route("forge:api:production")
+            .is_err()
+    );
     assert!(!env.generation_dir(1).join("snapshot.json").exists());
 }
 
@@ -225,12 +257,8 @@ fn dogfood_bad_app_failed_generation_is_cleaned() {
     let _ = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
 
     assert!(!docker_container_exists("prod-api-gen-1"));
-    let cleanup = fs::read_to_string(
-        harness
-            .generation_dir(1)
-            .join("cleanup.json"),
-    )
-    .expect("cleanup record should exist for failed generation");
+    let cleanup = fs::read_to_string(harness.generation_dir(1).join("cleanup.json"))
+        .expect("cleanup record should exist for failed generation");
     assert!(cleanup.contains("\"container_removed\": true"));
     assert!(cleanup.contains("\"tombstoned\": false"));
 }
@@ -303,7 +331,12 @@ fn dogfood_crash_during_route_activation_recovers_without_orphan_route() {
     );
     daemon.start().unwrap();
 
-    assert!(harness.routing.inspect_route("forge:api:production").is_err());
+    assert!(
+        harness
+            .routing
+            .inspect_route("forge:api:production")
+            .is_err()
+    );
     let cleanup = fs::read_to_string(harness.generation_dir(1).join("cleanup.json"))
         .expect("startup cleanup should be recorded");
     assert!(cleanup.contains("\"route_removed\": true"));
@@ -428,10 +461,13 @@ fn secret_value_is_redacted_from_diagnostics() {
 
     harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
     harness.enqueue_deploy();
-    let result = harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
+    let result =
+        harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
     assert!(matches!(
         result,
-        Err(DeploymentError::ValidationFailed("http health probe failed"))
+        Err(DeploymentError::ValidationFailed(
+            "http health probe failed"
+        ))
     ));
 
     let summary = fs::read_to_string(harness.generation_dir(1).join("diagnostics/summary.json"))
@@ -449,10 +485,13 @@ fn logs_endpoint_redacts_secret_values() {
 
     harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
     let deployment_id = harness.enqueue_deploy();
-    let result = harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
+    let result =
+        harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
     assert!(matches!(
         result,
-        Err(DeploymentError::ValidationFailed("http health probe failed"))
+        Err(DeploymentError::ValidationFailed(
+            "http health probe failed"
+        ))
     ));
 
     let logs = harness.get_logs(&deployment_id);
@@ -478,7 +517,9 @@ fn failed_deploy_logs_preserve_diagnostic_context() {
     let result = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
     assert!(matches!(
         result,
-        Err(DeploymentError::ValidationFailed("http health probe failed"))
+        Err(DeploymentError::ValidationFailed(
+            "http health probe failed"
+        ))
     ));
 
     let logs = harness.get_logs(&deployment_id);
@@ -504,8 +545,12 @@ fn missing_required_secret_fails_before_container_start() {
     let result = harness.execute_next_deployment_for_fixture(&common::secret_http_app_fixture());
     assert!(matches!(result, Err(DeploymentError::MissingSecret(_))));
     assert!(!docker_container_exists("prod-api-gen-1"));
-    let reason = fs::read_to_string(harness.generation_dir(1).join("diagnostics/failure_reason.log"))
-        .expect("failure reason should be present");
+    let reason = fs::read_to_string(
+        harness
+            .generation_dir(1)
+            .join("diagnostics/failure_reason.log"),
+    )
+    .expect("failure reason should be present");
     assert!(reason.contains("missing required secret DATABASE_URL"));
 }
 
@@ -554,7 +599,10 @@ impl E2eHarness {
             "-p",
             &format!("127.0.0.1:{admin_port}:2019"),
             "-v",
-            &format!("{}:/etc/caddy/caddy.json:ro", runtime_root.join("caddy.json").display()),
+            &format!(
+                "{}:/etc/caddy/caddy.json:ro",
+                runtime_root.join("caddy.json").display()
+            ),
             "caddy:2.8.4",
             "caddy",
             "run",
@@ -638,14 +686,20 @@ impl E2eHarness {
 
     fn execute_next_deployment(
         &mut self,
-    ) -> Result<forge_core::deployments::DeploymentExecution, forge_core::deployments::DeploymentError> {
+    ) -> Result<
+        forge_core::deployments::DeploymentExecution,
+        forge_core::deployments::DeploymentError,
+    > {
         self.execute_next_deployment_for_fixture(&common::sample_http_app_fixture())
     }
 
     fn execute_next_deployment_for_fixture(
         &mut self,
         fixture: &Path,
-    ) -> Result<forge_core::deployments::DeploymentExecution, forge_core::deployments::DeploymentError> {
+    ) -> Result<
+        forge_core::deployments::DeploymentExecution,
+        forge_core::deployments::DeploymentError,
+    > {
         let queue = PersistentQueue::new(self.runtime_root.join("queue")).unwrap();
         let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
         let mut probes = DockerNetworkProbeRuntime::new(self.network_name.clone(), 3000);
@@ -660,7 +714,9 @@ impl E2eHarness {
             ValidationPolicy {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
-                activation: ActivationMode::Http { internal_port: 3000 },
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -690,7 +746,8 @@ impl E2eHarness {
                     .clone()
                     .expect("repository cache root should be configured"),
             },
-            forge_core::http::DeliveryStore::new(self.runtime_root.join("github-deliveries")).unwrap(),
+            forge_core::http::DeliveryStore::new(self.runtime_root.join("github-deliveries"))
+                .unwrap(),
         ))
     }
 
@@ -698,9 +755,15 @@ impl E2eHarness {
         let repo = self.runtime_root.join("webhook-repo");
         fs::create_dir_all(&repo).unwrap();
         git_in(&self.runtime_root, &["init", repo.to_str().unwrap()]);
-        git_in(&self.runtime_root, &["-C", repo.to_str().unwrap(), "checkout", "-b", branch]);
+        git_in(
+            &self.runtime_root,
+            &["-C", repo.to_str().unwrap(), "checkout", "-b", branch],
+        );
         fs::write(repo.join("forge.project.json"), manifest).unwrap();
-        git_in(&self.runtime_root, &["-C", repo.to_str().unwrap(), "add", "forge.project.json"]);
+        git_in(
+            &self.runtime_root,
+            &["-C", repo.to_str().unwrap(), "add", "forge.project.json"],
+        );
         git_in(
             &self.runtime_root,
             &[
@@ -728,7 +791,10 @@ impl E2eHarness {
             .post(self.api_url("webhooks/github"))
             .header("x-github-delivery", delivery_id)
             .header("x-github-event", event)
-            .header("x-hub-signature-256", github_signature("github-test-secret", body.as_bytes()))
+            .header(
+                "x-hub-signature-256",
+                github_signature("github-test-secret", body.as_bytes()),
+            )
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
@@ -801,7 +867,9 @@ impl E2eHarness {
                 network_name: Some(self.network_name.clone()),
             })
             .unwrap();
-        docker.start_container(&format!("prod-api-gen-{generation}")).unwrap();
+        docker
+            .start_container(&format!("prod-api-gen-{generation}"))
+            .unwrap();
 
         if attach_route {
             let mut routing = CaddyApiRuntime::new(self.admin_base_url(), self.public_base_url());
@@ -882,7 +950,9 @@ impl E2eHarness {
                 project_id: "api".into(),
                 environment: "production".into(),
                 now_unix: *now,
-                truth: ActiveTruth::HttpRouted { internal_port: 3000 },
+                truth: ActiveTruth::HttpRouted {
+                    internal_port: 3000,
+                },
                 http_health_path: http_health_path.map(|path| path.to_string()),
             })?;
         }
@@ -898,18 +968,29 @@ impl E2eHarness {
     }
 
     fn public_url(&self, path: &str) -> String {
-        format!("{}/{}", self.public_base_url(), path.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            self.public_base_url(),
+            path.trim_start_matches('/')
+        )
     }
 
     fn api_url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}/{}", self.api_port, path.trim_start_matches('/'))
+        format!(
+            "http://127.0.0.1:{}/{}",
+            self.api_port,
+            path.trim_start_matches('/')
+        )
     }
 
     fn wait_for_caddy(&self) {
         for _ in 0..40 {
             if let Ok(response) = self
                 .http_client
-                .get(format!("{}/config/apps/http/servers/forge/routes", self.admin_base_url()))
+                .get(format!(
+                    "{}/config/apps/http/servers/forge/routes",
+                    self.admin_base_url()
+                ))
                 .send()
             {
                 if response.status().is_success() {
@@ -1025,7 +1106,8 @@ impl RoutingRuntime for NoopRoutingRuntime {
     fn inspect_route(
         &mut self,
         subtree_id: &str,
-    ) -> Result<forge_core::runtime::RouteInspection, forge_core::runtime::RoutingRuntimeError> {
+    ) -> Result<forge_core::runtime::RouteInspection, forge_core::runtime::RoutingRuntimeError>
+    {
         Ok(forge_core::runtime::RouteInspection {
             subtree_id: subtree_id.into(),
             active_target: String::new(),
@@ -1036,7 +1118,8 @@ impl RoutingRuntime for NoopRoutingRuntime {
 
     fn list_managed_routes(
         &mut self,
-    ) -> Result<Vec<forge_core::runtime::RouteInspection>, forge_core::runtime::RoutingRuntimeError> {
+    ) -> Result<Vec<forge_core::runtime::RouteInspection>, forge_core::runtime::RoutingRuntimeError>
+    {
         Ok(Vec::new())
     }
 
@@ -1062,12 +1145,7 @@ fn docker(args: &[&str]) -> Result<(), String> {
 
 fn cleanup_forge_containers() -> Result<(), String> {
     let output = Command::new("docker")
-        .args([
-            "ps",
-            "-aq",
-            "--filter",
-            "label=forge.managed=true",
-        ])
+        .args(["ps", "-aq", "--filter", "label=forge.managed=true"])
         .output()
         .map_err(|err| err.to_string())?;
     if !output.status.success() {
@@ -1094,7 +1172,11 @@ fn write_caddy_config(root: &Path) {
             }
         }
     });
-    std::fs::write(root.join("caddy.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    std::fs::write(
+        root.join("caddy.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
 }
 
 fn docker_container_exists(name: &str) -> bool {
@@ -1132,7 +1214,11 @@ fn ensure_test_master_key() {
 }
 
 fn git_in(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -1141,7 +1227,11 @@ fn git_in(cwd: &Path, args: &[&str]) {
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").current_dir(repo).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",

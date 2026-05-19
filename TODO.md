@@ -168,6 +168,7 @@ Track:
 
 # Phase 5: Installation UX
 
+- [x] Wire `forge daemon` to the existing HTTP/daemon runtime path
 - [ ] Add `forge init`
 - [ ] Generate basic `forge.project.json`
 - [ ] Generate local example config

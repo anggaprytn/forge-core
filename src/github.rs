@@ -292,7 +292,8 @@ mod tests {
 }"#,
             "main",
         );
-        let commit_sha = git_output(&root, &["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"]).unwrap();
+        let commit_sha =
+            git_output(&root, &["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"]).unwrap();
         let payload = format!(
             r#"{{
   "ref": "refs/heads/main",
@@ -324,9 +325,17 @@ mod tests {
         let repo = root.join("repo");
         fs::create_dir_all(&repo).unwrap();
         git(root, &["init", repo.to_str().unwrap()]).unwrap();
-        git(root, &["-C", repo.to_str().unwrap(), "checkout", "-b", branch]).unwrap();
+        git(
+            root,
+            &["-C", repo.to_str().unwrap(), "checkout", "-b", branch],
+        )
+        .unwrap();
         fs::write(repo.join("forge.project.json"), manifest).unwrap();
-        git(root, &["-C", repo.to_str().unwrap(), "add", "forge.project.json"]).unwrap();
+        git(
+            root,
+            &["-C", repo.to_str().unwrap(), "add", "forge.project.json"],
+        )
+        .unwrap();
         git(
             root,
             &[
