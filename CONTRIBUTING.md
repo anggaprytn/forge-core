@@ -20,13 +20,13 @@ Most implementation mistakes come from violating orchestration invariants.
 
 Forge is not:
 
-```txt id="mxeb2x"
+```txt
 container automation
 ```
 
 Forge is:
 
-```txt id="nrz3pn"
+```txt
 runtime convergence software
 ```
 
@@ -51,13 +51,13 @@ These rules apply to:
 
 Minimum required:
 
-```bash id="kltmzh"
+```bash
 cargo test -q
 ```
 
 Integration baseline:
 
-```bash id="mjlwm6"
+```bash
 FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
 ```
 
@@ -69,7 +69,7 @@ Do not submit patches without running tests.
 
 Never violate:
 
-```txt id="7g7i6o"
+```txt
 candidate
 → validated
 → finalized
@@ -99,7 +99,7 @@ Read `INVARIANTS.md` before touching:
 
 Forbidden contribution style:
 
-```txt id="pryqtx"
+```txt
 large cleanup
 architecture rewrite
 trait redesign
@@ -113,7 +113,7 @@ Large refactors hide semantic regressions.
 
 Prefer:
 
-```txt id="jlwmft"
+```txt
 small focused changes
 ```
 
@@ -123,7 +123,7 @@ small focused changes
 
 Target:
 
-```txt id="9fknji"
+```txt
 1 concern per PR
 ```
 
@@ -165,7 +165,7 @@ No exceptions.
 
 Forge owns orchestration authority.
 
-```txt id="g2d0h5"
+```txt
 Docker = execution runtime
 Caddy  = routing layer
 Forge  = orchestration authority
@@ -265,7 +265,7 @@ Never:
 
 `current` means:
 
-```txt id="i9mcr5"
+```txt
 intended active generation
 ```
 
@@ -298,7 +298,7 @@ AI-generated patches must be:
 
 Before accepting AI-generated changes:
 
-```bash id="vbbf8y"
+```bash
 git diff --stat
 git diff
 cargo test -q
@@ -319,13 +319,13 @@ Reject patches that:
 
 Recommended workflow:
 
-```bash id="dzq0hq"
+```bash
 git checkout -b small-feature-slice
 ```
 
 After successful tests:
 
-```bash id="szyatq"
+```bash
 git commit -m "Add metrics endpoint"
 ```
 
@@ -356,7 +356,7 @@ Do not stack unrelated changes into one commit.
 
 Forge prioritizes:
 
-```txt id="y0vvpi"
+```txt
 operational correctness
 ```
 
@@ -383,7 +383,7 @@ Do not casually "simplify" orchestration behavior.
 
 Never break:
 
-```txt id="j17mym"
+```txt
 running container != successful deployment
 ```
 
