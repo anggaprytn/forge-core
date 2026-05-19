@@ -210,6 +210,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Ok(secrets) => secrets,
             Err(DeploymentError::MissingSecret(message)) => {
                 diagnostics.write_failure_reason(&message, &[])?;
+                diagnostics.append_log_line(
+                    &format!("deployment started for {}", record.deployment_id),
+                    &[],
+                )?;
+                diagnostics.append_log_line(&message, &[])?;
                 diagnostics.write_summary(&DiagnosticSummary {
                     deployment_id: Some(record.deployment_id.clone()),
                     failure_stage: "preparing".into(),
@@ -235,22 +240,59 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .collect::<Vec<_>>();
         let redacted_env_preview = runtime_env_preview(&runtime_secrets);
         append_event(&events, record, generation, "DEPLOYMENT_STARTED", None)?;
+        diagnostics.append_log_line(
+            &format!("deployment started for {}", record.deployment_id),
+            &secret_values,
+        )?;
 
-        let image_ref = self.docker.build_image(BuildImageRequest {
+        let image_ref = match self.docker.build_image(BuildImageRequest {
             image_tag: image_tag.clone(),
             context_path: self.execution.context_path.clone(),
             dockerfile_path: self.execution.dockerfile_path.clone(),
             labels: labels.clone(),
-        })?;
+        }) {
+            Ok(image_ref) => image_ref,
+            Err(err) => {
+                let failure_reason = format!("image build failed: {err}");
+                self.record_failed_attempt(
+                    &events,
+                    &diagnostics,
+                    record,
+                    generation,
+                    "building",
+                    &failure_reason,
+                    &redacted_env_preview,
+                    &secret_values,
+                )?;
+                return Err(err.into());
+            }
+        };
         append_event(&events, record, generation, "IMAGE_BUILT", None)?;
+        diagnostics.append_log_line(&format!("image built: {image_ref}"), &secret_values)?;
 
-        self.docker.create_container(CreateContainerRequest {
+        match self.docker.create_container(CreateContainerRequest {
             container_name: container_name.clone(),
             image_ref: image_ref.clone(),
             labels: labels.clone(),
             environment: runtime_environment(&runtime_secrets),
             network_name: self.execution.network_name.clone(),
-        })?;
+        }) {
+            Ok(_) => {}
+            Err(err) => {
+                let failure_reason = format!("container create failed: {err}");
+                self.record_failed_attempt(
+                    &events,
+                    &diagnostics,
+                    record,
+                    generation,
+                    "preparing",
+                    &failure_reason,
+                    &redacted_env_preview,
+                    &secret_values,
+                )?;
+                return Err(err.into());
+            }
+        }
         append_redacted_event(
             &events,
             record,
@@ -259,10 +301,66 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Some(redacted_env_preview.join(", ")),
             &secret_values,
         )?;
-        self.docker.start_container(&container_name)?;
+        diagnostics.append_log_line(
+            &format!("runtime environment prepared: {}", redacted_env_preview.join(", ")),
+            &secret_values,
+        )?;
+        if let Err(err) = self.docker.start_container(&container_name) {
+            let failure_reason = format!("container start failed: {err}");
+            self.record_failed_generation(
+                &env,
+                &events,
+                &diagnostics,
+                record,
+                generation,
+                &container_name,
+                None,
+                "starting",
+                &failure_reason,
+                &redacted_env_preview,
+                &secret_values,
+            )?;
+            return Err(err.into());
+        }
         append_event(&events, record, generation, "CONTAINER_STARTED", None)?;
-        let inspection = self.docker.inspect_container(&container_name)?;
-        validate_inspection(&inspection, &container_name)?;
+        diagnostics.append_log_line(&format!("container started: {container_name}"), &secret_values)?;
+        let inspection = match self.docker.inspect_container(&container_name) {
+            Ok(inspection) => inspection,
+            Err(err) => {
+                let failure_reason = format!("container inspection failed: {err}");
+                self.record_failed_generation(
+                    &env,
+                    &events,
+                    &diagnostics,
+                    record,
+                    generation,
+                    &container_name,
+                    None,
+                    "validating_runtime",
+                    &failure_reason,
+                    &redacted_env_preview,
+                    &secret_values,
+                )?;
+                return Err(err.into());
+            }
+        };
+        if let Err(err) = validate_inspection(&inspection, &container_name) {
+            let failure_reason = err.to_string();
+            self.record_failed_generation(
+                &env,
+                &events,
+                &diagnostics,
+                record,
+                generation,
+                &container_name,
+                None,
+                "validating_runtime",
+                &failure_reason,
+                &redacted_env_preview,
+                &secret_values,
+            )?;
+            return Err(err);
+        }
         writer.write_artifact(
             "build.json",
             &format!(
@@ -277,6 +375,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 inspection.container_name, inspection.running
             ),
         )?;
+        diagnostics.append_log_line("runtime inspection passed", &secret_values)?;
         self.validate_candidate(
             &env,
             &container_name,
@@ -290,6 +389,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
         writer.finalize(&record.project_id, &record.environment, SnapshotState::Healthy)?;
         append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
+        diagnostics.append_log_line("snapshot finalized", &secret_values)?;
         if let Err(err) = self.activate_generation(record, &env, generation, &container_name) {
             self.record_failed_generation(
                 &env,
@@ -307,6 +407,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             return Err(err);
         }
         append_event(&events, record, generation, "GENERATION_PROMOTED", None)?;
+        diagnostics.append_log_line("generation promoted", &secret_values)?;
 
         Ok(DeploymentExecution {
             deployment_id: record.deployment_id.clone(),
@@ -343,6 +444,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             )?;
             return Err(DeploymentError::ValidationFailed("tcp probe failed"));
         }
+        diagnostics.append_log_line("tcp validation passed", secret_values)?;
 
         if let Some(path) = &self.validation.http_health_path {
             if !self.probes.probe_http(container_name, path)? {
@@ -361,9 +463,42 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 )?;
                 return Err(DeploymentError::ValidationFailed("http health probe failed"));
             }
+            diagnostics.append_log_line(&format!("http validation passed: {path}"), secret_values)?;
         }
 
         append_event(events, record, generation, "VALIDATION_PASSED", None)?;
+        Ok(())
+    }
+
+    fn record_failed_attempt(
+        &self,
+        events: &EventStore,
+        diagnostics: &DiagnosticsStore,
+        record: &DeploymentRecord,
+        generation: u64,
+        failure_stage: &str,
+        failure_reason: &str,
+        redacted_env_preview: &[String],
+        secret_values: &[String],
+    ) -> Result<(), DeploymentError> {
+        diagnostics.write_failure_reason(failure_reason, secret_values)?;
+        diagnostics.append_log_line(failure_reason, secret_values)?;
+        append_redacted_event(
+            events,
+            record,
+            generation,
+            "GENERATION_FAILED",
+            Some(failure_reason.into()),
+            secret_values,
+        )?;
+        diagnostics.write_summary(&DiagnosticSummary {
+            deployment_id: Some(record.deployment_id.clone()),
+            failure_stage: failure_stage.into(),
+            failure_reason: failure_reason.into(),
+            container_name: String::new(),
+            cleanup_recorded: false,
+            runtime_env_preview: redacted_env_preview.to_vec(),
+        })?;
         Ok(())
     }
 
@@ -383,6 +518,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
         diagnostics.write_failure_reason(failure_reason, secret_values)?;
+        diagnostics.append_log_line(failure_reason, secret_values)?;
         append_redacted_event(
             events,
             record,

@@ -4,13 +4,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    validate_deployment_request, DeploymentAccepted, DeploymentRequest, DeploymentStatus, EventList,
-    ErrorResponse,
+    validate_deployment_request, DeploymentAccepted, DeploymentLogs, DeploymentRequest,
+    DeploymentStatus, EventList, ErrorResponse,
 };
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
 use crate::convergence::{ActiveDeploymentDecider, ConvergenceError, RecoveryOutcome, StartupConvergence};
-use crate::storage::{EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore};
+use crate::events::EventRecord;
+use crate::storage::{DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore};
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 
@@ -222,6 +223,34 @@ where
         Ok(EventList { events })
     }
 
+    pub fn get_deployment_logs(&self, deployment_id: &str) -> Result<Option<DeploymentLogs>, ErrorResponse> {
+        let Some(entry) = persisted_deployments(&self.config.storage_root)
+            .map_err(|err| ErrorResponse {
+                code: "logs_unavailable".into(),
+                message: err.to_string(),
+            })?
+            .into_iter()
+            .find(|entry| entry.deployment_id == deployment_id)
+        else {
+            return Ok(None);
+        };
+
+        let lines = DiagnosticsStore::new(
+            EnvironmentPaths::new(&self.config.storage_root, &entry.project_id, &entry.environment),
+            entry.generation,
+        )
+        .read_log_lines()
+        .map_err(|err| ErrorResponse {
+            code: "logs_unavailable".into(),
+            message: err.to_string(),
+        })?;
+
+        Ok(Some(DeploymentLogs {
+            deployment_id: entry.deployment_id,
+            lines,
+        }))
+    }
+
     pub fn queue_depth(&self) -> Result<usize, ErrorResponse> {
         let Some(queue) = self.queue.as_ref() else {
             return Err(ErrorResponse {
@@ -284,6 +313,7 @@ struct PersistedDeployment {
     deployment_id: String,
     project_id: String,
     environment: String,
+    generation: u64,
 }
 
 fn persisted_deployments(root: &std::path::Path) -> Result<Vec<PersistedDeployment>, std::io::Error> {
@@ -311,22 +341,51 @@ fn persisted_deployments(root: &std::path::Path) -> Result<Vec<PersistedDeployme
             }
             for generation in std::fs::read_dir(generations)? {
                 let generation = generation?;
-                let build = generation.path().join("build.json");
-                if !build.exists() {
-                    continue;
-                }
-                let raw = std::fs::read_to_string(build)?;
-                if let Some(deployment_id) = extract_json_string(&raw, "deployment_id") {
+                let generation_id = generation
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<u64>()
+                    .ok();
+                let deployment_id = read_generation_deployment_id(&generation.path())?;
+                if let (Some(generation), Some(deployment_id)) = (generation_id, deployment_id) {
                     deployments.push(PersistedDeployment {
                         deployment_id,
                         project_id: project_id.clone(),
                         environment: environment.clone(),
+                        generation,
                     });
                 }
             }
         }
     }
     Ok(deployments)
+}
+
+fn read_generation_deployment_id(path: &std::path::Path) -> Result<Option<String>, std::io::Error> {
+    let build = path.join("build.json");
+    if build.exists() {
+        let raw = std::fs::read_to_string(build)?;
+        if let Some(deployment_id) = extract_json_string(&raw, "deployment_id") {
+            return Ok(Some(deployment_id));
+        }
+    }
+
+    let events = path.join("events.jsonl");
+    if !events.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(events)?;
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<EventRecord>(line)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+        if let Some(deployment_id) = event.deployment_id {
+            return Ok(Some(deployment_id));
+        }
+    }
+    Ok(None)
 }
 
 fn extract_json_string(raw: &str, key: &str) -> Option<String> {

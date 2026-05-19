@@ -87,6 +87,7 @@ Responsibilities:
 • webhook ingestion
 • event access
 • status queries
+• deployment diagnostic log access
 • secret management
 
 The API is intentionally thin.
@@ -187,6 +188,8 @@ runtime_state.json
 events.jsonl
 diagnostics/
 cleanup.json
+
+`diagnostics/` contains redacted, bounded observability artifacts such as failure summaries and persisted deployment log excerpts.
 
 Snapshots are the rollback source of truth.
 

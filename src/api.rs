@@ -34,6 +34,13 @@ pub struct DeploymentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[derive(Serialize, Deserialize)]
+pub struct DeploymentLogs {
+    pub deployment_id: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 pub struct EventList {
     pub events: Vec<EventRecord>,
 }

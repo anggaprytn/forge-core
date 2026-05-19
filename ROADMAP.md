@@ -193,10 +193,10 @@ Explicit non-goals:
 
 Planned:
 
-- [ ] persisted deployment logs
-- [ ] bounded retention policies
-- [ ] redacted log delivery
-- [ ] deployment log API
+- [x] persisted deployment logs
+- [x] bounded retention policies
+- [x] redacted log delivery
+- [x] deployment log API
 
 Explicitly deferred:
 

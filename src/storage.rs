@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_RETRY_LIMIT: usize = 200;
+const DIAGNOSTIC_LOG_MAX_LINES: usize = 64;
+const DIAGNOSTIC_LOG_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotState {
@@ -372,11 +374,46 @@ impl DiagnosticsStore {
             .join("diagnostics")
             .join("failure_reason.log");
         let redacted = redact_text(reason, secrets);
-        let bounded = if redacted.len() > 4096 {
-            redacted[..4096].to_string()
+        let bounded = truncate_to_recent_bytes(&redacted, DIAGNOSTIC_LOG_MAX_BYTES);
+        atomic_write(path, bounded.as_bytes())
+    }
+
+    pub fn append_log_line(&self, line: &str, secrets: &[String]) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("diagnostics")
+            .join("deployment.log");
+        let mut lines = if path.exists() {
+            fs::read_to_string(&path)?
+                .lines()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
         } else {
-            redacted
+            Vec::new()
         };
+
+        for value in redact_text(line, secrets).lines() {
+            lines.push(value.to_string());
+        }
+        if lines.is_empty() {
+            return Ok(());
+        }
+
+        while lines.len() > DIAGNOSTIC_LOG_MAX_LINES {
+            lines.remove(0);
+        }
+
+        let mut bounded = lines.join("\n");
+        while bounded.len() > DIAGNOSTIC_LOG_MAX_BYTES && lines.len() > 1 {
+            lines.remove(0);
+            bounded = lines.join("\n");
+        }
+        if bounded.len() > DIAGNOSTIC_LOG_MAX_BYTES {
+            bounded = truncate_to_recent_bytes(&bounded, DIAGNOSTIC_LOG_MAX_BYTES);
+        }
+        bounded.push('\n');
         atomic_write(path, bounded.as_bytes())
     }
 
@@ -406,6 +443,21 @@ impl DiagnosticsStore {
             return Ok(None);
         }
         Ok(Some(fs::read_to_string(path)?))
+    }
+
+    pub fn read_log_lines(&self) -> StorageResult<Vec<String>> {
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("diagnostics")
+            .join("deployment.log");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        Ok(fs::read_to_string(path)?
+            .lines()
+            .map(|value| value.to_string())
+            .collect())
     }
 }
 
@@ -575,6 +627,17 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+fn truncate_to_recent_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut start = input.len() - max_bytes;
+    while !input.is_char_boundary(start) {
+        start += 1;
+    }
+    input[start..].to_string()
 }
 
 #[cfg(unix)]

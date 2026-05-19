@@ -83,16 +83,16 @@ Track:
 
 ## 2.2 Bounded Logs
 
-- [ ] Add bounded persisted deployment log excerpts
-- [ ] Expose `GET /logs/:deployment_id`
-- [ ] Redact secret values before persistence/delivery
-- [ ] Enforce max retained log size
+- [x] Add bounded persisted deployment log excerpts
+- [x] Expose `GET /logs/:deployment_id`
+- [x] Redact secret values before persistence/delivery
+- [x] Enforce max retained log size
 
 ### Tests
 
-- [ ] `logs_endpoint_redacts_secret_values`
-- [ ] `logs_endpoint_is_bounded`
-- [ ] `failed_deploy_logs_preserve_diagnostic_context`
+- [x] `logs_endpoint_redacts_secret_values`
+- [x] `logs_endpoint_is_bounded`
+- [x] `failed_deploy_logs_preserve_diagnostic_context`
 
 ### Rules
 

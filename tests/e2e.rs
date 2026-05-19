@@ -441,6 +441,59 @@ fn secret_value_is_redacted_from_diagnostics() {
 }
 
 #[test]
+fn logs_endpoint_redacts_secret_values() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("logs-redacted") else {
+        return;
+    };
+
+    harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
+    let deployment_id = harness.enqueue_deploy();
+    let result = harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
+    assert!(matches!(
+        result,
+        Err(DeploymentError::ValidationFailed("http health probe failed"))
+    ));
+
+    let logs = harness.get_logs(&deployment_id);
+    let rendered = logs["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("DATABASE_URL=[REDACTED]"));
+    assert!(!rendered.contains("postgres://alpha-secret-value"));
+}
+
+#[test]
+fn failed_deploy_logs_preserve_diagnostic_context() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("logs-context") else {
+        return;
+    };
+
+    let deployment_id = harness.enqueue_deploy();
+    let result = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
+    assert!(matches!(
+        result,
+        Err(DeploymentError::ValidationFailed("http health probe failed"))
+    ));
+
+    let logs = harness.get_logs(&deployment_id);
+    let lines = logs["lines"].as_array().unwrap();
+    let rendered = lines
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("deployment started"));
+    assert!(rendered.contains("container started"));
+    assert!(rendered.contains("http health probe failed"));
+}
+
+#[test]
 fn missing_required_secret_fails_before_container_start() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("missing-required-secret") else {
@@ -787,6 +840,18 @@ impl E2eHarness {
             .bearer_auth(&self.token)
             .send()
             .expect("deployment status request should reach api");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response.json::<Value>().unwrap();
+        json["data"].clone()
+    }
+
+    fn get_logs(&self, deployment_id: &str) -> Value {
+        let response = self
+            .http_client
+            .get(self.api_url(&format!("logs/{deployment_id}")))
+            .bearer_auth(&self.token)
+            .send()
+            .expect("deployment logs request should reach api");
         assert_eq!(response.status(), StatusCode::OK);
         let json = response.json::<Value>().unwrap();
         json["data"].clone()

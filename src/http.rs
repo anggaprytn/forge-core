@@ -11,7 +11,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList};
+use crate::api::{
+    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
+};
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{resolve_webhook, verify_signature, GitHubError, GitHubWebhookConfig, WebhookResolution};
 use crate::metrics::render_prometheus;
@@ -34,6 +36,7 @@ pub trait ControlPlane: Send {
         request: DeploymentRequest,
     ) -> Result<DeploymentAccepted, ErrorResponse>;
     fn get_deployment(&self, deployment_id: &str) -> Result<Option<DeploymentStatus>, ErrorResponse>;
+    fn get_deployment_logs(&self, deployment_id: &str) -> Result<Option<DeploymentLogs>, ErrorResponse>;
     fn list_events(&self) -> Result<EventList, ErrorResponse>;
     fn queue_depth(&self) -> Result<usize, ErrorResponse>;
 }
@@ -57,6 +60,10 @@ where
 
     fn get_deployment(&self, deployment_id: &str) -> Result<Option<DeploymentStatus>, ErrorResponse> {
         Daemon::get_deployment(self, deployment_id)
+    }
+
+    fn get_deployment_logs(&self, deployment_id: &str) -> Result<Option<DeploymentLogs>, ErrorResponse> {
+        Daemon::get_deployment_logs(self, deployment_id)
     }
 
     fn list_events(&self) -> Result<EventList, ErrorResponse> {
@@ -264,6 +271,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/secrets", post(post_secrets))
         .route("/webhooks/github", post(post_github_webhook))
         .route("/deployments/{id}", get(get_deployment))
+        .route("/logs/{id}", get(get_logs))
         .route("/events", get(get_events))
         .with_state(state)
 }
@@ -692,6 +700,52 @@ async fn get_events(State(state): State<HttpState>, headers: HeaderMap) -> Respo
     }
 }
 
+async fn get_logs(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let daemon = match state.daemon.lock() {
+        Ok(daemon) => daemon,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "daemon_lock_error".into(),
+                    message: "daemon lock poisoned".into(),
+                },
+            );
+        }
+    };
+
+    match daemon.get_deployment_logs(&id) {
+        Ok(Some(logs)) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: logs,
+            }),
+        ),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            &request_id,
+            ErrorResponse {
+                code: "deployment_not_found".into(),
+                message: "deployment not found".into(),
+            },
+        ),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+    }
+}
+
 fn ensure_authorized(state: &HttpState, headers: &HeaderMap, request_id: &str) -> Result<(), Response> {
     let Some(value) = header_value(headers, AUTHORIZATION) else {
         return Err(error_response(
@@ -951,7 +1005,7 @@ impl crate::convergence::ActiveDeploymentDecider for StaticDecider {
 }
 
 #[cfg(test)]
-fn build_state(ready: bool) -> HttpState {
+fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
     crate::metrics::reset_for_tests();
     let root = if ready {
         test_root("http-ready")
@@ -970,13 +1024,21 @@ fn build_state(ready: bool) -> HttpState {
     if ready {
         daemon.start().unwrap();
     }
-    HttpState::new(
-        Arc::new(Mutex::new(Box::new(daemon))),
-        config.bearer_token,
-        IdempotencyStore::new(root.join("idempotency")).unwrap(),
-        None,
-        SecretStore::new(root.join("secrets")).unwrap(),
+    (
+        HttpState::new(
+            Arc::new(Mutex::new(Box::new(daemon))),
+            config.bearer_token,
+            IdempotencyStore::new(root.join("idempotency")).unwrap(),
+            None,
+            SecretStore::new(root.join("secrets")).unwrap(),
+        ),
+        root,
     )
+}
+
+#[cfg(test)]
+fn build_state(ready: bool) -> HttpState {
+    build_state_with_root(ready).0
 }
 
 #[cfg(test)]
@@ -1177,5 +1239,55 @@ pub mod metrics_report_queue_depth {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("forge_queue_depth 1"));
+    }
+}
+
+#[cfg(test)]
+pub mod logs_endpoint_is_bounded {
+    use super::*;
+    use crate::events::EventRecord;
+    use crate::storage::{DiagnosticsStore, EnvironmentPaths, EventStore};
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn logs_endpoint_is_bounded() {
+        let (state, root) = build_state_with_root(true);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let events = EventStore::new(env.clone(), 1);
+        events
+            .append(&EventRecord {
+                timestamp_unix: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                generation: Some(1),
+                deployment_id: Some("dep-logs-bounded".into()),
+                event_type: "DEPLOYMENT_STARTED".into(),
+                reason: None,
+            })
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env, 1);
+        for idx in 0..200 {
+            diagnostics.append_log_line(&format!("line-{idx}"), &[]).unwrap();
+        }
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/logs/dep-logs-bounded")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let lines = json["data"]["lines"].as_array().unwrap();
+        assert!(lines.len() <= 64);
+        assert_eq!(lines.last().unwrap(), "line-199");
+        assert_ne!(lines.first().unwrap(), "line-0");
     }
 }

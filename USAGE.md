@@ -195,6 +195,26 @@ curl http://localhost:8080/deployments/<deployment_id>
 
 ---
 
+# Deployment Logs
+
+Forge persists a bounded, redacted diagnostic log excerpt for each deployment.
+
+## API
+
+```bash
+curl http://localhost:8080/logs/<deployment_id>
+```
+
+The response contains recent log lines only.
+
+Rules:
+
+- secret values are redacted before persistence and delivery
+- logs are retained as bounded diagnostic excerpts, not as unbounded streams
+- Forge does not expose `docker logs -f`, SSE, or websocket log tails
+
+---
+
 # Events
 
 Forge emits append-only deployment events.
