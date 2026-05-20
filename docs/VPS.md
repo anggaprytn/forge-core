@@ -106,32 +106,31 @@ cd /srv/forge/sample-http-app
 forge init
 ```
 
-This generates `forge.yml`. While Forge is transitioning to YAML-first configuration, you should also create a compatible `forge.project.json` for current runtime flows:
+This generates `forge.yml`. This is the primary operator-facing configuration for Forge.
 
-```json
-{
-  "forge_schema_version": 1,
-  "project_id": "api",
-  "repository": { "provider": "github" },
-  "environments": {
-    "development": { "branch": "dev" },
-    "staging": { "branch": "staging" },
-    "production": { "branch": "main" }
-  },
-  "build": { "dockerfile_path": "./Dockerfile", "context_path": "." },
-  "runtime": {
-    "service_type": "http",
-    "internal_port": 3000,
-    "subdomain": "api",
-    "resources": { "memory_limit_mb": 512, "cpu_shares": 1024 }
-  },
-  "health": {
-    "tcp_required": true,
-    "http": { "enabled": true, "path": "/health", "expected_status": [200], "timeout_ms": 5000 },
-    "startup_grace_seconds": 30
-  },
-  "contract": { "version": 1, "spec": {} }
-}
+### Example forge.yml
+
+Forge strictly validates `forge.yml`. Unsupported or unknown fields are rejected intentionally.
+
+```yaml
+version: 1
+name: api
+type: web # Only single-service web apps supported currently
+
+build:
+  dockerfile: Dockerfile
+  context: .
+
+runtime:
+  port: 3000
+  healthcheck:
+    path: /health
+    expected_status: 200
+
+invariants:
+  - name: health
+    path: /health
+    expect_status: 200
 ```
 
 ## 7. Configure `forge.conf`

@@ -106,7 +106,6 @@ Typical repository:
 my-app/
 ├── Dockerfile
 ├── forge.yml
-├── forge.project.json
 └── src/
 ```
 
@@ -123,12 +122,14 @@ This generates a deterministic `forge.yml` file. This command:
 - is intentionally minimal to reduce onboarding friction
 - refuses to overwrite an existing `forge.yml` unless you pass `--force`
 
-### Example forge.yml
+### Validated forge.yml Fields
+
+Forge strictly validates `forge.yml`. Unsupported or unknown fields are rejected intentionally.
 
 ```yaml
 version: 1
 name: api
-type: web
+type: web # Only single-service web apps supported currently
 
 build:
   dockerfile: Dockerfile
@@ -146,6 +147,18 @@ invariants:
     expect_status: 200
 ```
 
+| Field | Purpose |
+|-------|---------|
+| `version` | Manifest schema version. |
+| `name` | Project identifier used in CLI and routing. |
+| `type` | Service type (currently only `web` is supported). |
+| `build.dockerfile` | Path to the Dockerfile (relative to context). |
+| `build.context` | Docker build context path (relative to `forge.yml`). |
+| `runtime.port` | Internal port the application binds to. |
+| `runtime.healthcheck.path` | HTTP path for health validation. |
+| `runtime.healthcheck.expected_status` | Expected success status for health check. |
+| `invariants` | List of runtime assertions enforced by convergence. |
+
 ### Overwriting Configuration
 
 If you need to reset your configuration, use the `--force` flag:
@@ -153,12 +166,6 @@ If you need to reset your configuration, use the `--force` flag:
 ```bash
 forge init --force
 ```
-
-Current compatibility note:
-
-- `forge deploy <project> <environment>` loads `forge.yml` from the daemon working directory when present.
-- Internal runtime artifacts remain JSON.
-- GitHub webhook flows continue to read the committed `forge.project.json`.
 
 ---
 

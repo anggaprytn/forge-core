@@ -221,12 +221,12 @@ These are intentionally separate systems.
 # CLI
 
 ```bash
-forge init
-forge deploy <project> <environment>
-forge status <deployment_id>
-forge events
-forge rollback <project> <environment>
-forge secrets set <project> <environment> <key> <value>
+forge init                                   # Generate forge.yml
+forge deploy <project> <environment>         # Deploy using forge.yml
+forge status <deployment_id>                 # Check deployment status
+forge events                                 # View orchestration events
+forge rollback <project> <environment>       # Restore previous healthy generation
+forge secrets set <project> <env> <k> <v>    # Set runtime secrets
 ```
 
 ---
@@ -239,55 +239,36 @@ forge secrets set <project> <environment> <key> <value>
 forge init
 ```
 
-This generates a deterministic `forge.yml` in the current directory. YAML is the primary user-facing configuration surface for Forge projects.
+This generates a deterministic `forge.yml` in the current directory. `forge.yml` is the primary operator-facing deployment configuration.
 
-## 2. Push Code
+## 2. Deploy to Production
+
+```bash
+forge deploy api production
+```
+
+Forge reads the `forge.yml` from the current directory (or the daemon's working directory) and enqueues a deployment for the `api` project in the `production` environment.
+
+**Current Limitation**: The Forge daemon currently builds and deploys from its own `WorkingDirectory`. Ensure the daemon is started in the root of the project you intend to deploy manually.
+
+## 3. GitHub Webhook (Automated)
+
+For automated flows, pushing to a tracked branch triggers the same deterministic pipeline:
 
 ```bash
 git push origin main
-```
-
-## 3. GitHub Webhook Triggers Forge
-
-Forge:
-
-- verifies signature
-- dedupes delivery
-- fetches exact commit
-- loads the committed webhook manifest
-- maps branch → environment
-- enqueues deployment
-
-## 4. Forge Executes Deployment
-
-```txt
-build
-→ start
-→ validate
-→ finalize
-→ activate
-→ promote
-```
-
-## 5. Runtime Convergence Maintains Correctness
-
-If deployment degrades:
-
-```txt
-restart
-→ rollback
-→ cleanup
-→ recover
 ```
 
 ---
 
 # Example Manifest (forge.yml)
 
+Forge strictly validates `forge.yml`. Unsupported or unknown fields are rejected intentionally.
+
 ```yaml
 version: 1
 name: api
-type: web
+type: web # Only single-service web apps supported currently
 
 build:
   dockerfile: Dockerfile
@@ -305,7 +286,16 @@ invariants:
     expect_status: 200
 ```
 
-`forge deploy <project> <environment>` now loads `forge.yml` from the daemon working directory when that file is present. Internal runtime artifacts and deployment ordering remain unchanged.
+Validated fields:
+- `version`: Manifest schema version.
+- `name`: Project identifier.
+- `type`: Service type (currently `web`).
+- `build.dockerfile`: Path to the Dockerfile.
+- `build.context`: Docker build context path.
+- `runtime.port`: The port the application binds to (0.0.0.0).
+- `runtime.healthcheck.path`: Endpoint for HTTP health validation.
+- `runtime.healthcheck.expected_status`: Expected HTTP status code.
+- `invariants`: Post-activation runtime assertions.
 
 ---
 

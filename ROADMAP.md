@@ -233,6 +233,7 @@ Completed in this slice:
 
 - [x] example `forge.conf`
 - [x] systemd service unit
+- [x] validated `forge.yml` deployment flow (`forge init` -> `forge deploy`)
 - [x] VPS operator runbook for daemon/API deploy flow
 - [x] VPS alpha milestone manual validation (12h soak, host reboot recovery)
 
@@ -250,6 +251,7 @@ Acceptance status:
 
 - [x] dogfood integration suite is green on daemon/VPS startup validation
 - [x] manual validation pass: deploy, rollback, restart, reboot, route recovery
+- [x] `forge.yml` manifest correctly drives build/runtime configuration
 
 ```txt
 operators can diagnose runtime failures quickly and deterministically
