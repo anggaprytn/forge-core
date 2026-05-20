@@ -1,5 +1,16 @@
 # Forge v1 Implementation Specification
 
+This document records the implementation-oriented v1 model. For the next alpha phase, product semantics are locked as follows:
+
+- `forge` is the client/operator CLI
+- `forged` is the future server/runtime authority binary name
+- current implementation may temporarily continue to use one binary
+- the server owns queueing, source resolution, snapshots, convergence, routes, rollback, and recovery
+- CLI, API, webhook, and web must converge into the same deployment pipeline
+- canonical deployment source is `repository + ref`, resolved into an immutable local checkout
+- `forge.yml` is the alpha manifest contract
+- supported alpha environments are `development`, `staging`, and `production`
+
 ## 1. Scope
 
 Forge v1 is a single-node, self-hosted runtime convergence daemon for deploying one containerized service per project onto one VPS.
@@ -9,6 +20,7 @@ Included in v1:
 - Rust daemon
 - GitHub webhook deploys
 - manual API deploys
+- local `--from` deploys for alpha/dev mode
 - single-service deployments
 - Runtime Contracts v1
 - Caddy HTTP routing
@@ -27,6 +39,8 @@ Excluded from v1:
 
 - multi-service graphs
 - preview environments
+- custom environments
+- custom per-environment domains
 - distributed workers
 - Redis/distributed queue
 - persistent volumes
@@ -34,6 +48,8 @@ Excluded from v1:
 - UDP workloads
 - autoscaling
 - RBAC
+- teams
+- DNS automation
 - multi-tenant isolation
 - AI auto-remediation
 
@@ -43,22 +59,24 @@ Forge v1 MUST enforce these invariants:
 
 - Docker is the execution engine only.
 - Forge is the orchestration authority.
+- The deployment server is the control-plane authority.
 - Docker restart policies are disabled for Forge-managed containers.
-- Desired state is defined by `forge.project.json` plus deploy request.
+- Desired state is defined by the resolved `forge.yml` plus deploy request intent.
 - Observed state is defined by Docker/Linux inspection.
 - Snapshot state is the immutable rollback artifact.
 - Reconstructed state is derived from snapshots, labels, pointers, and runtime inspection.
 - SQLite is never authoritative.
 - Secrets are never persisted plaintext.
-- `current` always points to the routed active generation.
+- `current` expresses intended active generation after route activation succeeds.
 - `previous` always points to the most recent superseded healthy generation.
 - Failed generations never become active pointers.
 - Generation numbers are monotonically increasing per `(project_id, environment)` and never reused.
 - Only one deployment may execute at a time across the daemon.
+- CLI, API, webhook, and web requests must feed the same deployment queue and state machine.
 
 ## 3. Environment Model
 
-Fixed environments in v1:
+Fixed environments in alpha:
 
 - `development`
 - `staging`
@@ -68,19 +86,32 @@ Rules:
 
 - environment names are fixed enums
 - each environment has an independent generation history
-- branch mappings are manifest-defined
+- default branch mappings are:
+  - `development -> development`
+  - `staging -> staging`
+  - `production -> main`
 - routing, secrets, snapshots, and rollback history are isolated per environment
+- custom environments are not supported in alpha
+
+Planned alpha domain derivation:
+
+- `production -> <base_domain>`
+- `staging -> staging-<base_domain>`
+- `development -> development-<base_domain>`
 
 ## 4. Manifest Model
 
-`forge.project.json` is mandatory, repo-rooted, versioned with application code, and loaded from the exact target commit being deployed.
+`forge.yml` is the alpha manifest contract. It is source-rooted, versioned with application code, and resolved from the exact deployment source checkout.
+
+Current implementation note:
+
+manual local `--from` deploys remain valid alpha/dev mode, but the long-term canonical source is `repository + ref`.
 
 ### 4.1 Manifest Purpose
 
 The manifest defines stable project configuration:
 
 - project identity
-- branch-to-environment mapping
 - build defaults
 - runtime defaults
 - route defaults
@@ -91,85 +122,16 @@ The manifest defines stable project configuration:
 
 ### 4.2 Manifest Schema v1
 
-```json
-{
-  "forge_schema_version": 1,
-  "project_id": "api",
-  "repository": {
-    "provider": "github"
-  },
-  "environments": {
-    "development": {
-      "branch": "development"
-    },
-    "staging": {
-      "branch": "staging"
-    },
-    "production": {
-      "branch": "main"
-    }
-  },
-  "build": {
-    "dockerfile_path": "./Dockerfile",
-    "context_path": "."
-  },
-  "runtime": {
-    "service_type": "http",
-    "internal_port": 3000,
-    "subdomain": "api",
-    "resources": {
-      "memory_limit_mb": 512,
-      "cpu_shares": 1024
-    }
-  },
-  "health": {
-    "tcp_required": true,
-    "http": {
-      "enabled": true,
-      "path": "/health",
-      "expected_status": [200],
-      "timeout_ms": 5000
-    },
-    "startup_grace_seconds": 30
-  },
-  "contract": {
-    "version": 1,
-    "spec": {
-      "network": {
-        "bind": "0.0.0.0",
-        "port_env": "PORT"
-      },
-      "shutdown": {
-        "graceful_timeout_ms": 10000
-      },
-      "environment": {
-        "required_variables": []
-      }
-    }
-  },
-  "secrets": {
-    "environment_variables": {
-      "DATABASE_URL": {
-        "scope": "environment",
-        "key": "DATABASE_URL"
-      }
-    }
-  }
-}
-```
+The current alpha surface is the narrower `forge.yml` contract already used by the runtime and CLI. It remains intentionally small while product semantics are being locked.
 
 ### 4.3 Manifest Validation Rules
 
-- `forge_schema_version` MUST equal `1`
-- `project_id` MUST match `^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`
-- `project_id` MUST be immutable after first successful deployment
-- `internal_port` MUST be a valid TCP port
-- `service_type` MUST be `http` or `tcp`
-- `subdomain` MUST be globally unique
+- manifest version MUST match the supported alpha schema
+- project identity MUST be stable after first successful deployment
+- runtime port MUST be a valid TCP port
+- current alpha service type is single-service web
 - secret values MUST NOT appear in manifest
-- branch mapping MUST exist for all three environments
-- `contract.version` MUST equal `1`
-- `service_type=http` requires `health.http.enabled=true` by default and may be disabled only with explicit override
+- manifest validation remains intentionally narrow and deterministic
 
 ## 5. Deploy Request Model
 
@@ -195,6 +157,10 @@ Headers:
 
 - `Authorization: Bearer <token>`
 - `Idempotency-Key: <opaque-key>`
+
+Product model note:
+
+the API is the automation surface only. It does not bypass queueing, source resolution, or deployment ordering.
 
 ### 5.2 Request Rules
 
@@ -225,11 +191,10 @@ Desired state is materialized at deployment start as a normalized object.
   "project_id": "api",
   "environment": "production",
   "source": {
-    "type": "github",
-    "repository_url": "https://github.com/org/api.git",
-    "branch": "main",
+    "repository": "https://github.com/org/api.git",
+    "ref": "main",
     "commit_sha": "abc123",
-    "image_digest": null
+    "source_checkout": "/var/lib/forge/.../source-checkouts/abc123"
   },
   "build": {
     "dockerfile_path": "./Dockerfile",
@@ -262,6 +227,19 @@ Precedence:
 - project manifest defaults
 - Forge inferred defaults
 - Forge non-overridable minimums
+
+Source revision identity chain:
+
+```txt
+repository
+-> ref
+-> commit_sha
+-> source_checkout
+-> generation
+-> image_ref
+-> snapshot
+-> route activation
+```
 
 Forge minimums include:
 
@@ -667,13 +645,14 @@ These labels support:
 
 ### 18.1 Supported Source Types
 
-- source build from GitHub repo
-- prebuilt image digest deployment
+- source build from Git repository plus ref
+- local `--from` source path for alpha/dev mode
 
 ### 18.2 Source Build Rules
 
 - BuildKit enabled
 - local Docker Engine build
+- source acquisition resolves to a local immutable checkout before build execution
 - host architecture only in v1
 - no multi-arch support
 - no remote cache export
@@ -733,6 +712,13 @@ Manifests contain secret references only.
 - one global bearer token in v1
 - single trusted operator model
 - no RBAC
+
+## 20.3 Web Role
+
+- web is a human visibility/control surface
+- web is not the primary deployment engine
+- initial scope is login, projects, environments, current/previous generation visibility, and events/logs/diagnostics
+- any web-triggered operation must flow through the same API and queue as every other surface
 
 ### 20.2 Webhook Security
 
@@ -907,7 +893,7 @@ src/
 
 The next concrete deliverables should be:
 
-1. JSON schema for `forge.project.json`
+1. JSON schema for `forge.yml`
 2. OpenAPI spec for deployment and secret endpoints
 3. snapshot file schemas
 4. event type registry

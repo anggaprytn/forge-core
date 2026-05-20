@@ -27,7 +27,7 @@ Example minimal Caddy config for local use:
 
 By default, manual `forge deploy <project> <environment>` builds from the Forge daemon process `WorkingDirectory`.
 
-For explicit operator control, prefer `forge deploy --from <path> <project> <environment>`. If you omit `--from`, start the daemon from the project directory that contains the `Dockerfile` and `forge.yml` you want to deploy.
+For explicit operator control, prefer `forge deploy --from <path> <project> <environment>`. If you omit `--from`, start the daemon from the project directory that contains the `Dockerfile` and `forge.yml` you want to deploy. `--from` remains the alpha/dev-mode source path; the long-term canonical source model is `repository + ref`, resolved into an immutable local checkout before deployment runs.
 
 ## 1. Build Forge
 

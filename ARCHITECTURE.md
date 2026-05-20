@@ -11,6 +11,13 @@ deterministic
 restart-safe
 runtime-authoritative
 
+Product direction for the next alpha phase keeps that runtime-authoritative model, while clarifying product surfaces:
+
+- `forge` is the operator/client CLI
+- `forged` is the future server/runtime authority binary name
+- current implementation may temporarily continue to ship one binary
+- the binary split is product taxonomy, not a required code migration in this phase
+
 Forge treats deployment as a state convergence problem, not a container-start problem.
 
 ⸻
@@ -29,6 +36,11 @@ High-Level Architecture
 
                     ┌─────────────────┐
                     │ GitHub Webhook  │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ Source Resolver │
                     └────────┬────────┘
                              │
                              ▼
@@ -77,6 +89,14 @@ High-Level Architecture
 
 Core Components
 
+Control-plane model:
+
+- Forge server owns deployment queueing, source resolution, immutable snapshots, convergence, routes, rollback, and restart recovery.
+- CLI is a stateless operator/client surface.
+- Web is a visibility/control surface for humans.
+- API is the automation surface.
+- CLI, API, and web requests must converge into the same queue and deployment pipeline.
+
 1. HTTP API
 
 The control-plane entrypoint.
@@ -106,6 +126,10 @@ Current implementation note:
 
 manual deploy requests execute against the daemon process working directory unless the deploy source is provided through the GitHub webhook path.
 
+Product direction note:
+
+the long-term canonical source model is `repository + ref -> commit_sha -> immutable local checkout`, with local `--from` remaining an alpha/dev-mode operator path.
+
 ⸻
 
 2. Persistent Queue
@@ -120,6 +144,8 @@ Properties:
 • idempotent enqueue semantics
 
 Queue state alone is never treated as deployment truth.
+
+All deploy requests, regardless of whether they originate from CLI, API, webhook, or future web actions, converge into this same queue.
 
 ⸻
 
@@ -205,6 +231,19 @@ cleanup.json
 
 Snapshots are the rollback source of truth.
 
+Source revision identity chain:
+
+```txt
+repository
+→ ref
+→ commit_sha
+→ source_checkout
+→ generation
+→ image_ref
+→ snapshot
+→ route activation
+```
+
 Generation retention is intentionally bounded.
 Forge always preserves `current` and `previous`, keeps only a small recent set of failed generations with diagnostics, and deterministically removes older unreferenced generations plus their Forge-managed runtime artifacts.
 Retention cleanup resolves and removes Forge-managed containers and images before deleting generation metadata, and orphaned runtime artifacts are also cleaned by Forge labels when metadata is already gone.
@@ -258,6 +297,18 @@ validated
 
 If route activation fails:
 • current does not advance
+
+Alpha environment model:
+
+- supported environments: `development`, `staging`, `production`
+- default branch mapping: `development -> development`, `staging -> staging`, `production -> main`
+- custom environments are intentionally out of scope for alpha
+
+Planned alpha domain derivation:
+
+- `production -> <base_domain>`
+- `staging -> staging-<base_domain>`
+- `development -> development-<base_domain>`
 • failed generation cleaned or tombstoned
 
 ⸻

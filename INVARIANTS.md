@@ -421,13 +421,25 @@ Rules:
 
 ## 25. Manifest Invariants
 
-`forge.project.json` is loaded from the exact commit being deployed.
+The effective deployment manifest is loaded from the resolved source checkout for the deployment.
+
+For the current alpha surface, that manifest is `forge.yml`.
+
+Long-term canonical deploy source is:
+
+```txt
+repository + ref
+→ commit_sha
+→ source_checkout
+```
 
 Manifest values define project configuration.
 
 Deployment request values define execution intent.
 
 Secret values must never appear in manifests.
+
+`--from <path>` remains an alpha/dev-mode source input and must still resolve to an immutable local source path before the deployment pipeline consumes it.
 
 ---
 
@@ -457,6 +469,8 @@ Business logic belongs in:
 
 API handlers must not duplicate orchestration logic.
 
+The API is the automation surface and must feed the same deployment queue and state machine used by CLI, webhook, and web.
+
 ---
 
 ## 28. CLI Invariants
@@ -467,6 +481,26 @@ Rules:
 
 - no business logic in CLI
 - all operations go through the API
+
+The CLI is a stateless operator/client surface, not orchestration authority.
+
+`forge` is the product-facing CLI name.
+
+`forged` is the planned future server/runtime authority binary name, but that product taxonomy does not require an immediate binary split in code.
+
+## 28.1 Web Surface Invariants
+
+The web surface is visibility and control for humans, not a separate deployment engine.
+
+Initial scope is:
+
+- login
+- projects
+- environments
+- current and previous generation visibility
+- events, logs, and diagnostics
+
+Web-triggered operations, when present, must flow through the same API, queue, and deployment FSM as every other surface.
 
 ---
 

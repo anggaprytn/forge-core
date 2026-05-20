@@ -107,7 +107,7 @@ FORGE_CADDY_PUBLIC_URL=https://api.forge.example.com
 
 `FORGE_MASTER_KEY` is required for secrets support.
 
-Forge web login is the primary human-operator entrypoint and requires these env vars:
+Forge web login is part of the human operator control surface and requires these env vars:
 
 ```bash
 FORGE_GITHUB_OAUTH_CLIENT_ID=...
@@ -121,7 +121,7 @@ FORGE_CLI_TOKEN_SECRET=...
 `FORGE_CLI_TOKEN_SECRET` signs CLI bearer tokens issued after browser approval.
 
 `/login` starts the GitHub OAuth flow, `/app` requires the resulting session cookie, `/login/cli?code=...` serves the CLI approval page, and `/api/cli-login/*` drives the short-lived browser approval flow used by `forge login`.
-CLI commands and bearer-token API auth remain available for automation and operator usage.
+CLI commands and bearer-token API auth remain available for automation and operator usage. Web actions are not a separate deployment engine; they flow through the same API and queue.
 
 ---
 
@@ -146,7 +146,7 @@ systemctl enable --now forge
 ```
 
 ### Manual Deployment Note
-By default, manual `forge deploy <project> <environment>` deployments build from the Forge daemon process `WorkingDirectory`. Prefer `forge deploy --from <path> <project> <environment>` when you want to target an explicit checkout.
+By default, manual `forge deploy <project> <environment>` deployments build from the Forge daemon process `WorkingDirectory`. Prefer `forge deploy --from <path> <project> <environment>` when you want to target an explicit checkout. `--from` remains an alpha/dev-mode operator path; long-term canonical deploy source is `repository + ref`, resolved to an immutable local checkout.
 
 ---
 
@@ -282,7 +282,7 @@ cd /srv/forge/sample-http-app
 forge init
 ```
 
-This generates `forge.yml`. This is the primary operator-facing configuration for Forge.
+This generates `forge.yml`. This is the current alpha operator-facing configuration for Forge.
 
 ### Example forge.yml
 

@@ -28,6 +28,61 @@ A deployment becomes successful only after runtime validation and route activati
 
 ---
 
+# Alpha Product Semantics
+
+## Binary Model
+
+- `forge` is the operator/client CLI.
+- `forged` is the planned server/runtime authority binary name.
+- The current implementation may still use one binary temporarily.
+- This is product direction for the next alpha phase, not an immediate migration requirement.
+
+## Control-Plane Model
+
+- Forge server owns deployment queueing, source resolution, snapshots, convergence, routes, rollback, and restart recovery.
+- CLI is a stateless operator/client surface.
+- Web is a visibility/control surface for humans.
+- API is the automation surface.
+- CLI, API, and web operations must all converge into the same deployment queue and deployment pipeline.
+
+## Source Model
+
+- Canonical long-term deploy source is `git repository + ref`.
+- Local `--from <path>` remains supported as alpha/dev mode.
+- Upload sources are not canonical product semantics.
+- Source acquisition resolves into a local immutable source checkout.
+- The deployment pipeline consumes that resolved source path.
+- Forge does not maintain a separate Git deployment FSM.
+
+## Source Revision Identity Chain
+
+```txt
+repository
+→ ref
+→ commit_sha
+→ source_checkout
+→ generation
+→ image_ref
+→ snapshot
+→ route activation
+```
+
+## Environments And Domains
+
+- Alpha supports only `development`, `staging`, and `production`.
+- Default branch mapping is `development -> development`, `staging -> staging`, `production -> main`.
+- Planned alpha domain derivation is:
+  `production -> <base_domain>`, `staging -> staging-<base_domain>`, `development -> development-<base_domain>`.
+- Custom environments and custom per-environment domains are deferred.
+
+## Web Role
+
+- Web is first a visibility/control plane, not the primary deployment engine.
+- Initial web scope is login, projects, environments, current/previous generation visibility, and events/logs/diagnostics.
+- Deployment execution still goes through the same API, queue, and FSM.
+
+---
+
 # Requirements
 
 Minimum runtime requirements:
@@ -240,6 +295,12 @@ Forge will:
 - load manifest from exact commit
 - map branch → environment
 - enqueue deployment
+
+Default branch mapping in alpha:
+
+- `development -> development`
+- `staging -> staging`
+- `main -> production`
 
 ---
 
@@ -454,7 +515,7 @@ Secrets are API-managed only.
 
 Never place secret values in:
 
-- forge.project.json
+- forge.yml
 - git
 - logs
 - diagnostics

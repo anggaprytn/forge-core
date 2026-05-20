@@ -86,6 +86,85 @@ Forge has been manually validated on a real VPS with the following:
 
 ---
 
+# Alpha Product Semantics
+
+## Binary Model
+
+- `forge` is the operator/client CLI product surface.
+- `forged` is the planned server/runtime authority binary name.
+- The current implementation may temporarily continue to ship one binary while command taxonomy and packaging settle.
+- This is product direction for the next alpha phase, not a required immediate binary split in code.
+
+## Control-Plane Model
+
+- Forge server owns the deployment queue, source resolution, immutable snapshots, convergence, routes, rollback, and restart recovery.
+- The Forge CLI is a stateless operator/client surface.
+- The web UI is a visibility and control surface for humans.
+- The API is the automation surface.
+- CLI, API, and web actions must converge into the same deployment queue and deployment state machine.
+
+## Source Model
+
+- Canonical long-term deployment source is `git repository + ref`.
+- Local `--from <path>` remains supported as alpha and developer mode.
+- Upload-style sources are not canonical product semantics.
+- Source acquisition resolves into a local immutable source checkout.
+- The deployment pipeline consumes that resolved source path regardless of whether the request originated from webhook, CLI, API, or web.
+- Forge does not maintain a separate Git-specific deployment FSM.
+
+## Source Revision Identity Chain
+
+```txt
+repository
+→ ref
+→ commit_sha
+→ source_checkout
+→ generation
+→ image_ref
+→ snapshot
+→ route activation
+```
+
+## Alpha Environments
+
+- Supported environments are fixed to `development`, `staging`, and `production`.
+- Default branch mapping is `development -> development`, `staging -> staging`, `production -> main`.
+- Custom environments are not part of alpha scope.
+
+## Planned Alpha Domain Derivation
+
+- `production -> <base_domain>`
+- `staging -> staging-<base_domain>`
+- `development -> development-<base_domain>`
+
+Example:
+
+- `api.example.com`
+- `staging-api.example.com`
+- `development-api.example.com`
+
+This is planned alpha product semantics and may land in implementation incrementally.
+
+## Web Role And Deferred Scope
+
+- Web is not the primary deployment engine.
+- Initial web scope is login, projects, environments, current/previous generation visibility, and events/logs/diagnostics.
+- Deployment execution still goes through the same API, queue, and FSM as every other surface.
+
+Explicitly deferred:
+
+- custom environments
+- custom per-environment domains
+- preview environments
+- multi-service orchestration
+- RBAC and teams
+- DNS automation
+- Kubernetes or distributed scheduling
+- stateful database ownership
+- a web deploy button as the primary product surface
+
+---
+
 # Core Principles
 
 ## 1. Forge Is Authority

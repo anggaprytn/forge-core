@@ -50,6 +50,119 @@ Validated capabilities:
   - routing repair after Caddy/Docker restart
   - deterministic generation cleanup/retention
 
+Current runtime note:
+
+Forge already contains many alpha runtime pieces. The next phase is not broad feature expansion first; it is product semantics alignment and command taxonomy hardening.
+
+---
+
+# Next Alpha Sequence
+
+Recommended implementation order for the next alpha phase:
+
+## Phase 0 — Lock Product Semantics
+
+Goal:
+
+```txt
+align product model, source model, environment model, and command taxonomy before more implementation breadth
+```
+
+Scope:
+
+- document `forge` as client/operator CLI
+- document `forged` as the future server/runtime authority binary name
+- lock the control-plane model across CLI, API, and web
+- lock git-first source semantics and the source revision identity chain
+- lock fixed alpha environments and derived domain semantics
+
+## Phase 1 — `forged` Server Command Taxonomy
+
+Goal:
+
+```txt
+separate server/runtime authority taxonomy from client/operator taxonomy without forcing an immediate binary split
+```
+
+## Phase 2 — `forge` Client Auth And Diagnostics
+
+Goal:
+
+```txt
+stabilize operator identity and health workflows
+```
+
+Planned focus:
+
+- `forge login`
+- `forge whoami`
+- `forge logout`
+- `forge doctor`
+
+## Phase 3 — `forge.yml` Manifest Contract
+
+Goal:
+
+```txt
+lock the alpha manifest surface before deeper source and deploy work
+```
+
+## Phase 4 — Git-Backed Source Acquisition
+
+Goal:
+
+```txt
+make repository plus ref the canonical deploy source path
+```
+
+## Phase 5 — Deploy By Git Ref
+
+Goal:
+
+```txt
+ensure manual, API, webhook, and future web flows all resolve through the same git-ref deployment pipeline
+```
+
+## Phase 6 — Derived Domain Routing
+
+Goal:
+
+```txt
+standardize alpha environment-to-domain derivation
+```
+
+## Phase 7 — Status, Events, And Diagnostics UX
+
+Goal:
+
+```txt
+improve visibility without moving orchestration authority out of the server
+```
+
+## Phase 8 — Rollback UX
+
+Goal:
+
+```txt
+make rollback intent and visibility clearer while preserving existing rollback authority semantics
+```
+
+## Phase 9 — Minimal Read-Only Web Visibility
+
+Goal:
+
+```txt
+ship a minimal human visibility surface after product semantics and operator flows are aligned
+```
+
+Initial web scope:
+
+- login
+- projects
+- environments
+- current and previous generation visibility
+- events, logs, and diagnostics
+
 ---
 
 # Core Philosophy
@@ -446,6 +559,14 @@ Forge is intentionally not optimizing for:
 - [ ] low-code abstractions
 - [ ] multi-cloud abstraction layers
 - [ ] generalized distributed schedulers
+- [ ] custom environments
+- [ ] custom per-environment domains
+- [ ] preview environments
+- [ ] multi-service orchestration in alpha
+- [ ] RBAC or teams
+- [ ] DNS automation
+- [ ] stateful database ownership
+- [ ] a web deploy button as the primary product surface
 
 The system is optimized for:
 

@@ -3,6 +3,73 @@
 Current baseline: CLI implemented.
 Goal: reach usable alpha without scope creep.
 
+Current runtime note: many runtime pieces already exist. The next alpha step is product-semantics and command-taxonomy alignment before more implementation breadth.
+
+---
+
+# Next Alpha Order
+
+## Phase 0: Lock product semantics
+
+- [ ] Document binary model: `forge` client/operator CLI, `forged` future server/runtime authority binary name
+- [ ] Document shared control-plane model across CLI, API, and web
+- [ ] Document git-first canonical source model and source revision identity chain
+- [ ] Document fixed alpha environments: `development`, `staging`, `production`
+- [ ] Document default branch mapping: `development -> development`, `staging -> staging`, `production -> main`
+- [ ] Document planned derived domain semantics
+- [ ] Document explicit non-goals for alpha scope
+- [ ] Document web as visibility/control, not primary deployment engine
+
+## Phase 1: `forged` server command taxonomy
+
+- [ ] Define server/runtime authority command taxonomy
+- [ ] Keep binary split as product direction unless code split is trivial
+
+## Phase 2: `forge` client login/whoami/logout/doctor
+
+- [ ] Confirm `forge login`
+- [ ] Confirm `forge whoami`
+- [ ] Confirm `forge logout`
+- [ ] Confirm `forge doctor`
+
+## Phase 3: `forge.yml` manifest contract
+
+- [ ] Lock `forge.yml` alpha manifest contract
+- [ ] Keep manifest narrow and deterministic
+
+## Phase 4: git-backed source acquisition
+
+- [ ] Resolve deploy source from repository + ref
+- [ ] Materialize immutable local source checkout
+- [ ] Keep local `--from` as alpha/dev mode
+
+## Phase 5: deploy by git ref
+
+- [ ] Route CLI/API/webhook deploy intent through the same git-ref pipeline
+- [ ] Avoid creating a separate Git deployment FSM
+
+## Phase 6: derived domain routing
+
+- [ ] `production -> <base_domain>`
+- [ ] `staging -> staging-<base_domain>`
+- [ ] `development -> development-<base_domain>`
+
+## Phase 7: status/events/diagnostics UX
+
+- [ ] Improve operator visibility for status, events, and diagnostics
+
+## Phase 8: rollback UX
+
+- [ ] Improve rollback operator flow and visibility
+
+## Phase 9: minimal read-only web visibility
+
+- [ ] Login
+- [ ] Projects
+- [ ] Environments
+- [ ] Current/previous generation visibility
+- [ ] Events/logs/diagnostics
+
 ---
 
 # Current Completed Baseline
@@ -127,7 +194,7 @@ Track:
 Goal: validate product thesis, not add features.
 
 - [ ] Generate 5 AI-created sample apps
-- [ ] Add `forge.project.json`
+- [ ] Add `forge.yml`
 - [ ] Deploy via GitHub webhook
 - [ ] Confirm route live
 - [ ] Confirm events visible
@@ -174,7 +241,7 @@ Track:
 
 - [x] Wire `forge daemon` to the existing HTTP/daemon runtime path
 - [x] Add `forge init`
-- [ ] Generate basic `forge.project.json`
+- [ ] Generate basic `forge.yml`
 - [x] Generate local example config
 - [ ] Add install instructions
 - [ ] Add local development quickstart
