@@ -20,15 +20,13 @@ impl std::error::Error for ProbeRuntimeInitError {}
 
 pub struct DockerNetworkProbeRuntime {
     network_name: String,
-    internal_port: u16,
     image_ref: String,
 }
 
 impl DockerNetworkProbeRuntime {
-    pub fn new(network_name: impl Into<String>, internal_port: u16) -> Self {
+    pub fn new(network_name: impl Into<String>, _internal_port: u16) -> Self {
         Self {
             network_name: network_name.into(),
-            internal_port,
             image_ref: "busybox:1.36".into(),
         }
     }
@@ -53,17 +51,19 @@ impl DockerNetworkProbeRuntime {
 }
 
 impl ProbeRuntime for DockerNetworkProbeRuntime {
-    fn probe_tcp(&mut self, container_name: &str) -> Result<bool, ProbeError> {
-        self.run_probe(&format!(
-            "nc -z -w 1 {container_name} {}",
-            self.internal_port
-        ))
+    fn probe_tcp(&mut self, container_name: &str, internal_port: u16) -> Result<bool, ProbeError> {
+        self.run_probe(&format!("nc -z -w 1 {container_name} {internal_port}"))
     }
 
-    fn probe_http(&mut self, container_name: &str, path: &str) -> Result<bool, ProbeError> {
+    fn probe_http(
+        &mut self,
+        container_name: &str,
+        internal_port: u16,
+        path: &str,
+    ) -> Result<bool, ProbeError> {
         self.run_probe(&format!(
             "wget -q -T 2 -O /dev/null http://{container_name}:{}{}",
-            self.internal_port, path
+            internal_port, path
         ))
     }
 }

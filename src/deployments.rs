@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::path::Path;
 use std::path::PathBuf;
 
 use crate::events::{EventRecord, redact_text};
+use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
@@ -200,6 +202,20 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         &mut self,
         record: &DeploymentRecord,
     ) -> Result<DeploymentExecution, DeploymentError> {
+        let forge_yaml = load_optional_forge_yaml(&self.execution.context_path, &record.project_id)
+            .map_err(|err| DeploymentError::InvalidInspection(err.to_string()))?;
+        let execution = forge_yaml
+            .as_ref()
+            .map(|config| {
+                let mut execution = config.execution().clone();
+                execution.network_name = self.execution.network_name.clone();
+                execution
+            })
+            .unwrap_or_else(|| self.execution.clone());
+        let validation = forge_yaml
+            .as_ref()
+            .map(|config| config.validation().clone())
+            .unwrap_or_else(|| self.validation.clone());
         let env =
             EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
         let generation = GenerationAllocator::new(env.clone()).allocate()?;
@@ -212,7 +228,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             record.project_id, record.environment, generation
         );
         let writer = SnapshotWriter::new(env.clone(), generation)?;
-        let runtime_secrets = match self.resolve_runtime_secrets(record) {
+        let runtime_secrets = match self.resolve_runtime_secrets(&execution.context_path, record) {
             Ok(secrets) => secrets,
             Err(DeploymentError::MissingSecret(message)) => {
                 diagnostics.write_failure_reason(&message, &[])?;
@@ -253,8 +269,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
         let image_ref = match self.docker.build_image(BuildImageRequest {
             image_tag: image_tag.clone(),
-            context_path: self.execution.context_path.clone(),
-            dockerfile_path: self.execution.dockerfile_path.clone(),
+            context_path: execution.context_path.clone(),
+            dockerfile_path: execution.dockerfile_path.clone(),
             labels: labels.clone(),
         }) {
             Ok(image_ref) => image_ref,
@@ -281,7 +297,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             image_ref: image_ref.clone(),
             labels: labels.clone(),
             environment: runtime_environment(&runtime_secrets),
-            network_name: self.execution.network_name.clone(),
+            network_name: execution.network_name.clone(),
         }) {
             Ok(_) => {}
             Err(err) => {
@@ -373,29 +389,27 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             )?;
             return Err(err);
         }
-        let probe_host = match resolve_validation_probe_host(
-            &inspection,
-            self.execution.network_name.as_deref(),
-        ) {
-            Ok(probe_host) => probe_host,
-            Err(err) => {
-                let failure_reason = err.to_string();
-                self.record_failed_generation(
-                    &env,
-                    &events,
-                    &diagnostics,
-                    record,
-                    generation,
-                    &container_name,
-                    None,
-                    "validating_runtime",
-                    &failure_reason,
-                    &redacted_env_preview,
-                    &secret_values,
-                )?;
-                return Err(err);
-            }
-        };
+        let probe_host =
+            match resolve_validation_probe_host(&inspection, execution.network_name.as_deref()) {
+                Ok(probe_host) => probe_host,
+                Err(err) => {
+                    let failure_reason = err.to_string();
+                    self.record_failed_generation(
+                        &env,
+                        &events,
+                        &diagnostics,
+                        record,
+                        generation,
+                        &container_name,
+                        None,
+                        "validating_runtime",
+                        &failure_reason,
+                        &redacted_env_preview,
+                        &secret_values,
+                    )?;
+                    return Err(err);
+                }
+            };
         let build_json = serde_json::to_string_pretty(&PersistedBuildInfo {
             deployment_id: record.deployment_id.clone(),
             image_ref: image_ref.clone(),
@@ -410,9 +424,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let runtime_json = serde_json::to_string_pretty(&PersistedRuntimeInfo {
             container_name: inspection.container_name.clone(),
             running: inspection.running,
-            network_name: self.execution.network_name.clone(),
-            probe_path: self.validation.http_health_path.clone(),
-            activation: Some(match &self.validation.activation {
+            network_name: execution.network_name.clone(),
+            probe_path: validation.http_health_path.clone(),
+            activation: Some(match &validation.activation {
                 ActivationMode::Direct => PersistedActivationMode::Direct,
                 ActivationMode::Http { internal_port } => PersistedActivationMode::Http {
                     internal_port: *internal_port,
@@ -431,6 +445,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         writer.write_artifact("runtime.json", &format!("{runtime_json}\n"))?;
         diagnostics.append_log_line("runtime inspection passed", &secret_values)?;
         self.validate_candidate(
+            &validation,
             &env,
             &container_name,
             &probe_host,
@@ -449,9 +464,15 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         )?;
         append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
         diagnostics.append_log_line("snapshot finalized", &secret_values)?;
-        if let Err(err) =
-            self.activate_generation(record, &env, generation, &container_name, &inspection)
-        {
+        if let Err(err) = self.activate_generation(
+            &validation,
+            &execution,
+            record,
+            &env,
+            generation,
+            &container_name,
+            &inspection,
+        ) {
             self.record_failed_generation(
                 &env,
                 &events,
@@ -480,6 +501,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
     fn validate_candidate(
         &mut self,
+        validation: &ValidationPolicy,
         env: &EnvironmentPaths,
         container_name: &str,
         probe_host: &str,
@@ -490,7 +512,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         redacted_env_preview: &[String],
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
-        if self.validation.tcp_required && !self.probes.probe_tcp(probe_host)? {
+        let internal_port = match validation.activation {
+            ActivationMode::Direct => 3000,
+            ActivationMode::Http { internal_port } => internal_port,
+        };
+        if validation.tcp_required && !self.probes.probe_tcp(probe_host, internal_port)? {
             self.record_failed_generation(
                 env,
                 events,
@@ -508,8 +534,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         }
         diagnostics.append_log_line("tcp validation passed", secret_values)?;
 
-        if let Some(path) = &self.validation.http_health_path {
-            if !self.probes.probe_http(probe_host, path)? {
+        if let Some(path) = &validation.http_health_path {
+            if !self.probes.probe_http(probe_host, internal_port, path)? {
                 self.record_failed_generation(
                     env,
                     events,
@@ -655,13 +681,15 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
     fn activate_generation(
         &mut self,
+        validation: &ValidationPolicy,
+        execution: &ExecutionConfig,
         record: &DeploymentRecord,
         env: &EnvironmentPaths,
         generation: u64,
         _container_name: &str,
         inspection: &ContainerInspection,
     ) -> Result<(), DeploymentError> {
-        match self.validation.activation {
+        match validation.activation {
             ActivationMode::Direct => {
                 PointerStore::new(env.clone()).swap_current(generation)?;
                 Ok(())
@@ -669,13 +697,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ActivationMode::Http { internal_port } => {
                 let subtree_id = route_subtree_id(record);
                 let target_host =
-                    resolve_route_target_host(inspection, self.execution.network_name.as_deref())?;
+                    resolve_route_target_host(inspection, execution.network_name.as_deref())?;
                 let target = format!("{target_host}:{internal_port}");
                 self.routing.update_route(RouteUpdateRequest {
                     subtree_id: subtree_id.clone(),
                     target: target.clone(),
                     health_checks_enabled: false,
-                    probe_path: self.validation.http_health_path.clone(),
+                    probe_path: validation.http_health_path.clone(),
                 })?;
                 let inspection = self.routing.inspect_route(&subtree_id)?;
                 validate_route_activation(&inspection, &subtree_id, &target)?;
@@ -687,9 +715,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
     fn resolve_runtime_secrets(
         &self,
+        context_path: &Path,
         record: &DeploymentRecord,
     ) -> Result<Vec<SecretResolution>, DeploymentError> {
-        let Some(manifest) = load_optional_manifest(&self.execution.context_path)? else {
+        let Some(manifest) = load_optional_manifest(context_path)? else {
             return Ok(Vec::new());
         };
         let store = SecretStore::new(self.storage_root.join("secrets"))?;
@@ -1022,11 +1051,20 @@ struct TestProbeRuntime {
 
 #[cfg(test)]
 impl ProbeRuntime for TestProbeRuntime {
-    fn probe_tcp(&mut self, _container_name: &str) -> Result<bool, ProbeError> {
+    fn probe_tcp(
+        &mut self,
+        _container_name: &str,
+        _internal_port: u16,
+    ) -> Result<bool, ProbeError> {
         Ok(self.tcp_ok)
     }
 
-    fn probe_http(&mut self, _container_name: &str, _path: &str) -> Result<bool, ProbeError> {
+    fn probe_http(
+        &mut self,
+        _container_name: &str,
+        _internal_port: u16,
+        _path: &str,
+    ) -> Result<bool, ProbeError> {
         Ok(self.http_ok)
     }
 }
@@ -1036,19 +1074,25 @@ impl ProbeRuntime for TestProbeRuntime {
 struct RecordingProbeRuntime {
     tcp_ok: bool,
     http_ok: bool,
-    tcp_hosts: Vec<String>,
-    http_hosts: Vec<(String, String)>,
+    tcp_hosts: Vec<(String, u16)>,
+    http_hosts: Vec<(String, u16, String)>,
 }
 
 #[cfg(test)]
 impl ProbeRuntime for RecordingProbeRuntime {
-    fn probe_tcp(&mut self, host: &str) -> Result<bool, ProbeError> {
-        self.tcp_hosts.push(host.to_string());
+    fn probe_tcp(&mut self, host: &str, internal_port: u16) -> Result<bool, ProbeError> {
+        self.tcp_hosts.push((host.to_string(), internal_port));
         Ok(self.tcp_ok)
     }
 
-    fn probe_http(&mut self, host: &str, path: &str) -> Result<bool, ProbeError> {
-        self.http_hosts.push((host.to_string(), path.to_string()));
+    fn probe_http(
+        &mut self,
+        host: &str,
+        internal_port: u16,
+        path: &str,
+    ) -> Result<bool, ProbeError> {
+        self.http_hosts
+            .push((host.to_string(), internal_port, path.to_string()));
         Ok(self.http_ok)
     }
 }
@@ -1606,11 +1650,390 @@ pub mod validation_probes_configured_network_ip {
         .execute_next()
         .unwrap();
 
-        assert_eq!(probes.tcp_hosts, vec!["172.19.0.5".to_string()]);
+        assert_eq!(probes.tcp_hosts, vec![("172.19.0.5".to_string(), 3000)]);
         assert_eq!(
             probes.http_hosts,
-            vec![("172.19.0.5".to_string(), "/health".to_string())]
+            vec![("172.19.0.5".to_string(), 3000, "/health".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_loads_forge_yml {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::load_generation_runtime_info;
+    use std::fs;
+
+    #[test]
+    fn deploy_loads_forge_yml() {
+        let root = test_root("deploy-loads-forge-yml");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "\n",
+                "build:\n",
+                "  dockerfile: deploy/Dockerfile\n",
+                "  context: app\n",
+                "\n",
+                "runtime:\n",
+                "  port: 4010\n",
+                "  healthcheck:\n",
+                "    path: /ready\n",
+                "    expected_status: 200\n",
+                "\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /ready\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:4010".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        let runtime =
+            load_generation_runtime_info(&EnvironmentPaths::new(&root, "api", "production"), 1)
+                .unwrap()
+                .unwrap();
+        assert_eq!(runtime.probe_path.as_deref(), Some("/ready"));
+        assert_eq!(
+            runtime.activation,
+            Some(PersistedActivationMode::Http {
+                internal_port: 4010,
+                route_subtree_id: Some("forge:api:production".into()),
+                target_source: PersistedRouteTargetSource::ContainerIp,
+            })
+        );
+        assert_eq!(routing.updates[0].target, "172.18.0.2:4010");
+        assert_eq!(
+            probes.http_hosts,
+            vec![("172.18.0.2".to_string(), 4010, "/ready".to_string())]
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_rejects_invalid_yaml {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn deploy_rejects_invalid_yaml() {
+        let root = test_root("deploy-invalid-forge-yaml");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: Dockerfile\n",
+                "  context: .\n",
+                "runtime:\n",
+                "  port: 3000\n",
+                "  healthcheck:\n",
+                "    path /health\n",
+                "    expected_status: 200\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /health\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: None,
+        })
+        .execute_next();
+
+        assert!(
+            matches!(result, Err(DeploymentError::InvalidInspection(message)) if message.contains("invalid forge.yml"))
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_rejects_missing_required_fields {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn deploy_rejects_missing_required_fields() {
+        let root = test_root("deploy-missing-forge-yaml-field");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: Dockerfile\n",
+                "  context: .\n",
+                "runtime:\n",
+                "  healthcheck:\n",
+                "    path: /health\n",
+                "    expected_status: 200\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /health\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: None,
+        })
+        .execute_next();
+
+        assert!(
+            matches!(result, Err(DeploymentError::InvalidInspection(message)) if message.contains("missing field `port`"))
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_uses_runtime_port_from_yaml {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn deploy_uses_runtime_port_from_yaml() {
+        let root = test_root("deploy-runtime-port-from-yaml");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: Dockerfile\n",
+                "  context: .\n",
+                "runtime:\n",
+                "  port: 4010\n",
+                "  healthcheck:\n",
+                "    path: /health\n",
+                "    expected_status: 200\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /health\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:4010".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(probes.tcp_hosts, vec![("172.18.0.2".to_string(), 4010)]);
+        assert_eq!(routing.updates[0].target, "172.18.0.2:4010");
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_uses_healthcheck_from_yaml {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn deploy_uses_healthcheck_from_yaml() {
+        let root = test_root("deploy-healthcheck-from-yaml");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: Dockerfile\n",
+                "  context: .\n",
+                "runtime:\n",
+                "  port: 3000\n",
+                "  healthcheck:\n",
+                "    path: /livez\n",
+                "    expected_status: 200\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /livez\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-test".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(
+            probes.http_hosts,
+            vec![("172.18.0.2".to_string(), 3000, "/livez".to_string())]
+        );
+        assert_eq!(routing.updates[0].probe_path.as_deref(), Some("/livez"));
     }
 }
 

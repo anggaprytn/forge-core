@@ -78,8 +78,13 @@ pub trait DockerRuntime {
 }
 
 pub trait ProbeRuntime {
-    fn probe_tcp(&mut self, container_name: &str) -> Result<bool, ProbeError>;
-    fn probe_http(&mut self, container_name: &str, path: &str) -> Result<bool, ProbeError>;
+    fn probe_tcp(&mut self, container_name: &str, internal_port: u16) -> Result<bool, ProbeError>;
+    fn probe_http(
+        &mut self,
+        container_name: &str,
+        internal_port: u16,
+        path: &str,
+    ) -> Result<bool, ProbeError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

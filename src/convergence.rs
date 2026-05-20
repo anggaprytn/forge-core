@@ -42,6 +42,15 @@ pub struct TickInput {
     pub http_health_path: Option<String>,
 }
 
+impl TickInput {
+    fn internal_port(&self) -> u16 {
+        match self.truth {
+            ActiveTruth::HttpRouted { internal_port } => internal_port,
+            ActiveTruth::Direct => 3000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TickOutcome {
     Healthy(u64),
@@ -364,9 +373,12 @@ where
 
         let container_name =
             generation_container_name(&input.environment, &input.project_id, active_generation);
-        let tcp_ok = self.probes.probe_tcp(&container_name)?;
+        let tcp_ok = self
+            .probes
+            .probe_tcp(&container_name, input.internal_port())?;
         let http_ok = if let Some(path) = &input.http_health_path {
-            self.probes.probe_http(&container_name, path)?
+            self.probes
+                .probe_http(&container_name, input.internal_port(), path)?
         } else {
             true
         };
@@ -1082,13 +1094,18 @@ struct TestProbeRuntime {
 
 #[cfg(test)]
 impl ProbeRuntime for TestProbeRuntime {
-    fn probe_tcp(&mut self, _container_name: &str) -> Result<bool, crate::runtime::ProbeError> {
+    fn probe_tcp(
+        &mut self,
+        _container_name: &str,
+        _internal_port: u16,
+    ) -> Result<bool, crate::runtime::ProbeError> {
         Ok(self.tcp_ok)
     }
 
     fn probe_http(
         &mut self,
         _container_name: &str,
+        _internal_port: u16,
         _path: &str,
     ) -> Result<bool, crate::runtime::ProbeError> {
         Ok(self.http_ok)

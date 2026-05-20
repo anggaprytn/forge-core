@@ -589,11 +589,20 @@ struct FixedProbeRuntime {
 }
 
 impl ProbeRuntime for FixedProbeRuntime {
-    fn probe_tcp(&mut self, _container_name: &str) -> Result<bool, ProbeError> {
+    fn probe_tcp(
+        &mut self,
+        _container_name: &str,
+        _internal_port: u16,
+    ) -> Result<bool, ProbeError> {
         Ok(self.tcp_ok)
     }
 
-    fn probe_http(&mut self, _container_name: &str, _path: &str) -> Result<bool, ProbeError> {
+    fn probe_http(
+        &mut self,
+        _container_name: &str,
+        _internal_port: u16,
+        _path: &str,
+    ) -> Result<bool, ProbeError> {
         Ok(self.http_ok)
     }
 }

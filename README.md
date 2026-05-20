@@ -254,7 +254,7 @@ Forge:
 - verifies signature
 - dedupes delivery
 - fetches exact commit
-- loads project manifest (YAML/JSON)
+- loads the committed webhook manifest
 - maps branch → environment
 - enqueues deployment
 
@@ -304,6 +304,8 @@ invariants:
     path: /health
     expect_status: 200
 ```
+
+`forge deploy <project> <environment>` now loads `forge.yml` from the daemon working directory when that file is present. Internal runtime artifacts and deployment ordering remain unchanged.
 
 ---
 

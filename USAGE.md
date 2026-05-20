@@ -156,9 +156,9 @@ forge init --force
 
 Current compatibility note:
 
-- **YAML** (`forge.yml`) is the primary user-facing configuration surface.
-- **JSON** (`forge.project.json`) is currently used as the internal runtime artifact and for GitHub webhook flows.
-- The current deployment flow compatibility remains unchanged: `forge deploy` will continue to function as expected while we transition to YAML-first configuration.
+- `forge deploy <project> <environment>` loads `forge.yml` from the daemon working directory when present.
+- Internal runtime artifacts remain JSON.
+- GitHub webhook flows continue to read the committed `forge.project.json`.
 
 ---
 
@@ -172,6 +172,8 @@ A minimal getting-started flow:
 forge init
 forge deploy api production
 ```
+
+`forge deploy` uses the `name`, build paths, runtime port, and healthcheck from `forge.yml`.
 
 ---
 
