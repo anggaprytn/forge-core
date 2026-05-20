@@ -297,7 +297,7 @@ reduce operational friction
 Planned:
 
 - [x] daemon CLI entrypoint
-- [ ] `forge init`
+- [x] `forge init`
 - [ ] local development setup
 - [ ] VPS installation guides
 - [ ] GitHub webhook setup

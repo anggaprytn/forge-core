@@ -99,7 +99,14 @@ The repository already includes a minimal Docker-backed sample app image definit
 cp tests/fixtures/sample-http-app/Dockerfile /srv/forge/sample-http-app/Dockerfile
 ```
 
-Create `/srv/forge/sample-http-app/forge.project.json`:
+Initialize the project configuration using `forge init`:
+
+```bash
+cd /srv/forge/sample-http-app
+forge init
+```
+
+This generates `forge.yml`. While Forge is transitioning to YAML-first configuration, you should also create a compatible `forge.project.json` for current runtime flows:
 
 ```json
 {

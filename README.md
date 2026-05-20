@@ -221,6 +221,7 @@ These are intentionally separate systems.
 # CLI
 
 ```bash
+forge init
 forge deploy <project> <environment>
 forge status <deployment_id>
 forge events
@@ -232,24 +233,32 @@ forge secrets set <project> <environment> <key> <value>
 
 # Example Workflow
 
-## 1. Push Code
+## 1. Initialize Project
+
+```bash
+forge init
+```
+
+This generates a deterministic `forge.yml` in the current directory. YAML is the primary user-facing configuration surface for Forge projects.
+
+## 2. Push Code
 
 ```bash
 git push origin main
 ```
 
-## 2. GitHub Webhook Triggers Forge
+## 3. GitHub Webhook Triggers Forge
 
 Forge:
 
 - verifies signature
 - dedupes delivery
 - fetches exact commit
-- loads `forge.project.json`
+- loads project manifest (YAML/JSON)
 - maps branch → environment
 - enqueues deployment
 
-## 3. Forge Executes Deployment
+## 4. Forge Executes Deployment
 
 ```txt
 build
@@ -260,7 +269,7 @@ build
 → promote
 ```
 
-## 4. Runtime Convergence Maintains Correctness
+## 5. Runtime Convergence Maintains Correctness
 
 If deployment degrades:
 
@@ -273,24 +282,27 @@ restart
 
 ---
 
-# Example Manifest
+# Example Manifest (forge.yml)
 
-```json
-{
-  "project_id": "api",
-  "service_type": "http",
-  "dockerfile": "Dockerfile",
-  "internal_port": 3000,
-  "healthcheck": {
-    "path": "/health"
-  },
-  "environments": {
-    "production": {
-      "branch": "main",
-      "subdomain": "api.example.com"
-    }
-  }
-}
+```yaml
+version: 1
+name: api
+type: web
+
+build:
+  dockerfile: Dockerfile
+  context: .
+
+runtime:
+  port: 3000
+  healthcheck:
+    path: /health
+    expected_status: 200
+
+invariants:
+  - name: health
+    path: /health
+    expect_status: 200
 ```
 
 ---
