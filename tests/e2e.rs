@@ -1222,6 +1222,10 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(request.image_tag)
     }
 
+    fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
+
     fn create_container(
         &mut self,
         request: forge_core::runtime::CreateContainerRequest,

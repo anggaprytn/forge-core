@@ -17,7 +17,9 @@ use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
 use forge_core::daemon::{Daemon, DeploymentWorkerSettings, run_deployment_worker_loop};
-use forge_core::deployments::{ActivationMode, ExecutionConfig, ValidationPolicy};
+use forge_core::deployments::{
+    ActivationMode, ExecutionConfig, FORGE_MANAGED_DOCKER_NETWORK, ValidationPolicy,
+};
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
 use forge_core::doctor::{DoctorOptions, run as run_doctor};
 use forge_core::events::EventRecord;
@@ -1043,7 +1045,7 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
         execution: ExecutionConfig {
             context_path: PathBuf::from("."),
             dockerfile_path: PathBuf::from("./Dockerfile"),
-            network_name: Some("bridge".into()),
+            network_name: Some(FORGE_MANAGED_DOCKER_NETWORK.into()),
         },
         ..DeploymentWorkerSettings::default()
     };
@@ -1053,7 +1055,7 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
             worker_storage_root,
             worker_queue,
             DockerCliRuntime::new(ProcessCommandRunner),
-            DockerNetworkProbeRuntime::new("bridge", 3000),
+            DockerNetworkProbeRuntime::new(FORGE_MANAGED_DOCKER_NETWORK, 3000),
             CaddyApiRuntime::new(worker_caddy_admin_url, worker_caddy_public_url),
             worker_settings,
         )

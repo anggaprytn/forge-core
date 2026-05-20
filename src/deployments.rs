@@ -140,6 +140,8 @@ pub enum ActivationMode {
     Http { internal_port: u16 },
 }
 
+pub const FORGE_MANAGED_DOCKER_NETWORK: &str = "forge-managed";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionConfig {
     pub context_path: PathBuf,
@@ -317,6 +319,28 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         };
         append_event(&events, record, generation, "IMAGE_BUILT", None)?;
         diagnostics.append_log_line(&format!("image built: {image_ref}"), &secret_values)?;
+        if let Some(network_name) = execution.network_name.as_deref() {
+            if let Err(err) = self.docker.ensure_network(network_name) {
+                let failure_reason =
+                    format!("docker network ensure failed for {network_name}: {err}");
+                self.record_failed_attempt(
+                    &events,
+                    &diagnostics,
+                    record,
+                    generation,
+                    "preparing",
+                    &failure_reason,
+                    None,
+                    &redacted_env_preview,
+                    &secret_values,
+                )?;
+                return Err(err.into());
+            }
+            diagnostics.append_log_line(
+                &format!("docker network ready: {network_name}"),
+                &secret_values,
+            )?;
+        }
 
         match self.docker.create_container(CreateContainerRequest {
             container_name: container_name.clone(),
@@ -539,6 +563,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ActivationMode::Http { internal_port } => internal_port,
         };
         let probe_path = validation.http_health_path.as_deref();
+        let selected_network = self.execution.network_name.clone();
         let inspection = match self.docker.inspect_container(container_name) {
             Ok(inspection) => inspection,
             Err(err) => {
@@ -574,6 +599,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 &context,
                 internal_port,
                 probe_path,
+                selected_network.as_deref(),
                 secret_values,
             )?;
             self.record_failed_generation(
@@ -612,6 +638,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     &context,
                     internal_port,
                     probe_path,
+                    selected_network.as_deref(),
                     secret_values,
                 )?;
                 self.record_failed_generation(
@@ -654,6 +681,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 &context,
                 internal_port,
                 None,
+                selected_network.as_deref(),
                 secret_values,
             )?;
             self.record_failed_generation(
@@ -698,6 +726,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     &context,
                     internal_port,
                     Some(path),
+                    selected_network.as_deref(),
                     secret_values,
                 )?;
                 self.record_failed_generation(
@@ -773,6 +802,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         context: &ValidationFailureContext,
         internal_port: u16,
         probe_path: Option<&str>,
+        selected_network: Option<&str>,
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
         if let Some(inspection) = &context.inspection {
@@ -795,6 +825,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 ),
                 secret_values,
             )?;
+            if let Some(note) = bridge_reachability_diagnostic(
+                inspection,
+                selected_network,
+                context.probe_target.as_ref(),
+            ) {
+                diagnostics.append_log_line(&note, secret_values)?;
+            }
         }
 
         let logs_tail = self
@@ -1155,7 +1192,6 @@ fn resolve_validation_probe_host(
         .values()
         .find(|ip| !ip.is_empty())
         .cloned()
-        .or_else(|| Some(inspection.container_name.clone()))
         .ok_or_else(|| DeploymentError::InvalidInspection("container missing network IP".into()))
 }
 
@@ -1291,6 +1327,25 @@ fn format_network_map(network_ips: &BTreeMap<String, String>) -> String {
         .map(|(network, ip)| format!("{network}={ip}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn bridge_reachability_diagnostic(
+    inspection: &ContainerInspection,
+    selected_network: Option<&str>,
+    probe_target: Option<&ProbeTargetContext>,
+) -> Option<String> {
+    let network_name = selected_network?;
+    if network_name != "bridge" {
+        return None;
+    }
+
+    let bridge_ip = inspection.network_ips.get("bridge")?;
+    let probe_host = probe_target
+        .map(|target| target.host.as_str())
+        .unwrap_or(bridge_ip.as_str());
+    Some(format!(
+        "selected docker network is bridge and probe target {probe_host} comes from that network; bridge IPs are not assumed reachable from the Forge daemon host or Caddy. Use a dedicated shared Docker network such as {FORGE_MANAGED_DOCKER_NETWORK} so validation and route activation use the same reachability semantics."
+    ))
 }
 
 fn container_exited_failure_reason(probe_name: &str, inspection: &ContainerInspection) -> String {
@@ -1454,6 +1509,15 @@ fn queued_record(queue: &PersistentQueue) {
 }
 
 #[cfg(test)]
+fn default_execution_config(root: &std::path::Path) -> ExecutionConfig {
+    ExecutionConfig {
+        context_path: root.to_path_buf(),
+        dockerfile_path: root.join("Dockerfile"),
+        network_name: Some(FORGE_MANAGED_DOCKER_NETWORK.into()),
+    }
+}
+
+#[cfg(test)]
 fn success_outputs(generation: u64) -> Vec<String> {
     success_outputs_with_network(generation, &[("forge-test", "172.18.0.2")])
 }
@@ -1470,6 +1534,16 @@ fn success_outputs_with_network(generation: u64, networks: &[(&str, &str)]) -> V
         inspection,
         String::new(),
     ]
+}
+
+#[cfg(test)]
+fn networked_success_outputs_with_network(
+    generation: u64,
+    networks: &[(&str, &str)],
+) -> Vec<String> {
+    let mut outputs = success_outputs_with_network(generation, networks);
+    outputs.insert(1, String::new());
+    outputs
 }
 
 #[cfg(test)]
@@ -1773,7 +1847,7 @@ pub mod finalized_runtime_persists_http_recovery_metadata {
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
-            success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+            networked_success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
         ));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
@@ -1953,7 +2027,7 @@ pub mod validation_probes_configured_network_ip {
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
-            success_outputs_with_network(
+            networked_success_outputs_with_network(
                 1,
                 &[("bridge", "172.17.0.2"), ("forge-net", "172.19.0.5")],
             ),
@@ -2010,7 +2084,7 @@ pub mod validation_probes_configured_network_ip {
             })
             .unwrap();
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
-            success_outputs_with_network(
+            networked_success_outputs_with_network(
                 1,
                 &[("bridge", "172.17.0.2"), ("forge-net", "172.19.0.5")],
             ),
@@ -2100,7 +2174,7 @@ pub mod deploy_loads_forge_yml {
             })
             .unwrap();
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
-            success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+            networked_success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
         ));
         let mut probes = RecordingProbeRuntime {
             tcp_ok: true,
@@ -2202,7 +2276,7 @@ pub mod deploy_loads_forge_yml {
             })
             .unwrap();
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
-            success_outputs_with_network(1, &[("bridge", "172.18.0.2")]),
+            networked_success_outputs_with_network(1, &[("bridge", "172.18.0.2")]),
         ));
         let mut probes = RecordingProbeRuntime {
             tcp_ok: true,
@@ -2296,6 +2370,7 @@ pub mod git_deploy_non_api_project_staging {
             .unwrap();
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
             "image_ref=forge/web:staging-gen-1".into(),
+            String::new(),
             "staging-web-gen-1".into(),
             String::new(),
             [
@@ -2375,7 +2450,7 @@ pub mod tcp_probe_failure_target_context {
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
-            success_outputs_with_network(1, &[("bridge", "172.18.0.2")]),
+            networked_success_outputs_with_network(1, &[("bridge", "172.18.0.2")]),
         ));
         let mut probes = TestProbeRuntime {
             tcp_ok: false,
@@ -2429,6 +2504,7 @@ pub mod tcp_probe_failure_preserves_container_logs {
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
             format!("image_ref=forge/api:production-gen-1"),
+            String::new(),
             "prod-api-gen-1".into(),
             String::new(),
             inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
@@ -2482,6 +2558,7 @@ pub mod tcp_probe_failure_records_network_map {
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
             format!("image_ref=forge/api:production-gen-1"),
+            String::new(),
             "prod-api-gen-1".into(),
             String::new(),
             inspection_output(
@@ -2552,6 +2629,7 @@ pub mod tcp_probe_reinspects_container_before_probe {
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
             format!("image_ref=forge/api:production-gen-1"),
+            String::new(),
             "prod-api-gen-1".into(),
             String::new(),
             inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
@@ -2599,6 +2677,7 @@ pub mod exited_container_reports_exit_state_not_generic_tcp_failure {
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
             format!("image_ref=forge/api:production-gen-1"),
+            String::new(),
             "prod-api-gen-1".into(),
             String::new(),
             inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
@@ -3045,7 +3124,7 @@ pub mod deploy_uses_runtime_port_from_yaml {
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
-            success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+            networked_success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
         ));
         let mut probes = RecordingProbeRuntime {
             tcp_ok: true,
@@ -3266,6 +3345,218 @@ pub mod route_targets_inspected_container_ip {
         .unwrap();
 
         assert_eq!(routing.updates[0].target, "172.18.0.2:3000");
+    }
+}
+
+#[cfg(test)]
+pub mod managed_container_attached_to_forge_network {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn create_container_uses_forge_managed_network() {
+        let root = test_root("managed-container-attached-to-forge-network");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(
+                1,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.18.0.2")],
+            ),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        assert!(docker.runner.commands.iter().any(|command| {
+            let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+            args == vec!["network", "inspect", FORGE_MANAGED_DOCKER_NETWORK]
+                || args == vec!["network", "create", FORGE_MANAGED_DOCKER_NETWORK]
+        }));
+        assert!(docker.runner.commands.iter().any(|command| {
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--network", FORGE_MANAGED_DOCKER_NETWORK])
+        }));
+    }
+}
+
+#[cfg(test)]
+pub mod probe_uses_forge_network_ip {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn validation_probes_use_selected_forge_network_ip() {
+        let root = test_root("probe-uses-forge-network-ip");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(
+                1,
+                &[
+                    ("bridge", "172.17.0.4"),
+                    (FORGE_MANAGED_DOCKER_NETWORK, "172.19.0.6"),
+                ],
+            ),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Direct,
+            },
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(probes.tcp_hosts, vec![("172.19.0.6".to_string(), 3000)]);
+        assert_eq!(
+            probes.http_hosts,
+            vec![("172.19.0.6".to_string(), 3000, "/health".to_string())]
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod caddy_route_uses_same_network_reachable_ip {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn route_activation_uses_same_forge_network_ip_as_validation() {
+        let root = test_root("caddy-route-uses-same-network-reachable-ip");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(
+                1,
+                &[
+                    ("bridge", "172.17.0.4"),
+                    (FORGE_MANAGED_DOCKER_NETWORK, "172.19.0.6"),
+                ],
+            ),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.19.0.6:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(probes.tcp_hosts, vec![("172.19.0.6".to_string(), 3000)]);
+        assert_eq!(routing.updates[0].target, "172.19.0.6:3000");
+    }
+}
+
+#[cfg(test)]
+pub mod bridge_ip_unreachable_diagnostic_is_clear {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn failure_logs_explain_bridge_reachability_mismatch() {
+        let root = test_root("bridge-ip-unreachable-diagnostic-is-clear");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            String::new(),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.17.0.4")]),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.17.0.4")]),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.17.0.4")]),
+            "Server is running on 0.0.0.0:3000".into(),
+        ]));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("bridge".into()),
+        })
+        .execute_next();
+
+        let logs =
+            fs::read_to_string(root.join(
+                "projects/api/environments/production/generations/1/diagnostics/deployment.log",
+            ))
+            .unwrap();
+        assert!(logs.contains("selected docker network is bridge"));
+        assert!(logs.contains("not assumed reachable from the Forge daemon host or Caddy"));
+        assert!(logs.contains(FORGE_MANAGED_DOCKER_NETWORK));
     }
 }
 

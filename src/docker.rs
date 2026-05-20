@@ -73,6 +73,24 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         Ok(parse_built_image_ref(&output).unwrap_or(request.image_tag))
     }
 
+    fn ensure_network(&mut self, network_name: &str) -> Result<(), DockerRuntimeError> {
+        let inspect_args = vec![
+            "network".to_string(),
+            "inspect".to_string(),
+            network_name.to_string(),
+        ];
+        if self.runner.run("docker", &inspect_args).is_ok() {
+            return Ok(());
+        }
+
+        let create_args = vec![
+            "network".to_string(),
+            "create".to_string(),
+            network_name.to_string(),
+        ];
+        self.runner.run("docker", &create_args).map(|_| ())
+    }
+
     fn create_container(
         &mut self,
         request: CreateContainerRequest,

@@ -71,6 +71,7 @@ impl std::error::Error for ProbeError {}
 
 pub trait DockerRuntime {
     fn build_image(&mut self, request: BuildImageRequest) -> Result<String, DockerRuntimeError>;
+    fn ensure_network(&mut self, network_name: &str) -> Result<(), DockerRuntimeError>;
     fn create_container(
         &mut self,
         request: CreateContainerRequest,

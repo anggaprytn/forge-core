@@ -628,6 +628,10 @@ impl DockerRuntime for FakeDockerRuntime {
         Ok(request.image_tag)
     }
 
+    fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
+
     fn create_container(
         &mut self,
         request: CreateContainerRequest,

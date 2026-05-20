@@ -2147,6 +2147,13 @@ impl DockerRuntime for TestDockerRuntime {
         Ok(request.image_tag)
     }
 
+    fn ensure_network(
+        &mut self,
+        _network_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
+
     fn create_container(
         &mut self,
         request: crate::runtime::CreateContainerRequest,

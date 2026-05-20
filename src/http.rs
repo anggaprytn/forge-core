@@ -2132,6 +2132,13 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(request.image_tag)
     }
 
+    fn ensure_network(
+        &mut self,
+        _network_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
+
     fn create_container(
         &mut self,
         request: crate::runtime::CreateContainerRequest,
@@ -2157,7 +2164,10 @@ impl DockerRuntime for NoopDockerRuntime {
             exit_code: Some(0),
             image_ref: "noop".into(),
             labels: Default::default(),
-            network_ips: Default::default(),
+            network_ips: std::collections::BTreeMap::from([(
+                "forge-managed".into(),
+                "172.18.0.2".into(),
+            )]),
             restart_policy: "no".into(),
         })
     }
