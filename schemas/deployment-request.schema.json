@@ -21,96 +21,12 @@
         "production"
       ]
     },
-    "commit_sha": {
-      "type": "string",
-      "pattern": "^[A-Fa-f0-9]{7,64}$"
-    },
-    "image_digest": {
-      "type": "string",
-      "pattern": "^sha256:[A-Fa-f0-9]{64}$"
-    },
     "intent": {
       "enum": [
         "deploy",
         "redeploy",
         "rollback"
       ]
-    },
-    "runtime_override": {
-      "type": "object",
-      "additionalProperties": true,
-      "default": {}
-    },
-    "metadata": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "reason": {
-          "type": "string",
-          "maxLength": 512
-        }
-      }
     }
-  },
-  "allOf": [
-    {
-      "not": {
-        "required": [
-          "commit_sha",
-          "image_digest"
-        ]
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "intent": {
-            "const": "rollback"
-          }
-        }
-      },
-      "then": {
-        "not": {
-          "anyOf": [
-            {
-              "required": [
-                "commit_sha"
-              ]
-            },
-            {
-              "required": [
-                "image_digest"
-              ]
-            }
-          ]
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "intent": {
-            "enum": [
-              "deploy",
-              "redeploy"
-            ]
-          }
-        }
-      },
-      "then": {
-        "anyOf": [
-          {
-            "required": [
-              "commit_sha"
-            ]
-          },
-          {
-            "required": [
-              "image_digest"
-            ]
-          }
-        ]
-      }
-    }
-  ]
+  }
 }

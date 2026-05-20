@@ -9,16 +9,8 @@
     "project_id",
     "environment",
     "generation",
-    "deployment_id",
     "state",
-    "created_at",
-    "finalized_at",
-    "rollback_eligible",
-    "source",
-    "runtime",
-    "contract_version",
-    "route",
-    "artifacts"
+    "finalized_at_unix"
   ],
   "properties": {
     "snapshot_version": {
@@ -39,10 +31,6 @@
       "type": "integer",
       "minimum": 1
     },
-    "deployment_id": {
-      "type": "string",
-      "format": "uuid"
-    },
     "state": {
       "enum": [
         "healthy",
@@ -52,156 +40,8 @@
         "rollback"
       ]
     },
-    "created_at": {
-      "type": "string",
-      "format": "date-time"
-    },
-    "finalized_at": {
-      "type": "string",
-      "format": "date-time"
-    },
-    "rollback_eligible": {
-      "type": "boolean"
-    },
-    "source": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "type"
-      ],
-      "properties": {
-        "type": {
-          "enum": [
-            "github",
-            "image"
-          ]
-        },
-        "repository_url": {
-          "type": "string",
-          "format": "uri"
-        },
-        "branch": {
-          "type": "string"
-        },
-        "commit_sha": {
-          "type": "string"
-        },
-        "image_digest": {
-          "type": "string"
-        }
-      }
-    },
-    "runtime": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "service_type",
-        "internal_port",
-        "container_name",
-        "resources"
-      ],
-      "properties": {
-        "service_type": {
-          "enum": [
-            "http",
-            "tcp"
-          ]
-        },
-        "internal_port": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "host_port": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "container_name": {
-          "type": "string",
-          "minLength": 1
-        },
-        "resources": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "memory_limit_mb",
-            "cpu_shares"
-          ],
-          "properties": {
-            "memory_limit_mb": {
-              "type": "integer",
-              "minimum": 64
-            },
-            "cpu_shares": {
-              "type": "integer",
-              "minimum": 2
-            }
-          }
-        }
-      }
-    },
-    "contract_version": {
-      "const": 1
-    },
-    "route": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "route_type",
-        "active",
-        "subtree_id"
-      ],
-      "properties": {
-        "route_type": {
-          "enum": [
-            "caddy_http",
-            "host_tcp"
-          ]
-        },
-        "active": {
-          "type": "boolean"
-        },
-        "subtree_id": {
-          "type": "string",
-          "pattern": "^forge:[a-z0-9][a-z0-9-]{1,62}[a-z0-9]:(development|staging|production)$"
-        },
-        "target": {
-          "type": "string"
-        }
-      }
-    },
-    "artifacts": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "desired_state_path",
-        "runtime_contract_path",
-        "route_path",
-        "build_path",
-        "events_path",
-        "diagnostics_path"
-      ],
-      "properties": {
-        "desired_state_path": {
-          "type": "string"
-        },
-        "runtime_contract_path": {
-          "type": "string"
-        },
-        "route_path": {
-          "type": "string"
-        },
-        "build_path": {
-          "type": "string"
-        },
-        "events_path": {
-          "type": "string"
-        },
-        "diagnostics_path": {
-          "type": "string"
-        }
-      }
+    "finalized_at_unix": {
+      "type": "integer"
     }
   }
 }

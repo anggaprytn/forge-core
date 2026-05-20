@@ -5,26 +5,14 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "event_id",
-    "timestamp",
+    "timestamp_unix",
     "project_id",
     "environment",
-    "generation",
-    "deployment_id",
-    "correlation_id",
-    "type",
-    "severity",
-    "payload",
-    "redacted"
+    "event_type"
   ],
   "properties": {
-    "event_id": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "timestamp": {
-      "type": "string",
-      "format": "date-time"
+    "timestamp_unix": {
+      "type": "integer"
     },
     "project_id": {
       "type": "string",
@@ -42,49 +30,28 @@
       "minimum": 1
     },
     "deployment_id": {
-      "type": "string",
-      "format": "uuid"
+      "type": "string"
     },
-    "correlation_id": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "type": {
+    "event_type": {
       "enum": [
-        "DEPLOYMENT_QUEUED",
+        "REQUIRED_SECRET_MISSING",
         "DEPLOYMENT_STARTED",
-        "SOURCE_FETCH_STARTED",
-        "IMAGE_BUILD_STARTED",
-        "IMAGE_BUILD_COMPLETED",
-        "CONTAINER_CREATED",
+        "IMAGE_BUILT",
+        "RUNTIME_ENV_PREPARED",
         "CONTAINER_STARTED",
+        "SNAPSHOT_FINALIZED",
+        "GENERATION_PROMOTED",
+        "VALIDATION_PASSED",
+        "GENERATION_FAILED",
         "TCP_PROBE_FAILED",
         "HTTP_PROBE_FAILED",
-        "CONTRACT_VALIDATION_FAILED",
-        "ROUTE_UPDATED",
-        "ROUTE_ACTIVATION_CONFIRMED",
-        "DEPLOYMENT_CONVERGED",
-        "DEPLOYMENT_DEGRADED",
-        "ROLLBACK_STARTED",
-        "ROLLBACK_COMPLETED",
-        "DEPLOYMENT_FAILED",
-        "CLEANUP_COMPLETED"
+        "FAILED_GENERATION_TOMBSTONED",
+        "FAILED_GENERATION_CLEANED",
+        "ROLLBACK_COMPLETED"
       ]
     },
-    "severity": {
-      "enum": [
-        "debug",
-        "info",
-        "warn",
-        "error"
-      ]
-    },
-    "payload": {
-      "type": "object",
-      "additionalProperties": true
-    },
-    "redacted": {
-      "type": "boolean"
+    "reason": {
+      "type": "string"
     }
   }
 }
