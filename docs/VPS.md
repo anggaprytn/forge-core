@@ -117,7 +117,8 @@ Future derived app domains require wildcard DNS aimed at the VPS:
 
 Example future domains:
 
-- `api-k7x9q2.forge.example.com`
+- `api.forge.example.com`
+- `api-k7x9q2.forge.example.com` (collision fallback)
 - `staging-api-k7x9q2.forge.example.com`
 - `development-api-k7x9q2.forge.example.com`
 

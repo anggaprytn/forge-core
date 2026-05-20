@@ -335,7 +335,7 @@ components:
           type:
             - string
             - 'null'
-          description: Optional explicit base domain. When omitted, Forge generates and persists a stable domain using FORGE_APPS_DOMAIN.
+          description: Optional explicit base domain. When omitted, Forge generates and persists a stable domain using FORGE_APPS_DOMAIN, preferring `<project_id>.<FORGE_APPS_DOMAIN>` and falling back to a short suffix only on collision.
     Project:
       type: object
       required:

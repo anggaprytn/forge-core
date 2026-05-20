@@ -14,6 +14,7 @@ pub enum ProjectRegistryError {
     InvalidRepoUrl(String),
     InvalidDefaultBranch,
     InvalidBaseDomain(String),
+    BaseDomainAlreadyInUse(String),
     MissingAppsDomain,
 }
 
@@ -28,6 +29,12 @@ impl Display for ProjectRegistryError {
             Self::InvalidRepoUrl(message) => write!(f, "{message}"),
             Self::InvalidDefaultBranch => write!(f, "default_branch must not be empty"),
             Self::InvalidBaseDomain(message) => write!(f, "{message}"),
+            Self::BaseDomainAlreadyInUse(base_domain) => {
+                write!(
+                    f,
+                    "base_domain is already used by another project: {base_domain}"
+                )
+            }
             Self::MissingAppsDomain => write!(
                 f,
                 "FORGE_APPS_DOMAIN is required when base_domain is not provided"
@@ -65,6 +72,8 @@ pub struct ProjectRegistryStore {
 }
 
 impl ProjectRegistryStore {
+    const GENERATED_DOMAIN_MAX_ATTEMPTS: usize = 4;
+
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
@@ -85,6 +94,7 @@ impl ProjectRegistryStore {
             .map(|project| project.created_at_unix)
             .unwrap_or_else(unix_now);
         let (domain_mode, base_domain) = resolve_domain(
+            self,
             &project_id,
             request.base_domain,
             existing.as_ref(),
@@ -174,6 +184,14 @@ impl ProjectRegistryStore {
     fn project_file(&self, project_id: &str) -> PathBuf {
         self.projects_root().join(project_id).join("project.json")
     }
+
+    fn find_domain_owner(&self, base_domain: &str) -> Result<Option<String>, ProjectRegistryError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|project| project.base_domain == base_domain)
+            .map(|project| project.project_id))
+    }
 }
 
 pub fn project_registry_error_response(
@@ -215,6 +233,13 @@ pub fn project_registry_error_response(
                 message,
             },
         ),
+        ProjectRegistryError::BaseDomainAlreadyInUse(base_domain) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            ErrorResponse {
+                code: "base_domain_conflict".into(),
+                message: format!("base_domain is already used by another project: {base_domain}"),
+            },
+        ),
         ProjectRegistryError::MissingAppsDomain => (
             axum::http::StatusCode::BAD_REQUEST,
             ErrorResponse {
@@ -226,6 +251,7 @@ pub fn project_registry_error_response(
 }
 
 fn resolve_domain(
+    store: &ProjectRegistryStore,
     project_id: &str,
     requested_base_domain: Option<String>,
     existing: Option<&ProjectRecord>,
@@ -233,6 +259,7 @@ fn resolve_domain(
 ) -> Result<(String, String), ProjectRegistryError> {
     if let Some(base_domain) = requested_base_domain {
         let normalized = normalize_hostname(&base_domain)?;
+        ensure_domain_available(store, project_id, &normalized)?;
         return Ok(("explicit".into(), normalized));
     }
 
@@ -242,10 +269,47 @@ fn resolve_domain(
 
     let apps_domain = apps_domain.ok_or(ProjectRegistryError::MissingAppsDomain)?;
     let apps_domain = normalize_hostname(apps_domain)?;
-    let shortid = generate_shortid(project_id);
-    let generated = format!("{project_id}-{shortid}.{apps_domain}");
-    let generated = normalize_hostname(&generated)?;
-    Ok(("generated".into(), generated))
+    let preferred = normalize_hostname(&format!("{project_id}.{apps_domain}"))?;
+    if domain_available(store, project_id, &preferred)? {
+        return Ok(("generated".into(), preferred));
+    }
+
+    for attempt in 0..ProjectRegistryStore::GENERATED_DOMAIN_MAX_ATTEMPTS {
+        let shortid = generate_shortid(project_id, attempt);
+        let generated = normalize_hostname(&format!("{project_id}-{shortid}.{apps_domain}"))?;
+        if domain_available(store, project_id, &generated)? {
+            return Ok(("generated".into(), generated));
+        }
+    }
+
+    Err(ProjectRegistryError::BaseDomainAlreadyInUse(format!(
+        "{project_id}.{apps_domain}"
+    )))
+}
+
+fn domain_available(
+    store: &ProjectRegistryStore,
+    project_id: &str,
+    base_domain: &str,
+) -> Result<bool, ProjectRegistryError> {
+    Ok(match store.find_domain_owner(base_domain)? {
+        Some(owner) => owner == project_id,
+        None => true,
+    })
+}
+
+fn ensure_domain_available(
+    store: &ProjectRegistryStore,
+    project_id: &str,
+    base_domain: &str,
+) -> Result<(), ProjectRegistryError> {
+    if domain_available(store, project_id, base_domain)? {
+        return Ok(());
+    }
+
+    Err(ProjectRegistryError::BaseDomainAlreadyInUse(
+        base_domain.to_string(),
+    ))
 }
 
 fn normalize_project_id(input: &str) -> Result<String, ProjectRegistryError> {
@@ -319,9 +383,14 @@ fn normalize_hostname(input: &str) -> Result<String, ProjectRegistryError> {
     Ok(value)
 }
 
-fn generate_shortid(project_id: &str) -> String {
+fn generate_shortid(project_id: &str, attempt: usize) -> String {
     let mut hasher = Sha256::new();
     hasher.update(project_id.as_bytes());
+    hasher.update(attempt.to_string().as_bytes());
+    #[cfg(test)]
+    if let Some(shortid) = take_test_shortid() {
+        return shortid;
+    }
     hasher.update(unix_now().to_string().as_bytes());
     hasher.update(std::process::id().to_string().as_bytes());
     hasher.update(
@@ -349,6 +418,26 @@ fn unix_now() -> u64 {
 }
 
 #[cfg(test)]
+fn test_shortids() -> &'static std::sync::Mutex<Vec<String>> {
+    use std::sync::{Mutex, OnceLock};
+
+    static SHORTIDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    SHORTIDS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn take_test_shortid() -> Option<String> {
+    test_shortids().lock().unwrap().pop()
+}
+
+#[cfg(test)]
+fn set_test_shortids(shortids: &[&str]) {
+    let mut values = test_shortids().lock().unwrap();
+    values.clear();
+    values.extend(shortids.iter().rev().map(|value| (*value).to_string()));
+}
+
+#[cfg(test)]
 fn test_root(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -371,7 +460,7 @@ mod tests {
             project_id: project_id.into(),
             repo_url: "https://github.com/example/api.git".into(),
             default_branch: "main".into(),
-            base_domain: Some("api.example.com".into()),
+            base_domain: Some(format!("{project_id}.example.com")),
         }
     }
 
@@ -443,20 +532,36 @@ mod tests {
     }
 
     #[test]
-    fn project_add_generates_domain_when_omitted() {
-        let root = test_root("generated-domain");
+    fn project_add_generates_clean_domain_when_available() {
+        let root = test_root("generated-clean-domain");
         let store = ProjectRegistryStore::new(&root);
         let mut request = request("api");
         request.base_domain = None;
 
         let created = store.upsert(request, Some("forge.example.com")).unwrap();
         assert_eq!(created.domain_mode, "generated");
-        assert!(created.base_domain.starts_with("api-"));
-        assert!(created.base_domain.ends_with(".forge.example.com"));
+        assert_eq!(created.base_domain, "api.forge.example.com");
     }
 
     #[test]
-    fn project_add_preserves_generated_domain_on_update() {
+    fn project_add_generates_suffixed_domain_on_collision() {
+        let root = test_root("generated-suffixed-domain");
+        let store = ProjectRegistryStore::new(&root);
+        let mut first = request("web");
+        first.base_domain = Some("api.forge.example.com".into());
+        store.upsert(first, Some("forge.example.com")).unwrap();
+
+        let mut second = request("api");
+        second.base_domain = None;
+        set_test_shortids(&["abcd1234"]);
+
+        let created = store.upsert(second, Some("forge.example.com")).unwrap();
+        assert_eq!(created.domain_mode, "generated");
+        assert_eq!(created.base_domain, "api-abcd1234.forge.example.com");
+    }
+
+    #[test]
+    fn project_update_preserves_generated_domain() {
         let root = test_root("preserve-generated");
         let store = ProjectRegistryStore::new(&root);
         let mut request = request("api");
@@ -474,7 +579,28 @@ mod tests {
     }
 
     #[test]
-    fn project_add_uses_explicit_domain_when_provided() {
+    fn project_add_rejects_explicit_domain_collision() {
+        let root = test_root("explicit-domain-collision");
+        let store = ProjectRegistryStore::new(&root);
+
+        store
+            .upsert(request("api"), Some("forge.example.com"))
+            .unwrap();
+        let mut request = request("web");
+        request.base_domain = Some("api.example.com".into());
+
+        let err = store
+            .upsert(request, Some("forge.example.com"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectRegistryError::BaseDomainAlreadyInUse(base_domain)
+            if base_domain == "api.example.com"
+        ));
+    }
+
+    #[test]
+    fn project_add_preserves_explicit_domain_behavior() {
         let root = test_root("explicit-domain");
         let store = ProjectRegistryStore::new(&root);
 
@@ -483,6 +609,35 @@ mod tests {
             .unwrap();
         assert_eq!(created.domain_mode, "explicit");
         assert_eq!(created.base_domain, "api.example.com");
+    }
+
+    #[test]
+    fn project_add_fails_when_generated_suffix_attempts_are_exhausted() {
+        let root = test_root("generated-domain-exhausted");
+        let store = ProjectRegistryStore::new(&root);
+
+        let mut existing = request("existing");
+        existing.base_domain = Some("api.forge.example.com".into());
+        store.upsert(existing, Some("forge.example.com")).unwrap();
+
+        for suffix in ["aaaa0001", "aaaa0002", "aaaa0003", "aaaa0004"] {
+            let mut taken = request(&format!("taken-{suffix}"));
+            taken.base_domain = Some(format!("api-{suffix}.forge.example.com"));
+            store.upsert(taken, Some("forge.example.com")).unwrap();
+        }
+
+        let mut request = request("api");
+        request.base_domain = None;
+        set_test_shortids(&["aaaa0001", "aaaa0002", "aaaa0003", "aaaa0004"]);
+
+        let err = store
+            .upsert(request, Some("forge.example.com"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectRegistryError::BaseDomainAlreadyInUse(base_domain)
+            if base_domain == "api.forge.example.com"
+        ));
     }
 
     #[test]

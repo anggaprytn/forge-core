@@ -93,7 +93,8 @@ Rules:
 
 - `--branch` defaults to `main`.
 - If `--domain` is provided, Forge stores it as an explicit `base_domain`.
-- If `--domain` is omitted on first creation, Forge generates `<project_id>-<shortid>.<FORGE_APPS_DOMAIN>`.
+- If `--domain` is omitted on first creation, Forge first tries `<project_id>.<FORGE_APPS_DOMAIN>`.
+- If that clean domain is already used by another project, Forge falls back to `<project_id>-<shortid>.<FORGE_APPS_DOMAIN>`.
 - Generated domains stay stable after the first creation and are not regenerated when `repo_url` or `default_branch` changes.
 - `FORGE_APPS_DOMAIN` is required only when Forge must generate a domain.
 - Repository URLs with embedded HTTP credentials such as `https://token@github.com/...` are rejected.
