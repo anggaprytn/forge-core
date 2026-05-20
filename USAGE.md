@@ -177,7 +177,8 @@ ready
 ```
 
 `/metrics` returns Prometheus text exposition for operational visibility.
-`/` returns a tiny built-in landing page.
+`/` returns the embedded `web/index.html` landing page.
+The alpha web UI is intentionally framework-free: plain HTML, CSS, and vanilla JS served directly by Forge with no frontend build step.
 CLI login uses a short-lived browser approval flow:
 
 ```bash

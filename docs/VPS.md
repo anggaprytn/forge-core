@@ -121,6 +121,7 @@ FORGE_CLI_TOKEN_SECRET=...
 `FORGE_CLI_TOKEN_SECRET` signs CLI bearer tokens issued after browser approval.
 
 `/login` starts the GitHub OAuth flow, `/app` requires the resulting session cookie, `/login/cli?code=...` serves the CLI approval page, and `/api/cli-login/*` drives the short-lived browser approval flow used by `forge login`.
+The static control-plane assets under `web/` are served by Forge itself, so the same process remains authoritative for auth, session validation, and protected page delivery.
 CLI commands and bearer-token API auth remain available for automation and operator usage. Web actions are not a separate deployment engine; they flow through the same API and queue.
 
 ---

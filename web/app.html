@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Forge Control</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="panel app-panel">
+        <div class="app-header">
+          <div>
+            <p class="eyebrow">Authenticated</p>
+            <h1>Forge Control</h1>
+          </div>
+          <form action="/logout" method="post">
+            <button class="button button-secondary" type="submit">Log out</button>
+          </form>
+        </div>
+
+        <p class="lede">Signed in as <strong>__GITHUB_LOGIN__</strong>.</p>
+        <p class="page-note">
+          Forge web login is for human operators. CLI and bearer-token API access remain available for automation.
+        </p>
+
+        <section class="status-grid" aria-label="Runtime visibility">
+          <article class="status-card">
+            <h2>Health</h2>
+            <p id="healthz-status">Checking...</p>
+          </article>
+          <article class="status-card">
+            <h2>Readiness</h2>
+            <p id="readyz-status">Checking...</p>
+          </article>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -38,7 +38,11 @@ const X_GITHUB_EVENT: &str = "x-github-event";
 const X_HUB_SIGNATURE_256: &str = "x-hub-signature-256";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const CORRELATION_ID_HEADER: &str = "x-correlation-id";
-const DEFAULT_LANDING_PAGE: &str = include_str!("../static/index.html");
+const WEB_INDEX_HTML: &str = include_str!("../web/index.html");
+const WEB_LOGIN_HTML: &str = include_str!("../web/login.html");
+const WEB_APP_HTML: &str = include_str!("../web/app.html");
+const WEB_STYLES_CSS: &str = include_str!("../web/styles.css");
+const WEB_APP_JS: &str = include_str!("../web/app.js");
 const WEB_LOGIN_REQUIRED_ENV_VARS: [&str; 4] = [
     "FORGE_GITHUB_OAUTH_CLIENT_ID",
     "FORGE_GITHUB_OAUTH_CLIENT_SECRET",
@@ -674,6 +678,8 @@ pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", get(get_root))
         .route("/login", get(get_login))
+        .route("/styles.css", get(get_styles))
+        .route("/app.js", get(get_app_js))
         .route(
             "/login/cli",
             get(get_login_cli).post(post_login_cli_approve),
@@ -697,7 +703,7 @@ pub fn router(state: HttpState) -> Router {
 }
 
 async fn get_root() -> Response {
-    html_response(StatusCode::OK, DEFAULT_LANDING_PAGE)
+    html_response(StatusCode::OK, WEB_INDEX_HTML)
 }
 
 async fn get_login(State(state): State<HttpState>, headers: HeaderMap) -> Response {
@@ -708,58 +714,44 @@ async fn get_login(State(state): State<HttpState>, headers: HeaderMap) -> Respon
     }
 
     let body = if state.web_auth.config.is_some() {
-        concat!(
-            "<!doctype html>\n",
-            "<html lang=\"en\">\n",
-            "<head>\n",
-            "  <meta charset=\"utf-8\">\n",
-            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
-            "  <title>Forge Login</title>\n",
-            "</head>\n",
-            "<body>\n",
-            "  <main>\n",
-            "    <h1>Forge Login</h1>\n",
-            "    <p>Forge web login is the primary operator entrypoint.</p>\n",
-            "    <p><a href=\"/oauth/github/start\">Continue with GitHub</a></p>\n",
-            "    <p>CLI and bearer-token API access remain available for automation.</p>\n",
-            "  </main>\n",
-            "</body>\n",
-            "</html>\n",
+        render_login_page(
+            "<a class=\"button\" href=\"/oauth/github/start\">Continue with GitHub</a>",
+            "<p class=\"page-note\">CLI and bearer-token API access remain available for automation.</p>",
         )
-        .to_string()
     } else {
-        format!(
-            concat!(
-                "<!doctype html>\n",
-                "<html lang=\"en\">\n",
-                "<head>\n",
-                "  <meta charset=\"utf-8\">\n",
-                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
-                "  <title>Forge Login</title>\n",
-                "</head>\n",
-                "<body>\n",
-                "  <main>\n",
-                "    <h1>Forge Login</h1>\n",
-                "    <p>GitHub OAuth login is not configured yet.</p>\n",
-                "    <p>Expected env vars:</p>\n",
-                "    <ul>\n",
-                "      <li>{}</li>\n",
-                "      <li>{}</li>\n",
-                "      <li>{}</li>\n",
-                "      <li>{}</li>\n",
-                "    </ul>\n",
-                "  </main>\n",
-                "</body>\n",
-                "</html>\n",
+        render_login_page(
+            "<p class=\"status-block\">GitHub OAuth login is not configured yet.</p>",
+            &format!(
+                concat!(
+                    "<p class=\"page-note\">Expected env vars:</p>",
+                    "<ul class=\"env-list\">",
+                    "<li>{}</li>",
+                    "<li>{}</li>",
+                    "<li>{}</li>",
+                    "<li>{}</li>",
+                    "</ul>"
+                ),
+                WEB_LOGIN_REQUIRED_ENV_VARS[0],
+                WEB_LOGIN_REQUIRED_ENV_VARS[1],
+                WEB_LOGIN_REQUIRED_ENV_VARS[2],
+                WEB_LOGIN_REQUIRED_ENV_VARS[3],
             ),
-            WEB_LOGIN_REQUIRED_ENV_VARS[0],
-            WEB_LOGIN_REQUIRED_ENV_VARS[1],
-            WEB_LOGIN_REQUIRED_ENV_VARS[2],
-            WEB_LOGIN_REQUIRED_ENV_VARS[3],
         )
     };
 
     html_response(StatusCode::OK, body)
+}
+
+async fn get_styles() -> Response {
+    asset_response(StatusCode::OK, "text/css; charset=utf-8", WEB_STYLES_CSS)
+}
+
+async fn get_app_js() -> Response {
+    asset_response(
+        StatusCode::OK,
+        "application/javascript; charset=utf-8",
+        WEB_APP_JS,
+    )
 }
 
 async fn get_login_cli(
@@ -1037,32 +1029,9 @@ async fn get_app(State(state): State<HttpState>, headers: HeaderMap) -> Response
         return redirect_response("/login");
     };
 
-    let login = escape_html(&session.github_login);
     html_response(
         StatusCode::OK,
-        format!(
-            concat!(
-                "<!doctype html>\n",
-                "<html lang=\"en\">\n",
-                "<head>\n",
-                "  <meta charset=\"utf-8\">\n",
-                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
-                "  <title>Forge Control</title>\n",
-                "</head>\n",
-                "<body>\n",
-                "  <main>\n",
-                "    <h1>Forge Control</h1>\n",
-                "    <p>Signed in as {}.</p>\n",
-                "    <p>Forge web login is for human operators. CLI and bearer-token API access remain available for automation.</p>\n",
-                "    <form action=\"/logout\" method=\"post\">\n",
-                "      <button type=\"submit\">Log out</button>\n",
-                "    </form>\n",
-                "  </main>\n",
-                "</body>\n",
-                "</html>\n",
-            ),
-            login
-        ),
+        WEB_APP_HTML.replace("__GITHUB_LOGIN__", &escape_html(&session.github_login)),
     )
 }
 
@@ -1781,10 +1750,18 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn html_response(status: StatusCode, body: impl Into<String>) -> Response {
+    asset_response(status, "text/html; charset=utf-8", body)
+}
+
+fn asset_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<String>,
+) -> Response {
     let mut response = (status, body.into()).into_response();
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
+        HeaderValue::from_static(content_type),
     );
     response
 }
@@ -1989,6 +1966,12 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn render_login_page(primary: &str, secondary: &str) -> String {
+    WEB_LOGIN_HTML
+        .replace("__LOGIN_PRIMARY__", primary)
+        .replace("__LOGIN_SECONDARY__", secondary)
 }
 
 fn json_response<T>(status: StatusCode, request_id: &str, body: Json<T>) -> Response
@@ -2239,7 +2222,7 @@ pub mod http_requires_bearer_token {
 }
 
 #[cfg(test)]
-pub mod root_endpoint_returns_html {
+pub mod root_serves_web_index {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -2266,12 +2249,13 @@ pub mod root_endpoint_returns_html {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Forge"));
+        assert!(body.contains("Forge Runtime"));
+        assert!(body.contains("/styles.css"));
     }
 }
 
 #[cfg(test)]
-pub mod login_endpoint_returns_html {
+pub mod login_serves_web_login {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -2299,6 +2283,7 @@ pub mod login_endpoint_returns_html {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("Forge Login"));
+        assert!(body.contains("/styles.css"));
     }
 }
 
@@ -2716,7 +2701,7 @@ pub mod oauth_callback_creates_session_cookie {
 }
 
 #[cfg(test)]
-pub mod app_requires_session {
+pub mod app_requires_valid_session {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -2736,6 +2721,83 @@ pub mod app_requires_session {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+}
+
+#[cfg(test)]
+pub mod static_assets_do_not_expose_secrets {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn static_assets_do_not_expose_secrets() {
+        let app = router(build_cli_login_state());
+
+        for path in ["/styles.css", "/app.js"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(axum::http::Method::GET)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(!body.contains("test-session-secret"));
+            assert!(!body.contains("forge_session"));
+            assert!(!body.contains("FORGE_SESSION_SECRET"));
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod app_page_preserves_auth_gate {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn app_page_preserves_auth_gate() {
+        let state = build_cli_login_state();
+        let config = state.web_auth.config.clone().unwrap();
+        let session_cookie = encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &config.session_secret,
+        )
+        .unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/app")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Forge Control"));
+        assert!(body.contains("octocat"));
+        assert!(body.contains("/app.js"));
     }
 }
 

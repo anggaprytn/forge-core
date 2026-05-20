@@ -100,6 +100,7 @@ Forge has been manually validated on a real VPS with the following:
 - Forge server owns the deployment queue, source resolution, immutable snapshots, convergence, routes, rollback, and restart recovery.
 - The Forge CLI is a stateless operator/client surface.
 - The web UI is a visibility and control surface for humans.
+- The framework-free web assets live in `web/` and are embedded by the Rust server so auth and route gating stay server-side.
 - The API is the automation surface.
 - CLI, API, and web actions must converge into the same deployment queue and deployment state machine.
 
@@ -349,9 +350,9 @@ forge secrets set <project> <env> <k> <v>    # Set runtime secrets
 
 ## HTTP Surface
 
-- `GET /` serves a built-in landing page so the root path does not 404.
+- `GET /` serves `web/index.html`.
 - `GET /login` is the primary human-operator login entrypoint and starts a GitHub OAuth web session.
-- `GET /app` requires a signed HTTP-only session cookie and serves the minimal Forge Control page.
+- `GET /app` requires a signed HTTP-only session cookie and serves `web/app.html`.
 - `GET /logout` and `POST /logout` clear the web session.
 - `POST /api/cli-login/start` creates a short-lived CLI login request.
 - `GET /login/cli?code=...` serves the browser approval page and reuses the existing web session.
