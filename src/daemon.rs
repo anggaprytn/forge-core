@@ -442,7 +442,14 @@ fn resolve_deployment_source(
             request.source_path.as_deref(),
             request.source_ref.as_deref(),
         )
-        .map_err(source_resolver_error_to_response)
+        .map_err(|err| {
+            let response = source_resolver_error_to_response(err);
+            eprintln!(
+                "forge source resolution failed: project={} environment={} reason={}",
+                request.project_id, request.environment, response.message
+            );
+            response
+        })
 }
 
 fn source_resolver_error_to_response(err: SourceResolverError) -> ErrorResponse {
@@ -471,11 +478,19 @@ fn source_resolver_error_to_response(err: SourceResolverError) -> ErrorResponse 
             code: "git_source_unavailable".into(),
             message,
         },
-        SourceResolverError::CheckoutConflict(path) => ErrorResponse {
+        SourceResolverError::CheckoutConflict {
+            path,
+            repo_url,
+            source_ref,
+            commit_sha,
+        } => ErrorResponse {
             code: "source_checkout_conflict".into(),
             message: format!(
-                "source checkout path already exists but does not match the requested commit: {}",
-                path.display()
+                "source checkout path already exists but does not match the requested commit: path={} repo={} ref={} sha={}",
+                path.display(),
+                repo_url,
+                source_ref,
+                commit_sha
             ),
         },
         SourceResolverError::Io(err) => ErrorResponse {
@@ -1018,6 +1033,30 @@ pub mod deploy_from_path_rejects_missing_directory {
 
         assert_eq!(response.code, "invalid_source_path");
         assert!(response.message.contains("missing"));
+    }
+}
+
+#[cfg(test)]
+pub mod source_resolution_failure_reports_repo_ref_and_sha {
+    use super::*;
+
+    #[test]
+    fn checkout_conflict_response_includes_resolution_context() {
+        let response = source_resolver_error_to_response(SourceResolverError::CheckoutConflict {
+            path: PathBuf::from("/tmp/source-checkouts/api/abc123"),
+            repo_url: "https://github.com/example/api.git".into(),
+            source_ref: "main".into(),
+            commit_sha: "abc123".into(),
+        });
+
+        assert_eq!(response.code, "source_checkout_conflict");
+        assert!(
+            response
+                .message
+                .contains("repo=https://github.com/example/api.git")
+        );
+        assert!(response.message.contains("ref=main"));
+        assert!(response.message.contains("sha=abc123"));
     }
 }
 

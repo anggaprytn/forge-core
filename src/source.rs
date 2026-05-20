@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 use crate::projects::{ProjectRegistryError, ProjectRegistryStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +24,12 @@ pub enum SourceResolverError {
     InvalidSourceRef,
     InvalidRepoUrl(String),
     GitCommand(String),
-    CheckoutConflict(PathBuf),
+    CheckoutConflict {
+        path: PathBuf,
+        repo_url: String,
+        source_ref: String,
+        commit_sha: String,
+    },
 }
 
 impl Display for SourceResolverError {
@@ -37,10 +44,18 @@ impl Display for SourceResolverError {
             Self::InvalidSourceRef => write!(f, "source_ref must not be empty"),
             Self::InvalidRepoUrl(message) => write!(f, "{message}"),
             Self::GitCommand(message) => write!(f, "{message}"),
-            Self::CheckoutConflict(path) => write!(
+            Self::CheckoutConflict {
+                path,
+                repo_url,
+                source_ref,
+                commit_sha,
+            } => write!(
                 f,
-                "source checkout path already exists but does not match the requested commit: {}",
-                path.display()
+                "source checkout path already exists but does not match the requested commit: path={} repo={} ref={} sha={}",
+                path.display(),
+                repo_url,
+                source_ref,
+                commit_sha
             ),
         }
     }
@@ -99,12 +114,16 @@ impl SourceResolver {
         let repository_path = self.repository_cache_path(project_id);
         prepare_repository(&repository_path, &repo_url)?;
         fetch_repository(&repository_path)?;
-        let commit_sha = resolve_commit_sha(&repository_path, &source_ref)?;
+        let commit_sha = resolve_commit_sha(&repository_path, &source_ref)
+            .map_err(|err| err.with_resolution_context(&repo_url, &source_ref, None))?;
         let source_path = ensure_checkout(
             &self.source_checkout_path(project_id, &commit_sha),
             &repository_path,
+            &repo_url,
+            &source_ref,
             &commit_sha,
-        )?;
+        )
+        .map_err(|err| err.with_resolution_context(&repo_url, &source_ref, Some(&commit_sha)))?;
 
         Ok(ResolvedDeploymentSource {
             source_path: Some(source_path),
@@ -123,6 +142,22 @@ impl SourceResolver {
             .join("source-checkouts")
             .join(project_id)
             .join(commit_sha)
+    }
+}
+
+impl SourceResolverError {
+    fn with_resolution_context(
+        self,
+        repo_url: &str,
+        source_ref: &str,
+        commit_sha: Option<&str>,
+    ) -> Self {
+        match self {
+            Self::GitCommand(message) => Self::GitCommand(format_resolution_failure(
+                repo_url, source_ref, commit_sha, &message,
+            )),
+            other => other,
+        }
     }
 }
 
@@ -254,26 +289,41 @@ fn resolve_commit_sha(
 }
 
 fn ref_candidates(source_ref: &str) -> Vec<String> {
-    vec![
-        format!("{source_ref}^{{commit}}"),
-        format!("refs/remotes/origin/{source_ref}^{{commit}}"),
-        format!("refs/tags/{source_ref}^{{commit}}"),
-    ]
+    let mut candidates = Vec::new();
+    if let Some(branch_name) = source_ref.strip_prefix("refs/heads/") {
+        candidates.push(format!("refs/remotes/origin/{branch_name}^{{commit}}"));
+    } else if source_ref.starts_with("refs/remotes/origin/") {
+        candidates.push(format!("{source_ref}^{{commit}}"));
+    } else if source_ref.starts_with("refs/tags/") {
+        candidates.push(format!("{source_ref}^{{commit}}"));
+    } else {
+        candidates.push(format!("refs/remotes/origin/{source_ref}^{{commit}}"));
+        candidates.push(format!("refs/tags/{source_ref}^{{commit}}"));
+    }
+    candidates.push(format!("{source_ref}^{{commit}}"));
+    candidates
 }
 
 fn ensure_checkout(
     checkout_path: &Path,
     repository_path: &Path,
+    repo_url: &str,
+    source_ref: &str,
     commit_sha: &str,
 ) -> Result<PathBuf, SourceResolverError> {
     if checkout_path.exists() {
         let head = rev_parse(checkout_path, "HEAD^{commit}")?;
-        if head.as_deref() == Some(commit_sha) {
+        if head.as_deref() == Some(commit_sha)
+            && checkout_metadata_matches(checkout_path, repo_url, commit_sha)?
+        {
             return Ok(checkout_path.to_path_buf());
         }
-        return Err(SourceResolverError::CheckoutConflict(
-            checkout_path.to_path_buf(),
-        ));
+        return Err(SourceResolverError::CheckoutConflict {
+            path: checkout_path.to_path_buf(),
+            repo_url: repo_url.to_string(),
+            source_ref: source_ref.to_string(),
+            commit_sha: commit_sha.to_string(),
+        });
     }
 
     fs::create_dir_all(
@@ -293,7 +343,69 @@ fn ensure_checkout(
             commit_sha,
         ],
     )?;
+    write_checkout_metadata(checkout_path, repo_url, source_ref, commit_sha)?;
     Ok(checkout_path.to_path_buf())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckoutMetadata {
+    repo_url: String,
+    source_ref: String,
+    commit_sha: String,
+}
+
+fn checkout_metadata_matches(
+    checkout_path: &Path,
+    repo_url: &str,
+    commit_sha: &str,
+) -> Result<bool, SourceResolverError> {
+    let path = checkout_metadata_path(checkout_path);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(path)?;
+    let metadata: CheckoutMetadata = serde_json::from_str(&raw).map_err(|err| {
+        SourceResolverError::GitCommand(format!(
+            "invalid source checkout metadata in {}: {err}",
+            checkout_path.display()
+        ))
+    })?;
+    Ok(metadata.repo_url == repo_url && metadata.commit_sha == commit_sha)
+}
+
+fn write_checkout_metadata(
+    checkout_path: &Path,
+    repo_url: &str,
+    source_ref: &str,
+    commit_sha: &str,
+) -> Result<(), SourceResolverError> {
+    let metadata = CheckoutMetadata {
+        repo_url: repo_url.to_string(),
+        source_ref: source_ref.to_string(),
+        commit_sha: commit_sha.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&metadata).map_err(|err| {
+        SourceResolverError::GitCommand(format!(
+            "failed to serialize source checkout metadata for {}: {err}",
+            checkout_path.display()
+        ))
+    })?;
+    fs::write(checkout_metadata_path(checkout_path), bytes)?;
+    Ok(())
+}
+
+fn checkout_metadata_path(checkout_path: &Path) -> PathBuf {
+    checkout_path.join(".forge-source.json")
+}
+
+fn format_resolution_failure(
+    repo_url: &str,
+    source_ref: &str,
+    commit_sha: Option<&str>,
+    message: &str,
+) -> String {
+    let sha = commit_sha.unwrap_or("unknown");
+    format!("source resolution failed: repo={repo_url} ref={source_ref} sha={sha}: {message}")
 }
 
 fn rev_parse(
@@ -406,6 +518,14 @@ fn create_git_repo(root: &Path) -> (PathBuf, String) {
 }
 
 #[cfg(test)]
+fn commit_file(repo: &Path, path: &str, contents: &str, message: &str) -> String {
+    fs::write(repo.join(path), contents).unwrap();
+    git_test(repo, &["add", path]);
+    git_test(repo, &["commit", "-m", message]);
+    git_test(repo, &["rev-parse", "HEAD"])
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -488,5 +608,73 @@ mod tests {
 
         assert_eq!(first.source_path, second.source_path);
         assert_eq!(second.commit_sha.as_deref(), Some(commit_sha.as_str()));
+    }
+
+    #[test]
+    fn deploy_by_ref_fetches_updated_remote_branch() {
+        let root = test_root("fetch-updated-remote-branch");
+        let (remote, first_commit) = create_git_repo(&root);
+        create_project_registry(&root, "api", remote.to_str().unwrap(), "main");
+        let resolver = SourceResolver::new(&root);
+
+        let first = resolver.resolve("api", None, Some("main")).unwrap();
+        let second_commit = commit_file(&remote, "forge.yml", "version: 2\n", "update forge");
+        let second = resolver.resolve("api", None, Some("main")).unwrap();
+
+        assert_eq!(first.commit_sha.as_deref(), Some(first_commit.as_str()));
+        assert_eq!(second.commit_sha.as_deref(), Some(second_commit.as_str()));
+        assert_ne!(first.source_path, second.source_path);
+        assert_eq!(
+            fs::read_to_string(second.source_path.unwrap().join("forge.yml")).unwrap(),
+            "version: 2\n"
+        );
+    }
+
+    #[test]
+    fn deploy_by_ref_does_not_reuse_stale_branch_checkout() {
+        let root = test_root("stale-branch-checkout");
+        let (remote, first_commit) = create_git_repo(&root);
+        create_project_registry(&root, "api", remote.to_str().unwrap(), "main");
+        let resolver = SourceResolver::new(&root);
+
+        resolver.resolve("api", None, Some("main")).unwrap();
+        let cached_repo = root.join("repositories").join("api");
+        git_test(&cached_repo, &["checkout", "--detach", &first_commit]);
+        git_test(&cached_repo, &["branch", "-f", "main", &first_commit]);
+
+        let second_commit = commit_file(&remote, "forge.yml", "runtime: node\n", "move main");
+        let resolved = resolver.resolve("api", None, Some("main")).unwrap();
+
+        assert_eq!(resolved.commit_sha.as_deref(), Some(second_commit.as_str()));
+        assert_eq!(
+            fs::read_to_string(resolved.source_path.unwrap().join("forge.yml")).unwrap(),
+            "runtime: node\n"
+        );
+    }
+
+    #[test]
+    fn source_checkout_contains_resolved_commit_contents() {
+        let root = test_root("checkout-contains-resolved-commit");
+        let (remote, _) = create_git_repo(&root);
+        let forge_yml = "version: 1\nruntime:\n  port: 8080\n";
+        let commit_sha = commit_file(&remote, "forge.yml", forge_yml, "add forge manifest");
+        create_project_registry(&root, "api", remote.to_str().unwrap(), "main");
+
+        let resolved = SourceResolver::new(&root)
+            .resolve("api", None, Some("main"))
+            .unwrap();
+        let source_path = resolved.source_path.unwrap();
+
+        assert_eq!(resolved.commit_sha.as_deref(), Some(commit_sha.as_str()));
+        assert_eq!(
+            fs::read_to_string(source_path.join("forge.yml")).unwrap(),
+            forge_yml
+        );
+
+        let metadata_raw = fs::read_to_string(source_path.join(".forge-source.json")).unwrap();
+        let metadata: CheckoutMetadata = serde_json::from_str(&metadata_raw).unwrap();
+        assert_eq!(metadata.repo_url, remote.to_str().unwrap());
+        assert_eq!(metadata.source_ref, "main");
+        assert_eq!(metadata.commit_sha, resolved.commit_sha.unwrap());
     }
 }
