@@ -149,10 +149,11 @@ Create `/etc/forge/forge.env`:
 ```bash
 FORGE_MASTER_KEY=<64 hex characters>
 FORGE_CADDY_ADMIN_URL=http://127.0.0.1:2019
-FORGE_CADDY_PUBLIC_URL=http://127.0.0.1
+FORGE_CADDY_PUBLIC_URL=https://api.forge.example.com
 ```
 
 `FORGE_MASTER_KEY` is required for secrets support and checked by `forge doctor`.
+`FORGE_CADDY_PUBLIC_URL` should point to the public entrypoint for route validation.
 
 ## 9. Run `forge doctor`
 
@@ -222,3 +223,10 @@ systemctl start forge
 → forge doctor
 → forge deploy api production
 ```
+
+## Troubleshooting VPS Deployments
+
+- **Caddy server ID**: Ensure Caddy is configured with server ID `"forge"`.
+- **Public Ingress**: If using Nginx as a public ingress, ensure it correctly proxies to the Caddy-managed routes or Forge-managed containers.
+- **Port Conflicts**: If port 8080 is taken, update `api_bind` in `forge.conf` and `FORGE_URL`.
+- **Docker Network**: Forge-managed containers must be reachable by Caddy.

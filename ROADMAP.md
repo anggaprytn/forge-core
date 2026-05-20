@@ -226,7 +226,7 @@ Goal achieved:
 Status:
 
 ```txt
-in progress
+completed
 ```
 
 Completed in this slice:
@@ -234,6 +234,7 @@ Completed in this slice:
 - [x] example `forge.conf`
 - [x] systemd service unit
 - [x] VPS operator runbook for daemon/API deploy flow
+- [x] VPS alpha milestone manual validation (12h soak, host reboot recovery)
 
 Current limitation documented explicitly:
 
@@ -248,6 +249,7 @@ Still needed:
 Acceptance status:
 
 - [x] dogfood integration suite is green on daemon/VPS startup validation
+- [x] manual validation pass: deploy, rollback, restart, reboot, route recovery
 
 ```txt
 operators can diagnose runtime failures quickly and deterministically

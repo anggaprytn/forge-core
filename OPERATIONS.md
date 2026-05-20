@@ -39,6 +39,75 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 ---
 
+# VPS Alpha Milestone (Validated)
+
+Forge has been manually validated on a real VPS for the alpha milestone.
+
+## Validated Topology
+
+```txt
+DNS (public)
+→ Nginx (public ingress / TLS termination)
+  → Caddy (internal routing / admin API)
+    → Forge Daemon (orchestration / systemd)
+      → Docker (container runtime)
+        → Forge-managed container (app)
+```
+
+## Required Environment & Config
+
+The following environment variables and configuration values are required for VPS operations:
+
+| Key                      | Purpose                                      | Source                 |
+| ------------------------ | -------------------------------------------- | ---------------------- |
+| `FORGE_CONFIG`           | Path to `forge.conf`                         | Env or CLI flag        |
+| `FORGE_MASTER_KEY`       | 64-hex char key for secret encryption        | Env or `forge.env`     |
+| `FORGE_CADDY_ADMIN_URL`  | Caddy admin API (default: localhost:2019)    | Env or `forge.env`     |
+| `FORGE_CADDY_PUBLIC_URL` | Public URL for route verification            | Env or `forge.env`     |
+| `FORGE_URL`              | Forge API address for CLI                    | CLI Env                |
+| `FORGE_TOKEN`            | `bearer_token` from `forge.conf` for CLI     | CLI Env                |
+
+## Operational Validation Checklist
+
+The following sequence must pass to confirm VPS readiness:
+
+- [x] **Deploy**: `forge deploy api production` promotes a new generation.
+- [x] **Rollback**: `forge rollback api production` restores the previous generation.
+- [x] **Restart Forge**: `systemctl restart forge` reconstructs state.
+- [x] **Restart Caddy**: `systemctl restart caddy` results in Forge repairing routes.
+- [x] **Restart Docker**: `systemctl restart docker` results in Forge repairing container IP churn.
+- [x] **Reboot VPS**: Host reboot results in full automatic recovery of containers and routes.
+
+## Expected Pass Outputs
+
+- Public `/health` returns `ok`
+- Public app returns expected content (e.g., `forge-sample`)
+- `systemd` successfully manages the Forge lifecycle
+- `current` pointer remains stable across restarts
+- `forge:ready` internal route stays behind active route as fallback
+
+---
+
+# Known Constraints (Alpha)
+
+- **Single-node only**: Forge manages one host at a time.
+- **Single-service HTTP**: Only one HTTP service per project generation is supported.
+- **Daemon WorkingDirectory**: Manual `forge deploy` builds from the daemon's `WorkingDirectory`.
+- **Stateful DB**: No native stateful database ownership or volume management yet.
+- **Orchestration**: No multi-service application orchestration yet.
+- **Public API**: Should remain bound to `localhost` behind Nginx/CLI unless intentionally exposed.
+
+---
+
+# Troubleshooting Notes
+
+- **Caddy Server ID**: Forge expects the Caddy server ID to be `"forge"`.
+- **Route Shadowing**: Ensure `forge:ready` does not shadow intended active routes.
+- **Port Conflicts**: Port `8080` may conflict with other services; use `18080` or similar if needed.
+- **CLI Connectivity**: CLI needs both `FORGE_URL` and `FORGE_TOKEN` exported.
+
+---
+
 # Runtime Model
 
 Forge manages:

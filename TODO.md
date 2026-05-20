@@ -175,8 +175,9 @@ Track:
 - [ ] Add install instructions
 - [ ] Add local development quickstart
 - [x] Add VPS setup guide
+- [x] Validate VPS alpha milestone (12h soak)
 - [ ] Add GitHub webhook setup guide
-- [ ] Add Caddy setup guide
+- [ ] Add Caddy setup automation
 
 ---
 
