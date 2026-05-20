@@ -37,6 +37,7 @@ fn caddy_integration_forge_only_mutates_owned_caddy_subtree() {
         .update_route(RouteUpdateRequest {
             subtree_id: "forge:api:production".into(),
             target: "prod-api-gen-41:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -45,6 +46,7 @@ fn caddy_integration_forge_only_mutates_owned_caddy_subtree() {
         .update_route(RouteUpdateRequest {
             subtree_id: "forge:api:production".into(),
             target: "prod-api-gen-41:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -54,6 +56,7 @@ fn caddy_integration_forge_only_mutates_owned_caddy_subtree() {
         .update_route(RouteUpdateRequest {
             subtree_id: "external:preserve".into(),
             target: "prod-api-gen-41:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -92,6 +95,7 @@ fn caddy_integration_route_targets_generation_named_container() {
         .update_route(RouteUpdateRequest {
             subtree_id: "forge:api:production".into(),
             target: "prod-api-gen-42:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -114,6 +118,7 @@ fn caddy_integration_route_activation_probe_succeeds() {
         .update_route(RouteUpdateRequest {
             subtree_id: "forge:api:production".into(),
             target: "prod-api-gen-43:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -126,6 +131,44 @@ fn caddy_integration_route_activation_probe_succeeds() {
     let response = reqwest::blocking::get(harness.public_url("health"))
         .expect("public caddy probe should succeed");
     assert_eq!(response.status().as_u16(), 200);
+}
+
+#[test]
+fn route_verification_sets_host_header() {
+    let _guard = integration_lock();
+    let Some(mut harness) = CaddyHarness::start("route-verification-host-header") else {
+        return;
+    };
+    harness.start_sample_app("prod-api-gen-43");
+    let mut routing = harness.routing();
+
+    routing
+        .update_route(RouteUpdateRequest {
+            subtree_id: "forge:api:production".into(),
+            target: "prod-api-gen-43:3000".into(),
+            domain: Some("api.example.com".into()),
+            health_checks_enabled: false,
+            probe_path: Some("/health".into()),
+        })
+        .unwrap();
+
+    let inspection = routing.inspect_route("forge:api:production").unwrap();
+    assert!(inspection.activation_verified);
+    assert_eq!(
+        inspection.verification_host.as_deref(),
+        Some("api.example.com")
+    );
+
+    let no_host = reqwest::blocking::get(harness.public_url("health"))
+        .expect("request without host header should complete");
+    assert_eq!(no_host.status().as_u16(), 404);
+
+    let with_host = reqwest::blocking::Client::new()
+        .get(harness.public_url("health"))
+        .header(reqwest::header::HOST, "api.example.com")
+        .send()
+        .expect("request with host header should reach routed app");
+    assert_eq!(with_host.status().as_u16(), 200);
 }
 
 #[test]
@@ -142,6 +185,7 @@ fn caddy_integration_active_route_overrides_ready_placeholder() {
         .update_route(RouteUpdateRequest {
             subtree_id: "forge:api:production".into(),
             target: "prod-api-gen-44:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -250,6 +294,7 @@ fn caddy_integration_route_rollback_restores_previous_generation() {
         .update_route(RouteUpdateRequest {
             subtree_id: "forge:api:production".into(),
             target: "prod-api-gen-2:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -297,6 +342,7 @@ fn caddy_integration_caddy_subtree_cleanup_removes_only_forge_routes() {
         .update_route(RouteUpdateRequest {
             subtree_id: "forge:api:production".into(),
             target: "prod-api-gen-44:3000".into(),
+            domain: None,
             health_checks_enabled: false,
             probe_path: Some("/health".into()),
         })
@@ -541,6 +587,9 @@ fn write_caddy_config(root: &Path) {
                 "servers": {
                     "forge": {
                         "listen": [":8080"],
+                        "automatic_https": {
+                            "disable": true
+                        },
                         "routes": [{
                             "@id": "external:preserve",
                             "match": [{

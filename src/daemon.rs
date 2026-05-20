@@ -709,7 +709,12 @@ impl RoutingRuntime for NoopRoutingRuntime {
         Ok(crate::runtime::RouteInspection {
             subtree_id: subtree_id.to_string(),
             active_target: String::new(),
+            domain: None,
             activation_verified: true,
+            verification_url: None,
+            verification_host: None,
+            verification_status_code: None,
+            verification_response_body: None,
             health_checks_enabled: false,
         })
     }

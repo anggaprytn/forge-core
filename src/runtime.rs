@@ -107,6 +107,7 @@ pub trait ProbeRuntime {
 pub struct RouteUpdateRequest {
     pub subtree_id: String,
     pub target: String,
+    pub domain: Option<String>,
     pub health_checks_enabled: bool,
     pub probe_path: Option<String>,
 }
@@ -115,7 +116,12 @@ pub struct RouteUpdateRequest {
 pub struct RouteInspection {
     pub subtree_id: String,
     pub active_target: String,
+    pub domain: Option<String>,
     pub activation_verified: bool,
+    pub verification_url: Option<String>,
+    pub verification_host: Option<String>,
+    pub verification_status_code: Option<u16>,
+    pub verification_response_body: Option<String>,
     pub health_checks_enabled: bool,
 }
 

@@ -1010,6 +1010,7 @@ impl E2eHarness {
                 .update_route(RouteUpdateRequest {
                     subtree_id: "forge:api:production".into(),
                     target: format!("prod-api-gen-{generation}:3000"),
+                    domain: None,
                     health_checks_enabled: false,
                     probe_path: Some("/health".into()),
                 })
@@ -1303,7 +1304,12 @@ impl RoutingRuntime for NoopRoutingRuntime {
         Ok(forge_core::runtime::RouteInspection {
             subtree_id: subtree_id.into(),
             active_target: String::new(),
+            domain: None,
             activation_verified: true,
+            verification_url: None,
+            verification_host: None,
+            verification_status_code: None,
+            verification_response_body: None,
             health_checks_enabled: false,
         })
     }
@@ -1406,6 +1412,9 @@ fn write_caddy_config(root: &Path) {
                 "servers": {
                     "forge": {
                         "listen": [":8080"],
+                        "automatic_https": {
+                            "disable": true
+                        },
                         "routes": []
                     }
                 }

@@ -2017,6 +2017,7 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
     routing.update_route(RouteUpdateRequest {
         subtree_id: subtree_id.to_string(),
         target: target.clone(),
+        domain: None,
         health_checks_enabled: false,
         probe_path,
     })?;
@@ -2332,7 +2333,12 @@ impl RoutingRuntime for TestRoutingRuntime {
         self.route = Some(RouteInspection {
             subtree_id: request.subtree_id.clone(),
             active_target: request.target.clone(),
+            domain: request.domain.clone(),
             activation_verified: true,
+            verification_url: None,
+            verification_host: None,
+            verification_status_code: None,
+            verification_response_body: None,
             health_checks_enabled: request.health_checks_enabled,
         });
         self.updates.push(request);
@@ -2757,7 +2763,12 @@ pub mod orphaned_candidate_generation_is_cleaned {
             route: Some(RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "prod-api-gen-2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }),
             remove_failures: Default::default(),
@@ -2809,7 +2820,12 @@ pub mod orphaned_candidate_generation_is_cleaned {
             route: Some(RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "prod-api-gen-2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }),
             remove_failures: Default::default(),
@@ -2970,7 +2986,12 @@ pub mod orphaned_candidate_generation_is_cleaned {
             route: Some(RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "prod-api-gen-2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }),
             remove_failures: std::collections::BTreeMap::from([("forge:api:production".into(), 2)]),
@@ -3459,7 +3480,12 @@ pub mod current_pointer_matches_active_route_after_restart {
             route: Some(RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.19.0.12:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }),
             remove_failures: Default::default(),
@@ -3583,7 +3609,12 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
             route: Some(RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "prod-api-gen-1:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }),
             remove_failures: Default::default(),

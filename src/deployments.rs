@@ -11,6 +11,7 @@ use crate::events::{EventRecord, redact_text};
 use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
+use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
@@ -129,6 +130,18 @@ struct ProbeAttemptResult {
     attempts: u32,
     elapsed_ms: u128,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteActivationContext {
+    route_id: String,
+    domain: Option<String>,
+    upstream_target: String,
+    verification_url: Option<String>,
+    verification_host: Option<String>,
+    verification_status_code: Option<u16>,
+    verification_response_body: Option<String>,
+    network_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,6 +551,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             generation,
             &container_name,
             &inspection,
+            &diagnostics,
+            &secret_values,
         ) {
             self.record_failed_generation(
                 &env,
@@ -648,7 +663,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "container exited before tcp probe",
             ));
         }
-        let probe_host = match resolve_validation_probe_host(
+        let probe_host = match resolve_selected_network_host(
             &inspection,
             self.execution.network_name.as_deref(),
         ) {
@@ -999,6 +1014,73 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         Ok(())
     }
 
+    fn capture_route_activation_failure_diagnostics(
+        &mut self,
+        diagnostics: &DiagnosticsStore,
+        inspection: &RouteInspection,
+        context: &RouteActivationContext,
+        secret_values: &[String],
+    ) -> Result<(), DeploymentError> {
+        diagnostics.append_log_line(&format!("route id: {}", context.route_id), secret_values)?;
+        if let Some(domain) = context.domain.as_deref() {
+            diagnostics.append_log_line(&format!("route domain: {domain}"), secret_values)?;
+        }
+        diagnostics.append_log_line(
+            &format!("route upstream target: {}", context.upstream_target),
+            secret_values,
+        )?;
+        if let Some(url) = context.verification_url.as_deref() {
+            diagnostics
+                .append_log_line(&format!("route verification url: {url}"), secret_values)?;
+        }
+        if let Some(host) = context.verification_host.as_deref() {
+            diagnostics
+                .append_log_line(&format!("route verification host: {host}"), secret_values)?;
+        }
+        if let Some(status_code) = context.verification_status_code {
+            diagnostics.append_log_line(
+                &format!("route verification status: {status_code}"),
+                secret_values,
+            )?;
+        }
+        if let Some(body) = context.verification_response_body.as_deref() {
+            diagnostics
+                .append_log_line(&format!("route verification body: {body}"), secret_values)?;
+        }
+        if let Some(note) = caddy_network_reachability_note(context.network_name.as_deref()) {
+            diagnostics.append_log_line(&note, secret_values)?;
+        }
+
+        let artifact = serde_json::json!({
+            "route_id": context.route_id,
+            "domain": context.domain,
+            "upstream_target": context.upstream_target,
+            "active_target": inspection.active_target,
+            "verification_url": context.verification_url,
+            "verification_host": context.verification_host,
+            "verification_status_code": context.verification_status_code,
+            "verification_response_body": context.verification_response_body,
+            "activation_verified": inspection.activation_verified,
+            "health_checks_enabled": inspection.health_checks_enabled,
+            "network_name": context.network_name,
+            "network_reachability_note": caddy_network_reachability_note(
+                context.network_name.as_deref()
+            ),
+        });
+        let artifact = serde_json::to_string_pretty(&artifact).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        diagnostics.write_artifact(
+            "route_activation_failure.json",
+            &format!("{artifact}\n"),
+            secret_values,
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record_failed_generation(
         &mut self,
@@ -1115,6 +1197,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         generation: u64,
         _container_name: &str,
         inspection: &ContainerInspection,
+        diagnostics: &DiagnosticsStore,
+        secret_values: &[String],
     ) -> Result<(), DeploymentError> {
         match validation.activation {
             ActivationMode::Direct => {
@@ -1124,16 +1208,40 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ActivationMode::Http { internal_port } => {
                 let subtree_id = route_subtree_id(record);
                 let target_host =
-                    resolve_route_target_host(inspection, execution.network_name.as_deref())?;
+                    resolve_selected_network_host(inspection, execution.network_name.as_deref())?;
                 let target = format!("{target_host}:{internal_port}");
+                let domain = load_environment_domain(
+                    &self.storage_root,
+                    &record.project_id,
+                    &record.environment,
+                )?;
                 self.routing.update_route(RouteUpdateRequest {
                     subtree_id: subtree_id.clone(),
                     target: target.clone(),
+                    domain: domain.clone(),
                     health_checks_enabled: false,
                     probe_path: validation.http_health_path.clone(),
                 })?;
                 let inspection = self.routing.inspect_route(&subtree_id)?;
-                validate_route_activation(&inspection, &subtree_id, &target)?;
+                let context = RouteActivationContext {
+                    route_id: subtree_id,
+                    domain,
+                    upstream_target: target,
+                    verification_url: inspection.verification_url.clone(),
+                    verification_host: inspection.verification_host.clone(),
+                    verification_status_code: inspection.verification_status_code,
+                    verification_response_body: inspection.verification_response_body.clone(),
+                    network_name: execution.network_name.clone(),
+                };
+                if let Err(err) = validate_route_activation(&inspection, &context) {
+                    self.capture_route_activation_failure_diagnostics(
+                        diagnostics,
+                        &inspection,
+                        &context,
+                        secret_values,
+                    )?;
+                    return Err(err);
+                }
                 PointerStore::new(env.clone()).swap_current(generation)?;
                 Ok(())
             }
@@ -1285,32 +1393,7 @@ fn validate_inspection(
     Ok(())
 }
 
-fn resolve_validation_probe_host(
-    inspection: &ContainerInspection,
-    network_name: Option<&str>,
-) -> Result<String, DeploymentError> {
-    if let Some(network_name) = network_name {
-        return inspection
-            .network_ips
-            .get(network_name)
-            .filter(|ip| !ip.is_empty())
-            .cloned()
-            .ok_or_else(|| {
-                DeploymentError::InvalidInspection(format!(
-                    "container missing IP on docker network {network_name}"
-                ))
-            });
-    }
-
-    inspection
-        .network_ips
-        .values()
-        .find(|ip| !ip.is_empty())
-        .cloned()
-        .ok_or_else(|| DeploymentError::InvalidInspection("container missing network IP".into()))
-}
-
-fn resolve_route_target_host(
+fn resolve_selected_network_host(
     inspection: &ContainerInspection,
     network_name: Option<&str>,
 ) -> Result<String, DeploymentError> {
@@ -1480,12 +1563,43 @@ fn route_subtree_id(record: &DeploymentRecord) -> String {
     format!("forge:{}:{}", record.project_id, record.environment)
 }
 
+fn load_environment_domain(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+) -> Result<Option<String>, DeploymentError> {
+    let project = ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            DeploymentError::InvalidInspection(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?;
+    Ok(project.map(|project| derive_environment_domain(&project.base_domain, environment)))
+}
+
+fn derive_environment_domain(base_domain: &str, environment: &str) -> String {
+    match environment {
+        "production" => base_domain.to_string(),
+        "staging" => format!("staging-{base_domain}"),
+        "development" => format!("development-{base_domain}"),
+        other => format!("{other}-{base_domain}"),
+    }
+}
+
+fn caddy_network_reachability_note(network_name: Option<&str>) -> Option<String> {
+    network_name.map(|network_name| {
+        format!(
+            "route activation assumes Caddy is attached to docker network {network_name}; upstream target reachability is only guaranteed when Caddy shares the selected deploy network."
+        )
+    })
+}
+
 fn validate_route_activation(
     inspection: &RouteInspection,
-    expected_subtree_id: &str,
-    expected_target: &str,
+    context: &RouteActivationContext,
 ) -> Result<(), DeploymentError> {
-    if inspection.subtree_id != expected_subtree_id {
+    if inspection.subtree_id != context.route_id {
         return Err(DeploymentError::InvalidInspection(
             "route subtree mismatch".into(),
         ));
@@ -1495,8 +1609,13 @@ fn validate_route_activation(
             "route activation verification failed",
         ));
     }
-    if inspection.active_target != expected_target {
+    if inspection.active_target != context.upstream_target {
         return Err(DeploymentError::ValidationFailed("route target mismatch"));
+    }
+    if inspection.domain != context.domain {
+        return Err(DeploymentError::ValidationFailed(
+            "route activation domain mismatch",
+        ));
     }
     if inspection.health_checks_enabled {
         return Err(DeploymentError::ValidationFailed(
@@ -1647,6 +1766,21 @@ fn queued_record(queue: &PersistentQueue) {
             repo_url: None,
             commit_sha: None,
         })
+        .unwrap();
+}
+
+#[cfg(test)]
+fn register_project(root: &std::path::Path, project_id: &str, base_domain: &str) {
+    ProjectRegistryStore::new(root)
+        .upsert(
+            crate::api::ProjectUpsertRequest {
+                project_id: Some(project_id.into()),
+                repo_url: format!("https://example.com/{project_id}.git"),
+                default_branch: "main".into(),
+                base_domain: Some(base_domain.into()),
+            },
+            None,
+        )
         .unwrap();
 }
 
@@ -1823,7 +1957,12 @@ pub mod validation_probe_retries {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -1926,7 +2065,12 @@ pub mod validation_probe_retries {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -2293,7 +2437,12 @@ pub mod finalized_runtime_persists_http_recovery_metadata {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -2621,7 +2770,12 @@ pub mod deploy_loads_forge_yml {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:4010".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -2723,7 +2877,12 @@ pub mod deploy_loads_forge_yml {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:4010".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -2839,7 +2998,12 @@ pub mod git_deploy_non_api_project_staging {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:web:staging".into(),
                 active_target: "172.19.0.8:4100".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -2869,6 +3033,114 @@ pub mod git_deploy_non_api_project_staging {
         );
         assert_eq!(routing.updates[0].subtree_id, "forge:web:staging");
         assert_eq!(routing.updates[0].target, "172.19.0.8:4100");
+    }
+
+    #[test]
+    fn route_activation_uses_generated_staging_domain() {
+        let root = test_root("route-activation-uses-generated-staging-domain");
+        register_project(&root, "web", "web.forge.example.com");
+        let source_root = root.join("source-checkouts").join("web").join("abc123");
+        std::fs::create_dir_all(source_root.join("deploy")).unwrap();
+        std::fs::write(
+            source_root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: web\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: deploy/Dockerfile\n",
+                "  context: .\n",
+                "runtime:\n",
+                "  port: 4100\n",
+                "  healthcheck:\n",
+                "    path: /healthz\n",
+                "    expected_status: 200\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /healthz\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "web".into(),
+                environment: "staging".into(),
+                source_path: Some(source_root),
+                source_ref: Some("release".into()),
+                repo_url: Some("https://github.com/example/web.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            "image_ref=forge/web:staging-gen-1".into(),
+            String::new(),
+            "staging-web-gen-1".into(),
+            String::new(),
+            [
+                "name=/staging-web-gen-1",
+                "status=running",
+                "running=true",
+                "exit_code=0",
+                "image=forge/web:staging-gen-1",
+                "restart_policy=no",
+                "network:forge-net=172.19.0.8",
+            ]
+            .join("\n"),
+            [
+                "name=/staging-web-gen-1",
+                "status=running",
+                "running=true",
+                "exit_code=0",
+                "image=forge/web:staging-gen-1",
+                "restart_policy=no",
+                "network:forge-net=172.19.0.8",
+            ]
+            .join("\n"),
+        ]));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:web:staging".into(),
+                active_target: "172.19.0.8:4100".into(),
+                domain: Some("staging-web.forge.example.com".into()),
+                activation_verified: true,
+                verification_url: Some("http://127.0.0.1/healthz".into()),
+                verification_host: Some("staging-web.forge.example.com".into()),
+                verification_status_code: Some(200),
+                verification_response_body: Some("ok".into()),
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            routing.updates[0].domain.as_deref(),
+            Some("staging-web.forge.example.com")
+        );
     }
 }
 
@@ -3618,7 +3890,12 @@ pub mod deploy_uses_runtime_port_from_yaml {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:4010".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -3695,7 +3972,12 @@ pub mod deploy_uses_healthcheck_from_yaml {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -3752,7 +4034,12 @@ pub mod route_updates_only_after_snapshot_finalized {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -3804,7 +4091,12 @@ pub mod route_targets_inspected_container_ip {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -3960,7 +4252,12 @@ pub mod caddy_route_uses_same_network_reachable_ip {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.19.0.6:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -3985,6 +4282,62 @@ pub mod caddy_route_uses_same_network_reachable_ip {
 
         assert_eq!(probes.tcp_hosts, vec![("172.19.0.6".to_string(), 3000)]);
         assert_eq!(routing.updates[0].target, "172.19.0.6:3000");
+    }
+
+    #[test]
+    fn route_activation_uses_same_target_as_validation() {
+        let root = test_root("route-activation-uses-same-target-as-validation");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(
+                1,
+                &[
+                    ("bridge", "172.17.0.4"),
+                    (FORGE_MANAGED_DOCKER_NETWORK, "172.19.0.6"),
+                ],
+            ),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.19.0.6:3000".into(),
+                domain: None,
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let validation_host = &probes.tcp_hosts[0].0;
+        assert_eq!(routing.updates[0].target, format!("{validation_host}:3000"));
     }
 }
 
@@ -4073,7 +4426,12 @@ pub mod route_activation_failure_rolls_back_pointer {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: false,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -4105,6 +4463,143 @@ pub mod route_activation_failure_rolls_back_pointer {
 }
 
 #[cfg(test)]
+pub mod route_activation_failure_diagnostics {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn route_activation_failure_records_route_diagnostics() {
+        let root = test_root("route-activation-failure-records-route-diagnostics");
+        register_project(&root, "api", "api.example.com");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: false,
+                verification_url: Some("http://127.0.0.1:8080/health".into()),
+                verification_host: Some("api.example.com".into()),
+                verification_status_code: Some(404),
+                verification_response_body: Some("stale route".into()),
+                health_checks_enabled: false,
+            }],
+        };
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next();
+
+        assert!(matches!(
+            result,
+            Err(DeploymentError::ValidationFailed(
+                "route activation verification failed"
+            ))
+        ));
+
+        let artifact = fs::read_to_string(root.join(
+            "projects/api/environments/production/generations/1/diagnostics/route_activation_failure.json",
+        ))
+        .unwrap();
+        assert!(artifact.contains("\"route_id\": \"forge:api:production\""));
+        assert!(artifact.contains("\"domain\": \"api.example.com\""));
+        assert!(artifact.contains("\"upstream_target\": \"172.18.0.2:3000\""));
+        assert!(artifact.contains("\"verification_url\": \"http://127.0.0.1:8080/health\""));
+        assert!(artifact.contains("\"verification_host\": \"api.example.com\""));
+        assert!(artifact.contains("\"verification_status_code\": 404"));
+        assert!(artifact.contains("\"verification_response_body\": \"stale route\""));
+    }
+
+    #[test]
+    fn caddy_network_reachability_is_verified_or_documented() {
+        let root = test_root("caddy-network-reachability-is-verified-or-documented");
+        register_project(&root, "api", "api.example.com");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(
+                1,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.18.0.2")],
+            ),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: false,
+                verification_url: Some("http://127.0.0.1:8080/health".into()),
+                verification_host: Some("api.example.com".into()),
+                verification_status_code: Some(502),
+                verification_response_body: Some("bad gateway".into()),
+                health_checks_enabled: false,
+            }],
+        };
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some(FORGE_MANAGED_DOCKER_NETWORK.into()),
+        })
+        .execute_next();
+
+        let artifact = fs::read_to_string(root.join(
+            "projects/api/environments/production/generations/1/diagnostics/route_activation_failure.json",
+        ))
+        .unwrap();
+        assert!(artifact.contains(FORGE_MANAGED_DOCKER_NETWORK));
+        assert!(artifact.contains("Caddy is attached to docker network"));
+    }
+}
+
+#[cfg(test)]
 pub mod caddy_health_checks_are_not_enabled {
     use super::*;
     use crate::docker::DockerCliRuntime;
@@ -4126,7 +4621,12 @@ pub mod caddy_health_checks_are_not_enabled {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
@@ -4174,7 +4674,12 @@ pub mod forge_owns_only_dedicated_route_subtree {
             inspections: vec![RouteInspection {
                 subtree_id: "forge:api:production".into(),
                 active_target: "172.18.0.2:3000".into(),
+                domain: None,
                 activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
                 health_checks_enabled: false,
             }],
         };
