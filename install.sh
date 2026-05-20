@@ -25,6 +25,139 @@ die() {
   exit 1
 }
 
+unit_service_value_from_file() {
+  local file="$1"
+  local key="$2"
+
+  [ -f "$file" ] || return 0
+
+  awk -F= -v key="$key" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    /^\[/ {
+      in_service = ($0 == "[Service]")
+    }
+
+    in_service {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^[#;]/ || index(line, "=") == 0) {
+        next
+      }
+
+      name = trim(substr(line, 1, index(line, "=") - 1))
+      if (name != key) {
+        next
+      }
+
+      value = trim(substr(line, index(line, "=") + 1))
+      print value
+    }
+  ' "$file" | tail -n 1
+}
+
+effective_unit_service_value() {
+  local key="$1"
+  local fallback="${2:-}"
+  local value=""
+  local dropin_dir
+  local dropin
+
+  if command -v systemctl >/dev/null 2>&1; then
+    value="$("${SUDO[@]}" systemctl show --property "$key" --value forge.service 2>/dev/null | tail -n 1 || true)"
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  fi
+
+  if [ -f "$UNIT_PATH" ]; then
+    value="$(unit_service_value_from_file "$UNIT_PATH" "$key" || true)"
+    if [ -n "$value" ]; then
+      fallback="$value"
+    fi
+  fi
+
+  for dropin_dir in \
+    /usr/lib/systemd/system/forge.service.d \
+    /usr/local/lib/systemd/system/forge.service.d \
+    /lib/systemd/system/forge.service.d \
+    /run/systemd/system/forge.service.d \
+    /etc/systemd/system/forge.service.d
+  do
+    [ -d "$dropin_dir" ] || continue
+    for dropin in "$dropin_dir"/*.conf; do
+      [ -e "$dropin" ] || continue
+      value="$(unit_service_value_from_file "$dropin" "$key" || true)"
+      if [ -n "$value" ]; then
+        fallback="$value"
+      fi
+    done
+  done
+
+  if [ -n "$fallback" ]; then
+    printf '%s\n' "$fallback"
+  fi
+}
+
+path_mode_triplet() {
+  local path="$1"
+
+  if stat -c '%u %g %a' "$path" >/dev/null 2>&1; then
+    stat -c '%u %g %a' "$path"
+    return 0
+  fi
+
+  stat -f '%u %g %Lp' "$path"
+}
+
+user_can_read_and_execute_dir() {
+  local user="$1"
+  local path="$2"
+  local stat_line
+  local path_uid
+  local path_gid
+  local path_mode
+  local path_perms
+  local owner_digit
+  local group_digit
+  local other_digit
+  local user_uid
+  local user_groups
+  local perm_digit
+
+  [ -d "$path" ] || return 1
+
+  user_uid="$(id -u "$user" 2>/dev/null)" || return 1
+  [ "$user_uid" -eq 0 ] && return 0
+
+  stat_line="$(path_mode_triplet "$path" 2>/dev/null)" || return 1
+  read -r path_uid path_gid path_mode <<EOF
+$stat_line
+EOF
+  path_perms="${path_mode: -3}"
+  owner_digit="${path_perms:0:1}"
+  group_digit="${path_perms:1:1}"
+  other_digit="${path_perms:2:1}"
+
+  if [ "$user_uid" -eq "$path_uid" ]; then
+    perm_digit="$owner_digit"
+  else
+    user_groups=" $(id -G "$user" 2>/dev/null) "
+    if [[ "$user_groups" == *" $path_gid "* ]]; then
+      perm_digit="$group_digit"
+    else
+      perm_digit="$other_digit"
+    fi
+  fi
+
+  [ $((perm_digit & 4)) -ne 0 ] && [ $((perm_digit & 1)) -ne 0 ]
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --force)
@@ -131,7 +264,6 @@ fi
   "$STORAGE_ROOT/indexes" \
   "$STORAGE_ROOT/idempotency" \
   "$STORAGE_ROOT/queue"
-"${SUDO[@]}" chown -R forge:forge "$STORAGE_ROOT" /srv/forge
 
 "${SUDO[@]}" install -m 0755 "$BIN_SRC" "$BIN_DEST"
 log "installed $BIN_DEST"
@@ -158,7 +290,7 @@ FORGE_CADDY_PUBLIC_URL=http://127.0.0.1
 EOF
 fi
 
-if [ -f "$SERVICE_SRC" ]; then
+  if [ -f "$SERVICE_SRC" ]; then
   unit_installed=0
   if [ -e "$UNIT_PATH" ] && [ "$FORCE" -ne 1 ]; then
     log "preserving existing $UNIT_PATH"
@@ -167,12 +299,40 @@ if [ -f "$SERVICE_SRC" ]; then
     unit_installed=1
   fi
 
-  if [ "$unit_installed" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+else
+    warn "deploy/forge.service not found; skipping systemd unit install"
+fi
+
+if [ -e "$UNIT_PATH" ]; then
+  if command -v systemctl >/dev/null 2>&1; then
     "${SUDO[@]}" systemctl daemon-reload
     log "reloaded systemd units"
   fi
-else
-  warn "deploy/forge.service not found; skipping systemd unit install"
+
+  service_user="$(effective_unit_service_value User)"
+  if [ -z "$service_user" ]; then
+    service_user="root"
+  fi
+  id "$service_user" >/dev/null 2>&1 || die "service user '$service_user' does not exist"
+
+  service_group="$(effective_unit_service_value Group)"
+  if [ -z "$service_group" ]; then
+    service_group="$(id -gn "$service_user" 2>/dev/null || id -g "$service_user" 2>/dev/null)" || \
+      die "could not resolve primary group for service user '$service_user'"
+  fi
+
+  "${SUDO[@]}" chown -R "$service_user:$service_group" "$STORAGE_ROOT"
+  log "ensured $STORAGE_ROOT is owned by $service_user:$service_group"
+
+  working_directory="$(effective_unit_service_value WorkingDirectory /srv/forge/sample-http-app)"
+  if [ -n "$working_directory" ]; then
+    working_directory="${working_directory#-}"
+    if [ ! -d "$working_directory" ]; then
+      warn "systemd WorkingDirectory '$working_directory' does not exist for service user '$service_user'"
+    elif ! user_can_read_and_execute_dir "$service_user" "$working_directory"; then
+      warn "systemd WorkingDirectory '$working_directory' is not readable/executable by service user '$service_user'"
+    fi
+  fi
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -193,6 +353,7 @@ WorkingDirectory note:
   Manual 'forge deploy <project> <environment>' builds from the daemon WorkingDirectory.
   The installed unit defaults to /srv/forge/sample-http-app. Point it at the project root you
   want manual deploys to build from before enabling the service.
+  This installer only fixes ownership for /var/lib/forge; it does not chown your project checkout.
 
 Next steps:
   forge doctor

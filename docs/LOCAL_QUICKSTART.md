@@ -149,3 +149,18 @@ For a Linux host with systemd, the repo now includes a conservative installer:
 ```
 
 It installs the binary, creates `/etc/forge/forge.conf` and `/etc/forge/forge.env` if missing, prepares `/var/lib/forge`, and installs the provided systemd unit without enabling it automatically.
+
+Before `systemctl enable --now forge`, verify the effective service account can write `/var/lib/forge` and can read/traverse the configured `WorkingDirectory`:
+
+```bash
+SERVICE_USER="$(systemctl show --property User --value forge.service)"
+[ -n "$SERVICE_USER" ] || SERVICE_USER=root
+SERVICE_GROUP="$(systemctl show --property Group --value forge.service)"
+[ -n "$SERVICE_GROUP" ] || SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
+WORKDIR="$(systemctl show --property WorkingDirectory --value forge.service)"
+
+sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" /var/lib/forge
+sudo -u "$SERVICE_USER" test -r "$WORKDIR" && sudo -u "$SERVICE_USER" test -x "$WORKDIR"
+```
+
+If the `test` command fails, adjust the checkout directory ownership or mode explicitly instead of recursively chowning arbitrary project trees by default.

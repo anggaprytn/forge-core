@@ -86,10 +86,12 @@ install -m 0755 target/release/forge /usr/local/bin/forge
 ```bash
 useradd --system --home /srv/forge --shell /usr/sbin/nologin forge
 mkdir -p /etc/forge /var/lib/forge /srv/forge/sample-http-app
-chown -R forge:forge /var/lib/forge /srv/forge
+chown -R forge:forge /var/lib/forge
 ```
 
 `/var/lib/forge` must exist before startup. Forge bootstrap waits when the configured storage root is missing.
+
+Forge only requires the service user to own `storage_root`. The project checkout named by the systemd `WorkingDirectory` only needs to be readable and searchable by that same service user.
 
 ## 6. Install the Sample App
 
@@ -195,6 +197,29 @@ The provided unit sets:
 - `WorkingDirectory=/srv/forge/sample-http-app`
 
 If you move the sample app checkout, update the unit `WorkingDirectory` to match.
+
+### Service User and Permissions
+
+Forge daemon file permissions follow the effective systemd service account:
+
+- `/var/lib/forge` must be owned by the service `User` so the daemon can persist queue, events, secrets, and deployment state.
+- The `WorkingDirectory` must be readable and executable by that same `User`.
+- Forge does not need the installer to recursively take ownership of your application checkout. Keep that change explicit and operator-controlled.
+
+If you preserve an existing unit or drop-in override, check the effective account and storage ownership before starting the daemon:
+
+```bash
+SERVICE_USER="$(systemctl show --property User --value forge.service)"
+[ -n "$SERVICE_USER" ] || SERVICE_USER=root
+SERVICE_GROUP="$(systemctl show --property Group --value forge.service)"
+[ -n "$SERVICE_GROUP" ] || SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
+WORKDIR="$(systemctl show --property WorkingDirectory --value forge.service)"
+
+chown -R "$SERVICE_USER:$SERVICE_GROUP" /var/lib/forge
+sudo -u "$SERVICE_USER" test -r "$WORKDIR" && sudo -u "$SERVICE_USER" test -x "$WORKDIR"
+```
+
+If the `test` command fails, fix the project checkout permissions deliberately for that directory before enabling the service.
 
 ## 11. Verify Readiness
 
