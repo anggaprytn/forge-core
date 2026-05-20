@@ -150,13 +150,14 @@ This is planned alpha product semantics and may land in implementation increment
 
 Forge now includes a minimal server-owned project registry for repository metadata and stable base domains.
 
-- `forge project add <project_id> --repo <repo_url> [--branch <branch>] [--domain <base_domain>]`
+- `forge project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]`
 - `forge project list`
 - `forge project show <project_id>`
 
 Registry behavior:
 
 - `--branch` defaults to `main`.
+- `project_id` is optional when `--repo` is provided. Forge infers it from the repository basename, normalizes it, and still validates it against the safe project ID rules.
 - `--domain` stores an explicit `base_domain`.
 - Omitting `--domain` creates a stable generated `base_domain` that prefers `<project_id>.<FORGE_APPS_DOMAIN>`.
 - If that clean domain is already used by another project, Forge falls back to `<project_id>-<shortid>.<FORGE_APPS_DOMAIN>`.
@@ -169,6 +170,11 @@ Example generated domains:
 - `api-k7x9q2.forge.anggaprytn.com` (collision fallback)
 - `staging-api-k7x9q2.forge.anggaprytn.com`
 - `development-api-k7x9q2.forge.anggaprytn.com`
+
+Example project creation:
+
+- `forge project add --repo https://github.com/example/api.git`
+- `forge project add api --repo https://github.com/example/api.git`
 
 This registry slice does not clone Git repositories, deploy by ref, activate derived routes, or add a web project UI yet.
 

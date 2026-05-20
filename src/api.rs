@@ -44,7 +44,8 @@ pub struct EventList {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectUpsertRequest {
-    pub project_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub repo_url: String,
     pub default_branch: String,
     #[serde(default)]

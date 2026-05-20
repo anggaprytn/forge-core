@@ -377,7 +377,7 @@ enum Command {
         environment: String,
     },
     ProjectAdd {
-        project_id: String,
+        project_id: Option<String>,
         repo_url: String,
         default_branch: String,
         base_domain: Option<String>,
@@ -598,7 +598,7 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] project add <project_id> --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
+        "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
         "  forge [--url URL] [--token TOKEN] project list",
         "  forge [--url URL] [--token TOKEN] project show <project_id>",
         "  forge [--url URL] [--token TOKEN] secrets set <project_id> <environment> <key> <value>",
@@ -628,14 +628,19 @@ fn parse_deploy_command(args: &[String]) -> Result<Command, CliError> {
 }
 
 fn parse_project_add_command(args: &[String]) -> Result<Command, CliError> {
-    let Some(project_id) = args.first() else {
+    if args.is_empty() {
         return Err(CliError::Usage(usage()));
-    };
+    }
 
+    let mut project_id = None;
     let mut repo_url = None;
     let mut default_branch = Some("main".to_string());
     let mut base_domain = None;
-    let mut index = 1;
+    let mut index = 0;
+    if !args[index].starts_with("--") {
+        project_id = Some(args[index].clone());
+        index += 1;
+    }
     while index < args.len() {
         match args[index].as_str() {
             "--repo" => {
@@ -677,7 +682,7 @@ fn parse_project_add_command(args: &[String]) -> Result<Command, CliError> {
     };
 
     Ok(Command::ProjectAdd {
-        project_id: project_id.clone(),
+        project_id,
         repo_url,
         default_branch: default_branch.unwrap_or_else(|| "main".into()),
         base_domain,

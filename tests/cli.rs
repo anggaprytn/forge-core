@@ -107,6 +107,34 @@ fn cli_project_add_posts_project_request() {
 }
 
 #[test]
+fn cli_project_add_allows_repo_only_request() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"forge-fullstack-api-test","repo_url":"https://github.com/anggaprytn/forge-fullstack-api-test.git","default_branch":"main","base_domain":"forge-fullstack-api-test.forge.example.com","domain_mode":"generated","created_at_unix":1,"updated_at_unix":1}}"#,
+    );
+
+    let output = run_cli(
+        &url,
+        &[
+            "project",
+            "add",
+            "--repo",
+            "https://github.com/anggaprytn/forge-fullstack-api-test.git",
+        ],
+    );
+    assert!(output.status.success());
+
+    let request = requests.lock().unwrap().remove(0);
+    let json: Value = serde_json::from_str(&request.body).unwrap();
+    assert!(json["project_id"].is_null());
+    assert_eq!(
+        json["repo_url"],
+        "https://github.com/anggaprytn/forge-fullstack-api-test.git"
+    );
+}
+
+#[test]
 fn cli_project_list_reads_projects() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(

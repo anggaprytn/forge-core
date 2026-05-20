@@ -320,12 +320,14 @@ components:
     ProjectUpsertRequest:
       type: object
       required:
-        - project_id
         - repo_url
         - default_branch
       properties:
         project_id:
-          type: string
+          type:
+            - string
+            - 'null'
+          description: Optional explicit project ID. When omitted, Forge infers it from the repository URL basename, normalizes invalid characters to hyphens, collapses duplicate hyphens, trims edge hyphens, and then validates it against the safe project ID rules.
         repo_url:
           type: string
         default_branch:

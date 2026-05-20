@@ -197,13 +197,14 @@ forge events
 Project registry examples:
 
 ```bash
+forge project add --repo https://github.com/example/api.git
 forge project add api --repo https://github.com/example/api.git
 forge project add api --repo https://github.com/example/api.git --domain api.example.com
 forge project list
 forge project show api
 ```
 
-This registry metadata does not clone Git repositories or trigger deploys yet.
+`project_id` is optional when `--repo` is present. Forge infers and normalizes it from the repository basename, then applies the same safe ID validation. This registry metadata does not clone Git repositories or trigger deploys yet.
 
 Cleanup and orphan recovery outcomes are emitted into the same event stream:
 

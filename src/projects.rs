@@ -85,8 +85,8 @@ impl ProjectRegistryStore {
         request: ProjectUpsertRequest,
         apps_domain: Option<&str>,
     ) -> Result<ProjectRecord, ProjectRegistryError> {
-        let project_id = normalize_project_id(&request.project_id)?;
         let repo_url = normalize_repo_url(&request.repo_url)?;
+        let project_id = resolve_project_id(request.project_id.as_deref(), &repo_url)?;
         let default_branch = normalize_default_branch(&request.default_branch)?;
         let existing = self.get(&project_id)?;
         let created_at_unix = existing
@@ -327,6 +327,66 @@ fn normalize_project_id(input: &str) -> Result<String, ProjectRegistryError> {
     Ok(value.to_string())
 }
 
+fn resolve_project_id(
+    requested_project_id: Option<&str>,
+    repo_url: &str,
+) -> Result<String, ProjectRegistryError> {
+    match requested_project_id {
+        Some(project_id) => normalize_project_id(project_id),
+        None => infer_project_id_from_repo_url(repo_url),
+    }
+}
+
+fn infer_project_id_from_repo_url(repo_url: &str) -> Result<String, ProjectRegistryError> {
+    let trimmed = repo_url.trim().trim_end_matches('/');
+    let Some(raw_basename) = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
+    else {
+        return Err(ProjectRegistryError::InvalidRepoUrl(
+            "repo_url must include a repository name".into(),
+        ));
+    };
+
+    let inferred = normalize_inferred_project_id(raw_basename);
+    if inferred.is_empty() {
+        return Err(ProjectRegistryError::InvalidRepoUrl(
+            "repo_url must include a usable repository name".into(),
+        ));
+    }
+
+    normalize_project_id(&inferred).map_err(|_| {
+        ProjectRegistryError::InvalidRepoUrl(
+            "repo_url produced an invalid inferred project_id".into(),
+        )
+    })
+}
+
+fn normalize_inferred_project_id(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len());
+    let mut previous_was_hyphen = false;
+    for ch in input.chars().flat_map(char::to_lowercase) {
+        let next = if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            Some(ch)
+        } else {
+            Some('-')
+        };
+        if let Some(ch) = next {
+            if ch == '-' {
+                if previous_was_hyphen {
+                    continue;
+                }
+                previous_was_hyphen = true;
+            } else {
+                previous_was_hyphen = false;
+            }
+            normalized.push(ch);
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
 fn normalize_repo_url(input: &str) -> Result<String, ProjectRegistryError> {
     let value = input.trim();
     if value.is_empty() {
@@ -457,7 +517,7 @@ mod tests {
 
     fn request(project_id: &str) -> ProjectUpsertRequest {
         ProjectUpsertRequest {
-            project_id: project_id.into(),
+            project_id: Some(project_id.into()),
             repo_url: "https://github.com/example/api.git".into(),
             default_branch: "main".into(),
             base_domain: Some(format!("{project_id}.example.com")),
@@ -649,5 +709,150 @@ mod tests {
 
         let err = store.upsert(request, None).unwrap_err();
         assert!(matches!(err, ProjectRegistryError::MissingAppsDomain));
+    }
+
+    #[test]
+    fn project_add_infers_project_id_from_repo_url() {
+        let root = test_root("infer-project-id");
+        let store = ProjectRegistryStore::new(&root);
+        let request = ProjectUpsertRequest {
+            project_id: None,
+            repo_url: "https://github.com/anggaprytn/forge-fullstack-api-test.git".into(),
+            default_branch: "main".into(),
+            base_domain: Some("forge-fullstack-api-test.example.com".into()),
+        };
+
+        let created = store.upsert(request, None).unwrap();
+        assert_eq!(created.project_id, "forge-fullstack-api-test");
+    }
+
+    #[test]
+    fn project_add_prefers_explicit_project_id() {
+        let root = test_root("explicit-project-id");
+        let store = ProjectRegistryStore::new(&root);
+        let request = ProjectUpsertRequest {
+            project_id: Some("custom-api".into()),
+            repo_url: "https://github.com/anggaprytn/forge-fullstack-api-test.git".into(),
+            default_branch: "main".into(),
+            base_domain: Some("custom-api.example.com".into()),
+        };
+
+        let created = store.upsert(request, None).unwrap();
+        assert_eq!(created.project_id, "custom-api");
+    }
+
+    #[test]
+    fn inferred_project_id_is_normalized() {
+        let root = test_root("normalized-inferred-project-id");
+        let store = ProjectRegistryStore::new(&root);
+        let request = ProjectUpsertRequest {
+            project_id: None,
+            repo_url: "https://github.com/example/Forge__Fullstack...API---Test.git".into(),
+            default_branch: "main".into(),
+            base_domain: Some("forge-fullstack-api-test.example.com".into()),
+        };
+
+        let created = store.upsert(request, None).unwrap();
+        assert_eq!(created.project_id, "forge-fullstack-api-test");
+    }
+
+    #[test]
+    fn generated_domain_prefers_clean_project_name() {
+        let root = test_root("generated-domain-clean-project-name");
+        let store = ProjectRegistryStore::new(&root);
+        let request = ProjectUpsertRequest {
+            project_id: None,
+            repo_url: "https://github.com/anggaprytn/forge-fullstack-api-test.git".into(),
+            default_branch: "main".into(),
+            base_domain: None,
+        };
+
+        let created = store.upsert(request, Some("forge.example.com")).unwrap();
+        assert_eq!(
+            created.base_domain,
+            "forge-fullstack-api-test.forge.example.com"
+        );
+    }
+
+    #[test]
+    fn generated_domain_adds_suffix_on_collision() {
+        let root = test_root("generated-domain-collision");
+        let store = ProjectRegistryStore::new(&root);
+        store
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("existing".into()),
+                    repo_url: "https://github.com/example/first.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("forge-fullstack-api-test.forge.example.com".into()),
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+        set_test_shortids(&["abcd1234"]);
+
+        let created = store
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: None,
+                    repo_url: "https://github.com/anggaprytn/forge-fullstack-api-test.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: None,
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+        assert_eq!(
+            created.base_domain,
+            "forge-fullstack-api-test-abcd1234.forge.example.com"
+        );
+    }
+
+    #[test]
+    fn generated_domain_is_stable_after_updates() {
+        let root = test_root("generated-domain-stable-updates");
+        let store = ProjectRegistryStore::new(&root);
+        let created = store
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: None,
+                    repo_url: "https://github.com/anggaprytn/forge-fullstack-api-test.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: None,
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+
+        let updated = store
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some(created.project_id.clone()),
+                    repo_url: "https://github.com/anggaprytn/forge-fullstack-api-test-renamed.git"
+                        .into(),
+                    default_branch: "develop".into(),
+                    base_domain: None,
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+
+        assert_eq!(updated.project_id, created.project_id);
+        assert_eq!(updated.base_domain, created.base_domain);
+    }
+
+    #[test]
+    fn project_add_rejects_repo_urls_without_usable_inferred_project_name() {
+        let root = test_root("invalid-inferred-project-id");
+        let store = ProjectRegistryStore::new(&root);
+        let request = ProjectUpsertRequest {
+            project_id: None,
+            repo_url: "https://github.com/example/---.git".into(),
+            default_branch: "main".into(),
+            base_domain: Some("invalid.example.com".into()),
+        };
+
+        let err = store.upsert(request, None).unwrap_err();
+        assert!(matches!(err, ProjectRegistryError::InvalidRepoUrl(_)));
     }
 }

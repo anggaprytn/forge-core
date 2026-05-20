@@ -82,6 +82,7 @@ Forge stores a server-owned project registry under the existing storage root. Th
 Commands:
 
 ```bash
+forge project add --repo https://github.com/example/api.git
 forge project add api --repo https://github.com/example/api.git
 forge project add api --repo https://github.com/example/api.git --branch development
 forge project add api --repo https://github.com/example/api.git --domain api.example.com
@@ -92,6 +93,7 @@ forge project show api
 Rules:
 
 - `--branch` defaults to `main`.
+- `project_id` is optional when `--repo` is provided. Forge infers it from the repository basename, normalizes it, and validates the resulting ID using the existing safe project ID rules.
 - If `--domain` is provided, Forge stores it as an explicit `base_domain`.
 - If `--domain` is omitted on first creation, Forge first tries `<project_id>.<FORGE_APPS_DOMAIN>`.
 - If that clean domain is already used by another project, Forge falls back to `<project_id>-<shortid>.<FORGE_APPS_DOMAIN>`.
