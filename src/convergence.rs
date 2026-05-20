@@ -253,7 +253,9 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
             let Some(generation) = cleanup_generation_for_route(&env, route, &references) else {
                 continue;
             };
-            if attempted_cleanup.contains(&(project_id.clone(), environment.clone(), generation)) {
+            if attempted_cleanup.contains(&(project_id.clone(), environment.clone(), generation))
+                && !env.generation_dir(generation).exists()
+            {
                 continue;
             }
             if route_has_valid_backing(
@@ -1332,7 +1334,6 @@ where
             },
             Some(cleanup.failure_reason.clone()),
         )?;
-        attempted_cleanup.insert((project_id, environment, generation));
         if cleanup.container_removed {
             removed.insert(container.container_name.clone());
         }
@@ -3099,5 +3100,68 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
                 .map(|route| route.active_target.clone()),
             Some("172.19.0.11:3000".into())
         );
+    }
+
+    #[test]
+    fn startup_recovery_removes_nonfinalized_candidate_route_after_container_cleanup() {
+        let root = test_root("startup-recover-removes-orphan-route");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        fs::create_dir_all(env.generation_dir(1).join("diagnostics")).unwrap();
+        crate::storage::atomic_write(
+            env.generation_dir(1).join("build.json"),
+            b"{\n  \"deployment_id\": \"d1\",\n  \"image_ref\": \"forge/api:gen-1\"\n}\n",
+        )
+        .unwrap();
+        crate::storage::atomic_write(
+            env.generation_dir(1).join("runtime.json"),
+            b"{\n  \"container_name\": \"prod-api-gen-1\",\n  \"running\": true\n}\n",
+        )
+        .unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "d1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+            })
+            .unwrap();
+        queue.start_next().unwrap().unwrap();
+
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-1:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }),
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        };
+
+        let outcome = StartupConvergence::new(&root, &queue, &ResumeDecider(false))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::Failed(DeploymentRecord {
+                deployment_id: "d1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+            })
+        );
+        assert_eq!(
+            routing.remove_calls,
+            vec!["forge:api:production".to_string()]
+        );
+        let cleanup = CleanupStore::new(env, 1).read_record().unwrap().unwrap();
+        assert!(cleanup.container_removed);
+        assert!(cleanup.route_removed);
+        assert!(!cleanup.tombstoned);
     }
 }
