@@ -317,6 +317,16 @@ components:
         intent:
           type: string
           enum: [deploy, redeploy, rollback]
+        source_path:
+          type:
+            - string
+            - 'null'
+          description: Optional explicit local source checkout path on the daemon host. Mutually exclusive with `source_ref`.
+        source_ref:
+          type:
+            - string
+            - 'null'
+          description: Optional Git ref to resolve from the registered project repository. When omitted for deploy intents, Forge uses the project's `default_branch`. Mutually exclusive with `source_path`.
     ProjectUpsertRequest:
       type: object
       required:

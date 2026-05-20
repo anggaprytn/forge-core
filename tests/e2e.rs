@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use forge_core::api::DeploymentRequest;
+use forge_core::api::{DeploymentRequest, ProjectUpsertRequest};
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::{
@@ -114,10 +114,10 @@ fn dogfood_rollback_restores_previous_generation() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     let second = harness.execute_next_deployment().unwrap();
     assert_eq!(second.generation, 2);
 
@@ -165,7 +165,7 @@ fn dogfood_daemon_restart_reconstructs_current_route() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
 
     let env = EnvironmentPaths::new(&harness.runtime_root, "api", "production");
@@ -196,7 +196,7 @@ fn dogfood_reboot_recovery_restores_container_and_route() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
 
     docker(&["rm", "-f", "prod-api-gen-1"]).expect("active generation should be removable");
@@ -240,7 +240,7 @@ fn dogfood_finalized_runtime_persists_http_route_recovery_metadata() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
 
     let runtime: Value = serde_json::from_str(
@@ -288,7 +288,10 @@ fn dogfood_restart_during_inflight_deploy_fails_or_recovers_deterministically() 
             deployment_id,
             project_id: "api".into(),
             environment: "production".into(),
-            source_path: None,
+            source_path: Some(common::sample_http_app_fixture()),
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
         }))
     );
     assert!(
@@ -308,7 +311,7 @@ fn dogfood_bad_app_failed_health_does_not_promote_current() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::bad_http_app_fixture());
     let result = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
 
     assert!(matches!(
@@ -340,7 +343,7 @@ fn dogfood_bad_app_failed_generation_is_cleaned() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::bad_http_app_fixture());
     let _ = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
 
     assert!(!docker_container_exists("prod-api-gen-1"));
@@ -357,7 +360,7 @@ fn dogfood_bad_app_diagnostics_are_visible() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::bad_http_app_fixture());
     let _ = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
 
     let diagnostics_dir = harness.generation_dir(1).join("diagnostics");
@@ -396,6 +399,9 @@ fn dogfood_crash_during_deploy_recovers_without_orphan_container() {
             project_id: "api".into(),
             environment: "production".into(),
             source_path: None,
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
         }))
     );
     assert!(!docker_container_exists("prod-api-gen-1"));
@@ -465,6 +471,17 @@ fn dogfood_github_webhook_push_enqueues_and_deploys() {
 }"#,
     );
     let commit_sha = git_output(&repo, &["rev-parse", "HEAD"]);
+    ProjectRegistryStore::new(&harness.runtime_root)
+        .upsert(
+            ProjectUpsertRequest {
+                project_id: Some("api".into()),
+                repo_url: repo.to_str().unwrap().into(),
+                default_branch: "main".into(),
+                base_domain: Some("api.example.com".into()),
+            },
+            None,
+        )
+        .unwrap();
 
     let response = harness.post_github_webhook(
         "delivery-1",
@@ -499,7 +516,7 @@ fn runtime_secret_is_injected_into_container() {
     };
 
     harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::secret_http_app_fixture());
     harness
         .execute_next_deployment_for_fixture(&common::secret_http_app_fixture())
         .unwrap();
@@ -523,7 +540,7 @@ fn secret_value_is_redacted_from_events() {
     };
 
     harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::secret_http_app_fixture());
     harness
         .execute_next_deployment_for_fixture(&common::secret_http_app_fixture())
         .unwrap();
@@ -548,7 +565,7 @@ fn secret_value_is_redacted_from_diagnostics() {
     };
 
     harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::secret_http_bad_app_fixture());
     let result =
         harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
     assert!(matches!(
@@ -572,7 +589,7 @@ fn logs_endpoint_redacts_secret_values() {
     };
 
     harness.put_secret("DATABASE_URL", "postgres://alpha-secret-value");
-    let deployment_id = harness.enqueue_deploy();
+    let deployment_id = harness.enqueue_deploy_for_fixture(&common::secret_http_bad_app_fixture());
     let result =
         harness.execute_next_deployment_for_fixture(&common::secret_http_bad_app_fixture());
     assert!(matches!(
@@ -601,7 +618,7 @@ fn failed_deploy_logs_preserve_diagnostic_context() {
         return;
     };
 
-    let deployment_id = harness.enqueue_deploy();
+    let deployment_id = harness.enqueue_deploy_for_fixture(&common::bad_http_app_fixture());
     let result = harness.execute_next_deployment_for_fixture(&common::bad_http_app_fixture());
     assert!(matches!(
         result,
@@ -629,7 +646,7 @@ fn missing_required_secret_fails_before_container_start() {
         return;
     };
 
-    harness.enqueue_deploy();
+    harness.enqueue_deploy_for_fixture(&common::secret_http_app_fixture());
     let result = harness.execute_next_deployment_for_fixture(&common::secret_http_app_fixture());
     assert!(matches!(result, Err(DeploymentError::MissingSecret(_))));
     assert!(!docker_container_exists("prod-api-gen-1"));
@@ -663,6 +680,10 @@ impl E2eHarness {
         }
         common::require_docker_available();
         ensure_test_master_key();
+        cleanup_forge_containers().expect("forge containers should be cleaned between e2e runs");
+        cleanup_forge_images().expect("forge images should be cleaned between e2e runs");
+        cleanup_e2e_caddy_containers()
+            .expect("e2e caddy containers should be cleaned between e2e runs");
 
         let runtime_root = common::runtime_root("e2e");
         let suffix = unique_suffix();
@@ -759,6 +780,10 @@ impl E2eHarness {
     }
 
     fn enqueue_deploy(&self) -> String {
+        self.enqueue_deploy_for_fixture(&common::sample_http_app_fixture())
+    }
+
+    fn enqueue_deploy_for_fixture(&self, fixture: &Path) -> String {
         let response = self
             .http_client
             .post(self.api_url("deployments"))
@@ -767,7 +792,8 @@ impl E2eHarness {
                 project_id: "api".into(),
                 environment: "production".into(),
                 intent: "deploy".into(),
-                source_path: None,
+                source_path: Some(fixture.to_path_buf()),
+                source_ref: None,
             })
             .send()
             .expect("deploy request should reach api");
@@ -852,9 +878,20 @@ impl E2eHarness {
             &["-C", repo.to_str().unwrap(), "checkout", "-b", branch],
         );
         fs::write(repo.join("forge.project.json"), manifest).unwrap();
+        fs::copy(
+            common::sample_http_app_fixture().join("Dockerfile"),
+            repo.join("Dockerfile"),
+        )
+        .unwrap();
         git_in(
             &self.runtime_root,
-            &["-C", repo.to_str().unwrap(), "add", "forge.project.json"],
+            &[
+                "-C",
+                repo.to_str().unwrap(),
+                "add",
+                "forge.project.json",
+                "Dockerfile",
+            ],
         );
         git_in(
             &self.runtime_root,
@@ -921,6 +958,9 @@ impl E2eHarness {
             project_id: "api".into(),
             environment: "production".into(),
             source_path: None,
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
         };
         let env = EnvironmentPaths::new(&self.runtime_root, "api", "production");
         env.ensure_exists().unwrap();
@@ -1302,6 +1342,36 @@ fn docker_container_ip(name: &str, network_name: &str) -> String {
 fn cleanup_forge_containers() -> Result<(), String> {
     let output = Command::new("docker")
         .args(["ps", "-aq", "--filter", "label=forge.managed=true"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let ids = String::from_utf8_lossy(&output.stdout);
+    for id in ids.lines().filter(|line| !line.trim().is_empty()) {
+        let _ = docker(&["rm", "-f", id.trim()]);
+    }
+    Ok(())
+}
+
+fn cleanup_forge_images() -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(["images", "-q", "forge/api"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let ids = String::from_utf8_lossy(&output.stdout);
+    for id in ids.lines().filter(|line| !line.trim().is_empty()) {
+        let _ = docker(&["rmi", "-f", id.trim()]);
+    }
+    Ok(())
+}
+
+fn cleanup_e2e_caddy_containers() -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(["ps", "-aq", "--filter", "name=forge-e2e-caddy-"])
         .output()
         .map_err(|err| err.to_string())?;
     if !output.status.success() {

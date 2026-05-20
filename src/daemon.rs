@@ -1,5 +1,4 @@
 use std::fmt::{Display, Formatter};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -21,6 +20,7 @@ use crate::deployments::{
 use crate::events::EventRecord;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
+use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
 };
@@ -170,12 +170,15 @@ where
         })?;
 
         let deployment_id = next_deployment_id();
-        let source_path = resolve_source_path(request.source_path.as_deref())?;
+        let resolved_source = resolve_deployment_source(&self.config.storage_root, &request)?;
         let record = DeploymentRecord {
             deployment_id: deployment_id.clone(),
             project_id: request.project_id,
             environment: request.environment,
-            source_path,
+            source_path: resolved_source.source_path,
+            source_ref: resolved_source.source_ref,
+            repo_url: resolved_source.repo_url,
+            commit_sha: resolved_source.commit_sha,
         };
         queue.enqueue(record).map_err(queue_error_to_response)?;
         let queue_position = queue.queued_len().map_err(queue_error_to_response)?;
@@ -420,30 +423,66 @@ fn next_deployment_id() -> String {
     format!("dep-{now}-{seq}")
 }
 
-fn resolve_source_path(
-    source_path: Option<&std::path::Path>,
-) -> Result<Option<PathBuf>, ErrorResponse> {
-    let Some(source_path) = source_path else {
-        return Ok(None);
-    };
-
-    let resolved = fs::canonicalize(source_path).map_err(|err| ErrorResponse {
-        code: "invalid_source_path".into(),
-        message: format!(
-            "source path `{}` is not accessible on the daemon host: {err}",
-            source_path.display()
-        ),
-    })?;
-    if !resolved.is_dir() {
-        return Err(ErrorResponse {
-            code: "invalid_source_path".into(),
-            message: format!(
-                "source path `{}` must be an existing directory",
-                resolved.display()
-            ),
+fn resolve_deployment_source(
+    storage_root: &std::path::Path,
+    request: &DeploymentRequest,
+) -> Result<ResolvedDeploymentSource, ErrorResponse> {
+    if request.intent == "rollback" {
+        return Ok(ResolvedDeploymentSource {
+            source_path: None,
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
         });
     }
-    Ok(Some(resolved))
+
+    SourceResolver::new(storage_root)
+        .resolve(
+            &request.project_id,
+            request.source_path.as_deref(),
+            request.source_ref.as_deref(),
+        )
+        .map_err(source_resolver_error_to_response)
+}
+
+fn source_resolver_error_to_response(err: SourceResolverError) -> ErrorResponse {
+    match err {
+        SourceResolverError::ProjectNotFound(project_id) => ErrorResponse {
+            code: "project_not_found".into(),
+            message: format!("project is not registered: {project_id}"),
+        },
+        SourceResolverError::InvalidSourcePath(message) => ErrorResponse {
+            code: "invalid_source_path".into(),
+            message,
+        },
+        SourceResolverError::InvalidSourceRef => ErrorResponse {
+            code: "invalid_source_ref".into(),
+            message: "source_ref must not be empty".into(),
+        },
+        SourceResolverError::InvalidRepoUrl(message) => ErrorResponse {
+            code: "invalid_repo_url".into(),
+            message,
+        },
+        SourceResolverError::ProjectRegistry(err) => ErrorResponse {
+            code: "project_registry_unavailable".into(),
+            message: err.to_string(),
+        },
+        SourceResolverError::GitCommand(message) => ErrorResponse {
+            code: "git_source_unavailable".into(),
+            message,
+        },
+        SourceResolverError::CheckoutConflict(path) => ErrorResponse {
+            code: "source_checkout_conflict".into(),
+            message: format!(
+                "source checkout path already exists but does not match the requested commit: {}",
+                path.display()
+            ),
+        },
+        SourceResolverError::Io(err) => ErrorResponse {
+            code: "source_resolution_failed".into(),
+            message: err.to_string(),
+        },
+    }
 }
 
 struct PersistedDeployment {
@@ -767,6 +806,7 @@ pub mod daemon_refuses_api_commands_before_ready {
             environment: "production".into(),
             intent: "deploy".into(),
             source_path: None,
+            source_ref: None,
         });
 
         assert_eq!(
@@ -794,6 +834,9 @@ pub mod daemon_recovers_queue_before_accepting_deploys {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         queue.start_next().unwrap().unwrap();
@@ -814,6 +857,9 @@ pub mod daemon_recovers_queue_before_accepting_deploys {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             }))
         );
         assert_eq!(daemon.startup_steps()[1], StartupStep::BootstrapReady);
@@ -846,6 +892,7 @@ pub mod daemon_drains_shutdown_safely {
             environment: "production".into(),
             intent: "deploy".into(),
             source_path: None,
+            source_ref: None,
         });
         assert!(response.is_err());
     }
@@ -866,6 +913,9 @@ pub mod daemon_does_not_start_health_loops_before_convergence_completes {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         queue.start_next().unwrap().unwrap();
@@ -915,6 +965,7 @@ pub mod post_deployments_enqueues_job_and_persists_across_restart {
                 environment: "production".into(),
                 intent: "deploy".into(),
                 source_path: Some(root.join("source")),
+                source_ref: None,
             })
             .unwrap();
 
@@ -961,6 +1012,7 @@ pub mod deploy_from_path_rejects_missing_directory {
                 environment: "production".into(),
                 intent: "deploy".into(),
                 source_path: Some(root.join("missing")),
+                source_ref: None,
             })
             .unwrap_err();
 
@@ -984,6 +1036,9 @@ pub mod daemon_consumes_queued_deployment {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
 
@@ -1027,6 +1082,9 @@ pub mod daemon_worker_leaves_no_active_queue_item_after_success_or_failure {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
 
@@ -1053,6 +1111,9 @@ pub mod daemon_worker_leaves_no_active_queue_item_after_success_or_failure {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
 

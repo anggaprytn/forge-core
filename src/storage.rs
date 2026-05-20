@@ -84,6 +84,14 @@ pub struct RuntimeState {
 pub struct PersistedBuildInfo {
     pub deployment_id: String,
     pub image_ref: String,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -123,6 +131,14 @@ pub struct PersistedRuntimeInfo {
     pub activation: Option<PersistedActivationMode>,
     #[serde(default)]
     pub environment_variables: BTreeMap<String, PersistedSecretReference>,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

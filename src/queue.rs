@@ -11,6 +11,12 @@ pub struct DeploymentRecord {
     pub environment: String,
     #[serde(default)]
     pub source_path: Option<PathBuf>,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +207,9 @@ fn parse_record(line: &str) -> Result<DeploymentRecord, QueueError> {
         project_id: parts[1].to_string(),
         environment: parts[2].to_string(),
         source_path: None,
+        source_ref: None,
+        repo_url: None,
+        commit_sha: None,
     })
 }
 
@@ -232,6 +241,9 @@ pub mod only_one_active_deployment {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         queue
@@ -240,6 +252,9 @@ pub mod only_one_active_deployment {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
 
@@ -267,6 +282,9 @@ pub mod queued_deployments_survive_restart {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: Some(PathBuf::from("/srv/apps/api")),
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
 

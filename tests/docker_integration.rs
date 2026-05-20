@@ -136,6 +136,9 @@ fn docker_integration_executor_validates_candidate_over_container_ip() {
             project_id: "api".into(),
             environment: "production".into(),
             source_path: None,
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
         })
         .unwrap();
 

@@ -2265,6 +2265,7 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
     );
     if ready {
         daemon.start().unwrap();
+        seed_test_project(&root);
     }
     (
         HttpState::new(
@@ -2284,6 +2285,52 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
 #[cfg(test)]
 fn build_state(ready: bool) -> HttpState {
     build_state_with_root(ready).0
+}
+
+#[cfg(test)]
+fn seed_test_project(root: &Path) {
+    use crate::api::ProjectUpsertRequest;
+
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_test(
+        root,
+        &["init", "--initial-branch=main", repo.to_str().unwrap()],
+    );
+    std::fs::write(repo.join("README.md"), "ok\n").unwrap();
+    git_test(&repo, &["add", "README.md"]);
+    git_test(&repo, &["commit", "-m", "initial"]);
+
+    ProjectRegistryStore::new(root)
+        .upsert(
+            ProjectUpsertRequest {
+                project_id: Some("api".into()),
+                repo_url: repo.to_str().unwrap().into(),
+                default_branch: "main".into(),
+                base_domain: Some("api.example.com".into()),
+            },
+            None,
+        )
+        .unwrap();
+}
+
+#[cfg(test)]
+fn git_test(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Forge Tests")
+        .env("GIT_AUTHOR_EMAIL", "forge-tests@example.com")
+        .env("GIT_COMMITTER_NAME", "Forge Tests")
+        .env("GIT_COMMITTER_EMAIL", "forge-tests@example.com")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(test)]

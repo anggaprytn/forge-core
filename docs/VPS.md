@@ -162,7 +162,7 @@ systemctl enable --now forge
 ```
 
 ### Manual Deployment Note
-By default, manual `forge deploy <project> <environment>` deployments build from the Forge daemon process `WorkingDirectory`. Prefer `forge deploy --from <path> <project> <environment>` when you want to target an explicit checkout. `--from` remains an alpha/dev-mode operator path; long-term canonical deploy source is `repository + ref`, resolved to an immutable local checkout.
+`forge deploy <project> <environment>` now resolves source from the registered project repository using the project's `default_branch`, or `--ref <ref>` when provided. Forge requires `git` to be installed on the server, reuses a repository cache under `/var/lib/forge/repositories/<project_id>/`, and deploys from immutable checkouts under `/var/lib/forge/source-checkouts/<project_id>/<commit_sha>/`. `--from` remains available for explicit local-path deploys.
 
 ---
 
@@ -190,6 +190,7 @@ Enqueue the deploy:
 
 ```bash
 forge deploy api production
+forge deploy api production --ref main
 forge deploy api production --from /srv/forge/sample-http-app
 forge events
 ```
@@ -204,7 +205,7 @@ forge project list
 forge project show api
 ```
 
-`project_id` is optional when `--repo` is present. Forge infers and normalizes it from the repository basename, then applies the same safe ID validation. This registry metadata does not clone Git repositories or trigger deploys yet.
+`project_id` is optional when `--repo` is present. Forge infers and normalizes it from the repository basename, then applies the same safe ID validation. This registry metadata is also the source of truth for deploy-by-ref source resolution.
 
 Cleanup and orphan recovery outcomes are emitted into the same event stream:
 

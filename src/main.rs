@@ -92,6 +92,7 @@ where
             project_id,
             environment,
             source_path,
+            source_ref,
         } => {
             let (base_url, token) = api_credentials.clone().unwrap();
             let client = ForgeClient::new(base_url, token);
@@ -100,6 +101,7 @@ where
                 environment,
                 intent: "deploy".into(),
                 source_path,
+                source_ref,
             })?;
             print_json(&accepted)?;
         }
@@ -126,6 +128,7 @@ where
                 environment,
                 intent: "rollback".into(),
                 source_path: None,
+                source_ref: None,
             })?;
             print_json(&accepted)?;
         }
@@ -367,6 +370,7 @@ enum Command {
         project_id: String,
         environment: String,
         source_path: Option<PathBuf>,
+        source_ref: Option<String>,
     },
     Status {
         deployment_id: String,
@@ -594,7 +598,7 @@ fn usage() -> String {
         "  forge login <server_url>",
         "  forge logout",
         "  forge whoami",
-        "  forge [--url URL] [--token TOKEN] deploy [--from PATH] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
@@ -607,21 +611,45 @@ fn usage() -> String {
 }
 
 fn parse_deploy_command(args: &[String]) -> Result<Command, CliError> {
-    match args {
+    let mut source_path = None;
+    let mut source_ref = None;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--from" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage("deploy requires --from <path>".into()));
+                };
+                source_path = Some(PathBuf::from(value));
+            }
+            "--ref" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage("deploy requires --ref <ref>".into()));
+                };
+                source_ref = Some(value.clone());
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+        index += 1;
+    }
+
+    if source_path.is_some() && source_ref.is_some() {
+        return Err(CliError::Usage(
+            "deploy accepts either --from <path> or --ref <ref>, not both".into(),
+        ));
+    }
+
+    match positionals.as_slice() {
         [project_id, environment] => Ok(Command::Deploy {
             project_id: project_id.clone(),
             environment: environment.clone(),
-            source_path: None,
-        }),
-        [flag, path, project_id, environment] if flag == "--from" => Ok(Command::Deploy {
-            project_id: project_id.clone(),
-            environment: environment.clone(),
-            source_path: Some(PathBuf::from(path)),
-        }),
-        [project_id, environment, flag, path] if flag == "--from" => Ok(Command::Deploy {
-            project_id: project_id.clone(),
-            environment: environment.clone(),
-            source_path: Some(PathBuf::from(path)),
+            source_path,
+            source_ref,
         }),
         _ => Err(CliError::Usage(usage())),
     }
@@ -1140,6 +1168,7 @@ mod tests {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: Some(PathBuf::from("/srv/api")),
+                source_ref: None,
             }
         );
     }
@@ -1165,7 +1194,57 @@ mod tests {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: Some(PathBuf::from("/srv/api")),
+                source_ref: None,
             }
+        );
+    }
+
+    #[test]
+    fn deploy_command_accepts_ref() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "deploy".into(),
+            "api".into(),
+            "production".into(),
+            "--ref".into(),
+            "release-2026-05".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::Deploy {
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: None,
+                source_ref: Some("release-2026-05".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn deploy_ref_and_from_are_mutually_exclusive() {
+        let err = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "deploy".into(),
+            "api".into(),
+            "production".into(),
+            "--from".into(),
+            "/srv/api".into(),
+            "--ref".into(),
+            "main".into(),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "deploy accepts either --from <path> or --ref <ref>, not both"
         );
     }
 }

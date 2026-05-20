@@ -81,7 +81,7 @@ Forge has been manually validated on a real VPS with the following:
 - **Single-service web apps**: Only one HTTP service per project.
 - **No stateful DB ownership**: Database volume/state management is not native yet.
 - **No multi-service orchestration**: No built-in cross-service dependency management.
-- **Manual deploy source**: By default, `forge deploy` builds from the daemon's `WorkingDirectory`; prefer `forge deploy --from <path>` for explicit operator control.
+- **Registered project required for deploy-by-ref**: `forge deploy <project> <environment>` resolves the source from the registered project repository and `default_branch`. Use `--ref <ref>` to override or `--from <path>` for explicit local-path deploys.
 - **API Visibility**: API is localhost-bound by default; do not expose publicly.
 
 ---
@@ -176,7 +176,7 @@ Example project creation:
 - `forge project add --repo https://github.com/example/api.git`
 - `forge project add api --repo https://github.com/example/api.git`
 
-This registry slice does not clone Git repositories, deploy by ref, activate derived routes, or add a web project UI yet.
+Forge now uses this registry metadata for deploy-by-ref source resolution. It clones or fetches repositories into `<storage_root>/repositories/<project_id>/` and reuses immutable source checkouts under `<storage_root>/source-checkouts/<project_id>/<commit_sha>/`.
 
 ## Web Role And Deferred Scope
 
@@ -410,12 +410,11 @@ This generates a deterministic `forge.yml` in the current directory. `forge.yml`
 
 ```bash
 forge deploy api production
+forge deploy api production --ref release-2026-05
 forge deploy api production --from /path/to/project
 ```
 
-Forge reads `forge.yml` from the deploy source root and enqueues a deployment for the `api` project in the `production` environment.
-
-By default, the deploy source is the daemon's `WorkingDirectory`. For predictable manual operations, prefer `forge deploy api production --from /path/to/project`.
+Forge resolves `forge deploy api production` from the registered project repository using the project's `default_branch`, fetches updates into the server-side repository cache, resolves an immutable commit SHA, and deploys from the corresponding immutable checkout. `--ref` overrides the branch or tag, and `--from` preserves the explicit local-path operator flow.
 
 ## 3. GitHub Webhook (Automated)
 

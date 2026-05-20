@@ -107,7 +107,7 @@ Planned derived domains are documented product semantics only in this slice:
 - `staging -> staging-<base_domain>`
 - `development -> development-<base_domain>`
 
-This does not deploy from Git yet. It only persists registry metadata for future git-backed deploy flows.
+Deploy-by-ref uses this registry metadata now. Forge clones or fetches repositories into `<storage_root>/repositories/<project_id>/`, resolves the requested ref or default branch to an immutable commit SHA, and reuses immutable checkouts from `<storage_root>/source-checkouts/<project_id>/<commit_sha>/`.
 
 ## Web Role
 
@@ -188,7 +188,7 @@ systemctl start forge
 
 - **Storage Root**: The service user must own `/var/lib/forge` (or your configured `storage_root`).
 - **WorkingDirectory**: The service user must have read and execute (traversal) permissions for the `WorkingDirectory` defined in the systemd unit.
-- **Manual Deploys**: By default, `forge deploy <project> <environment>` builds from the daemon's `WorkingDirectory`. Prefer `forge deploy --from <path> <project> <environment>` when you want an explicit source checkout.
+- **Deploy Source Resolution**: `forge deploy <project> <environment>` resolves the registered project's `default_branch` by default. Use `forge deploy <project> <environment> --ref <ref>` to override the ref, or `forge deploy --from <path> <project> <environment>` for an explicit local source checkout.
 
 ---
 
@@ -303,10 +303,12 @@ A minimal getting-started flow:
 ```bash
 forge init
 forge deploy api production
+forge deploy api production --ref main
+forge deploy api production --ref release-2026-05
 forge deploy api production --from /path/to/project
 ```
 
-`forge deploy` uses the `name`, build paths, runtime port, and healthcheck from `forge.yml`.
+Deploy-by-ref fetches the registered repository into the server-side cache, resolves an immutable commit SHA, and then uses the checkout's `forge.yml` for the deployment. `--from` bypasses Git resolution and deploys directly from the provided local path.
 
 ---
 
@@ -361,6 +363,7 @@ build
 
 ```bash
 forge deploy api production
+forge deploy api production --ref main
 ```
 
 ## CLI Login
@@ -765,7 +768,7 @@ AI-generated apps deploy successfully without manual infrastructure repair
 | Action       | Command                          |
 | ------------ | -------------------------------- |
 | start daemon | `forge daemon`                   |
-| deploy       | `forge deploy [--from PATH] <project> <env>` |
+| deploy       | `forge deploy [--from PATH] [--ref REF] <project> <env>` |
 | rollback     | `forge rollback <project> <env>` |
 | status       | `forge status <deployment_id>`   |
 | events       | `forge events`                   |

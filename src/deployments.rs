@@ -426,6 +426,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let build_json = serde_json::to_string_pretty(&PersistedBuildInfo {
             deployment_id: record.deployment_id.clone(),
             image_ref: image_ref.clone(),
+            source_ref: record.source_ref.clone(),
+            repo_url: record.repo_url.clone(),
+            commit_sha: record.commit_sha.clone(),
+            source_path: record.source_path.clone(),
         })
         .map_err(|err| {
             StorageError::Io(std::io::Error::new(
@@ -448,6 +452,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 },
             }),
             environment_variables: runtime_secret_references(&runtime_secrets),
+            source_ref: record.source_ref.clone(),
+            repo_url: record.repo_url.clone(),
+            commit_sha: record.commit_sha.clone(),
+            source_path: record.source_path.clone(),
         })
         .map_err(|err| {
             StorageError::Io(std::io::Error::new(
@@ -1169,6 +1177,9 @@ fn queued_record(queue: &PersistentQueue) {
             project_id: "api".into(),
             environment: "production".into(),
             source_path: None,
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
         })
         .unwrap();
 }
@@ -1740,6 +1751,9 @@ pub mod deploy_loads_forge_yml {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: Some(source_root.clone()),
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
@@ -1821,6 +1835,9 @@ pub mod deploy_from_path_uses_project_directory {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: Some(source_root.clone()),
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         let mut docker =
@@ -1907,6 +1924,135 @@ pub mod deploy_without_from_preserves_working_directory_behavior {
                 .windows(2)
                 .any(|pair| pair == ["-f", &root.join("Dockerfile").display().to_string()])
         );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_by_ref_preserves_existing_deploy_fsm {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn deploy_by_ref_preserves_existing_deploy_fsm() {
+        let root = test_root("deploy-by-ref-preserves-fsm");
+        let source_root = root.join("source-checkouts").join("api").join("abc123");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(source_root),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: None,
+        })
+        .execute_next()
+        .unwrap();
+
+        let event_types = EventStore::list_all(&root)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.deployment_id.as_deref() == Some("dep-1"))
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            vec![
+                "DEPLOYMENT_STARTED",
+                "IMAGE_BUILT",
+                "RUNTIME_ENV_PREPARED",
+                "CONTAINER_STARTED",
+                "VALIDATION_PASSED",
+                "SNAPSHOT_FINALIZED",
+                "GENERATION_PROMOTED",
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod deployment_metadata_records_commit_sha {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::{load_generation_build_info, load_generation_runtime_info};
+
+    #[test]
+    fn deployment_metadata_records_commit_sha() {
+        let root = test_root("deployment-metadata-records-commit");
+        let source_root = root.join("source-checkouts").join("api").join("abc123");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(source_root.clone()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: None,
+        })
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let build = load_generation_build_info(&env, 1).unwrap().unwrap();
+        let runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+
+        assert_eq!(build.commit_sha.as_deref(), Some("abc123"));
+        assert_eq!(build.source_ref.as_deref(), Some("main"));
+        assert_eq!(build.source_path.as_ref(), Some(&source_root));
+        assert_eq!(runtime.commit_sha.as_deref(), Some("abc123"));
+        assert_eq!(runtime.source_ref.as_deref(), Some("main"));
+        assert_eq!(runtime.source_path.as_ref(), Some(&source_root));
     }
 }
 

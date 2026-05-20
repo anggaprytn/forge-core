@@ -2402,6 +2402,9 @@ pub mod in_flight_deployment_is_recovered_or_failed_deterministically {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         let active = queue.start_next().unwrap().unwrap();
@@ -2427,6 +2430,9 @@ pub mod in_flight_deployment_is_recovered_or_failed_deterministically {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         let active = queue.start_next().unwrap().unwrap();
@@ -3534,6 +3540,9 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
             .unwrap();
         queue.start_next().unwrap().unwrap();
@@ -3563,6 +3572,9 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
                 project_id: "api".into(),
                 environment: "production".into(),
                 source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
             })
         );
         assert_eq!(

@@ -19,4 +19,5 @@ pub mod projects;
 pub mod queue;
 pub mod runtime;
 pub mod secrets;
+pub mod source;
 pub mod storage;

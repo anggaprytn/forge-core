@@ -151,6 +151,7 @@ pub fn resolve_webhook(
         environment: environment.into(),
         intent: "deploy".into(),
         source_path: None,
+        source_ref: None,
     }))
 }
 
@@ -319,6 +320,7 @@ mod tests {
                 environment: "production".into(),
                 intent: "deploy".into(),
                 source_path: None,
+                source_ref: None,
             })
         );
     }

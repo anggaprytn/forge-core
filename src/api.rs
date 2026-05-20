@@ -9,6 +9,8 @@ pub struct DeploymentRequest {
     pub intent: String,
     #[serde(default)]
     pub source_path: Option<PathBuf>,
+    #[serde(default)]
+    pub source_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,10 +125,30 @@ pub fn validate_deployment_request(request: &DeploymentRequest) -> Result<(), Er
         });
     }
 
-    if request.intent == "rollback" && request.source_path.is_some() {
+    if request
+        .source_ref
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
         return Err(ErrorResponse {
-            code: "invalid_source_path".into(),
-            message: "source_path is only supported for deploy intents".into(),
+            code: "invalid_source_ref".into(),
+            message: "source_ref must not be empty".into(),
+        });
+    }
+
+    if request.source_path.is_some() && request.source_ref.is_some() {
+        return Err(ErrorResponse {
+            code: "invalid_source".into(),
+            message: "source_path and source_ref are mutually exclusive".into(),
+        });
+    }
+
+    if request.intent == "rollback"
+        && (request.source_path.is_some() || request.source_ref.is_some())
+    {
+        return Err(ErrorResponse {
+            code: "invalid_source".into(),
+            message: "source_path and source_ref are only supported for deploy intents".into(),
         });
     }
 
