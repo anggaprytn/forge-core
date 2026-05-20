@@ -1,11 +1,13 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::{env, fs};
 
 use serde_json::Value;
+use serde_yaml::Value as YamlValue;
 
 #[derive(Debug, Clone)]
 struct CapturedRequest {
@@ -167,11 +169,96 @@ fn cli_doctor_reports_local_diagnostics() {
     assert!(stdout.contains("[OK] API token configured"));
 }
 
+#[test]
+fn init_creates_forge_yml() {
+    let root = test_root("cli-init-creates");
+
+    let output = run_cli_in_dir(&root, &["init"]);
+    assert!(output.status.success());
+
+    let rendered = fs::read_to_string(root.join("forge.yml")).unwrap();
+    assert_eq!(
+        rendered,
+        concat!(
+            "version: 1\n",
+            "name: api\n",
+            "type: web\n",
+            "\n",
+            "build:\n",
+            "  dockerfile: Dockerfile\n",
+            "  context: .\n",
+            "\n",
+            "runtime:\n",
+            "  port: 3000\n",
+            "  healthcheck:\n",
+            "    path: /health\n",
+            "    expected_status: 200\n",
+            "\n",
+            "invariants:\n",
+            "  - name: health\n",
+            "    path: /health\n",
+            "    expect_status: 200\n",
+        )
+    );
+}
+
+#[test]
+fn init_refuses_to_overwrite_existing_file() {
+    let root = test_root("cli-init-refuses-overwrite");
+    fs::write(root.join("forge.yml"), "version: 999\n").unwrap();
+
+    let output = run_cli_in_dir(&root, &["init"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(root.join("forge.yml")).unwrap(),
+        "version: 999\n"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("forge.yml already exists"));
+    assert!(stderr.contains("--force"));
+}
+
+#[test]
+fn init_force_overwrites_existing_file() {
+    let root = test_root("cli-init-force");
+    fs::write(root.join("forge.yml"), "version: 999\n").unwrap();
+
+    let output = run_cli_in_dir(&root, &["init", "--force"]);
+    assert!(output.status.success());
+
+    let rendered = fs::read_to_string(root.join("forge.yml")).unwrap();
+    assert!(rendered.contains("version: 1"));
+    assert!(rendered.contains("name: api"));
+}
+
+#[test]
+fn init_output_is_valid_yaml() {
+    let root = test_root("cli-init-yaml");
+
+    let output = run_cli_in_dir(&root, &["init"]);
+    assert!(output.status.success());
+
+    let rendered = fs::read_to_string(root.join("forge.yml")).unwrap();
+    let yaml: YamlValue = serde_yaml::from_str(&rendered).unwrap();
+    assert_eq!(yaml["version"].as_u64(), Some(1));
+    assert_eq!(yaml["name"].as_str(), Some("api"));
+    assert_eq!(yaml["type"].as_str(), Some("web"));
+}
+
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)
         .env("FORGE_URL", url)
         .env("FORGE_TOKEN", "test-token")
+        .output()
+        .unwrap()
+}
+
+fn run_cli_in_dir(workdir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(args)
+        .current_dir(workdir)
         .output()
         .unwrap()
 }
@@ -234,7 +321,7 @@ fn spawn_server(
     (url, handle)
 }
 
-fn test_root(name: &str) -> std::path::PathBuf {
+fn test_root(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(1);

@@ -1,5 +1,7 @@
 use std::env;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -44,7 +46,10 @@ where
     F: FnOnce(DaemonCommand) -> Result<(), CliError>,
 {
     let parsed = ParsedArgs::parse(args)?;
-    let api_credentials = if matches!(parsed.command, Command::Doctor { .. } | Command::Daemon(_)) {
+    let api_credentials = if matches!(
+        parsed.command,
+        Command::Doctor { .. } | Command::Daemon(_) | Command::Init { .. }
+    ) {
         None
     } else {
         Some((parsed.base_url()?, parsed.token()?))
@@ -68,6 +73,7 @@ where
             }
         }
         Command::Daemon(command) => daemon_runner(command)?,
+        Command::Init { force } => init_project_config(force)?,
         Command::Deploy {
             project_id,
             environment,
@@ -238,6 +244,9 @@ enum Command {
         metrics_url: Option<String>,
     },
     Daemon(DaemonCommand),
+    Init {
+        force: bool,
+    },
     Deploy {
         project_id: String,
         environment: String,
@@ -383,6 +392,8 @@ fn parse_command(
             caddy_admin_url,
             caddy_public_url,
         })),
+        [cmd] if cmd == "init" => Ok(Command::Init { force: false }),
+        [cmd, flag] if cmd == "init" && flag == "--force" => Ok(Command::Init { force: true }),
         [cmd, project_id, environment] if cmd == "deploy" => Ok(Command::Deploy {
             project_id: project_id.clone(),
             environment: environment.clone(),
@@ -414,6 +425,7 @@ fn usage() -> String {
         "usage:",
         "  forge [--config PATH] [--caddy-admin-url URL] [--metrics-url URL] doctor",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] daemon",
+        "  forge init [--force]",
         "  forge [--url URL] [--token TOKEN] deploy <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] events",
@@ -438,6 +450,45 @@ struct ErrorEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct _EventList {
     events: Vec<EventRecord>,
+}
+
+fn init_project_config(force: bool) -> Result<(), CliError> {
+    let path = PathBuf::from("forge.yml");
+    if !force && path.exists() {
+        return Err(CliError::Usage(
+            "forge.yml already exists; rerun with --force to overwrite".into(),
+        ));
+    }
+    match fs::write(&path, default_init_config()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => Err(CliError::Usage(
+            "forge.yml already exists; rerun with --force to overwrite".into(),
+        )),
+        Err(err) => Err(CliError::Usage(err.to_string())),
+    }
+}
+
+fn default_init_config() -> &'static str {
+    concat!(
+        "version: 1\n",
+        "name: api\n",
+        "type: web\n",
+        "\n",
+        "build:\n",
+        "  dockerfile: Dockerfile\n",
+        "  context: .\n",
+        "\n",
+        "runtime:\n",
+        "  port: 3000\n",
+        "  healthcheck:\n",
+        "    path: /health\n",
+        "    expected_status: 200\n",
+        "\n",
+        "invariants:\n",
+        "  - name: health\n",
+        "    path: /health\n",
+        "    expect_status: 200\n",
+    )
 }
 
 fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
