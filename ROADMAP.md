@@ -43,6 +43,12 @@ Validated capabilities:
 - GitHub-triggered deploys
 - secret injection and redaction
 - AI-generated application deployment proofs
+- **VPS Alpha Milestone (Manual Validation)**:
+  - conservative and idempotent `install.sh`
+  - systemd-managed daemon lifecycle
+  - host reboot / daemon restart recovery
+  - routing repair after Caddy/Docker restart
+  - deterministic generation cleanup/retention
 
 ---
 

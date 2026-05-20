@@ -43,16 +43,28 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 Forge has been manually validated on a real VPS for the alpha milestone.
 
-## Validated Topology
+## Alpha Readiness Checklist
 
-```txt
-DNS (public)
-→ Nginx (public ingress / TLS termination)
-  → Caddy (internal routing / admin API)
-    → Forge Daemon (orchestration / systemd)
-      → Docker (container runtime)
-        → Forge-managed container (app)
-```
+- [x] **Install**: `install.sh` is conservative and idempotent.
+- [x] **Deploy**: `forge deploy api production` promotes a new generation.
+- [x] **Rollback**: `forge rollback api production` restores the previous generation.
+- [x] **Restart Forge**: `systemctl restart forge` reconstructs state.
+- [x] **Restart Caddy**: `systemctl restart caddy` results in route repair.
+- [x] **Restart Docker**: `systemctl restart docker` results in container IP churn repair.
+- [x] **Reboot VPS**: Host reboot results in full automatic recovery.
+- [x] **Retention**: Old generations and metadata are cleaned up deterministically.
+- [x] **Orphans**: Orphaned containers and routes are removed or tombstoned.
+- [x] **12h Soak**: Runtime remains stable under soak.
+
+## install.sh behavior
+
+The `install.sh` script is designed to be safe and non-destructive:
+- It installs the binary and systemd unit.
+- It prepares the storage root at `/var/lib/forge`.
+- It creates default config/env files if they are missing.
+- It **does not** install Docker or Caddy.
+- It **does not** modify firewall or Nginx rules.
+- It **does not** expose the API publicly.
 
 ## Required Environment & Config
 
@@ -67,24 +79,11 @@ The following environment variables and configuration values are required for VP
 | `FORGE_URL`              | Forge API address for CLI                    | CLI Env                |
 | `FORGE_TOKEN`            | `bearer_token` from `forge.conf` for CLI     | CLI Env                |
 
-## Operational Validation Checklist
+## Operational Permissions
 
-The following sequence must pass to confirm VPS readiness:
-
-- [x] **Deploy**: `forge deploy api production` promotes a new generation.
-- [x] **Rollback**: `forge rollback api production` restores the previous generation.
-- [x] **Restart Forge**: `systemctl restart forge` reconstructs state.
-- [x] **Restart Caddy**: `systemctl restart caddy` results in Forge repairing routes.
-- [x] **Restart Docker**: `systemctl restart docker` results in Forge repairing container IP churn.
-- [x] **Reboot VPS**: Host reboot results in full automatic recovery of containers and routes.
-
-## Expected Pass Outputs
-
-- Public `/health` returns `ok`
-- Public app returns expected content (e.g., `forge-sample`)
-- `systemd` successfully manages the Forge lifecycle
-- `current` pointer remains stable across restarts
-- `forge:ready` internal route stays behind active route as fallback
+- **Storage**: The service user MUST own `/var/lib/forge` (or your configured `storage_root`).
+- **WorkingDirectory**: Must be readable and executable (traversable) by the service user.
+- **Manual Deploys**: Build from the daemon's `WorkingDirectory`. Point the service `WorkingDirectory` at the application checkout you want Forge to deploy.
 
 ---
 
@@ -96,6 +95,16 @@ The following sequence must pass to confirm VPS readiness:
 - **Stateful DB**: No native stateful database ownership or volume management yet.
 - **Orchestration**: No multi-service application orchestration yet.
 - **Public API**: Should remain bound to `localhost` behind Nginx/CLI unless intentionally exposed.
+
+---
+
+# Cleanup and Retention
+
+Forge automatically manages disk space and resource leaks:
+- **Current/Previous**: Always preserved for stability and rollback.
+- **Generations**: Old generation metadata is bounded.
+- **Runtime artifacts**: Old containers and images are removed deterministically.
+- **Events**: Cleanup outcomes are visible through `forge events`.
 
 ---
 

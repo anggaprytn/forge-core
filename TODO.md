@@ -28,12 +28,15 @@ Goal: reach usable alpha without scope creep.
 - [x] Secret injection and redaction
 - [x] GitHub webhook trigger path
 - [x] Dogfood E2E proofs
+- [x] Phase 1 (Stabilize Alpha Baseline)
+- [x] Phase 2 (Operational Visibility)
+- [x] Phase 5 (Installation UX) - *Partially completed (validated installer/VPS guide)*
 
 ---
 
 # Phase 1: Stabilize Current Alpha Baseline
 
-- [ ] Commit clean CLI baseline
+- [x] Commit clean CLI baseline
 - [x] Verify all tests pass
 
 ```bash
@@ -41,10 +44,10 @@ cargo test -q
 FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
 ```
 
-- [ ] Remove or silence harmless warnings
-- [ ] Ensure `README.md` matches actual current state
-- [ ] Ensure `ARCHITECTURE.md` matches actual current state
-- [ ] Add this `TODO.md`
+- [x] Remove or silence harmless warnings
+- [x] Ensure `README.md` matches actual current state
+- [x] Ensure `ARCHITECTURE.md` matches actual current state
+- [x] Add this `TODO.md`
 
 ---
 

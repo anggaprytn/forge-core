@@ -142,7 +142,7 @@ Rollback restores the previous healthy finalized generation:
 
 ## Optional Linux Host Install
 
-For a Linux host with systemd, the repo now includes a conservative installer:
+For a Linux host with systemd, the repo now includes a conservative and idempotent installer:
 
 ```bash
 ./install.sh
@@ -150,6 +150,7 @@ For a Linux host with systemd, the repo now includes a conservative installer:
 
 It installs the binary, creates `/etc/forge/forge.conf` and `/etc/forge/forge.env` if missing, prepares `/var/lib/forge`, and installs the provided systemd unit without enabling it automatically.
 
+### Permissions and Paths
 Before `systemctl enable --now forge`, verify the effective service account can write `/var/lib/forge` and can read/traverse the configured `WorkingDirectory`:
 
 ```bash

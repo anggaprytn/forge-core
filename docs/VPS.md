@@ -10,13 +10,169 @@ forge daemon
 
 It is intentionally aligned to the current implementation, not an aspirational installer.
 
-## Important Current Constraint
+## 1. Prerequisites (Docker & Caddy)
 
-Manual `forge deploy <project_id> <environment>` deployments build from the Forge daemon process working directory.
+Forge does not install Docker or Caddy for you. Install them using your distribution's package manager.
 
-For a fresh VPS sample deployment, point the systemd unit `WorkingDirectory` at the sample app checkout you want Forge to build.
+### Install Docker
 
-GitHub webhook deployments do not rely on the daemon working directory, but they do require `repository_cache_root` and webhook configuration.
+```bash
+apt-get update
+apt-get install -y docker.io
+systemctl enable --now docker
+```
+
+### Install Caddy
+
+```bash
+apt-get update
+apt-get install -y caddy
+systemctl enable --now caddy
+```
+
+### Configure Caddy Admin API
+
+Forge expects the Caddy admin API at `http://127.0.0.1:2019`.
+
+Example `/etc/caddy/Caddyfile`:
+
+```caddyfile
+{
+	admin 127.0.0.1:2019
+}
+
+:80 {
+	respond "caddy ready" 200
+}
+```
+
+Restart Caddy: `systemctl restart caddy`.
+
+---
+
+## 2. Conservative Installation
+
+For Linux hosts with systemd, use the provided conservative installer:
+
+```bash
+./install.sh
+```
+
+The installer is **idempotent** and safe:
+- Installs `forge` to `/usr/local/bin`.
+- Creates `/etc/forge/forge.conf` and `/etc/forge/forge.env` if missing.
+- Prepares `/var/lib/forge` for storage.
+- Installs the systemd unit `forge.service`.
+
+---
+
+## 3. Host Directory & Permissions
+
+While `install.sh` creates the storage root, you must ensure your application checkout is accessible:
+
+```bash
+# Example project directory
+mkdir -p /srv/forge/sample-http-app
+chown -R forge:forge /var/lib/forge
+```
+
+### Critical Permission Rules
+- **Storage**: `/var/lib/forge` (storage_root) MUST be owned by the `forge` service user.
+- **Project**: The `WorkingDirectory` (e.g., `/srv/forge/sample-http-app`) must be readable and traversable by the `forge` service user.
+
+---
+
+## 4. Initialize Your Project
+
+Go to your application directory and initialize `forge.yml`:
+
+```bash
+cd /srv/forge/sample-http-app
+forge init
+```
+
+Forge strictly validates `forge.yml`. Unsupported fields are rejected.
+
+---
+
+## 5. Configure Forge Environment
+
+Update `/etc/forge/forge.env` with your master key:
+
+```bash
+FORGE_MASTER_KEY=<64 hex characters>
+FORGE_CADDY_ADMIN_URL=http://127.0.0.1:2019
+FORGE_CADDY_PUBLIC_URL=https://api.forge.example.com
+```
+
+`FORGE_MASTER_KEY` is required for secrets support.
+
+---
+
+## 6. Run Diagnostics
+
+Before starting the service, verify your environment:
+
+```bash
+FORGE_CONFIG=/etc/forge/forge.conf \
+FORGE_CADDY_ADMIN_URL=http://127.0.0.1:2019 \
+FORGE_MASTER_KEY=<64 hex characters> \
+forge doctor
+```
+
+---
+
+## 7. Start the Forge Daemon
+
+```bash
+systemctl daemon-reload
+systemctl enable --now forge
+```
+
+### Manual Deployment Note
+Manual `forge deploy <project> <environment>` deployments build from the Forge daemon process `WorkingDirectory`. Update the systemd unit if you move your project checkout.
+
+---
+
+## 8. Verify Readiness
+
+```bash
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/readyz
+curl http://127.0.0.1:8080/metrics
+```
+
+---
+
+## 9. Deploy the Sample App
+
+Set the CLI client environment:
+
+```bash
+export FORGE_URL=http://127.0.0.1:8080
+export FORGE_TOKEN=replace-with-the-bearer_token-from-forge.conf
+```
+
+Enqueue the deploy:
+
+```bash
+forge deploy api production
+forge events
+```
+
+Cleanup and orphan recovery outcomes are emitted into the same event stream:
+
+```bash
+forge events | rg 'ORPHANED_|CLEANUP_'
+```
+
+---
+
+## Troubleshooting VPS Deployments
+
+- **Caddy server ID**: Ensure Caddy is configured with server ID `"forge"`.
+- **Port Conflicts**: If port 8080 is taken, update `api_bind` in `forge.conf` and `FORGE_URL`.
+- **API Visibility**: Keep the API bound to `localhost` (127.0.0.1) for security.
 
 ## 1. Install Docker
 

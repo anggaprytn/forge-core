@@ -41,6 +41,29 @@ Minimum runtime requirements:
 
 ---
 
+# Installation
+
+## Conservative Installer (Linux)
+
+For Linux hosts with systemd, use the provided conservative installer:
+
+```bash
+./install.sh
+```
+
+The installer is **idempotent** and performs the following:
+- Installs the `forge` binary to `/usr/local/bin`.
+- Creates `/etc/forge/forge.conf` and `/etc/forge/forge.env` if they do not exist.
+- Prepares the storage root at `/var/lib/forge`.
+- Installs the systemd unit `forge.service` (does not enable or start it automatically).
+
+**What the installer does NOT do:**
+- It does **not** install Docker or Caddy.
+- It does **not** modify your firewall or Nginx configuration.
+- It does **not** expose the Forge API publicly (remains localhost-bound by default).
+
+---
+
 # Starting Forge
 
 ## Start Daemon
@@ -72,9 +95,11 @@ Or via systemd:
 systemctl start forge
 ```
 
-Current implementation note:
+### Permissions and Paths
 
-manual `forge deploy <project> <environment>` builds from the daemon process working directory. For a VPS quickstart, point the service `WorkingDirectory` at the application checkout you want Forge to deploy.
+- **Storage Root**: The service user must own `/var/lib/forge` (or your configured `storage_root`).
+- **WorkingDirectory**: The service user must have read and execute (traversal) permissions for the `WorkingDirectory` defined in the systemd unit.
+- **Manual Deploys**: `forge deploy <project> <environment>` builds from the daemon's `WorkingDirectory`. For VPS setups, ensure this points to your application checkout.
 
 ---
 
@@ -181,30 +206,6 @@ forge deploy api production
 ```
 
 `forge deploy` uses the `name`, build paths, runtime port, and healthcheck from `forge.yml`.
-
----
-
-# forge.project.json
-
-Example:
-
-```json
-{
-  "project_id": "api",
-  "service_type": "http",
-  "dockerfile": "Dockerfile",
-  "internal_port": 3000,
-  "healthcheck": {
-    "path": "/health"
-  },
-  "environments": {
-    "production": {
-      "branch": "main",
-      "subdomain": "api.example.com"
-    }
-  }
-}
-```
 
 ---
 

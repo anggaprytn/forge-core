@@ -53,7 +53,36 @@ with minimal human intervention.
 # Getting Started
 
 - Local alpha loop: [docs/LOCAL_QUICKSTART.md](docs/LOCAL_QUICKSTART.md)
-- Linux/systemd host bootstrap: [install.sh](install.sh)
+- Linux/systemd host bootstrap: [install.sh](install.sh) (conservative and idempotent)
+
+---
+
+# Alpha Readiness Checklist
+
+Forge has been manually validated on a real VPS with the following:
+
+- [x] **Install**: `install.sh` successfully sets up binary, config, and systemd.
+- [x] **Deploy**: `forge deploy` promotes a new generation successfully.
+- [x] **Rollback**: `forge rollback` restores the previous healthy generation.
+- [x] **Daemon Restart**: `systemctl restart forge` reconstructs state.
+- [x] **Caddy Restart**: `systemctl restart caddy` results in route repair.
+- [x] **Docker Restart**: `systemctl restart docker` results in container recovery.
+- [x] **Host Reboot**: VPS reboot results in full automatic recovery.
+- [x] **Route Recovery**: Routing remains stable across runtime churn.
+- [x] **Bounded Retention**: Old generations are cleaned up deterministically.
+- [x] **Orphan Cleanup**: Orphaned containers/routes are removed or tombstoned.
+- [x] **12h Soak**: Daemon remains healthy under idle and active convergence.
+
+---
+
+# Known Constraints (Alpha)
+
+- **Single-node only**: Forge manages exactly one host.
+- **Single-service web apps**: Only one HTTP service per project.
+- **No stateful DB ownership**: Database volume/state management is not native yet.
+- **No multi-service orchestration**: No built-in cross-service dependency management.
+- **Manual deploy source**: `forge deploy` builds from the daemon's `WorkingDirectory`.
+- **API Visibility**: API is localhost-bound by default; do not expose publicly.
 
 ---
 
