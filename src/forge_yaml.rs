@@ -33,6 +33,7 @@ impl From<std::io::Error> for ForgeYamlError {
 pub struct ForgeYamlConfig {
     execution: ExecutionConfig,
     validation: ValidationPolicy,
+    validation_timeout_ms: Option<u64>,
 }
 
 impl ForgeYamlConfig {
@@ -42,6 +43,10 @@ impl ForgeYamlConfig {
 
     pub fn validation(&self) -> &ValidationPolicy {
         &self.validation
+    }
+
+    pub fn validation_timeout_ms(&self) -> Option<u64> {
+        self.validation_timeout_ms
     }
 }
 
@@ -84,6 +89,8 @@ struct RawInvariant {
     name: String,
     path: String,
     expect_status: u16,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 pub fn load_optional_forge_yaml(
@@ -192,6 +199,7 @@ impl RawForgeYaml {
                     internal_port: self.runtime.port,
                 },
             },
+            validation_timeout_ms: invariant.timeout_ms,
         })
     }
 }
