@@ -265,6 +265,12 @@ forge rollback <project> <environment>       # Restore previous healthy generati
 forge secrets set <project> <env> <k> <v>    # Set runtime secrets
 ```
 
+## HTTP Surface
+
+- `GET /` serves a tiny built-in landing page (`Forge Runtime`) so the root path does not 404.
+- `GET /login/cli` serves a placeholder Forge CLI login bootstrap page.
+- GitHub OAuth, callback handling, session storage, and Forge token issuance for CLI login are not implemented yet.
+
 ---
 
 # Example Workflow

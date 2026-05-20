@@ -109,6 +109,8 @@ systemctl start forge
 curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
 curl http://localhost:8080/metrics
+curl http://localhost:8080/
+curl http://localhost:8080/login/cli
 forge doctor
 ```
 
@@ -120,6 +122,8 @@ ready
 ```
 
 `/metrics` returns Prometheus text exposition for operational visibility.
+`/` returns a tiny built-in landing page.
+`/login/cli` returns a placeholder CLI login page; GitHub OAuth and Forge token issuance are not implemented yet.
 
 ---
 

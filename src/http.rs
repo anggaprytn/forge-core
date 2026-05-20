@@ -31,6 +31,13 @@ const X_GITHUB_EVENT: &str = "x-github-event";
 const X_HUB_SIGNATURE_256: &str = "x-hub-signature-256";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const CORRELATION_ID_HEADER: &str = "x-correlation-id";
+const DEFAULT_LANDING_PAGE: &str = include_str!("../static/index.html");
+const CLI_LOGIN_REQUIRED_ENV_VARS: [&str; 4] = [
+    "FORGE_GITHUB_OAUTH_CLIENT_ID",
+    "FORGE_GITHUB_OAUTH_CLIENT_SECRET",
+    "FORGE_PUBLIC_URL",
+    "FORGE_CLI_TOKEN_SECRET",
+];
 
 pub trait ControlPlane: Send {
     fn is_ready(&self) -> bool;
@@ -273,6 +280,8 @@ impl DeliveryStore {
 
 pub fn router(state: HttpState) -> Router {
     Router::new()
+        .route("/", get(get_root))
+        .route("/login/cli", get(get_login_cli))
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
         .route("/metrics", get(get_metrics))
@@ -283,6 +292,66 @@ pub fn router(state: HttpState) -> Router {
         .route("/logs/{id}", get(get_logs))
         .route("/events", get(get_events))
         .with_state(state)
+}
+
+async fn get_root() -> Response {
+    html_response(StatusCode::OK, DEFAULT_LANDING_PAGE)
+}
+
+async fn get_login_cli() -> Response {
+    let configured = cli_login_oauth_configured();
+    let body = if configured {
+        concat!(
+            "<!doctype html>\n",
+            "<html lang=\"en\">\n",
+            "<head>\n",
+            "  <meta charset=\"utf-8\">\n",
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+            "  <title>Forge CLI Login</title>\n",
+            "</head>\n",
+            "<body>\n",
+            "  <main>\n",
+            "    <h1>Forge CLI Login</h1>\n",
+            "    <p>GitHub OAuth bootstrap is not implemented yet.</p>\n",
+            "    <p><a href=\"#\" aria-disabled=\"true\">Continue with GitHub</a></p>\n",
+            "  </main>\n",
+            "</body>\n",
+            "</html>\n",
+        )
+        .to_string()
+    } else {
+        format!(
+            concat!(
+                "<!doctype html>\n",
+                "<html lang=\"en\">\n",
+                "<head>\n",
+                "  <meta charset=\"utf-8\">\n",
+                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+                "  <title>Forge CLI Login</title>\n",
+                "</head>\n",
+                "<body>\n",
+                "  <main>\n",
+                "    <h1>Forge CLI Login</h1>\n",
+                "    <p>GitHub OAuth login is not configured yet.</p>\n",
+                "    <p>Expected env vars:</p>\n",
+                "    <ul>\n",
+                "      <li>{}</li>\n",
+                "      <li>{}</li>\n",
+                "      <li>{}</li>\n",
+                "      <li>{}</li>\n",
+                "    </ul>\n",
+                "  </main>\n",
+                "</body>\n",
+                "</html>\n",
+            ),
+            CLI_LOGIN_REQUIRED_ENV_VARS[0],
+            CLI_LOGIN_REQUIRED_ENV_VARS[1],
+            CLI_LOGIN_REQUIRED_ENV_VARS[2],
+            CLI_LOGIN_REQUIRED_ENV_VARS[3],
+        )
+    };
+
+    html_response(StatusCode::OK, body)
 }
 
 async fn get_healthz() -> impl IntoResponse {
@@ -871,6 +940,21 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+fn html_response(status: StatusCode, body: impl Into<String>) -> Response {
+    let mut response = (status, body.into()).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+}
+
+fn cli_login_oauth_configured() -> bool {
+    CLI_LOGIN_REQUIRED_ENV_VARS
+        .iter()
+        .all(|key| std::env::var_os(key).is_some())
+}
+
 fn json_response<T>(status: StatusCode, request_id: &str, body: Json<T>) -> Response
 where
     T: Serialize,
@@ -1105,6 +1189,134 @@ pub mod http_requires_bearer_token {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(test)]
+pub mod root_endpoint_returns_html {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn root_endpoint_returns_html() {
+        let app = router(build_state(true));
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/html; charset=utf-8"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Forge Runtime"));
+    }
+}
+
+#[cfg(test)]
+pub mod login_cli_endpoint_returns_html {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn login_cli_endpoint_returns_html() {
+        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let app = router(build_state(true));
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/login/cli")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/html; charset=utf-8"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Forge CLI Login"));
+    }
+}
+
+#[cfg(test)]
+pub mod login_cli_endpoint_mentions_missing_oauth_config_when_unconfigured {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn login_cli_endpoint_mentions_missing_oauth_config_when_unconfigured() {
+        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let app = router(build_state(true));
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/login/cli")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("GitHub OAuth login is not configured yet"));
+        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
+            assert!(body.contains(key));
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod login_cli_endpoint_does_not_require_auth {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn login_cli_endpoint_does_not_require_auth() {
+        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let app = router(build_state(true));
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/login/cli")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Forge CLI Login"));
     }
 }
 

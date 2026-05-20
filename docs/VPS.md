@@ -107,6 +107,17 @@ FORGE_CADDY_PUBLIC_URL=https://api.forge.example.com
 
 `FORGE_MASTER_KEY` is required for secrets support.
 
+Future CLI login support will also require these env vars before `/login/cli` can progress past the placeholder page:
+
+```bash
+FORGE_GITHUB_OAUTH_CLIENT_ID=...
+FORGE_GITHUB_OAUTH_CLIENT_SECRET=...
+FORGE_PUBLIC_URL=https://forge.example.com
+FORGE_CLI_TOKEN_SECRET=...
+```
+
+GitHub OAuth callback handling and CLI token issuance are not implemented yet.
+
 ---
 
 ## 6. Run Diagnostics
