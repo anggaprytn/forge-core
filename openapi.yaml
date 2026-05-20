@@ -47,6 +47,80 @@ paths:
             text/plain; version=0.0.4:
               schema:
                 type: string
+  /api/projects:
+    post:
+      summary: Create or update a project registry entry
+      operationId: upsertProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectUpsertRequest'
+      responses:
+        '200':
+          description: Project stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeProject'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    get:
+      summary: List registered projects
+      operationId: listProjects
+      responses:
+        '200':
+          description: Registered projects
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeProjectList'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}:
+    get:
+      summary: Get one registered project
+      operationId: getProject
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Project
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeProject'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /deployments:
     post:
       summary: Enqueue a deployment operation
@@ -243,6 +317,61 @@ components:
         intent:
           type: string
           enum: [deploy, redeploy, rollback]
+    ProjectUpsertRequest:
+      type: object
+      required:
+        - project_id
+        - repo_url
+        - default_branch
+      properties:
+        project_id:
+          type: string
+        repo_url:
+          type: string
+        default_branch:
+          type: string
+          default: main
+        base_domain:
+          type:
+            - string
+            - 'null'
+          description: Optional explicit base domain. When omitted, Forge generates and persists a stable domain using FORGE_APPS_DOMAIN.
+    Project:
+      type: object
+      required:
+        - project_id
+        - repo_url
+        - default_branch
+        - base_domain
+        - domain_mode
+        - created_at_unix
+        - updated_at_unix
+      properties:
+        project_id:
+          type: string
+        repo_url:
+          type: string
+        default_branch:
+          type: string
+        base_domain:
+          type: string
+          description: Base project domain. Planned derived domains are production=`<base_domain>`, staging=`staging-<base_domain>`, development=`development-<base_domain>`.
+        domain_mode:
+          type: string
+          enum: [generated, explicit]
+        created_at_unix:
+          type: integer
+        updated_at_unix:
+          type: integer
+    ProjectList:
+      type: object
+      required:
+        - projects
+      properties:
+        projects:
+          type: array
+          items:
+            $ref: '#/components/schemas/Project'
     DeploymentAccepted:
       type: object
       required:
@@ -364,6 +493,20 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/DeploymentAccepted'}
+    SuccessEnvelopeProject:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/Project'}
+    SuccessEnvelopeProjectList:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/ProjectList'}
     SuccessEnvelopeDeploymentStatus:
       type: object
       required: [request_id, correlation_id, data]

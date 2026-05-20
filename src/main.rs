@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use forge_core::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
+    DeploymentRequest, DeploymentStatus, ErrorResponse, EventList, ProjectList, ProjectRecord,
+    ProjectUpsertRequest,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -26,6 +27,7 @@ use forge_core::http::{
     router,
 };
 use forge_core::probes::DockerNetworkProbeRuntime;
+use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use reqwest::StatusCode;
@@ -127,6 +129,34 @@ where
             })?;
             print_json(&accepted)?;
         }
+        Command::ProjectAdd {
+            project_id,
+            repo_url,
+            default_branch,
+            base_domain,
+        } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let project = client.post_project(ProjectUpsertRequest {
+                project_id,
+                repo_url,
+                default_branch,
+                base_domain,
+            })?;
+            print_json(&project)?;
+        }
+        Command::ProjectList => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let projects = client.get_projects()?;
+            print_json(&projects.projects)?;
+        }
+        Command::ProjectShow { project_id } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let project = client.get_project(&project_id)?;
+            print_json(&project)?;
+        }
         Command::SecretsSet {
             project_id,
             environment,
@@ -194,6 +224,25 @@ impl ForgeClient {
             self.http
                 .post(format!("{}/secrets", self.base_url))
                 .json(&request),
+        )
+    }
+
+    fn post_project(&self, request: ProjectUpsertRequest) -> Result<ProjectRecord, CliError> {
+        self.send_json(
+            self.http
+                .post(format!("{}/api/projects", self.base_url))
+                .json(&request),
+        )
+    }
+
+    fn get_projects(&self) -> Result<ProjectList, CliError> {
+        self.send_json(self.http.get(format!("{}/api/projects", self.base_url)))
+    }
+
+    fn get_project(&self, project_id: &str) -> Result<ProjectRecord, CliError> {
+        self.send_json(
+            self.http
+                .get(format!("{}/api/projects/{}", self.base_url, project_id)),
         )
     }
 
@@ -326,6 +375,16 @@ enum Command {
     Rollback {
         project_id: String,
         environment: String,
+    },
+    ProjectAdd {
+        project_id: String,
+        repo_url: String,
+        default_branch: String,
+        base_domain: Option<String>,
+    },
+    ProjectList,
+    ProjectShow {
+        project_id: String,
     },
     SecretsSet {
         project_id: String,
@@ -503,6 +562,15 @@ fn parse_command(
             project_id: project_id.clone(),
             environment: environment.clone(),
         }),
+        [group, action] if group == "project" && action == "list" => Ok(Command::ProjectList),
+        [group, action, project_id] if group == "project" && action == "show" => {
+            Ok(Command::ProjectShow {
+                project_id: project_id.clone(),
+            })
+        }
+        [group, action, rest @ ..] if group == "project" && action == "add" => {
+            parse_project_add_command(rest)
+        }
         [group, action, project_id, environment, key, value]
             if group == "secrets" && action == "set" =>
         {
@@ -530,6 +598,9 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] project add <project_id> --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
+        "  forge [--url URL] [--token TOKEN] project list",
+        "  forge [--url URL] [--token TOKEN] project show <project_id>",
         "  forge [--url URL] [--token TOKEN] secrets set <project_id> <environment> <key> <value>",
     ]
     .join("\n")
@@ -554,6 +625,63 @@ fn parse_deploy_command(args: &[String]) -> Result<Command, CliError> {
         }),
         _ => Err(CliError::Usage(usage())),
     }
+}
+
+fn parse_project_add_command(args: &[String]) -> Result<Command, CliError> {
+    let Some(project_id) = args.first() else {
+        return Err(CliError::Usage(usage()));
+    };
+
+    let mut repo_url = None;
+    let mut default_branch = Some("main".to_string());
+    let mut base_domain = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "project add requires --repo <repo_url>".into(),
+                    ));
+                };
+                repo_url = Some(value.clone());
+            }
+            "--branch" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "project add requires --branch <branch>".into(),
+                    ));
+                };
+                default_branch = Some(value.clone());
+            }
+            "--domain" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "project add requires --domain <base_domain>".into(),
+                    ));
+                };
+                base_domain = Some(value.clone());
+            }
+            _ => return Err(CliError::Usage(usage())),
+        }
+        index += 1;
+    }
+
+    let Some(repo_url) = repo_url else {
+        return Err(CliError::Usage(
+            "project add requires --repo <repo_url>".into(),
+        ));
+    };
+
+    Ok(Command::ProjectAdd {
+        project_id: project_id.clone(),
+        repo_url,
+        default_branch: default_branch.unwrap_or_else(|| "main".into()),
+        base_domain,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -902,6 +1030,7 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
         github_webhooks,
         forge_core::secrets::SecretStore::new(config.storage_root.join("secrets"))
             .map_err(|err| CliError::Usage(err.to_string()))?,
+        ProjectRegistryStore::new(&config.storage_root),
         WebAuthState::from_env(),
         forge_core::http::CliAuthState::from_env(config.storage_root.join("cli-logins"))
             .map_err(|err| CliError::Usage(err.to_string()))?,

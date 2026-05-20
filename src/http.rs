@@ -20,13 +20,15 @@ use subtle::ConstantTimeEq;
 
 use crate::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList, ProjectList,
+    ProjectUpsertRequest,
 };
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{
     GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
 };
 use crate::metrics::render_prometheus;
+use crate::projects::{ProjectRegistryStore, project_registry_error_response};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::storage::atomic_write;
@@ -122,6 +124,7 @@ pub struct HttpState {
     idempotency: IdempotencyStore,
     github_webhooks: Option<GitHubWebhookState>,
     secret_store: SecretStore,
+    project_registry: ProjectRegistryStore,
     web_auth: WebAuthState,
     cli_auth: Option<CliAuthState>,
 }
@@ -133,6 +136,7 @@ impl HttpState {
         idempotency: IdempotencyStore,
         github_webhooks: Option<GitHubWebhookState>,
         secret_store: SecretStore,
+        project_registry: ProjectRegistryStore,
         web_auth: WebAuthState,
         cli_auth: Option<CliAuthState>,
     ) -> Self {
@@ -142,6 +146,7 @@ impl HttpState {
             idempotency,
             github_webhooks,
             secret_store,
+            project_registry,
             web_auth,
             cli_auth,
         }
@@ -694,6 +699,8 @@ pub fn router(state: HttpState) -> Router {
         .route("/readyz", get(get_readyz))
         .route("/metrics", get(get_metrics))
         .route("/deployments", post(post_deployments))
+        .route("/api/projects", post(post_projects).get(get_projects))
+        .route("/api/projects/{project_id}", get(get_project))
         .route("/secrets", post(post_secrets))
         .route("/webhooks/github", post(post_github_webhook))
         .route("/deployments/{id}", get(get_deployment))
@@ -1509,6 +1516,95 @@ async fn post_secrets(
     }
 }
 
+async fn post_projects(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<ProjectUpsertRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let apps_domain = std::env::var("FORGE_APPS_DOMAIN").ok();
+    match state
+        .project_registry
+        .upsert(request, apps_domain.as_deref())
+    {
+        Ok(project) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: project,
+            }),
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
+async fn get_projects(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state.project_registry.list() {
+        Ok(projects) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: ProjectList { projects },
+            }),
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
+async fn get_project(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(project_id): AxumPath<String>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state.project_registry.get(&project_id) {
+        Ok(Some(project)) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: project,
+            }),
+        ),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            &request_id,
+            ErrorResponse {
+                code: "project_not_found".into(),
+                message: "project not found".into(),
+            },
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
 async fn get_deployment(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -2177,6 +2273,7 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
             IdempotencyStore::new(root.join("idempotency")).unwrap(),
             None,
             SecretStore::new(root.join("secrets")).unwrap(),
+            ProjectRegistryStore::new(&root),
             WebAuthState::unconfigured(),
             None,
         ),
@@ -3065,5 +3162,59 @@ pub mod logs_endpoint_is_bounded {
         assert!(lines.len() <= 64);
         assert_eq!(lines.last().unwrap(), "line-199");
         assert_ne!(lines.first().unwrap(), "line-0");
+    }
+}
+
+#[cfg(test)]
+pub mod project_registry_endpoints_round_trip {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn project_registry_endpoints_round_trip() {
+        let app = router(build_state(true));
+        let create = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/projects")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-token")
+            .body(Body::from(
+                r#"{"project_id":"api","repo_url":"https://github.com/example/api.git","default_branch":"main","base_domain":"api.example.com"}"#,
+            ))
+            .unwrap();
+        let create_response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let list = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/projects")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+        let list_response = app.clone().oneshot(list).await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(list_json["data"]["projects"][0]["project_id"], "api");
+
+        let show = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/projects/api")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+        let show_response = app.oneshot(show).await.unwrap();
+        assert_eq!(show_response.status(), StatusCode::OK);
+        let show_body = to_bytes(show_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let show_json: Value = serde_json::from_slice(&show_body).unwrap();
+        assert_eq!(show_json["data"]["base_domain"], "api.example.com");
+        assert_eq!(show_json["data"]["domain_mode"], "explicit");
     }
 }

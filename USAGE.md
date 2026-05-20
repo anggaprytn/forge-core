@@ -75,6 +75,37 @@ repository
   `production -> <base_domain>`, `staging -> staging-<base_domain>`, `development -> development-<base_domain>`.
 - Custom environments and custom per-environment domains are deferred.
 
+## Project Registry
+
+Forge stores a server-owned project registry under the existing storage root. This slice records repository metadata and a stable `base_domain` only.
+
+Commands:
+
+```bash
+forge project add api --repo https://github.com/example/api.git
+forge project add api --repo https://github.com/example/api.git --branch development
+forge project add api --repo https://github.com/example/api.git --domain api.example.com
+forge project list
+forge project show api
+```
+
+Rules:
+
+- `--branch` defaults to `main`.
+- If `--domain` is provided, Forge stores it as an explicit `base_domain`.
+- If `--domain` is omitted on first creation, Forge generates `<project_id>-<shortid>.<FORGE_APPS_DOMAIN>`.
+- Generated domains stay stable after the first creation and are not regenerated when `repo_url` or `default_branch` changes.
+- `FORGE_APPS_DOMAIN` is required only when Forge must generate a domain.
+- Repository URLs with embedded HTTP credentials such as `https://token@github.com/...` are rejected.
+
+Planned derived domains are documented product semantics only in this slice:
+
+- `production -> <base_domain>`
+- `staging -> staging-<base_domain>`
+- `development -> development-<base_domain>`
+
+This does not deploy from Git yet. It only persists registry metadata for future git-backed deploy flows.
+
 ## Web Role
 
 - Web is first a visibility/control plane, not the primary deployment engine.

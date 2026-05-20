@@ -103,9 +103,23 @@ Update `/etc/forge/forge.env` with your master key:
 FORGE_MASTER_KEY=<64 hex characters>
 FORGE_CADDY_ADMIN_URL=http://127.0.0.1:2019
 FORGE_CADDY_PUBLIC_URL=https://api.forge.example.com
+FORGE_APPS_DOMAIN=forge.example.com
 ```
 
 `FORGE_MASTER_KEY` is required for secrets support.
+`FORGE_APPS_DOMAIN` is required only if you want Forge to generate project base domains when `forge project add` omits `--domain`.
+
+Future derived app domains require wildcard DNS aimed at the VPS:
+
+```txt
+*.forge.example.com -> <your VPS public IP>
+```
+
+Example future domains:
+
+- `api-k7x9q2.forge.example.com`
+- `staging-api-k7x9q2.forge.example.com`
+- `development-api-k7x9q2.forge.example.com`
 
 Forge web login is part of the human operator control surface and requires these env vars:
 
@@ -178,6 +192,17 @@ forge deploy api production
 forge deploy api production --from /srv/forge/sample-http-app
 forge events
 ```
+
+Project registry examples:
+
+```bash
+forge project add api --repo https://github.com/example/api.git
+forge project add api --repo https://github.com/example/api.git --domain api.example.com
+forge project list
+forge project show api
+```
+
+This registry metadata does not clone Git repositories or trigger deploys yet.
 
 Cleanup and orphan recovery outcomes are emitted into the same event stream:
 

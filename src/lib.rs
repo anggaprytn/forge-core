@@ -15,6 +15,7 @@ pub mod invariants;
 pub mod manifest;
 pub mod metrics;
 pub mod probes;
+pub mod projects;
 pub mod queue;
 pub mod runtime;
 pub mod secrets;

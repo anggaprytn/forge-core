@@ -77,6 +77,72 @@ fn cli_events_reads_event_stream() {
 }
 
 #[test]
+fn cli_project_add_posts_project_request() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","repo_url":"https://github.com/example/api.git","default_branch":"main","base_domain":"api-k7x9q2.forge.example.com","domain_mode":"generated","created_at_unix":1,"updated_at_unix":1}}"#,
+    );
+
+    let output = run_cli(
+        &url,
+        &[
+            "project",
+            "add",
+            "api",
+            "--repo",
+            "https://github.com/example/api.git",
+        ],
+    );
+    assert!(output.status.success());
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/api/projects");
+    let json: Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(json["project_id"], "api");
+    assert_eq!(json["repo_url"], "https://github.com/example/api.git");
+    assert_eq!(json["default_branch"], "main");
+    assert!(json["base_domain"].is_null());
+}
+
+#[test]
+fn cli_project_list_reads_projects() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"projects":[{"project_id":"api","repo_url":"https://github.com/example/api.git","default_branch":"main","base_domain":"api.example.com","domain_mode":"explicit","created_at_unix":1,"updated_at_unix":1}]}}"#,
+    );
+
+    let output = run_cli(&url, &["project", "list"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"project_id\": \"api\""));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/projects");
+}
+
+#[test]
+fn cli_project_show_reads_project() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","repo_url":"https://github.com/example/api.git","default_branch":"main","base_domain":"api.example.com","domain_mode":"explicit","created_at_unix":1,"updated_at_unix":1}}"#,
+    );
+
+    let output = run_cli(&url, &["project", "show", "api"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"base_domain\": \"api.example.com\""));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/projects/api");
+}
+
+#[test]
 fn cli_rollback_posts_rollback_intent() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(

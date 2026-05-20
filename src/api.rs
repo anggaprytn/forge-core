@@ -43,6 +43,31 @@ pub struct EventList {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectUpsertRequest {
+    pub project_id: String,
+    pub repo_url: String,
+    pub default_branch: String,
+    #[serde(default)]
+    pub base_domain: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRecord {
+    pub project_id: String,
+    pub repo_url: String,
+    pub default_branch: String,
+    pub base_domain: String,
+    pub domain_mode: String,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectList {
+    pub projects: Vec<ProjectRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliLoginStartResponse {
     pub code: String,
     pub expires_at_unix: u64,
