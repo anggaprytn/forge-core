@@ -680,6 +680,10 @@ impl DockerRuntime for FakeDockerRuntime {
         self.running.remove(container_name);
         Ok(())
     }
+
+    fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
 }
 
 fn fake_container_labels(container_name: &str) -> BTreeMap<String, String> {

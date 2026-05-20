@@ -574,6 +574,10 @@ impl DockerRuntime for NoopDockerRuntime {
     ) -> Result<(), crate::runtime::DockerRuntimeError> {
         Ok(())
     }
+
+    fn remove_image(&mut self, _image_ref: &str) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

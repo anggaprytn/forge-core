@@ -205,6 +205,9 @@ cleanup.json
 
 Snapshots are the rollback source of truth.
 
+Generation retention is intentionally bounded.
+Forge always preserves `current` and `previous`, keeps only a small recent set of failed generations with diagnostics, and deterministically removes older unreferenced generations plus their Forge-managed runtime artifacts.
+
 ⸻
 
 Pointer Semantics

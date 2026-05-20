@@ -19,6 +19,8 @@ use crate::storage::{
     load_generation_build_info, load_generation_runtime_info,
 };
 
+const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
     Recovered(DeploymentRecord),
@@ -213,6 +215,17 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
                 &managed_routes,
                 &mut attempted_cleanup,
             )?;
+            enforce_generation_retention(
+                docker,
+                routing,
+                &project_id,
+                &environment,
+                &env,
+                active_record,
+                &managed_containers,
+                &managed_routes,
+                &mut attempted_cleanup,
+            )?;
         }
 
         let removed_containers = cleanup_orphaned_containers(
@@ -240,6 +253,9 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
             let Some(generation) = cleanup_generation_for_route(&env, route, &references) else {
                 continue;
             };
+            if attempted_cleanup.contains(&(project_id.clone(), environment.clone(), generation)) {
+                continue;
+            }
             if route_has_valid_backing(
                 route,
                 &project_id,
@@ -493,6 +509,18 @@ where
             &mut attempted_cleanup,
         )?;
 
+        enforce_generation_retention(
+            self.docker,
+            self.routing,
+            &input.project_id,
+            &input.environment,
+            env,
+            queue_state.active.as_ref(),
+            &managed_containers,
+            &managed_routes,
+            &mut attempted_cleanup,
+        )?;
+
         let removed_containers = cleanup_orphaned_containers(
             self.docker,
             &self.storage_root,
@@ -520,6 +548,9 @@ where
             let Some(generation) = cleanup_generation_for_route(env, route, &references) else {
                 continue;
             };
+            if attempted_cleanup.contains(&(project_id.clone(), environment.clone(), generation)) {
+                continue;
+            }
             if route_has_valid_backing(
                 route,
                 &project_id,
@@ -1025,10 +1056,13 @@ fn persist_cleanup_state(
             route_subtree_id: existing
                 .route_subtree_id
                 .or(new_record.route_subtree_id.clone()),
+            image_ref: existing.image_ref.or(new_record.image_ref.clone()),
             container_removed: existing.container_removed || new_record.container_removed,
             route_removed: existing.route_removed || new_record.route_removed,
+            image_removed: existing.image_removed || new_record.image_removed,
             tombstoned: !(existing.container_removed || new_record.container_removed)
-                || !(existing.route_removed || new_record.route_removed),
+                || !(existing.route_removed || new_record.route_removed)
+                || !(existing.image_removed || new_record.image_removed),
         }
     } else {
         new_record
@@ -1070,6 +1104,37 @@ fn append_cleanup_event(
     Ok(())
 }
 
+fn append_retention_event(
+    env: &EnvironmentPaths,
+    references: &RuntimeReferences,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    event_type: &str,
+    reason: Option<String>,
+) -> Result<(), ConvergenceError> {
+    let anchor_generation = references
+        .current
+        .or(references.previous)
+        .or(references.route_generation)
+        .or(references.converging_generation)
+        .unwrap_or(generation);
+    let timestamp_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    EventStore::new(env.clone(), anchor_generation).append(&EventRecord {
+        timestamp_unix,
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        generation: Some(generation),
+        deployment_id: None,
+        event_type: event_type.to_string(),
+        reason,
+    })?;
+    Ok(())
+}
+
 fn attempt_cleanup<RtD, RtR>(
     docker: &mut RtD,
     routing: &mut RtR,
@@ -1105,14 +1170,29 @@ where
         route_removed = true;
     }
 
+    let mut image_removed = cleanup.image_removed;
+    let image_ref = cleanup.image_ref.clone();
+    if let Some(image_ref) = cleanup.image_ref.as_deref() {
+        if !image_removed {
+            image_removed = docker.remove_image(image_ref).is_ok();
+        }
+    } else {
+        image_removed = true;
+    }
+
     let cleanup = CleanupRecord::new(
         cleanup.failure_reason,
         cleanup.container_name,
         cleanup.route_subtree_id,
         container_removed,
         route_removed,
-        !(container_removed && route_removed),
+        !(container_removed && route_removed && image_removed),
     );
+    let cleanup = CleanupRecord {
+        image_ref,
+        image_removed,
+        ..cleanup
+    };
     persist_cleanup_state(env, generation, cleanup.clone(), deployment_id.clone())?;
     append_cleanup_event(
         env,
@@ -1258,6 +1338,233 @@ where
         }
     }
     Ok(removed)
+}
+
+fn enforce_generation_retention<RtD, RtR>(
+    docker: &mut RtD,
+    routing: &mut RtR,
+    project_id: &str,
+    environment: &str,
+    env: &EnvironmentPaths,
+    active_record: Option<&DeploymentRecord>,
+    managed_containers: &[ContainerInspection],
+    managed_routes: &[RouteInspection],
+    attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
+) -> Result<(), ConvergenceError>
+where
+    RtD: DockerRuntime,
+    RtR: RoutingRuntime,
+{
+    if !env.generations_dir().exists() {
+        return Ok(());
+    }
+
+    let references = environment_runtime_references(
+        env,
+        project_id,
+        environment,
+        active_record,
+        managed_containers,
+        managed_routes,
+    )?;
+    let generations = list_generation_numbers(env)?;
+    let retained_failed = retained_failed_generations(env, &references, &generations)?;
+
+    for generation in generations {
+        if references.contains(generation) || retained_failed.contains(&generation) {
+            continue;
+        }
+        retention_cleanup_generation(
+            docker,
+            routing,
+            env,
+            &references,
+            project_id,
+            environment,
+            generation,
+        )?;
+        attempted_cleanup.insert((project_id.to_string(), environment.to_string(), generation));
+    }
+    Ok(())
+}
+
+fn retained_failed_generations(
+    env: &EnvironmentPaths,
+    references: &RuntimeReferences,
+    generations: &[u64],
+) -> Result<BTreeSet<u64>, ConvergenceError> {
+    let mut retained = BTreeSet::new();
+    for generation in generations.iter().rev().copied() {
+        if references.contains(generation) {
+            continue;
+        }
+        if !generation_has_failure_diagnostics(env, generation)? {
+            continue;
+        }
+        retained.insert(generation);
+        if retained.len() >= FAILED_GENERATION_RETENTION_LIMIT {
+            break;
+        }
+    }
+    Ok(retained)
+}
+
+fn generation_has_failure_diagnostics(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> Result<bool, ConvergenceError> {
+    let diagnostics = env.generation_dir(generation).join("diagnostics");
+    let summary_path = diagnostics.join("summary.json");
+    if summary_path.exists() {
+        let raw = fs::read_to_string(summary_path)?;
+        let summary: DiagnosticSummary = serde_json::from_str(&raw).map_err(|err| {
+            ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )))
+        })?;
+        if summary.failure_stage != "startup_recovery" {
+            return Ok(true);
+        }
+    }
+    Ok(diagnostics.join("failure_reason.log").exists()
+        || diagnostics.join("deployment.log").exists())
+}
+
+fn list_generation_numbers(env: &EnvironmentPaths) -> Result<Vec<u64>, ConvergenceError> {
+    let mut generations = Vec::new();
+    for entry in fs::read_dir(env.generations_dir())? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(generation) = entry.file_name().to_string_lossy().parse::<u64>().ok() else {
+            continue;
+        };
+        generations.push(generation);
+    }
+    generations.sort_unstable();
+    Ok(generations)
+}
+
+fn retention_cleanup_generation<RtD, RtR>(
+    docker: &mut RtD,
+    routing: &mut RtR,
+    env: &EnvironmentPaths,
+    references: &RuntimeReferences,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+) -> Result<(), ConvergenceError>
+where
+    RtD: DockerRuntime,
+    RtR: RoutingRuntime,
+{
+    let runtime_info = match load_generation_runtime_info(env, generation) {
+        Ok(value) => value,
+        Err(crate::storage::StorageError::Io(err))
+            if err.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let build_info = match load_generation_build_info(env, generation) {
+        Ok(value) => value,
+        Err(crate::storage::StorageError::Io(err))
+            if err.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let route_subtree_id = runtime_info.as_ref().and_then(retention_route_subtree_id);
+    let existing_cleanup = CleanupStore::new(env.clone(), generation).read_record()?;
+    let mut cleanup = existing_cleanup
+        .clone()
+        .unwrap_or_else(|| CleanupRecord::new("retention cleanup", None, None, true, true, false));
+    if cleanup.container_name.is_none() {
+        cleanup.container_name = Some(
+            runtime_info
+                .as_ref()
+                .map(|info| info.container_name.clone())
+                .unwrap_or_else(|| generation_container_name(environment, project_id, generation)),
+        );
+    }
+    if cleanup.route_subtree_id.is_none() {
+        cleanup.route_subtree_id = route_subtree_id;
+    }
+    if cleanup.image_ref.is_none() {
+        cleanup.image_ref = build_info.as_ref().map(|info| info.image_ref.clone());
+    }
+    if existing_cleanup.is_none() {
+        cleanup.container_removed = cleanup.container_name.is_none();
+        cleanup.route_removed = cleanup.route_subtree_id.is_none();
+        cleanup.image_removed = cleanup.image_ref.is_none();
+    }
+    let cleanup = attempt_cleanup(
+        docker,
+        routing,
+        env,
+        project_id,
+        environment,
+        generation,
+        cleanup,
+        None,
+        "RETENTION_RUNTIME_ARTIFACTS_REMOVED",
+        "RETENTION_RUNTIME_ARTIFACTS_TOMBSTONED",
+    )?;
+    if cleanup.tombstoned {
+        append_retention_event(
+            env,
+            references,
+            project_id,
+            environment,
+            generation,
+            "GENERATION_RETENTION_TOMBSTONED",
+            Some(cleanup.failure_reason),
+        )?;
+        return Ok(());
+    }
+
+    match fs::remove_dir_all(env.generation_dir(generation)) {
+        Ok(()) => append_retention_event(
+            env,
+            references,
+            project_id,
+            environment,
+            generation,
+            "GENERATION_RETENTION_REMOVED",
+            Some("retention cleanup".into()),
+        )?,
+        Err(err) => {
+            let cleanup = CleanupRecord {
+                failure_reason: format!("retention directory removal failed: {err}"),
+                tombstoned: true,
+                ..cleanup
+            };
+            persist_cleanup_state(env, generation, cleanup.clone(), None)?;
+            append_retention_event(
+                env,
+                references,
+                project_id,
+                environment,
+                generation,
+                "GENERATION_RETENTION_TOMBSTONED",
+                Some(cleanup.failure_reason),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn retention_route_subtree_id(runtime_info: &PersistedRuntimeInfo) -> Option<String> {
+    match runtime_info.activation.as_ref() {
+        Some(PersistedActivationMode::Http {
+            route_subtree_id, ..
+        }) => route_subtree_id.clone(),
+        _ => None,
+    }
 }
 
 fn cleanup_generation_for_route(
@@ -1518,11 +1825,13 @@ struct TestDockerRuntime {
     containers: std::collections::BTreeMap<String, bool>,
     network_ips: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     remove_failures: std::collections::BTreeMap<String, usize>,
+    image_remove_failures: std::collections::BTreeMap<String, usize>,
     build_calls: Vec<String>,
     create_calls: Vec<String>,
     start_calls: Vec<String>,
     stop_calls: Vec<String>,
     remove_calls: Vec<String>,
+    image_remove_calls: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1642,6 +1951,19 @@ impl DockerRuntime for TestDockerRuntime {
             }
         }
         self.containers.remove(container_name);
+        Ok(())
+    }
+
+    fn remove_image(&mut self, image_ref: &str) -> Result<(), crate::runtime::DockerRuntimeError> {
+        self.image_remove_calls.push(image_ref.into());
+        if let Some(remaining) = self.image_remove_failures.get_mut(image_ref) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(crate::runtime::DockerRuntimeError::CommandFailed(
+                    "forced image remove failure".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -2031,12 +2353,7 @@ pub mod orphaned_candidate_generation_is_cleaned {
                 .iter()
                 .any(|name| name == "prod-api-gen-2")
         );
-        let cleanup = CleanupStore::new(env.clone(), 2)
-            .read_record()
-            .unwrap()
-            .unwrap();
-        assert!(cleanup.container_removed);
-        assert!(!cleanup.tombstoned);
+        assert!(!env.generation_dir(2).exists());
     }
 
     #[test]
@@ -2074,8 +2391,8 @@ pub mod orphaned_candidate_generation_is_cleaned {
             event.project_id == "api"
                 && event.environment == "production"
                 && event.generation == Some(2)
-                && event.event_type == "ORPHANED_CONTAINER_REMOVED"
-                && event.reason.as_deref() == Some("orphaned container cleanup")
+                && event.event_type == "GENERATION_RETENTION_REMOVED"
+                && event.reason.as_deref() == Some("retention cleanup")
         }));
     }
 
@@ -2223,12 +2540,9 @@ pub mod orphaned_candidate_generation_is_cleaned {
             .unwrap();
 
         assert_eq!(outcome, TickOutcome::Healthy(1));
-        let cleanup = CleanupStore::new(env.clone(), 2)
-            .read_record()
-            .unwrap()
-            .unwrap();
-        assert!(cleanup.tombstoned);
-        assert!(env.generation_dir(2).join("tombstone").exists());
+        assert!(
+            !env.generation_dir(2).exists() || env.generation_dir(2).join("tombstone").exists()
+        );
     }
 
     #[test]
@@ -2281,12 +2595,7 @@ pub mod orphaned_candidate_generation_is_cleaned {
             })
             .unwrap();
 
-        let cleanup = CleanupStore::new(env.clone(), 2)
-            .read_record()
-            .unwrap()
-            .unwrap();
-        assert!(!cleanup.tombstoned);
-        assert!(!env.generation_dir(2).join("tombstone").exists());
+        assert!(!env.generation_dir(2).exists());
     }
 
     #[test]
@@ -2363,19 +2672,285 @@ pub mod orphaned_candidate_generation_is_cleaned {
                 .unwrap(),
             TickOutcome::Healthy(1)
         );
+        assert_eq!(
+            engine
+                .tick(TickInput {
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    now_unix: 102,
+                    truth: ActiveTruth::HttpRouted {
+                        internal_port: 3000,
+                    },
+                    http_health_path: Some("/health".into()),
+                })
+                .unwrap(),
+            TickOutcome::Healthy(1)
+        );
         assert!(
-            !CleanupStore::new(env.clone(), 2)
-                .read_record()
-                .unwrap()
-                .unwrap()
-                .tombstoned
+            !env.generation_dir(2).exists()
+                || !CleanupStore::new(env.clone(), 2)
+                    .read_record()
+                    .unwrap()
+                    .unwrap()
+                    .tombstoned
         );
         let events = EventStore::list_all(&root).unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "CLEANUP_RETRY_SUCCEEDED"
+                || event.event_type == "GENERATION_RETENTION_REMOVED"
+        }));
+    }
+}
+
+#[cfg(test)]
+pub mod bounded_generation_retention {
+    use super::*;
+
+    #[test]
+    fn retention_preserves_current_and_previous() {
+        let root = test_root("retention-preserves-current-previous");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(3));
+        assert!(env.generation_dir(2).exists());
+        assert!(env.generation_dir(3).exists());
+        assert!(!env.generation_dir(1).exists());
+    }
+
+    #[test]
+    fn retention_removes_old_unreferenced_generations() {
+        let root = test_root("retention-removes-old-unreferenced");
+        for generation in 1..=5 {
+            setup_active_generation(&root, generation);
+        }
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(4).unwrap();
+        pointers.swap_current(5).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        for generation in 1..=5 {
+            docker
+                .containers
+                .insert(format!("prod-api-gen-{generation}"), true);
+        }
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        for generation in 1..=3 {
+            assert!(!env.generation_dir(generation).exists());
+        }
+        assert!(env.generation_dir(4).exists());
+        assert!(env.generation_dir(5).exists());
+    }
+
+    #[test]
+    fn retention_does_not_delete_rollback_target() {
+        let root = test_root("retention-does-not-delete-rollback-target");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(pointers.read_pointer("previous").unwrap(), Some(2));
+        assert!(env.generation_dir(2).exists());
+    }
+
+    #[test]
+    fn retention_cleanup_failure_is_retried() {
+        let root = test_root("retention-cleanup-failure-is-retried");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        docker
+            .image_remove_failures
+            .insert("forge/api:production-gen-1".into(), 1);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+        let cleanup = CleanupStore::new(env.clone(), 1)
+            .read_record()
+            .unwrap()
+            .unwrap();
+        assert!(cleanup.tombstoned);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 101,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+        let cleanup = CleanupStore::new(env.clone(), 1).read_record().unwrap();
+        if let Some(cleanup) = cleanup {
+            assert!(!cleanup.tombstoned);
+        }
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 102,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 103,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert!(!env.generation_dir(1).exists());
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(events.iter().any(|event| {
+            event.generation == Some(1) && event.event_type == "GENERATION_RETENTION_TOMBSTONED"
+        }));
+    }
+
+    #[test]
+    fn retention_removes_old_runtime_artifacts() {
+        let root = test_root("retention-removes-old-runtime-artifacts");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
         assert!(
-            events
+            docker
+                .remove_calls
                 .iter()
-                .any(|event| event.event_type == "CLEANUP_RETRY_SUCCEEDED")
+                .any(|name| name == "prod-api-gen-1")
         );
+        assert!(
+            docker
+                .image_remove_calls
+                .iter()
+                .any(|image| image == "forge/api:production-gen-1")
+        );
+        assert!(!env.generation_dir(1).exists());
     }
 }
 

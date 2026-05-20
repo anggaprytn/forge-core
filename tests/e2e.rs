@@ -1210,6 +1210,10 @@ impl DockerRuntime for NoopDockerRuntime {
     fn remove_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
         Ok(())
     }
+
+    fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]

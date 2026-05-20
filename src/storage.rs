@@ -131,8 +131,12 @@ pub struct CleanupRecord {
     pub failure_reason: String,
     pub container_name: Option<String>,
     pub route_subtree_id: Option<String>,
+    #[serde(default)]
+    pub image_ref: Option<String>,
     pub container_removed: bool,
     pub route_removed: bool,
+    #[serde(default = "default_true")]
+    pub image_removed: bool,
     pub tombstoned: bool,
 }
 
@@ -552,8 +556,10 @@ impl CleanupRecord {
             failure_reason: failure_reason.into(),
             container_name,
             route_subtree_id,
+            image_ref: None,
             container_removed,
             route_removed,
+            image_removed: true,
             tombstoned,
         }
     }
@@ -736,6 +742,10 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn truncate_to_recent_bytes(input: &str, max_bytes: usize) -> String {

@@ -169,6 +169,11 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         ];
         self.runner.run("docker", &args).map(|_| ())
     }
+
+    fn remove_image(&mut self, image_ref: &str) -> Result<(), DockerRuntimeError> {
+        let args = vec!["rmi".to_string(), "-f".to_string(), image_ref.to_string()];
+        self.runner.run("docker", &args).map(|_| ())
+    }
 }
 
 fn parse_built_image_ref(output: &str) -> Option<String> {
@@ -420,6 +425,23 @@ pub mod docker_adapter_removes_failed_generation {
                 "rm".to_string(),
                 "-f".to_string(),
                 "prod-api-gen-42".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_image_uses_force_remove() {
+        let runner = RecordingCommandRunner::with_outputs(vec![String::new()]);
+        let mut docker = DockerCliRuntime::new(runner);
+
+        docker.remove_image("forge:test").unwrap();
+
+        assert_eq!(
+            docker.runner.commands[0].args,
+            vec![
+                "rmi".to_string(),
+                "-f".to_string(),
+                "forge:test".to_string()
             ]
         );
     }

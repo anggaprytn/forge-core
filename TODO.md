@@ -152,7 +152,7 @@ Track:
 - [x] Orphaned container cleanup
 - [x] Orphaned route cleanup
 - [x] Tombstone retry loop
-- [ ] Disk pressure handling
+- [x] Disk pressure handling
 - [ ] Docker unavailable recovery
 - [ ] Caddy unavailable recovery
 
