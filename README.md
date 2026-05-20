@@ -258,6 +258,9 @@ These are intentionally separate systems.
 
 ```bash
 forge init                                   # Generate forge.yml
+forge login https://forge.example.com        # Approve CLI access in browser
+forge whoami                                 # Show configured server/auth status
+forge logout                                 # Remove saved CLI token
 forge deploy [--from PATH] <project> <environment> # Deploy using forge.yml
 forge status <deployment_id>                 # Check deployment status
 forge events                                 # View orchestration events
@@ -271,8 +274,13 @@ forge secrets set <project> <env> <k> <v>    # Set runtime secrets
 - `GET /login` is the primary human-operator login entrypoint and starts a GitHub OAuth web session.
 - `GET /app` requires a signed HTTP-only session cookie and serves the minimal Forge Control page.
 - `GET /logout` and `POST /logout` clear the web session.
-- `GET /login/cli` redirects to `/login`.
+- `POST /api/cli-login/start` creates a short-lived CLI login request.
+- `GET /login/cli?code=...` serves the browser approval page and reuses the existing web session.
+- `POST /login/cli` approves the waiting CLI session after GitHub login.
+- `POST /api/cli-login/poll` returns `pending`, `approved`, or `expired`, and returns the CLI token only once.
 - CLI commands and bearer-token API auth remain available for automation and operator workflows.
+
+`forge login <server_url>` starts the approval flow, opens or prints the approval URL, polls until approval, and saves `server_url` plus the CLI token in `~/.config/forge/config.toml`. `FORGE_URL` and `FORGE_TOKEN` still override the saved config when present.
 
 ---
 

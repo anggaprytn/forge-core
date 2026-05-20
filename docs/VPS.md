@@ -114,9 +114,13 @@ FORGE_GITHUB_OAUTH_CLIENT_ID=...
 FORGE_GITHUB_OAUTH_CLIENT_SECRET=...
 FORGE_PUBLIC_URL=https://forge.example.com
 FORGE_SESSION_SECRET=...
+FORGE_CLI_TOKEN_SECRET=...
 ```
 
-`/login` starts the GitHub OAuth flow, `/app` requires the resulting session cookie, and `/login/cli` redirects to `/login`.
+`FORGE_PUBLIC_URL` must be the public Forge origin used by operators and `forge login`.
+`FORGE_CLI_TOKEN_SECRET` signs CLI bearer tokens issued after browser approval.
+
+`/login` starts the GitHub OAuth flow, `/app` requires the resulting session cookie, `/login/cli?code=...` serves the CLI approval page, and `/api/cli-login/*` drives the short-lived browser approval flow used by `forge login`.
 CLI commands and bearer-token API auth remain available for automation and operator usage.
 
 ---
@@ -158,11 +162,12 @@ curl http://127.0.0.1:8080/metrics
 
 ## 9. Deploy the Sample App
 
-Set the CLI client environment:
+Set the CLI client environment for bearer-token auth, or use browser approval:
 
 ```bash
 export FORGE_URL=http://127.0.0.1:8080
 export FORGE_TOKEN=replace-with-the-bearer_token-from-forge.conf
+forge login https://forge.example.com
 ```
 
 Enqueue the deploy:
@@ -402,11 +407,12 @@ curl http://127.0.0.1:8080/metrics
 
 ## 12. Deploy the Sample App
 
-Manual deploys go through the HTTP API. Set the CLI client environment first:
+Manual deploys go through the HTTP API. Set the CLI client environment first, or log in once with browser approval:
 
 ```bash
 export FORGE_URL=http://127.0.0.1:8080
 export FORGE_TOKEN=replace-with-the-bearer_token-from-forge.conf
+forge login https://forge.example.com
 ```
 
 Then enqueue the deploy:

@@ -42,6 +42,25 @@ pub struct EventList {
     pub events: Vec<EventRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliLoginStartResponse {
+    pub code: String,
+    pub expires_at_unix: u64,
+    pub poll_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliLoginPollRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliLoginPollResponse {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
 pub fn validate_deployment_request(request: &DeploymentRequest) -> Result<(), ErrorResponse> {
     if request.project_id.is_empty() {
         return Err(ErrorResponse {

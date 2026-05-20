@@ -2,9 +2,10 @@ use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Form, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -18,8 +19,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::api::{
-    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse,
-    EventList,
+    CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
 };
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{
@@ -49,6 +50,8 @@ const OAUTH_STATE_COOKIE_NAME: &str = "forge_oauth_state";
 const GITHUB_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_USER_URL: &str = "https://api.github.com/user";
+const CLI_LOGIN_TTL_SECONDS: u64 = 300;
+const CLI_LOGIN_POLL_INTERVAL_SECONDS: u64 = 1;
 
 pub trait ControlPlane: Send {
     fn is_ready(&self) -> bool;
@@ -116,6 +119,7 @@ pub struct HttpState {
     github_webhooks: Option<GitHubWebhookState>,
     secret_store: SecretStore,
     web_auth: WebAuthState,
+    cli_auth: Option<CliAuthState>,
 }
 
 impl HttpState {
@@ -126,6 +130,7 @@ impl HttpState {
         github_webhooks: Option<GitHubWebhookState>,
         secret_store: SecretStore,
         web_auth: WebAuthState,
+        cli_auth: Option<CliAuthState>,
     ) -> Self {
         Self {
             daemon,
@@ -134,6 +139,7 @@ impl HttpState {
             github_webhooks,
             secret_store,
             web_auth,
+            cli_auth,
         }
     }
 }
@@ -282,15 +288,122 @@ struct OAuthStateQuery {
     state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct OAuthStartQuery {
+    next: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct OAuthStateCookie {
     nonce: String,
+    #[serde(default)]
+    return_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionCookie {
     github_login: String,
     github_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CliTokenClaims {
+    github_login: String,
+    github_id: u64,
+    issued_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CliLoginQuery {
+    code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CliLoginApproveForm {
+    code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CliLoginRecord {
+    created_at_unix: u64,
+    expires_at_unix: u64,
+    approved_by_login: Option<String>,
+    approved_by_id: Option<u64>,
+    approved_at_unix: Option<u64>,
+    consumed_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliLoginStartRecord {
+    code: String,
+    expires_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliLoginPollStatus {
+    Pending,
+    Approved(String),
+    Expired,
+}
+
+#[derive(Clone)]
+pub struct CliAuthState {
+    token_secret: Arc<String>,
+    requests: Arc<Mutex<CliLoginStore>>,
+}
+
+impl CliAuthState {
+    pub fn from_env(root: impl AsRef<Path>) -> Result<Option<Self>, std::io::Error> {
+        let Some(token_secret) = std::env::var("FORGE_CLI_TOKEN_SECRET").ok() else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            token_secret: Arc::new(token_secret),
+            requests: Arc::new(Mutex::new(CliLoginStore::new(root, CLI_LOGIN_TTL_SECONDS)?)),
+        }))
+    }
+
+    #[cfg(test)]
+    fn configured_for_tests(root: impl AsRef<Path>) -> Self {
+        Self {
+            token_secret: Arc::new("test-cli-token-secret".into()),
+            requests: Arc::new(Mutex::new(
+                CliLoginStore::new(root, CLI_LOGIN_TTL_SECONDS).unwrap(),
+            )),
+        }
+    }
+
+    fn start_request(&self) -> Result<CliLoginStartRecord, String> {
+        self.requests
+            .lock()
+            .map_err(|_| "cli login state lock poisoned".to_string())?
+            .create_request()
+    }
+
+    fn read_request(&self, code: &str) -> Result<Option<CliLoginRecord>, String> {
+        self.requests
+            .lock()
+            .map_err(|_| "cli login state lock poisoned".to_string())?
+            .read(code)
+    }
+
+    fn approve_request(&self, code: &str, session: &SessionCookie) -> Result<bool, String> {
+        self.requests
+            .lock()
+            .map_err(|_| "cli login state lock poisoned".to_string())?
+            .approve(code, session)
+    }
+
+    fn poll_request(&self, code: &str) -> Result<CliLoginPollStatus, String> {
+        self.requests
+            .lock()
+            .map_err(|_| "cli login state lock poisoned".to_string())?
+            .poll(code, self.token_secret.as_ref())
+    }
+
+    fn verify_token(&self, token: &str) -> bool {
+        decode_cli_token(token, self.token_secret.as_ref()).is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -447,15 +560,130 @@ impl DeliveryStore {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CliLoginStore {
+    root: PathBuf,
+    ttl_seconds: u64,
+}
+
+impl CliLoginStore {
+    fn new(root: impl AsRef<Path>, ttl_seconds: u64) -> Result<Self, std::io::Error> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root, ttl_seconds })
+    }
+
+    fn create_request(&mut self) -> Result<CliLoginStartRecord, String> {
+        let now = unix_now();
+        let record = CliLoginRecord {
+            created_at_unix: now,
+            expires_at_unix: now + self.ttl_seconds,
+            approved_by_login: None,
+            approved_by_id: None,
+            approved_at_unix: None,
+            consumed_at_unix: None,
+        };
+        let mut attempts = 0usize;
+        loop {
+            let code = generate_cli_login_code();
+            if self.read(&code)?.is_none() {
+                self.write(&code, &record)?;
+                return Ok(CliLoginStartRecord {
+                    code,
+                    expires_at_unix: record.expires_at_unix,
+                });
+            }
+            attempts += 1;
+            if attempts >= 8 {
+                return Err("failed to allocate cli login code".into());
+            }
+        }
+    }
+
+    fn read(&self, code: &str) -> Result<Option<CliLoginRecord>, String> {
+        let path = self.path_for(code);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|err| err.to_string())
+    }
+
+    fn write(&self, code: &str, record: &CliLoginRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(record).map_err(|err| err.to_string())?;
+        atomic_write(self.path_for(code), &bytes).map_err(|err| err.to_string())
+    }
+
+    fn approve(&mut self, code: &str, session: &SessionCookie) -> Result<bool, String> {
+        let Some(mut record) = self.read(code)? else {
+            return Ok(false);
+        };
+        if self.is_expired(&record) || record.consumed_at_unix.is_some() {
+            return Ok(false);
+        }
+        record.approved_by_login = Some(session.github_login.clone());
+        record.approved_by_id = Some(session.github_id);
+        record.approved_at_unix = Some(unix_now());
+        self.write(code, &record)?;
+        Ok(true)
+    }
+
+    fn poll(&mut self, code: &str, token_secret: &str) -> Result<CliLoginPollStatus, String> {
+        let Some(mut record) = self.read(code)? else {
+            return Ok(CliLoginPollStatus::Expired);
+        };
+        if self.is_expired(&record) || record.consumed_at_unix.is_some() {
+            return Ok(CliLoginPollStatus::Expired);
+        }
+        if let (Some(github_login), Some(github_id), Some(_)) = (
+            record.approved_by_login.clone(),
+            record.approved_by_id,
+            record.approved_at_unix,
+        ) {
+            let token = encode_cli_token(
+                &CliTokenClaims {
+                    github_login,
+                    github_id,
+                    issued_at_unix: unix_now(),
+                },
+                token_secret,
+            )?;
+            record.consumed_at_unix = Some(unix_now());
+            self.write(code, &record)?;
+            return Ok(CliLoginPollStatus::Approved(token));
+        }
+        Ok(CliLoginPollStatus::Pending)
+    }
+
+    fn path_for(&self, code: &str) -> PathBuf {
+        let sanitized = code
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>();
+        self.root.join(format!("{sanitized}.json"))
+    }
+
+    fn is_expired(&self, record: &CliLoginRecord) -> bool {
+        unix_now() >= record.expires_at_unix
+    }
+}
+
 pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", get(get_root))
         .route("/login", get(get_login))
-        .route("/login/cli", get(get_login_cli))
+        .route(
+            "/login/cli",
+            get(get_login_cli).post(post_login_cli_approve),
+        )
         .route("/oauth/github/start", get(get_oauth_github_start))
         .route("/oauth/github/callback", get(get_oauth_github_callback))
         .route("/app", get(get_app))
         .route("/logout", get(get_logout).post(post_logout))
+        .route("/api/cli-login/start", post(post_cli_login_start))
+        .route("/api/cli-login/poll", post(post_cli_login_poll))
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
         .route("/metrics", get(get_metrics))
@@ -534,16 +762,100 @@ async fn get_login(State(state): State<HttpState>, headers: HeaderMap) -> Respon
     html_response(StatusCode::OK, body)
 }
 
-async fn get_login_cli() -> Response {
-    redirect_response("/login")
+async fn get_login_cli(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<CliLoginQuery>,
+) -> Response {
+    let Some(code) = query.code else {
+        return html_response(StatusCode::BAD_REQUEST, "missing cli login code");
+    };
+    let Some(cli_auth) = state.cli_auth.as_ref() else {
+        return html_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cli login approval is not configured",
+        );
+    };
+    let Some(config) = state.web_auth.config.as_ref() else {
+        return redirect_response("/login");
+    };
+    let return_to = format!("/login/cli?code={code}");
+    let Some(record) = cli_auth.read_request(&code).ok().flatten() else {
+        return html_response(StatusCode::GONE, "cli login request expired");
+    };
+    if unix_now() >= record.expires_at_unix {
+        return html_response(StatusCode::GONE, "cli login request expired");
+    }
+
+    let continue_url = local_url_with_query("/oauth/github/start", &[("next", return_to.as_str())]);
+    let body = if let Some(session) = read_session_cookie(&headers, config) {
+        let login = escape_html(&session.github_login);
+        format!(
+            concat!(
+                "<!doctype html>\n",
+                "<html lang=\"en\">\n",
+                "<head>\n",
+                "  <meta charset=\"utf-8\">\n",
+                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+                "  <title>Approve Forge CLI</title>\n",
+                "</head>\n",
+                "<body>\n",
+                "  <main>\n",
+                "    <h1>Approve Forge CLI</h1>\n",
+                "    <p>Signed in as {}.</p>\n",
+                "    <p>This will issue a Forge CLI token to the waiting terminal.</p>\n",
+                "    <form action=\"/login/cli\" method=\"post\">\n",
+                "      <input type=\"hidden\" name=\"code\" value=\"{}\">\n",
+                "      <button type=\"submit\">Approve CLI Access</button>\n",
+                "    </form>\n",
+                "  </main>\n",
+                "</body>\n",
+                "</html>\n",
+            ),
+            login,
+            escape_html(&code)
+        )
+    } else {
+        format!(
+            concat!(
+                "<!doctype html>\n",
+                "<html lang=\"en\">\n",
+                "<head>\n",
+                "  <meta charset=\"utf-8\">\n",
+                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+                "  <title>Forge CLI Login</title>\n",
+                "</head>\n",
+                "<body>\n",
+                "  <main>\n",
+                "    <h1>Forge CLI Login</h1>\n",
+                "    <p>Sign in with GitHub to approve CLI access for the waiting terminal.</p>\n",
+                "    <p><a href=\"{}\">Continue with GitHub</a></p>\n",
+                "  </main>\n",
+                "</body>\n",
+                "</html>\n",
+            ),
+            escape_html(&continue_url)
+        )
+    };
+
+    html_response(StatusCode::OK, body)
 }
 
-async fn get_oauth_github_start(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+async fn get_oauth_github_start(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<OAuthStartQuery>,
+) -> Response {
     let Some(config) = state.web_auth.config.as_ref() else {
         return redirect_response("/login");
     };
     if read_session_cookie(&headers, config).is_some() {
-        return redirect_response("/app");
+        let target = query
+            .next
+            .as_deref()
+            .and_then(sanitize_return_to)
+            .unwrap_or("/app");
+        return redirect_response(target);
     }
 
     let nonce = generate_nonce();
@@ -559,13 +871,20 @@ async fn get_oauth_github_start(State(state): State<HttpState>, headers: HeaderM
         Ok(url) => url.to_string(),
         Err(_) => return html_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid oauth config"),
     };
-    let state_cookie =
-        match encode_signed_value(&OAuthStateCookie { nonce }, &config.session_secret) {
-            Ok(cookie) => cookie,
-            Err(_) => {
-                return html_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid oauth config");
-            }
-        };
+    let state_cookie = match encode_signed_value(
+        &OAuthStateCookie {
+            nonce,
+            return_to: query
+                .next
+                .and_then(|value| sanitize_return_to(&value).map(str::to_string)),
+        },
+        &config.session_secret,
+    ) {
+        Ok(cookie) => cookie,
+        Err(_) => {
+            return html_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid oauth config");
+        }
+    };
 
     redirect_with_cookies(
         StatusCode::SEE_OTHER,
@@ -647,7 +966,11 @@ async fn get_oauth_github_callback(
 
     redirect_with_cookies(
         StatusCode::SEE_OTHER,
-        "/app",
+        expected_state
+            .return_to
+            .as_deref()
+            .and_then(sanitize_return_to)
+            .unwrap_or("/app"),
         &[
             clear_state_cookie,
             build_cookie(
@@ -658,6 +981,52 @@ async fn get_oauth_github_callback(
             ),
         ],
     )
+}
+
+async fn post_login_cli_approve(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Form(form): Form<CliLoginApproveForm>,
+) -> Response {
+    let Some(cli_auth) = state.cli_auth.as_ref() else {
+        return html_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cli login approval is not configured",
+        );
+    };
+    let Some(config) = state.web_auth.config.as_ref() else {
+        return redirect_response("/login");
+    };
+    let Some(session) = read_session_cookie(&headers, config) else {
+        return redirect_response(&format!("/login/cli?code={}", form.code));
+    };
+
+    match cli_auth.approve_request(&form.code, &session) {
+        Ok(true) => html_response(
+            StatusCode::OK,
+            concat!(
+                "<!doctype html>\n",
+                "<html lang=\"en\">\n",
+                "<head>\n",
+                "  <meta charset=\"utf-8\">\n",
+                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+                "  <title>CLI Approved</title>\n",
+                "</head>\n",
+                "<body>\n",
+                "  <main>\n",
+                "    <h1>CLI Approved</h1>\n",
+                "    <p>You can return to the terminal.</p>\n",
+                "  </main>\n",
+                "</body>\n",
+                "</html>\n",
+            ),
+        ),
+        Ok(false) => html_response(StatusCode::GONE, "cli login request expired"),
+        Err(_) => html_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cli login approval failed",
+        ),
+    }
 }
 
 async fn get_app(State(state): State<HttpState>, headers: HeaderMap) -> Response {
@@ -712,6 +1081,118 @@ async fn get_healthz() -> impl IntoResponse {
             status: "ok".into(),
         }),
     )
+}
+
+async fn post_cli_login_start(State(state): State<HttpState>) -> Response {
+    let request_id = next_request_id();
+    let Some(cli_auth) = state.cli_auth.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            ErrorResponse {
+                code: "cli_login_not_configured".into(),
+                message: "cli login is not configured".into(),
+            },
+        );
+    };
+    if state.web_auth.config.is_none() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            ErrorResponse {
+                code: "web_login_not_configured".into(),
+                message: "web login is not configured".into(),
+            },
+        );
+    }
+
+    match cli_auth.start_request() {
+        Ok(record) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: CliLoginStartResponse {
+                    code: record.code,
+                    expires_at_unix: record.expires_at_unix,
+                    poll_interval_seconds: CLI_LOGIN_POLL_INTERVAL_SECONDS,
+                },
+            }),
+        ),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "cli_login_start_failed".into(),
+                message: err,
+            },
+        ),
+    }
+}
+
+async fn post_cli_login_poll(
+    State(state): State<HttpState>,
+    Json(request): Json<CliLoginPollRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    let Some(cli_auth) = state.cli_auth.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            ErrorResponse {
+                code: "cli_login_not_configured".into(),
+                message: "cli login is not configured".into(),
+            },
+        );
+    };
+
+    match cli_auth.poll_request(&request.code) {
+        Ok(CliLoginPollStatus::Pending) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: CliLoginPollResponse {
+                    status: "pending".into(),
+                    token: None,
+                },
+            }),
+        ),
+        Ok(CliLoginPollStatus::Approved(token)) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: CliLoginPollResponse {
+                    status: "approved".into(),
+                    token: Some(token),
+                },
+            }),
+        ),
+        Ok(CliLoginPollStatus::Expired) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: CliLoginPollResponse {
+                    status: "expired".into(),
+                    token: None,
+                },
+            }),
+        ),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "cli_login_poll_failed".into(),
+                message: err,
+            },
+        ),
+    }
 }
 
 async fn get_readyz(State(state): State<HttpState>) -> Response {
@@ -1202,18 +1683,26 @@ fn ensure_authorized(
     };
 
     let expected = format!("Bearer {}", state.bearer_token);
-    if value != expected {
-        return Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            request_id,
-            ErrorResponse {
-                code: "unauthorized".into(),
-                message: "invalid bearer token".into(),
-            },
-        ));
+    if value == expected {
+        return Ok(());
     }
 
-    Ok(())
+    let cli_authorized = value
+        .strip_prefix("Bearer ")
+        .and_then(|token| state.cli_auth.as_ref().map(|auth| auth.verify_token(token)))
+        .unwrap_or(false);
+    if cli_authorized {
+        return Ok(());
+    }
+
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
+        request_id,
+        ErrorResponse {
+            code: "unauthorized".into(),
+            message: "invalid bearer token".into(),
+        },
+    ))
 }
 
 fn github_error_response(request_id: &str, err: GitHubError) -> Response {
@@ -1352,6 +1841,11 @@ fn generate_nonce() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn generate_cli_login_code() -> String {
+    let bytes: [u8; 6] = rand::random();
+    hex::encode(bytes)
+}
+
 fn encode_signed_value<T>(value: &T, secret: &str) -> Result<String, String>
 where
     T: Serialize,
@@ -1367,6 +1861,26 @@ fn sign_value(secret: &str, payload: &str) -> Result<String, String> {
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|err| err.to_string())?;
     mac.update(payload.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn encode_cli_token(claims: &CliTokenClaims, secret: &str) -> Result<String, String> {
+    let payload = serde_json::to_vec(claims).map_err(|err| err.to_string())?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let signature = sign_value(secret, &payload)?;
+    Ok(format!("forge_cli.{payload}.{signature}"))
+}
+
+fn decode_cli_token(token: &str, secret: &str) -> Option<CliTokenClaims> {
+    let raw = token.strip_prefix("forge_cli.")?;
+    let (payload, signature) = raw.rsplit_once('.')?;
+    let expected = sign_value(secret, payload).ok()?;
+    if !bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn read_signed_cookie<T>(headers: &HeaderMap, name: &str, secret: &str) -> Option<T>
@@ -1436,6 +1950,36 @@ fn logout_response(state: &HttpState) -> Response {
             build_clear_cookie(OAUTH_STATE_COOKIE_NAME, secure),
         ],
     )
+}
+
+fn sanitize_return_to(value: &str) -> Option<&str> {
+    if value.starts_with('/') && !value.starts_with("//") {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn local_url_with_query(path: &str, params: &[(&str, &str)]) -> String {
+    let base = format!("http://localhost{path}");
+    match Url::parse_with_params(&base, params) {
+        Ok(url) => {
+            let mut rendered = url.path().to_string();
+            if let Some(query) = url.query() {
+                rendered.push('?');
+                rendered.push_str(query);
+            }
+            rendered
+        }
+        Err(_) => path.to_string(),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn escape_html(value: &str) -> String {
@@ -1651,6 +2195,7 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
             None,
             SecretStore::new(root.join("secrets")).unwrap(),
             WebAuthState::unconfigured(),
+            None,
         ),
         root,
     )
@@ -1659,6 +2204,14 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
 #[cfg(test)]
 fn build_state(ready: bool) -> HttpState {
     build_state_with_root(ready).0
+}
+
+#[cfg(test)]
+fn build_cli_login_state() -> HttpState {
+    let (mut state, root) = build_state_with_root(true);
+    state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+    state.cli_auth = Some(CliAuthState::configured_for_tests(root.join("cli-logins")));
+    state
 }
 
 #[cfg(test)]
@@ -1777,24 +2330,28 @@ pub mod login_endpoint_mentions_missing_oauth_config_when_unconfigured {
 }
 
 #[cfg(test)]
-pub mod login_cli_endpoint_does_not_require_auth {
+pub mod cli_login_start_creates_pending_request {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use serde_json::Value;
     use tower::util::ServiceExt;
 
     #[tokio::test]
-    async fn login_cli_endpoint_redirects_to_login() {
-        let app = router(build_state(true));
+    async fn cli_login_start_creates_pending_request() {
+        let app = router(build_cli_login_state());
         let request = Request::builder()
-            .method(axum::http::Method::GET)
-            .uri("/login/cli")
+            .method(axum::http::Method::POST)
+            .uri("/api/cli-login/start")
             .body(Body::empty())
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["poll_interval_seconds"], 1);
+        assert_eq!(json["data"]["code"].as_str().unwrap().len(), 12);
     }
 }
 
@@ -1869,6 +2426,243 @@ pub mod oauth_start_redirects_to_github {
 }
 
 #[cfg(test)]
+pub mod login_cli_requires_session_to_approve {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn login_cli_requires_session_to_approve() {
+        let app = router(build_cli_login_state());
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(start.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let code = json["data"]["code"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/login/cli")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("code={code}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            &format!("/login/cli?code={code}")
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod login_cli_approve_marks_request_approved {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn login_cli_approve_marks_request_approved() {
+        let state = build_cli_login_state();
+        let config = state.web_auth.config.clone().unwrap();
+        let session_cookie = encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &config.session_secret,
+        )
+        .unwrap();
+        let app = router(state);
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(start.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let code = json["data"]["code"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/login/cli")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(format!("code={code}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+pub mod cli_login_poll_returns_pending_before_approval {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn cli_login_poll_returns_pending_before_approval() {
+        let app = router(build_cli_login_state());
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(start.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let code = json["data"]["code"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/poll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["status"], "pending");
+        assert!(json["data"]["token"].is_null());
+    }
+}
+
+#[cfg(test)]
+pub mod cli_login_poll_returns_token_once_after_approval {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn cli_login_poll_returns_token_once_after_approval() {
+        let state = build_cli_login_state();
+        let config = state.web_auth.config.clone().unwrap();
+        let session_cookie = encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &config.session_secret,
+        )
+        .unwrap();
+        let app = router(state);
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(start.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let code = json["data"]["code"].as_str().unwrap().to_string();
+
+        let _approved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/login/cli")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(format!("code={code}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/poll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["data"]["status"], "approved");
+        assert!(
+            first_json["data"]["token"]
+                .as_str()
+                .unwrap()
+                .starts_with("forge_cli.")
+        );
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/poll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["data"]["status"], "expired");
+        assert!(second_json["data"]["token"].is_null());
+    }
+}
+
+#[cfg(test)]
 pub mod oauth_callback_creates_session_cookie {
     use super::*;
     use axum::body::Body;
@@ -1885,6 +2679,7 @@ pub mod oauth_callback_creates_session_cookie {
         let state_cookie = encode_signed_value(
             &OAuthStateCookie {
                 nonce: state_value.into(),
+                return_to: None,
             },
             &config.session_secret,
         )

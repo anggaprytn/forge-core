@@ -246,6 +246,39 @@ fn init_output_is_valid_yaml() {
     assert_eq!(yaml["type"].as_str(), Some("web"));
 }
 
+#[test]
+fn cli_config_env_vars_override_saved_config() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"deployment_id":"dep-1","queue_position":1}}"#,
+    );
+    let config_root = test_root("cli-config-override");
+    let forge_config_dir = config_root.join("forge");
+    fs::create_dir_all(&forge_config_dir).unwrap();
+    fs::write(
+        forge_config_dir.join("config.toml"),
+        concat!(
+            "server_url = \"http://127.0.0.1:9\"\n",
+            "token = \"saved-token\"\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(["deploy", "api", "production"])
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env("FORGE_URL", &url)
+        .env("FORGE_TOKEN", "env-token")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.path, "/deployments");
+    assert_eq!(request.authorization, "Bearer env-token");
+}
+
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)

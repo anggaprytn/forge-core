@@ -110,7 +110,7 @@ curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
 curl http://localhost:8080/metrics
 curl http://localhost:8080/
-curl http://localhost:8080/login/cli
+curl -X POST http://localhost:8080/api/cli-login/start
 forge doctor
 ```
 
@@ -123,7 +123,13 @@ ready
 
 `/metrics` returns Prometheus text exposition for operational visibility.
 `/` returns a tiny built-in landing page.
-`/login/cli` returns a placeholder CLI login page; GitHub OAuth and Forge token issuance are not implemented yet.
+CLI login uses a short-lived browser approval flow:
+
+```bash
+forge login https://forge.example.com
+```
+
+Forge creates a pending CLI login, opens or prints `/login/cli?code=...`, reuses the existing GitHub web session for approval, and stores the resulting token in `~/.config/forge/config.toml`. `FORGE_URL` and `FORGE_TOKEN` override the saved config when present.
 
 ---
 
@@ -260,6 +266,16 @@ build
 ```bash
 forge deploy api production
 ```
+
+## CLI Login
+
+```bash
+forge login https://forge.example.com
+forge whoami
+forge logout
+```
+
+`forge whoami` reports the resolved server URL and whether the current credentials appear authenticated. `forge logout` removes the saved local token without removing `FORGE_URL` or `FORGE_TOKEN` from the environment.
 
 ---
 

@@ -2,11 +2,15 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::ErrorKind;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use forge_core::api::{
-    DeploymentAccepted, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
+    CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
+    DeploymentRequest, DeploymentStatus, ErrorResponse, EventList,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -28,7 +32,6 @@ use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use tokio::net::TcpListener;
 
 fn main() {
@@ -49,7 +52,12 @@ where
     let parsed = ParsedArgs::parse(args)?;
     let api_credentials = if matches!(
         parsed.command,
-        Command::Doctor { .. } | Command::Daemon(_) | Command::Init { .. }
+        Command::Doctor { .. }
+            | Command::Daemon(_)
+            | Command::Init { .. }
+            | Command::Login { .. }
+            | Command::Logout
+            | Command::WhoAmI
     ) {
         None
     } else {
@@ -75,6 +83,9 @@ where
         }
         Command::Daemon(command) => daemon_runner(command)?,
         Command::Init { force } => init_project_config(force)?,
+        Command::Login { server_url } => run_login(server_url)?,
+        Command::Logout => run_logout()?,
+        Command::WhoAmI => run_whoami(&parsed)?,
         Command::Deploy {
             project_id,
             environment,
@@ -186,11 +197,58 @@ impl ForgeClient {
         )
     }
 
-    fn send_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, CliError> {
-        let response = request
+    fn post_cli_login_start(&self) -> Result<CliLoginStartResponse, CliError> {
+        self.send_json_without_auth(
+            self.http
+                .post(format!("{}/api/cli-login/start", self.base_url)),
+        )
+    }
+
+    fn post_cli_login_poll(
+        &self,
+        request: CliLoginPollRequest,
+    ) -> Result<CliLoginPollResponse, CliError> {
+        self.send_json_without_auth(
+            self.http
+                .post(format!("{}/api/cli-login/poll", self.base_url))
+                .json(&request),
+        )
+    }
+
+    fn check_auth(&self) -> Result<bool, CliError> {
+        let response = self
+            .http
+            .get(format!("{}/events", self.base_url))
             .bearer_auth(&self.token)
             .send()
             .map_err(|err| CliError::Http(err.to_string()))?;
+        Ok(response.status().is_success())
+    }
+
+    fn send_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, CliError> {
+        self.decode_response(
+            request
+                .bearer_auth(&self.token)
+                .send()
+                .map_err(|err| CliError::Http(err.to_string()))?,
+        )
+    }
+
+    fn send_json_without_auth<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<T, CliError> {
+        self.decode_response(
+            request
+                .send()
+                .map_err(|err| CliError::Http(err.to_string()))?,
+        )
+    }
+
+    fn decode_response<T: DeserializeOwned>(
+        &self,
+        response: reqwest::blocking::Response,
+    ) -> Result<T, CliError> {
         let status = response.status();
         if status.is_success() {
             let envelope = response
@@ -251,6 +309,11 @@ enum Command {
     Init {
         force: bool,
     },
+    Login {
+        server_url: String,
+    },
+    Logout,
+    WhoAmI,
     Deploy {
         project_id: String,
         environment: String,
@@ -366,6 +429,11 @@ impl ParsedArgs {
         self.base_url
             .clone()
             .or_else(|| env::var("FORGE_URL").ok())
+            .or_else(|| {
+                load_saved_cli_config()
+                    .ok()
+                    .and_then(|config| config.server_url)
+            })
             .ok_or_else(|| CliError::Usage("missing Forge URL: use --url or FORGE_URL".into()))
     }
 
@@ -373,9 +441,31 @@ impl ParsedArgs {
         self.token
             .clone()
             .or_else(|| env::var("FORGE_TOKEN").ok())
+            .or_else(|| load_saved_cli_config().ok().and_then(|config| config.token))
             .ok_or_else(|| {
                 CliError::Usage("missing Forge token: use --token or FORGE_TOKEN".into())
             })
+    }
+
+    fn resolved_server_url(&self) -> Result<Option<String>, CliError> {
+        if let Some(value) = self.base_url.clone() {
+            return Ok(Some(value));
+        }
+        if let Ok(value) = env::var("FORGE_URL") {
+            return Ok(Some(value));
+        }
+        Ok(load_saved_cli_config()?.server_url)
+    }
+
+    fn resolved_token(&self) -> Result<(Option<String>, &'static str), CliError> {
+        if let Some(value) = self.token.clone() {
+            return Ok((Some(value), "flag"));
+        }
+        if let Ok(value) = env::var("FORGE_TOKEN") {
+            return Ok((Some(value), "env"));
+        }
+        let config = load_saved_cli_config()?;
+        Ok((config.token, "config"))
     }
 }
 
@@ -399,6 +489,11 @@ fn parse_command(
         })),
         [cmd] if cmd == "init" => Ok(Command::Init { force: false }),
         [cmd, flag] if cmd == "init" && flag == "--force" => Ok(Command::Init { force: true }),
+        [cmd, server_url] if cmd == "login" => Ok(Command::Login {
+            server_url: server_url.clone(),
+        }),
+        [cmd] if cmd == "logout" => Ok(Command::Logout),
+        [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
         [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
         [cmd, deployment_id] if cmd == "status" => Ok(Command::Status {
             deployment_id: deployment_id.clone(),
@@ -428,6 +523,9 @@ fn usage() -> String {
         "  forge [--config PATH] [--caddy-admin-url URL] [--metrics-url URL] doctor",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] daemon",
         "  forge init [--force]",
+        "  forge login <server_url>",
+        "  forge logout",
+        "  forge whoami",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] events",
@@ -514,6 +612,249 @@ fn default_init_config() -> &'static str {
     )
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SavedCliConfig {
+    server_url: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct WhoAmIOutput {
+    server_url: Option<String>,
+    token_source: String,
+    authenticated: String,
+}
+
+fn run_login(server_url: String) -> Result<(), CliError> {
+    let server_url = server_url.trim_end_matches('/').to_string();
+    let client = ForgeClient::new(server_url.clone(), String::new());
+    let start = client.post_cli_login_start()?;
+    let approval_url = format!("{}/login/cli?code={}", server_url, start.code);
+
+    println!("Approve this Forge CLI login in your browser:");
+    println!("{approval_url}");
+    let _ = try_open_browser(&approval_url);
+    println!("Waiting for approval...");
+
+    loop {
+        let poll = client.post_cli_login_poll(CliLoginPollRequest {
+            code: start.code.clone(),
+        })?;
+        match poll.status.as_str() {
+            "pending" => thread::sleep(Duration::from_secs(start.poll_interval_seconds.max(1))),
+            "approved" => {
+                let token = poll.token.ok_or_else(|| {
+                    CliError::Usage("cli login approval returned no token".into())
+                })?;
+                save_cli_config(&SavedCliConfig {
+                    server_url: Some(server_url.clone()),
+                    token: Some(token),
+                })?;
+                println!("Logged in to {server_url}");
+                return Ok(());
+            }
+            "expired" => {
+                return Err(CliError::Usage(
+                    "cli login request expired before approval".into(),
+                ));
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unexpected cli login status: {other}"
+                )));
+            }
+        }
+    }
+}
+
+fn run_logout() -> Result<(), CliError> {
+    let mut config = load_saved_cli_config()?;
+    config.token = None;
+    if config.server_url.is_none() {
+        remove_saved_cli_config()?;
+    } else {
+        save_cli_config(&config)?;
+    }
+    println!("Removed saved Forge token.");
+    Ok(())
+}
+
+fn run_whoami(parsed: &ParsedArgs) -> Result<(), CliError> {
+    let server_url = parsed.resolved_server_url()?;
+    let (token, token_source) = parsed.resolved_token()?;
+    let authenticated = match (server_url.clone(), token.clone()) {
+        (Some(url), Some(token)) => {
+            let client = ForgeClient::new(url, token);
+            match client.check_auth() {
+                Ok(true) => "authenticated",
+                Ok(false) => "unauthenticated",
+                Err(_) => "unknown",
+            }
+        }
+        _ => "missing_credentials",
+    };
+
+    print_json(&WhoAmIOutput {
+        server_url,
+        token_source: if token.is_some() {
+            token_source.into()
+        } else {
+            "none".into()
+        },
+        authenticated: authenticated.into(),
+    })
+}
+
+fn load_saved_cli_config() -> Result<SavedCliConfig, CliError> {
+    let path = saved_cli_config_path()?;
+    if !path.exists() {
+        return Ok(SavedCliConfig::default());
+    }
+    let raw = fs::read_to_string(&path).map_err(|err| CliError::Usage(err.to_string()))?;
+    parse_saved_cli_config(&raw)
+}
+
+fn parse_saved_cli_config(raw: &str) -> Result<SavedCliConfig, CliError> {
+    let mut config = SavedCliConfig::default();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(CliError::Usage("invalid Forge CLI config".into()));
+        };
+        let key = key.trim();
+        let value = parse_toml_string(value.trim())?;
+        match key {
+            "server_url" => config.server_url = Some(value),
+            "token" => config.token = Some(value),
+            _ => {}
+        }
+    }
+    Ok(config)
+}
+
+fn parse_toml_string(value: &str) -> Result<String, CliError> {
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(CliError::Usage("invalid Forge CLI config".into()));
+    };
+    Ok(value.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+fn save_cli_config(config: &SavedCliConfig) -> Result<(), CliError> {
+    if config.server_url.is_none() && config.token.is_none() {
+        return remove_saved_cli_config();
+    }
+    let path = saved_cli_config_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CliError::Usage("invalid Forge CLI config path".into()))?;
+    fs::create_dir_all(parent).map_err(|err| CliError::Usage(err.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+
+    let mut rendered = String::new();
+    if let Some(server_url) = &config.server_url {
+        rendered.push_str("server_url = \"");
+        rendered.push_str(&escape_toml_string(server_url));
+        rendered.push_str("\"\n");
+    }
+    if let Some(token) = &config.token {
+        rendered.push_str("token = \"");
+        rendered.push_str(&escape_toml_string(token));
+        rendered.push_str("\"\n");
+    }
+    write_private_file(&path, rendered.as_bytes())
+}
+
+fn remove_saved_cli_config() -> Result<(), CliError> {
+    let path = saved_cli_config_path()?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CliError::Usage(err.to_string())),
+    }
+}
+
+fn saved_cli_config_path() -> Result<PathBuf, CliError> {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(config_home).join("forge").join("config.toml"));
+    }
+    if let Ok(home) = env::var("HOME") {
+        return Ok(PathBuf::from(home)
+            .join(".config")
+            .join("forge")
+            .join("config.toml"));
+    }
+    Err(CliError::Usage(
+        "missing HOME or XDG_CONFIG_HOME for Forge CLI config".into(),
+    ))
+}
+
+fn escape_toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+    let tmp_path = path.with_extension("tmp");
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|err| CliError::Usage(err.to_string()))?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    file.write_all(contents)
+        .and_then(|_| file.sync_all())
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(tmp_path, path).map_err(|err| CliError::Usage(err.to_string()))
+}
+
+fn try_open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
 fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
     let config = DaemonConfig::load_from_file(&command.config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
@@ -562,6 +903,8 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
         forge_core::secrets::SecretStore::new(config.storage_root.join("secrets"))
             .map_err(|err| CliError::Usage(err.to_string()))?,
         WebAuthState::from_env(),
+        forge_core::http::CliAuthState::from_env(config.storage_root.join("cli-logins"))
+            .map_err(|err| CliError::Usage(err.to_string()))?,
     );
     let app = router(state);
 
