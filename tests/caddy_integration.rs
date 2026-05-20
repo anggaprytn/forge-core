@@ -671,6 +671,12 @@ impl DockerRuntime for FakeDockerRuntime {
             .collect())
     }
 
+    fn list_managed_images(
+        &mut self,
+    ) -> Result<Vec<forge_core::runtime::ManagedImage>, DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
         self.running.remove(container_name);
         Ok(())

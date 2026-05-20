@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use crate::events::EventRecord;
 use crate::queue::{DeploymentRecord, PersistentQueue};
 use crate::runtime::{
-    ContainerInspection, CreateContainerRequest, DockerRuntime, ProbeRuntime, RouteInspection,
-    RouteUpdateRequest, RoutingRuntime,
+    ContainerInspection, CreateContainerRequest, DockerRuntime, ManagedImage, ProbeRuntime,
+    RouteInspection, RouteUpdateRequest, RoutingRuntime,
 };
 use crate::secrets::SecretStore;
 #[cfg(test)]
@@ -19,6 +19,7 @@ use crate::storage::{
     load_generation_build_info, load_generation_runtime_info,
 };
 
+// Beyond current/previous, retain only a small recent diagnostic tail of failed generations.
 const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,34 +196,30 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
     {
         let mut managed_containers = docker.list_managed_containers()?;
         managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
+        let mut managed_images = docker.list_managed_images()?;
+        managed_images.sort_by(|left, right| left.image_ref.cmp(&right.image_ref));
         let mut managed_routes = routing.list_managed_routes()?;
         managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
         let queue_state = self.queue.load_state()?;
         let active_record = resumable_active.or(queue_state.active.as_ref());
         let mut attempted_cleanup = BTreeSet::new();
 
-        for (project_id, environment, env) in
-            cleanup_scan_environments(&self.storage_root, &managed_containers, &managed_routes)?
-        {
+        let environments = cleanup_scan_environments(
+            &self.storage_root,
+            &managed_containers,
+            &managed_images,
+            &managed_routes,
+        )?;
+        for (project_id, environment, env) in &environments {
             retry_tombstoned_cleanup(
                 docker,
                 routing,
-                &project_id,
-                &environment,
-                &env,
+                project_id,
+                environment,
+                env,
                 active_record,
                 &managed_containers,
-                &managed_routes,
-                &mut attempted_cleanup,
-            )?;
-            enforce_generation_retention(
-                docker,
-                routing,
-                &project_id,
-                &environment,
-                &env,
-                active_record,
-                &managed_containers,
+                &managed_images,
                 &managed_routes,
                 &mut attempted_cleanup,
             )?;
@@ -233,9 +230,33 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
             &self.storage_root,
             active_record,
             &managed_containers,
+            &managed_images,
             &managed_routes,
             &mut attempted_cleanup,
         )?;
+        cleanup_orphaned_images(
+            docker,
+            &self.storage_root,
+            active_record,
+            &managed_containers,
+            &managed_images,
+            &managed_routes,
+            &mut attempted_cleanup,
+        )?;
+        for (project_id, environment, env) in &environments {
+            enforce_generation_retention(
+                docker,
+                routing,
+                project_id,
+                environment,
+                env,
+                active_record,
+                &managed_containers,
+                &managed_images,
+                &managed_routes,
+                &mut attempted_cleanup,
+            )?;
+        }
 
         for route in &managed_routes {
             let Some((project_id, environment)) = parse_route_identity(&route.subtree_id) else {
@@ -494,6 +515,8 @@ where
     ) -> Result<(), ConvergenceError> {
         let mut managed_containers = self.docker.list_managed_containers()?;
         managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
+        let mut managed_images = self.docker.list_managed_images()?;
+        managed_images.sort_by(|left, right| left.image_ref.cmp(&right.image_ref));
         let mut managed_routes = self.routing.list_managed_routes()?;
         managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
         let queue_state = self.queue.load_state()?;
@@ -507,18 +530,7 @@ where
             env,
             queue_state.active.as_ref(),
             &managed_containers,
-            &managed_routes,
-            &mut attempted_cleanup,
-        )?;
-
-        enforce_generation_retention(
-            self.docker,
-            self.routing,
-            &input.project_id,
-            &input.environment,
-            env,
-            queue_state.active.as_ref(),
-            &managed_containers,
+            &managed_images,
             &managed_routes,
             &mut attempted_cleanup,
         )?;
@@ -528,6 +540,28 @@ where
             &self.storage_root,
             queue_state.active.as_ref(),
             &managed_containers,
+            &managed_images,
+            &managed_routes,
+            &mut attempted_cleanup,
+        )?;
+        cleanup_orphaned_images(
+            self.docker,
+            &self.storage_root,
+            queue_state.active.as_ref(),
+            &managed_containers,
+            &managed_images,
+            &managed_routes,
+            &mut attempted_cleanup,
+        )?;
+        enforce_generation_retention(
+            self.docker,
+            self.routing,
+            &input.project_id,
+            &input.environment,
+            env,
+            queue_state.active.as_ref(),
+            &managed_containers,
+            &managed_images,
             &managed_routes,
             &mut attempted_cleanup,
         )?;
@@ -931,6 +965,51 @@ fn container_identity(inspection: &ContainerInspection) -> Option<(String, Strin
     Some((project_id, environment, generation))
 }
 
+fn image_identity(image: &ManagedImage) -> Option<(String, String, u64)> {
+    let project_id = image.labels.get("forge.project_id")?.to_string();
+    let environment = image.labels.get("forge.environment")?.to_string();
+    let generation = image.labels.get("forge.generation")?.parse::<u64>().ok()?;
+    Some((project_id, environment, generation))
+}
+
+fn container_for_generation<'a>(
+    managed_containers: &'a [ContainerInspection],
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+) -> Option<&'a ContainerInspection> {
+    managed_containers.iter().find(|container| {
+        container_identity(container)
+            == Some((project_id.to_string(), environment.to_string(), generation))
+    })
+}
+
+fn image_for_generation<'a>(
+    managed_images: &'a [ManagedImage],
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+) -> Option<&'a ManagedImage> {
+    managed_images.iter().find(|image| {
+        image_identity(image) == Some((project_id.to_string(), environment.to_string(), generation))
+    })
+}
+
+fn image_ref_for_generation(
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
+) -> Option<String> {
+    container_for_generation(managed_containers, project_id, environment, generation)
+        .map(|container| container.image_ref.clone())
+        .or_else(|| {
+            image_for_generation(managed_images, project_id, environment, generation)
+                .map(|image| image.image_ref.clone())
+        })
+}
+
 #[derive(Debug, Clone, Default)]
 struct RuntimeReferences {
     current: Option<u64>,
@@ -1004,6 +1083,7 @@ fn latest_nonfinalized_generation(env: &EnvironmentPaths) -> Result<Option<u64>,
 fn cleanup_scan_environments(
     storage_root: &std::path::Path,
     managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
     managed_routes: &[RouteInspection],
 ) -> Result<Vec<(String, String, EnvironmentPaths)>, ConvergenceError> {
     let mut environments = list_environments(storage_root)?;
@@ -1013,6 +1093,17 @@ fn cleanup_scan_environments(
         .collect::<BTreeSet<_>>();
     for container in managed_containers {
         if let Some((project_id, environment, _)) = container_identity(container) {
+            if seen.insert((project_id.clone(), environment.clone())) {
+                environments.push((
+                    project_id.clone(),
+                    environment.clone(),
+                    EnvironmentPaths::new(storage_root, &project_id, &environment),
+                ));
+            }
+        }
+    }
+    for image in managed_images {
+        if let Some((project_id, environment, _)) = image_identity(image) {
             if seen.insert((project_id.clone(), environment.clone())) {
                 environments.push((
                     project_id.clone(),
@@ -1220,6 +1311,7 @@ fn retry_tombstoned_cleanup<RtD, RtR>(
     env: &EnvironmentPaths,
     active_record: Option<&DeploymentRecord>,
     managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
     managed_routes: &[RouteInspection],
     attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
 ) -> Result<(), ConvergenceError>
@@ -1262,7 +1354,15 @@ where
         if !cleanup.tombstoned {
             continue;
         }
-        attempt_cleanup(
+        let cleanup = hydrate_cleanup_record(
+            cleanup,
+            project_id,
+            environment,
+            generation,
+            managed_containers,
+            managed_images,
+        );
+        let cleanup = attempt_cleanup(
             docker,
             routing,
             env,
@@ -1274,9 +1374,44 @@ where
             "CLEANUP_RETRY_SUCCEEDED",
             "CLEANUP_RETRY_TOMBSTONED",
         )?;
-        attempted_cleanup.insert((project_id.to_string(), environment.to_string(), generation));
+        if cleanup.container_removed {
+            attempted_cleanup.insert((project_id.to_string(), environment.to_string(), generation));
+        }
     }
     Ok(())
+}
+
+fn hydrate_cleanup_record(
+    mut cleanup: CleanupRecord,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
+) -> CleanupRecord {
+    if cleanup.container_name.is_none() {
+        cleanup.container_name = Some(generation_container_name(
+            environment,
+            project_id,
+            generation,
+        ));
+    }
+    if cleanup.image_ref.is_none() {
+        cleanup.image_ref = image_ref_for_generation(
+            project_id,
+            environment,
+            generation,
+            managed_containers,
+            managed_images,
+        );
+    }
+    if cleanup.container_name.is_none() {
+        cleanup.container_removed = true;
+    }
+    if cleanup.image_ref.is_none() {
+        cleanup.image_removed = true;
+    }
+    cleanup
 }
 
 fn cleanup_orphaned_containers<RtD>(
@@ -1284,6 +1419,7 @@ fn cleanup_orphaned_containers<RtD>(
     storage_root: &std::path::Path,
     active_record: Option<&DeploymentRecord>,
     managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
     managed_routes: &[RouteInspection],
     attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
 ) -> Result<BTreeSet<String>, ConvergenceError>
@@ -1310,35 +1446,132 @@ where
         if references.contains(generation) {
             continue;
         }
-        let _ = docker.stop_container(&container.container_name);
-        let container_removed = docker.remove_container(&container.container_name).is_ok();
-        let cleanup = CleanupRecord::new(
-            "orphaned container cleanup",
-            Some(container.container_name.clone()),
-            None,
-            container_removed,
-            true,
-            !container_removed,
-        );
-        persist_cleanup_state(&env, generation, cleanup.clone(), None)?;
-        append_cleanup_event(
+        let cleanup = attempt_cleanup(
+            docker,
+            &mut NoopRouteRemover,
             &env,
             &project_id,
             &environment,
             generation,
-            None,
-            if cleanup.tombstoned {
-                "ORPHANED_CONTAINER_TOMBSTONED"
-            } else {
-                "ORPHANED_CONTAINER_REMOVED"
+            CleanupRecord {
+                image_ref: image_ref_for_generation(
+                    &project_id,
+                    &environment,
+                    generation,
+                    managed_containers,
+                    managed_images,
+                ),
+                image_removed: image_ref_for_generation(
+                    &project_id,
+                    &environment,
+                    generation,
+                    managed_containers,
+                    managed_images,
+                )
+                .is_none(),
+                ..CleanupRecord::new(
+                    "orphaned container cleanup",
+                    Some(container.container_name.clone()),
+                    None,
+                    false,
+                    true,
+                    true,
+                )
             },
-            Some(cleanup.failure_reason.clone()),
+            None,
+            "ORPHANED_CONTAINER_REMOVED",
+            "ORPHANED_CONTAINER_TOMBSTONED",
         )?;
         if cleanup.container_removed {
             removed.insert(container.container_name.clone());
         }
     }
     Ok(removed)
+}
+
+struct NoopRouteRemover;
+
+impl RoutingRuntime for NoopRouteRemover {
+    fn update_route(
+        &mut self,
+        _request: RouteUpdateRequest,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        Ok(())
+    }
+
+    fn inspect_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<RouteInspection, crate::runtime::RoutingRuntimeError> {
+        Err(crate::runtime::RoutingRuntimeError::InspectionFailed(
+            "missing route".into(),
+        ))
+    }
+
+    fn list_managed_routes(
+        &mut self,
+    ) -> Result<Vec<RouteInspection>, crate::runtime::RoutingRuntimeError> {
+        Ok(Vec::new())
+    }
+
+    fn remove_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        Ok(())
+    }
+}
+
+fn cleanup_orphaned_images<RtD>(
+    docker: &mut RtD,
+    storage_root: &std::path::Path,
+    active_record: Option<&DeploymentRecord>,
+    managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
+    managed_routes: &[RouteInspection],
+    attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
+) -> Result<(), ConvergenceError>
+where
+    RtD: DockerRuntime,
+{
+    for image in managed_images {
+        let Some((project_id, environment, generation)) = image_identity(image) else {
+            continue;
+        };
+        if attempted_cleanup.contains(&(project_id.clone(), environment.clone(), generation)) {
+            continue;
+        }
+        let env = EnvironmentPaths::new(storage_root, &project_id, &environment);
+        let references = environment_runtime_references(
+            &env,
+            &project_id,
+            &environment,
+            active_record,
+            managed_containers,
+            managed_routes,
+        )?;
+        if references.contains(generation) {
+            continue;
+        }
+        let _ = attempt_cleanup(
+            docker,
+            &mut NoopRouteRemover,
+            &env,
+            &project_id,
+            &environment,
+            generation,
+            CleanupRecord {
+                image_ref: Some(image.image_ref.clone()),
+                image_removed: false,
+                ..CleanupRecord::new("orphaned image cleanup", None, None, true, true, true)
+            },
+            None,
+            "ORPHANED_IMAGE_REMOVED",
+            "ORPHANED_IMAGE_TOMBSTONED",
+        )?;
+        attempted_cleanup.insert((project_id, environment, generation));
+    }
+    Ok(())
 }
 
 fn enforce_generation_retention<RtD, RtR>(
@@ -1349,6 +1582,7 @@ fn enforce_generation_retention<RtD, RtR>(
     env: &EnvironmentPaths,
     active_record: Option<&DeploymentRecord>,
     managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
     managed_routes: &[RouteInspection],
     attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
 ) -> Result<(), ConvergenceError>
@@ -1375,7 +1609,7 @@ where
         if references.contains(generation) || retained_failed.contains(&generation) {
             continue;
         }
-        retention_cleanup_generation(
+        let cleanup = retention_cleanup_generation(
             docker,
             routing,
             env,
@@ -1383,8 +1617,12 @@ where
             project_id,
             environment,
             generation,
+            managed_containers,
+            managed_images,
         )?;
-        attempted_cleanup.insert((project_id.to_string(), environment.to_string(), generation));
+        if cleanup.container_removed {
+            attempted_cleanup.insert((project_id.to_string(), environment.to_string(), generation));
+        }
     }
     Ok(())
 }
@@ -1456,7 +1694,9 @@ fn retention_cleanup_generation<RtD, RtR>(
     project_id: &str,
     environment: &str,
     generation: u64,
-) -> Result<(), ConvergenceError>
+    managed_containers: &[ContainerInspection],
+    managed_images: &[ManagedImage],
+) -> Result<CleanupRecord, ConvergenceError>
 where
     RtD: DockerRuntime,
     RtR: RoutingRuntime,
@@ -1485,18 +1725,37 @@ where
         .clone()
         .unwrap_or_else(|| CleanupRecord::new("retention cleanup", None, None, true, true, false));
     if cleanup.container_name.is_none() {
-        cleanup.container_name = Some(
-            runtime_info
-                .as_ref()
-                .map(|info| info.container_name.clone())
-                .unwrap_or_else(|| generation_container_name(environment, project_id, generation)),
-        );
+        cleanup.container_name = runtime_info
+            .as_ref()
+            .map(|info| info.container_name.clone())
+            .or_else(|| {
+                container_for_generation(managed_containers, project_id, environment, generation)
+                    .map(|container| container.container_name.clone())
+            })
+            .or_else(|| {
+                Some(generation_container_name(
+                    environment,
+                    project_id,
+                    generation,
+                ))
+            });
     }
     if cleanup.route_subtree_id.is_none() {
         cleanup.route_subtree_id = route_subtree_id;
     }
     if cleanup.image_ref.is_none() {
-        cleanup.image_ref = build_info.as_ref().map(|info| info.image_ref.clone());
+        cleanup.image_ref = build_info
+            .as_ref()
+            .map(|info| info.image_ref.clone())
+            .or_else(|| {
+                image_ref_for_generation(
+                    project_id,
+                    environment,
+                    generation,
+                    managed_containers,
+                    managed_images,
+                )
+            });
     }
     if existing_cleanup.is_none() {
         cleanup.container_removed = cleanup.container_name.is_none();
@@ -1523,9 +1782,9 @@ where
             environment,
             generation,
             "GENERATION_RETENTION_TOMBSTONED",
-            Some(cleanup.failure_reason),
+            Some(cleanup.failure_reason.clone()),
         )?;
-        return Ok(());
+        return Ok(cleanup);
     }
 
     match fs::remove_dir_all(env.generation_dir(generation)) {
@@ -1552,11 +1811,12 @@ where
                 environment,
                 generation,
                 "GENERATION_RETENTION_TOMBSTONED",
-                Some(cleanup.failure_reason),
+                Some(cleanup.failure_reason.clone()),
             )?;
+            return Ok(cleanup);
         }
     }
-    Ok(())
+    Ok(cleanup)
 }
 
 fn retention_route_subtree_id(runtime_info: &PersistedRuntimeInfo) -> Option<String> {
@@ -1824,6 +2084,7 @@ impl ProbeRuntime for TestProbeRuntime {
 #[derive(Default)]
 struct TestDockerRuntime {
     containers: std::collections::BTreeMap<String, bool>,
+    images: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     network_ips: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     remove_failures: std::collections::BTreeMap<String, usize>,
     image_remove_failures: std::collections::BTreeMap<String, usize>,
@@ -1851,6 +2112,24 @@ impl TestDockerRuntime {
                 )])
             })
     }
+
+    fn seed_image(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+        generation: u64,
+        image_ref: &str,
+    ) {
+        self.images.insert(
+            image_ref.into(),
+            std::collections::BTreeMap::from([
+                ("forge.managed".into(), "true".into()),
+                ("forge.project_id".into(), project_id.into()),
+                ("forge.environment".into(), environment.into()),
+                ("forge.generation".into(), generation.to_string()),
+            ]),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1860,6 +2139,8 @@ impl DockerRuntime for TestDockerRuntime {
         request: crate::runtime::BuildImageRequest,
     ) -> Result<String, crate::runtime::DockerRuntimeError> {
         self.build_calls.push(request.image_tag.clone());
+        self.images
+            .insert(request.image_tag.clone(), request.labels.clone());
         Ok(request.image_tag)
     }
 
@@ -1893,7 +2174,7 @@ impl DockerRuntime for TestDockerRuntime {
         Ok(ContainerInspection {
             container_name: container_name.into(),
             running,
-            image_ref: "noop".into(),
+            image_ref: test_image_ref(container_name),
             labels: Default::default(),
             network_ips: self.inspection_network_ips(container_name),
             restart_policy: "no".into(),
@@ -1909,7 +2190,7 @@ impl DockerRuntime for TestDockerRuntime {
             .map(|(container_name, running)| ContainerInspection {
                 container_name: container_name.clone(),
                 running: *running,
-                image_ref: "noop".into(),
+                image_ref: test_image_ref(container_name),
                 labels: std::collections::BTreeMap::from([
                     ("forge.managed".into(), "true".into()),
                     ("forge.project_id".into(), "api".into()),
@@ -1925,6 +2206,19 @@ impl DockerRuntime for TestDockerRuntime {
                 ]),
                 network_ips: self.inspection_network_ips(container_name),
                 restart_policy: "no".into(),
+            })
+            .collect())
+    }
+
+    fn list_managed_images(
+        &mut self,
+    ) -> Result<Vec<ManagedImage>, crate::runtime::DockerRuntimeError> {
+        Ok(self
+            .images
+            .iter()
+            .map(|(image_ref, labels)| ManagedImage {
+                image_ref: image_ref.clone(),
+                labels: labels.clone(),
             })
             .collect())
     }
@@ -1965,6 +2259,7 @@ impl DockerRuntime for TestDockerRuntime {
                 ));
             }
         }
+        self.images.remove(image_ref);
         Ok(())
     }
 }
@@ -1977,6 +2272,16 @@ fn test_container_ip(container_name: &str) -> String {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     format!("172.19.0.{}", generation + 10)
+}
+
+#[cfg(test)]
+fn test_image_ref(container_name: &str) -> String {
+    let generation = container_name
+        .rsplit("-gen-")
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    format!("forge/api:production-gen-{generation}")
 }
 
 #[cfg(test)]
@@ -2842,7 +3147,7 @@ pub mod bounded_generation_retention {
         docker.containers.insert("prod-api-gen-3".into(), true);
         docker
             .image_remove_failures
-            .insert("forge/api:production-gen-1".into(), 1);
+            .insert("forge/api:production-gen-1".into(), 2);
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,
@@ -2952,6 +3257,107 @@ pub mod bounded_generation_retention {
                 .any(|image| image == "forge/api:production-gen-1")
         );
         assert!(!env.generation_dir(1).exists());
+    }
+
+    #[test]
+    fn retention_removes_image_when_build_metadata_is_missing() {
+        let root = test_root("retention-removes-image-missing-build-metadata");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        fs::remove_file(env.generation_dir(1).join("build.json")).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        for generation in 1..=3 {
+            docker
+                .containers
+                .insert(format!("prod-api-gen-{generation}"), true);
+            docker.seed_image(
+                "api",
+                "production",
+                generation,
+                &format!("forge/api:production-gen-{generation}"),
+            );
+        }
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert!(
+            docker
+                .image_remove_calls
+                .iter()
+                .any(|image| image == "forge/api:production-gen-1")
+        );
+        assert!(!env.generation_dir(1).exists());
+    }
+
+    #[test]
+    fn orphaned_runtime_artifacts_are_removed_after_generation_metadata_deletion() {
+        let root = test_root("orphaned-runtime-artifacts-after-metadata-deletion");
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        docker.seed_image("api", "production", 1, "forge/api:production-gen-1");
+        docker.seed_image("api", "production", 2, "forge/api:production-gen-2");
+        docker.seed_image("api", "production", 3, "forge/api:production-gen-3");
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert!(
+            docker
+                .remove_calls
+                .iter()
+                .any(|name| name == "prod-api-gen-1")
+        );
+        assert!(
+            docker
+                .image_remove_calls
+                .iter()
+                .any(|image| image == "forge/api:production-gen-1")
+        );
+        assert!(!env.generation_dir(1).join("snapshot.json").exists());
     }
 }
 

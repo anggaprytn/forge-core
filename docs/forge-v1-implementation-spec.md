@@ -792,8 +792,10 @@ Rollback is initiated through `POST /deployments` with `intent=rollback`.
 
 - only healthy retained generations are rollback eligible
 - failed generations are diagnostic only
-- keep last 5 healthy generations
-- retain failed generations for 7 days
+- always preserve `current`
+- always preserve `previous`
+- retain at most 2 additional failed generations with diagnostics
+- remove runtime artifacts for unreferenced generations deterministically before deleting retained metadata
 
 ### 24.2 Rollback Procedure
 

@@ -1203,6 +1203,12 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(Vec::new())
     }
 
+    fn list_managed_images(
+        &mut self,
+    ) -> Result<Vec<forge_core::runtime::ManagedImage>, DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
         Ok(())
     }

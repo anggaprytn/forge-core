@@ -207,6 +207,7 @@ Snapshots are the rollback source of truth.
 
 Generation retention is intentionally bounded.
 Forge always preserves `current` and `previous`, keeps only a small recent set of failed generations with diagnostics, and deterministically removes older unreferenced generations plus their Forge-managed runtime artifacts.
+Retention cleanup resolves and removes Forge-managed containers and images before deleting generation metadata, and orphaned runtime artifacts are also cleaned by Forge labels when metadata is already gone.
 
 ⸻
 

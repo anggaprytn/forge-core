@@ -4,7 +4,7 @@ use std::process::Command;
 
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
-    DockerRuntimeError,
+    DockerRuntimeError, ManagedImage,
 };
 
 pub trait CommandRunner {
@@ -156,6 +156,41 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         Ok(containers)
     }
 
+    fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError> {
+        let args = vec![
+            "image".to_string(),
+            "ls".to_string(),
+            "--filter".to_string(),
+            "label=forge.managed=true".to_string(),
+            "--format".to_string(),
+            "{{.Repository}}:{{.Tag}}".to_string(),
+        ];
+        let output = self.runner.run("docker", &args)?;
+        let mut images = Vec::new();
+        for image_ref in output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && *line != "<none>:<none>")
+        {
+            let inspect_args = vec![
+                "image".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                [
+                    "image={{join .RepoTags \",\"}}",
+                    "{{range $key, $value := .Config.Labels}}",
+                    "label:{{$key}}={{$value}}",
+                    "{{end}}",
+                ]
+                .join("\n"),
+                image_ref.to_string(),
+            ];
+            let inspection = self.runner.run("docker", &inspect_args)?;
+            images.push(parse_image_inspection_output(&inspection)?);
+        }
+        Ok(images)
+    }
+
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
         let args = vec!["stop".to_string(), container_name.to_string()];
         self.runner.run("docker", &args).map(|_| ())
@@ -228,6 +263,40 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
         network_ips,
         restart_policy: restart_policy
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing restart policy".into()))?,
+    })
+}
+
+fn parse_image_inspection_output(output: &str) -> Result<ManagedImage, DockerRuntimeError> {
+    let mut image_ref = None;
+    let mut labels = BTreeMap::new();
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "image" => {
+                let resolved = value
+                    .split(',')
+                    .map(str::trim)
+                    .find(|candidate| !candidate.is_empty())
+                    .unwrap_or(value);
+                image_ref = Some(resolved.to_string());
+            }
+            _ if key.starts_with("label:") => {
+                labels.insert(
+                    key.trim_start_matches("label:").to_string(),
+                    value.to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ManagedImage {
+        image_ref: image_ref
+            .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,
+        labels,
     })
 }
 
@@ -444,5 +513,27 @@ pub mod docker_adapter_removes_failed_generation {
                 "forge:test".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn list_managed_images_uses_label_filter() {
+        let runner = RecordingCommandRunner::with_outputs(vec![
+            "forge:test".into(),
+            "image=forge:test\nlabel:forge.managed=true\nlabel:forge.project_id=api\nlabel:forge.environment=production\nlabel:forge.generation=42".into(),
+        ]);
+        let mut docker = DockerCliRuntime::new(runner);
+
+        let images = docker.list_managed_images().unwrap();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].image_ref, "forge:test");
+        assert_eq!(
+            images[0].labels.get("forge.generation"),
+            Some(&"42".to_string())
+        );
+        assert_eq!(docker.runner.commands[0].args[0], "image");
+        assert_eq!(docker.runner.commands[0].args[1], "ls");
+        assert_eq!(docker.runner.commands[1].args[0], "image");
+        assert_eq!(docker.runner.commands[1].args[1], "inspect");
     }
 }

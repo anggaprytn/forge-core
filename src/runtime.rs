@@ -30,6 +30,12 @@ pub struct ContainerInspection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedImage {
+    pub image_ref: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerRuntimeError {
     CommandFailed(String),
     InvalidResponse(String),
@@ -73,6 +79,7 @@ pub trait DockerRuntime {
         container_name: &str,
     ) -> Result<ContainerInspection, DockerRuntimeError>;
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError>;
+    fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError>;
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_image(&mut self, image_ref: &str) -> Result<(), DockerRuntimeError>;

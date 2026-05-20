@@ -339,6 +339,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 record,
                 generation,
                 &container_name,
+                Some(&image_ref),
                 None,
                 "starting",
                 &failure_reason,
@@ -363,6 +364,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     record,
                     generation,
                     &container_name,
+                    Some(&image_ref),
                     None,
                     "validating_runtime",
                     &failure_reason,
@@ -381,6 +383,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 record,
                 generation,
                 &container_name,
+                Some(&image_ref),
                 None,
                 "validating_runtime",
                 &failure_reason,
@@ -401,6 +404,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         record,
                         generation,
                         &container_name,
+                        Some(&image_ref),
                         None,
                         "validating_runtime",
                         &failure_reason,
@@ -448,6 +452,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &validation,
             &env,
             &container_name,
+            &image_ref,
             &probe_host,
             &events,
             &diagnostics,
@@ -480,6 +485,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 record,
                 generation,
                 &container_name,
+                Some(&image_ref),
                 Some(route_subtree_id(record)),
                 "routing",
                 &err.to_string(),
@@ -504,6 +510,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         validation: &ValidationPolicy,
         env: &EnvironmentPaths,
         container_name: &str,
+        image_ref: &str,
         probe_host: &str,
         events: &EventStore,
         diagnostics: &DiagnosticsStore,
@@ -524,6 +531,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 record,
                 generation,
                 container_name,
+                Some(image_ref),
                 None,
                 "validation",
                 "tcp probe failed",
@@ -543,6 +551,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     record,
                     generation,
                     container_name,
+                    Some(image_ref),
                     None,
                     "validation",
                     "http health probe failed",
@@ -602,6 +611,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         record: &DeploymentRecord,
         generation: u64,
         container_name: &str,
+        image_ref: Option<&str>,
         route_subtree_id: Option<String>,
         failure_stage: &str,
         failure_reason: &str,
@@ -626,6 +636,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             env,
             generation,
             container_name,
+            image_ref,
             route_subtree_id.clone(),
             failure_reason,
         )?;
@@ -657,6 +668,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         env: &EnvironmentPaths,
         generation: u64,
         container_name: &str,
+        image_ref: Option<&str>,
         route_subtree_id: Option<String>,
         failure_reason: &str,
     ) -> Result<CleanupRecord, DeploymentError> {
@@ -675,6 +687,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             route_removed,
             !(container_removed && route_removed),
         );
+        let image_removed = if let Some(image_ref) = image_ref {
+            self.docker.remove_image(image_ref).is_ok()
+        } else {
+            true
+        };
+        let cleanup = CleanupRecord {
+            image_ref: image_ref.map(|value| value.to_string()),
+            image_removed,
+            tombstoned: !(container_removed && route_removed && image_removed),
+            ..cleanup
+        };
         CleanupStore::new(env.clone(), generation).write_record(&cleanup)?;
         Ok(cleanup)
     }
@@ -1294,6 +1317,11 @@ pub mod failed_generation_is_cleaned_up {
             commands
                 .iter()
                 .any(|cmd| cmd.args.first() == Some(&"rm".to_string()))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| cmd.args.first() == Some(&"rmi".to_string()))
         );
     }
 }

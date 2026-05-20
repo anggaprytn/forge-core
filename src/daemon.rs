@@ -561,6 +561,12 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(Vec::new())
     }
 
+    fn list_managed_images(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::ManagedImage>, crate::runtime::DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(
         &mut self,
         _container_name: &str,
