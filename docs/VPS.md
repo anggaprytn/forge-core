@@ -222,6 +222,21 @@ forge deploy api production
 forge events
 ```
 
+Cleanup and orphan recovery outcomes are emitted into the same event stream. To inspect them directly:
+
+```bash
+forge events | rg 'ORPHANED_|CLEANUP_'
+```
+
+Relevant event types:
+
+- `ORPHANED_CONTAINER_REMOVED`
+- `ORPHANED_CONTAINER_TOMBSTONED`
+- `ORPHANED_ROUTE_REMOVED`
+- `ORPHANED_ROUTE_TOMBSTONED`
+- `CLEANUP_RETRY_SUCCEEDED`
+- `CLEANUP_RETRY_TOMBSTONED`
+
 This is the current VPS-ready flow:
 
 ```txt

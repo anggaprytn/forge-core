@@ -319,6 +319,14 @@ Forge emits append-only deployment events.
 forge events
 ```
 
+Cleanup outcomes are included in the same stream. To surface orphan and tombstone activity:
+
+```bash
+forge events | rg 'ORPHANED_|CLEANUP_'
+```
+
+Expected cleanup event types include `ORPHANED_CONTAINER_REMOVED`, `ORPHANED_CONTAINER_TOMBSTONED`, `ORPHANED_ROUTE_REMOVED`, `ORPHANED_ROUTE_TOMBSTONED`, `CLEANUP_RETRY_SUCCEEDED`, and `CLEANUP_RETRY_TOMBSTONED`.
+
 ---
 
 ## API

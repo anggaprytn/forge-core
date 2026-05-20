@@ -2040,6 +2040,46 @@ pub mod orphaned_candidate_generation_is_cleaned {
     }
 
     #[test]
+    fn orphaned_container_cleanup_emits_event() {
+        let root = test_root("orphaned-container-event");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(events.iter().any(|event| {
+            event.project_id == "api"
+                && event.environment == "production"
+                && event.generation == Some(2)
+                && event.event_type == "ORPHANED_CONTAINER_REMOVED"
+                && event.reason.as_deref() == Some("orphaned container cleanup")
+        }));
+    }
+
+    #[test]
     fn orphaned_route_is_removed() {
         let root = test_root("orphaned-route-removed");
         setup_recoverable_http_generation(&root, 1);
@@ -2089,6 +2129,56 @@ pub mod orphaned_candidate_generation_is_cleaned {
             .unwrap();
         assert!(cleanup.route_removed);
         assert!(!cleanup.tombstoned);
+    }
+
+    #[test]
+    fn orphaned_route_cleanup_emits_event() {
+        let root = test_root("orphaned-route-event");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-2:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }),
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        };
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::HttpRouted {
+                    internal_port: 3000,
+                },
+                http_health_path: Some("/health".into()),
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(events.iter().any(|event| {
+            event.project_id == "api"
+                && event.environment == "production"
+                && event.generation == Some(2)
+                && event.event_type == "ORPHANED_ROUTE_REMOVED"
+                && event.reason.as_deref() == Some("orphaned route cleanup")
+        }));
     }
 
     #[test]
