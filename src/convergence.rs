@@ -1,20 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::events::EventRecord;
 use crate::queue::{DeploymentRecord, PersistentQueue};
-#[cfg(test)]
-use crate::runtime::RouteInspection;
 use crate::runtime::{
-    ContainerInspection, CreateContainerRequest, DockerRuntime, ProbeRuntime, RouteUpdateRequest,
-    RoutingRuntime,
+    ContainerInspection, CreateContainerRequest, DockerRuntime, ProbeRuntime, RouteInspection,
+    RouteUpdateRequest, RoutingRuntime,
 };
 use crate::secrets::SecretStore;
 #[cfg(test)]
 use crate::storage::SnapshotState;
 use crate::storage::{
-    CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths,
+    CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     PersistedActivationMode, PersistedRouteTargetSource, PersistedRuntimeInfo,
     PersistedSecretReference, PointerStore, RuntimeHealthState, RuntimeStateStore,
     load_generation_build_info, load_generation_runtime_info,
@@ -192,74 +191,84 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
         RtD: DockerRuntime,
         RtR: RoutingRuntime,
     {
-        let managed_containers = docker.list_managed_containers()?;
+        let mut managed_containers = docker.list_managed_containers()?;
+        managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
+        let mut managed_routes = routing.list_managed_routes()?;
+        managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
+        let queue_state = self.queue.load_state()?;
+        let active_record = resumable_active.or(queue_state.active.as_ref());
+        let mut attempted_cleanup = BTreeSet::new();
 
-        for container in &managed_containers {
-            let Some((project_id, environment, generation)) = container_identity(&container) else {
-                continue;
-            };
-            if should_preserve_runtime_resource(
-                resumable_active,
+        for (project_id, environment, env) in
+            cleanup_scan_environments(&self.storage_root, &managed_containers, &managed_routes)?
+        {
+            retry_tombstoned_cleanup(
+                docker,
+                routing,
                 &project_id,
                 &environment,
-                generation,
-                &self.storage_root,
-            ) {
-                continue;
-            }
-
-            let env = EnvironmentPaths::new(&self.storage_root, &project_id, &environment);
-            let _ = docker.stop_container(&container.container_name);
-            let container_removed = docker.remove_container(&container.container_name).is_ok();
-            persist_cleanup_state(
                 &env,
-                generation,
-                CleanupRecord::new(
-                    "startup orphan container cleanup",
-                    Some(container.container_name.clone()),
-                    None,
-                    container_removed,
-                    true,
-                    !container_removed,
-                ),
-                None,
+                active_record,
+                &managed_containers,
+                &managed_routes,
+                &mut attempted_cleanup,
             )?;
         }
 
-        for route in routing.list_managed_routes()? {
+        let removed_containers = cleanup_orphaned_containers(
+            docker,
+            &self.storage_root,
+            active_record,
+            &managed_containers,
+            &managed_routes,
+            &mut attempted_cleanup,
+        )?;
+
+        for route in &managed_routes {
             let Some((project_id, environment)) = parse_route_identity(&route.subtree_id) else {
                 continue;
             };
-            let Some(generation) =
-                resolve_generation_from_target(&route.active_target, &managed_containers)
-            else {
-                let _ = routing.remove_route(&route.subtree_id);
-                continue;
-            };
-            if should_preserve_runtime_resource(
-                resumable_active,
+            let env = EnvironmentPaths::new(&self.storage_root, &project_id, &environment);
+            let references = environment_runtime_references(
+                &env,
                 &project_id,
                 &environment,
-                generation,
-                &self.storage_root,
+                active_record,
+                &managed_containers,
+                &managed_routes,
+            )?;
+            let Some(generation) = cleanup_generation_for_route(&env, route, &references) else {
+                continue;
+            };
+            if route_has_valid_backing(
+                route,
+                &project_id,
+                &environment,
+                &env,
+                &references,
+                &managed_containers,
+                &removed_containers,
             ) {
                 continue;
             }
-
-            let env = EnvironmentPaths::new(&self.storage_root, &project_id, &environment);
-            let route_removed = routing.remove_route(&route.subtree_id).is_ok();
-            persist_cleanup_state(
+            attempt_cleanup(
+                docker,
+                routing,
                 &env,
+                &project_id,
+                &environment,
                 generation,
                 CleanupRecord::new(
                     "startup orphan route cleanup",
                     None,
                     Some(route.subtree_id.clone()),
                     true,
-                    route_removed,
-                    !route_removed,
+                    false,
+                    true,
                 ),
                 None,
+                "ORPHANED_ROUTE_REMOVED",
+                "ORPHANED_ROUTE_TOMBSTONED",
             )?;
         }
         Ok(())
@@ -465,54 +474,82 @@ where
         input: &TickInput,
         env: &EnvironmentPaths,
     ) -> Result<(), ConvergenceError> {
-        let current = PointerStore::new(env.clone()).read_pointer("current")?;
-        let previous = PointerStore::new(env.clone()).read_pointer("previous")?;
+        let mut managed_containers = self.docker.list_managed_containers()?;
+        managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
+        let mut managed_routes = self.routing.list_managed_routes()?;
+        managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
         let queue_state = self.queue.load_state()?;
-        let route_generation = match input.truth {
-            ActiveTruth::HttpRouted { .. } => self.route_generation(input)?,
-            ActiveTruth::Direct => None,
-        };
+        let mut attempted_cleanup = BTreeSet::new();
 
-        if !env.generations_dir().exists() {
-            return Ok(());
-        }
+        retry_tombstoned_cleanup(
+            self.docker,
+            self.routing,
+            &input.project_id,
+            &input.environment,
+            env,
+            queue_state.active.as_ref(),
+            &managed_containers,
+            &managed_routes,
+            &mut attempted_cleanup,
+        )?;
 
-        for entry in fs::read_dir(env.generations_dir())? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let generation_name = entry.file_name();
-            let generation_name = generation_name.to_string_lossy();
-            let Ok(generation) = generation_name.parse::<u64>() else {
+        let removed_containers = cleanup_orphaned_containers(
+            self.docker,
+            &self.storage_root,
+            queue_state.active.as_ref(),
+            &managed_containers,
+            &managed_routes,
+            &mut attempted_cleanup,
+        )?;
+
+        for route in &managed_routes {
+            let Some((project_id, environment)) = parse_route_identity(&route.subtree_id) else {
                 continue;
             };
-            let generation_dir = env.generation_dir(generation);
-            if generation_dir.join("snapshot.json").exists() {
+            if project_id != input.project_id || environment != input.environment {
                 continue;
             }
-            if Some(generation) == current
-                || Some(generation) == previous
-                || Some(generation) == route_generation
-            {
+            let references = environment_runtime_references(
+                env,
+                &project_id,
+                &environment,
+                queue_state.active.as_ref(),
+                &managed_containers,
+                &managed_routes,
+            )?;
+            let Some(generation) = cleanup_generation_for_route(env, route, &references) else {
+                continue;
+            };
+            if route_has_valid_backing(
+                route,
+                &project_id,
+                &environment,
+                env,
+                &references,
+                &managed_containers,
+                &removed_containers,
+            ) {
                 continue;
             }
-            let active_queue_refs = queue_state
-                .active
-                .as_ref()
-                .map(|record| {
-                    record.project_id == input.project_id && record.environment == input.environment
-                })
-                .unwrap_or(false);
-            if active_queue_refs {
-                continue;
-            }
-            let container_name =
-                generation_container_name(&input.environment, &input.project_id, generation);
-            if self.docker.inspect_container(&container_name).is_ok() {
-                let _ = self.docker.stop_container(&container_name);
-                let _ = self.docker.remove_container(&container_name);
-            }
+            attempt_cleanup(
+                self.docker,
+                self.routing,
+                env,
+                &project_id,
+                &environment,
+                generation,
+                CleanupRecord::new(
+                    "orphaned route cleanup",
+                    None,
+                    Some(route.subtree_id.clone()),
+                    true,
+                    false,
+                    true,
+                ),
+                None,
+                "ORPHANED_ROUTE_REMOVED",
+                "ORPHANED_ROUTE_TOMBSTONED",
+            )?;
         }
         Ok(())
     }
@@ -620,9 +657,18 @@ where
     }
 
     fn route_generation(&mut self, input: &TickInput) -> Result<Option<u64>, ConvergenceError> {
-        let inspection = self
+        let inspection = match self
             .routing
-            .inspect_route(&route_subtree_id(&input.project_id, &input.environment))?;
+            .inspect_route(&route_subtree_id(&input.project_id, &input.environment))
+        {
+            Ok(inspection) => inspection,
+            Err(crate::runtime::RoutingRuntimeError::InspectionFailed(message))
+                if message.contains("missing route") =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
         let containers = self.docker.list_managed_containers()?;
         Ok(resolve_generation_from_target(
             &inspection.active_target,
@@ -852,21 +898,110 @@ fn container_identity(inspection: &ContainerInspection) -> Option<(String, Strin
     Some((project_id, environment, generation))
 }
 
-fn should_preserve_runtime_resource(
-    resumable_active: Option<&DeploymentRecord>,
+#[derive(Debug, Clone, Default)]
+struct RuntimeReferences {
+    current: Option<u64>,
+    previous: Option<u64>,
+    route_generation: Option<u64>,
+    converging_generation: Option<u64>,
+}
+
+impl RuntimeReferences {
+    fn contains(&self, generation: u64) -> bool {
+        self.current == Some(generation)
+            || self.previous == Some(generation)
+            || self.route_generation == Some(generation)
+            || self.converging_generation == Some(generation)
+    }
+}
+
+fn environment_runtime_references(
+    env: &EnvironmentPaths,
     project_id: &str,
     environment: &str,
-    generation: u64,
-    storage_root: &std::path::Path,
-) -> bool {
-    if snapshot_is_finalized(
-        &EnvironmentPaths::new(storage_root, project_id, environment),
-        generation,
-    ) {
-        return true;
+    active_record: Option<&DeploymentRecord>,
+    managed_containers: &[ContainerInspection],
+    managed_routes: &[RouteInspection],
+) -> Result<RuntimeReferences, ConvergenceError> {
+    env.ensure_exists()?;
+    let active_matches = active_record
+        .is_some_and(|record| record.project_id == project_id && record.environment == environment);
+    let route_generation = managed_routes
+        .iter()
+        .find(|route| route.subtree_id == route_subtree_id(project_id, environment))
+        .and_then(|route| {
+            resolve_generation_from_target(&route.active_target, managed_containers)
+                .or_else(|| parse_generation_from_target(&route.active_target))
+        })
+        .filter(|generation| active_matches || snapshot_is_finalized(env, *generation));
+    Ok(RuntimeReferences {
+        current: PointerStore::new(env.clone()).read_pointer("current")?,
+        previous: PointerStore::new(env.clone()).read_pointer("previous")?,
+        route_generation,
+        converging_generation: if active_matches {
+            latest_nonfinalized_generation(env)?
+        } else {
+            None
+        },
+    })
+}
+
+fn latest_nonfinalized_generation(env: &EnvironmentPaths) -> Result<Option<u64>, ConvergenceError> {
+    if !env.generations_dir().exists() {
+        return Ok(None);
     }
-    resumable_active
-        .is_some_and(|active| active.project_id == project_id && active.environment == environment)
+    let mut latest: Option<u64> = None;
+    for entry in fs::read_dir(env.generations_dir())? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let generation = entry.file_name().to_string_lossy().parse::<u64>().ok();
+        let Some(generation) = generation else {
+            continue;
+        };
+        if snapshot_is_finalized(env, generation) {
+            continue;
+        }
+        latest = Some(latest.map_or(generation, |current| current.max(generation)));
+    }
+    Ok(latest)
+}
+
+fn cleanup_scan_environments(
+    storage_root: &std::path::Path,
+    managed_containers: &[ContainerInspection],
+    managed_routes: &[RouteInspection],
+) -> Result<Vec<(String, String, EnvironmentPaths)>, ConvergenceError> {
+    let mut environments = list_environments(storage_root)?;
+    let mut seen = environments
+        .iter()
+        .map(|(project_id, environment, _)| (project_id.clone(), environment.clone()))
+        .collect::<BTreeSet<_>>();
+    for container in managed_containers {
+        if let Some((project_id, environment, _)) = container_identity(container) {
+            if seen.insert((project_id.clone(), environment.clone())) {
+                environments.push((
+                    project_id.clone(),
+                    environment.clone(),
+                    EnvironmentPaths::new(storage_root, &project_id, &environment),
+                ));
+            }
+        }
+    }
+    for route in managed_routes {
+        if let Some((project_id, environment)) = parse_route_identity(&route.subtree_id) {
+            if seen.insert((project_id.clone(), environment.clone())) {
+                environments.push((
+                    project_id.clone(),
+                    environment.clone(),
+                    EnvironmentPaths::new(storage_root, &project_id, &environment),
+                ));
+            }
+        }
+    }
+    environments.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    Ok(environments)
 }
 
 fn persist_cleanup_state(
@@ -892,7 +1027,8 @@ fn persist_cleanup_state(
                 .or(new_record.route_subtree_id.clone()),
             container_removed: existing.container_removed || new_record.container_removed,
             route_removed: existing.route_removed || new_record.route_removed,
-            tombstoned: existing.tombstoned || new_record.tombstoned,
+            tombstoned: !(existing.container_removed || new_record.container_removed)
+                || !(existing.route_removed || new_record.route_removed),
         }
     } else {
         new_record
@@ -907,6 +1043,269 @@ fn persist_cleanup_state(
         runtime_env_preview: Vec::new(),
     })?;
     Ok(())
+}
+
+fn append_cleanup_event(
+    env: &EnvironmentPaths,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    deployment_id: Option<String>,
+    event_type: &str,
+    reason: Option<String>,
+) -> Result<(), ConvergenceError> {
+    let timestamp_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    EventStore::new(env.clone(), generation).append(&EventRecord {
+        timestamp_unix,
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        generation: Some(generation),
+        deployment_id,
+        event_type: event_type.to_string(),
+        reason,
+    })?;
+    Ok(())
+}
+
+fn attempt_cleanup<RtD, RtR>(
+    docker: &mut RtD,
+    routing: &mut RtR,
+    env: &EnvironmentPaths,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    cleanup: CleanupRecord,
+    deployment_id: Option<String>,
+    success_event: &str,
+    tombstone_event: &str,
+) -> Result<CleanupRecord, ConvergenceError>
+where
+    RtD: DockerRuntime,
+    RtR: RoutingRuntime,
+{
+    let mut container_removed = cleanup.container_removed;
+    if let Some(container_name) = cleanup.container_name.as_deref() {
+        if !container_removed {
+            let _ = docker.stop_container(container_name);
+            container_removed = docker.remove_container(container_name).is_ok();
+        }
+    } else {
+        container_removed = true;
+    }
+
+    let mut route_removed = cleanup.route_removed;
+    if let Some(subtree_id) = cleanup.route_subtree_id.as_deref() {
+        if !route_removed {
+            route_removed = routing.remove_route(subtree_id).is_ok();
+        }
+    } else {
+        route_removed = true;
+    }
+
+    let cleanup = CleanupRecord::new(
+        cleanup.failure_reason,
+        cleanup.container_name,
+        cleanup.route_subtree_id,
+        container_removed,
+        route_removed,
+        !(container_removed && route_removed),
+    );
+    persist_cleanup_state(env, generation, cleanup.clone(), deployment_id.clone())?;
+    append_cleanup_event(
+        env,
+        project_id,
+        environment,
+        generation,
+        deployment_id,
+        if cleanup.tombstoned {
+            tombstone_event
+        } else {
+            success_event
+        },
+        Some(cleanup.failure_reason.clone()),
+    )?;
+    Ok(cleanup)
+}
+
+fn retry_tombstoned_cleanup<RtD, RtR>(
+    docker: &mut RtD,
+    routing: &mut RtR,
+    project_id: &str,
+    environment: &str,
+    env: &EnvironmentPaths,
+    active_record: Option<&DeploymentRecord>,
+    managed_containers: &[ContainerInspection],
+    managed_routes: &[RouteInspection],
+    attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
+) -> Result<(), ConvergenceError>
+where
+    RtD: DockerRuntime,
+    RtR: RoutingRuntime,
+{
+    if !env.generations_dir().exists() {
+        return Ok(());
+    }
+    let references = environment_runtime_references(
+        env,
+        project_id,
+        environment,
+        active_record,
+        managed_containers,
+        managed_routes,
+    )?;
+    let mut generations = Vec::new();
+    for entry in fs::read_dir(env.generations_dir())? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(generation) = entry.file_name().to_string_lossy().parse::<u64>().ok() else {
+            continue;
+        };
+        generations.push(generation);
+    }
+    generations.sort_unstable();
+
+    for generation in generations {
+        if references.contains(generation) {
+            continue;
+        }
+        let store = CleanupStore::new(env.clone(), generation);
+        let Some(cleanup) = store.read_record()? else {
+            continue;
+        };
+        if !cleanup.tombstoned {
+            continue;
+        }
+        attempt_cleanup(
+            docker,
+            routing,
+            env,
+            project_id,
+            environment,
+            generation,
+            cleanup,
+            None,
+            "CLEANUP_RETRY_SUCCEEDED",
+            "CLEANUP_RETRY_TOMBSTONED",
+        )?;
+        attempted_cleanup.insert((project_id.to_string(), environment.to_string(), generation));
+    }
+    Ok(())
+}
+
+fn cleanup_orphaned_containers<RtD>(
+    docker: &mut RtD,
+    storage_root: &std::path::Path,
+    active_record: Option<&DeploymentRecord>,
+    managed_containers: &[ContainerInspection],
+    managed_routes: &[RouteInspection],
+    attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
+) -> Result<BTreeSet<String>, ConvergenceError>
+where
+    RtD: DockerRuntime,
+{
+    let mut removed = BTreeSet::new();
+    for container in managed_containers {
+        let Some((project_id, environment, generation)) = container_identity(container) else {
+            continue;
+        };
+        if attempted_cleanup.contains(&(project_id.clone(), environment.clone(), generation)) {
+            continue;
+        }
+        let env = EnvironmentPaths::new(storage_root, &project_id, &environment);
+        let references = environment_runtime_references(
+            &env,
+            &project_id,
+            &environment,
+            active_record,
+            managed_containers,
+            managed_routes,
+        )?;
+        if references.contains(generation) {
+            continue;
+        }
+        let _ = docker.stop_container(&container.container_name);
+        let container_removed = docker.remove_container(&container.container_name).is_ok();
+        let cleanup = CleanupRecord::new(
+            "orphaned container cleanup",
+            Some(container.container_name.clone()),
+            None,
+            container_removed,
+            true,
+            !container_removed,
+        );
+        persist_cleanup_state(&env, generation, cleanup.clone(), None)?;
+        append_cleanup_event(
+            &env,
+            &project_id,
+            &environment,
+            generation,
+            None,
+            if cleanup.tombstoned {
+                "ORPHANED_CONTAINER_TOMBSTONED"
+            } else {
+                "ORPHANED_CONTAINER_REMOVED"
+            },
+            Some(cleanup.failure_reason.clone()),
+        )?;
+        attempted_cleanup.insert((project_id, environment, generation));
+        if cleanup.container_removed {
+            removed.insert(container.container_name.clone());
+        }
+    }
+    Ok(removed)
+}
+
+fn cleanup_generation_for_route(
+    env: &EnvironmentPaths,
+    route: &RouteInspection,
+    references: &RuntimeReferences,
+) -> Option<u64> {
+    resolve_generation_from_target(&route.active_target, &[])
+        .or_else(|| parse_generation_from_target(&route.active_target))
+        .or(references.route_generation)
+        .or(references.current)
+        .or(references.previous)
+        .or(references.converging_generation)
+        .or_else(|| latest_nonfinalized_generation(env).ok().flatten())
+}
+
+fn route_has_valid_backing(
+    route: &RouteInspection,
+    project_id: &str,
+    environment: &str,
+    env: &EnvironmentPaths,
+    references: &RuntimeReferences,
+    managed_containers: &[ContainerInspection],
+    removed_containers: &BTreeSet<String>,
+) -> bool {
+    let Some(generation) = resolve_generation_from_target(&route.active_target, managed_containers)
+        .or_else(|| parse_generation_from_target(&route.active_target))
+    else {
+        return false;
+    };
+    if !references.contains(generation) {
+        return false;
+    }
+    if !generation_artifacts_exist(env, generation) {
+        return false;
+    }
+    managed_containers.iter().any(|container| {
+        !removed_containers.contains(&container.container_name)
+            && container_identity(container)
+                == Some((project_id.to_string(), environment.to_string(), generation))
+    })
+}
+
+fn generation_artifacts_exist(env: &EnvironmentPaths, generation: u64) -> bool {
+    let generation_dir = env.generation_dir(generation);
+    generation_dir.join("snapshot.json").exists()
+        || generation_dir.join("runtime.json").exists()
+        || generation_dir.join("build.json").exists()
 }
 
 fn list_environments(
@@ -942,6 +1341,7 @@ fn list_environments(
         }
     }
 
+    environments.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
     Ok(environments)
 }
 
@@ -1117,6 +1517,7 @@ impl ProbeRuntime for TestProbeRuntime {
 struct TestDockerRuntime {
     containers: std::collections::BTreeMap<String, bool>,
     network_ips: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    remove_failures: std::collections::BTreeMap<String, usize>,
     build_calls: Vec<String>,
     create_calls: Vec<String>,
     start_calls: Vec<String>,
@@ -1232,6 +1633,14 @@ impl DockerRuntime for TestDockerRuntime {
         container_name: &str,
     ) -> Result<(), crate::runtime::DockerRuntimeError> {
         self.remove_calls.push(container_name.into());
+        if let Some(remaining) = self.remove_failures.get_mut(container_name) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(crate::runtime::DockerRuntimeError::CommandFailed(
+                    "forced remove failure".into(),
+                ));
+            }
+        }
         self.containers.remove(container_name);
         Ok(())
     }
@@ -1251,6 +1660,8 @@ fn test_container_ip(container_name: &str) -> String {
 #[derive(Default)]
 struct TestRoutingRuntime {
     route: Option<RouteInspection>,
+    remove_failures: std::collections::BTreeMap<String, usize>,
+    remove_calls: Vec<String>,
     updates: Vec<RouteUpdateRequest>,
 }
 
@@ -1289,8 +1700,17 @@ impl RoutingRuntime for TestRoutingRuntime {
 
     fn remove_route(
         &mut self,
-        _subtree_id: &str,
+        subtree_id: &str,
     ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        self.remove_calls.push(subtree_id.into());
+        if let Some(remaining) = self.remove_failures.get_mut(subtree_id) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(crate::runtime::RoutingRuntimeError::UpdateFailed(
+                    "forced route remove failure".into(),
+                ));
+            }
+        }
         self.route = None;
         Ok(())
     }
@@ -1574,6 +1994,299 @@ pub mod orphaned_candidate_generation_is_cleaned {
                 .any(|name| name == "prod-api-gen-2")
         );
     }
+
+    #[test]
+    fn orphaned_container_is_removed() {
+        let root = test_root("orphaned-container-removed");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        assert!(
+            docker
+                .remove_calls
+                .iter()
+                .any(|name| name == "prod-api-gen-2")
+        );
+        let cleanup = CleanupStore::new(env.clone(), 2)
+            .read_record()
+            .unwrap()
+            .unwrap();
+        assert!(cleanup.container_removed);
+        assert!(!cleanup.tombstoned);
+    }
+
+    #[test]
+    fn orphaned_route_is_removed() {
+        let root = test_root("orphaned-route-removed");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-2:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }),
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        };
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::HttpRouted {
+                    internal_port: 3000,
+                },
+                http_health_path: Some("/health".into()),
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        assert_eq!(
+            routing.remove_calls,
+            vec!["forge:api:production".to_string()]
+        );
+        let cleanup = CleanupStore::new(env.clone(), 2)
+            .read_record()
+            .unwrap()
+            .unwrap();
+        assert!(cleanup.route_removed);
+        assert!(!cleanup.tombstoned);
+    }
+
+    #[test]
+    fn cleanup_failure_is_tombstoned() {
+        let root = test_root("cleanup-failure-tombstoned");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        fs::create_dir_all(env.generation_dir(2)).unwrap();
+        crate::storage::atomic_write(env.generation_dir(2).join("runtime.json"), b"{}\n").unwrap();
+        CleanupStore::new(env.clone(), 2)
+            .write_record(&CleanupRecord::new(
+                "forced cleanup retry",
+                Some("prod-api-gen-2".into()),
+                None,
+                false,
+                true,
+                true,
+            ))
+            .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.remove_failures.insert("prod-api-gen-2".into(), 1);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        let cleanup = CleanupStore::new(env.clone(), 2)
+            .read_record()
+            .unwrap()
+            .unwrap();
+        assert!(cleanup.tombstoned);
+        assert!(env.generation_dir(2).join("tombstone").exists());
+    }
+
+    #[test]
+    fn cleanup_retry_eventually_succeeds() {
+        let root = test_root("cleanup-retry-succeeds");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        fs::create_dir_all(env.generation_dir(2)).unwrap();
+        crate::storage::atomic_write(env.generation_dir(2).join("runtime.json"), b"{}\n").unwrap();
+        CleanupStore::new(env.clone(), 2)
+            .write_record(&CleanupRecord::new(
+                "forced cleanup retry",
+                Some("prod-api-gen-2".into()),
+                None,
+                false,
+                true,
+                true,
+            ))
+            .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.remove_failures.insert("prod-api-gen-2".into(), 1);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+        let _ = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 101,
+                truth: ActiveTruth::Direct,
+                http_health_path: None,
+            })
+            .unwrap();
+
+        let cleanup = CleanupStore::new(env.clone(), 2)
+            .read_record()
+            .unwrap()
+            .unwrap();
+        assert!(!cleanup.tombstoned);
+        assert!(!env.generation_dir(2).join("tombstone").exists());
+    }
+
+    #[test]
+    fn convergence_recovers_from_partial_cleanup_failure() {
+        let root = test_root("partial-cleanup-recovery");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        fs::create_dir_all(env.generation_dir(2)).unwrap();
+        CleanupStore::new(env.clone(), 2)
+            .write_record(&CleanupRecord::new(
+                "partial cleanup retry",
+                None,
+                Some("forge:api:production".into()),
+                true,
+                false,
+                true,
+            ))
+            .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "prod-api-gen-2:3000".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }),
+            remove_failures: std::collections::BTreeMap::from([("forge:api:production".into(), 2)]),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        };
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        assert_eq!(
+            engine
+                .tick(TickInput {
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    now_unix: 100,
+                    truth: ActiveTruth::HttpRouted {
+                        internal_port: 3000,
+                    },
+                    http_health_path: Some("/health".into()),
+                })
+                .unwrap(),
+            TickOutcome::Healthy(1)
+        );
+        assert!(
+            CleanupStore::new(env.clone(), 2)
+                .read_record()
+                .unwrap()
+                .unwrap()
+                .tombstoned
+        );
+
+        assert_eq!(
+            engine
+                .tick(TickInput {
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    now_unix: 101,
+                    truth: ActiveTruth::HttpRouted {
+                        internal_port: 3000,
+                    },
+                    http_health_path: Some("/health".into()),
+                })
+                .unwrap(),
+            TickOutcome::Healthy(1)
+        );
+        assert!(
+            !CleanupStore::new(env.clone(), 2)
+                .read_record()
+                .unwrap()
+                .unwrap()
+                .tombstoned
+        );
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "CLEANUP_RETRY_SUCCEEDED")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1639,6 +2352,8 @@ pub mod current_pointer_matches_active_route_after_restart {
                 activation_verified: true,
                 health_checks_enabled: false,
             }),
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
             updates: Vec::new(),
         };
         let mut engine =

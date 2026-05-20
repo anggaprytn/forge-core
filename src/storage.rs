@@ -364,6 +364,7 @@ impl EventStore {
 
     pub fn append(&self, event: &EventRecord) -> StorageResult<()> {
         self.env.ensure_exists()?;
+        fs::create_dir_all(self.env.generation_dir(self.generation))?;
         let path = self
             .env
             .generation_dir(self.generation)
@@ -438,6 +439,7 @@ impl DiagnosticsStore {
 
     pub fn write_failure_reason(&self, reason: &str, secrets: &[String]) -> StorageResult<()> {
         self.env.ensure_exists()?;
+        fs::create_dir_all(self.env.generation_dir(self.generation).join("diagnostics"))?;
         let path = self
             .env
             .generation_dir(self.generation)
@@ -450,6 +452,7 @@ impl DiagnosticsStore {
 
     pub fn append_log_line(&self, line: &str, secrets: &[String]) -> StorageResult<()> {
         self.env.ensure_exists()?;
+        fs::create_dir_all(self.env.generation_dir(self.generation).join("diagnostics"))?;
         let path = self
             .env
             .generation_dir(self.generation)
@@ -489,6 +492,7 @@ impl DiagnosticsStore {
 
     pub fn write_summary(&self, summary: &DiagnosticSummary) -> StorageResult<()> {
         self.env.ensure_exists()?;
+        fs::create_dir_all(self.env.generation_dir(self.generation).join("diagnostics"))?;
         let path = self
             .env
             .generation_dir(self.generation)
@@ -567,6 +571,7 @@ impl CleanupStore {
 
     pub fn write_record(&self, record: &CleanupRecord) -> StorageResult<()> {
         self.env.ensure_exists()?;
+        fs::create_dir_all(self.env.generation_dir(self.generation))?;
         let bytes = serde_json::to_vec_pretty(record).map_err(|err| {
             StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -584,6 +589,11 @@ impl CleanupStore {
                 self.env.generation_dir(self.generation).join("tombstone"),
                 b"cleanup_incomplete\n",
             )?;
+        } else {
+            let tombstone = self.env.generation_dir(self.generation).join("tombstone");
+            if tombstone.exists() {
+                fs::remove_file(tombstone)?;
+            }
         }
         Ok(())
     }

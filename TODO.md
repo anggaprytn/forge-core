@@ -149,9 +149,9 @@ Track:
 - [ ] Crash during validation recovery
 - [ ] Crash during route activation recovery
 - [ ] Crash during rollback recovery
-- [ ] Orphaned container cleanup
-- [ ] Orphaned route cleanup
-- [ ] Tombstone retry loop
+- [x] Orphaned container cleanup
+- [x] Orphaned route cleanup
+- [x] Tombstone retry loop
 - [ ] Disk pressure handling
 - [ ] Docker unavailable recovery
 - [ ] Caddy unavailable recovery
@@ -160,9 +160,10 @@ Track:
 
 - [ ] `crash_during_build_recovers`
 - [ ] `crash_during_route_activation_recovers`
-- [ ] `orphaned_container_is_tombstoned`
+- [x] `orphaned_container_is_removed`
 - [ ] `orphaned_route_is_removed`
-- [ ] `cleanup_retry_eventually_succeeds`
+- [x] `orphaned_route_is_removed`
+- [x] `cleanup_retry_eventually_succeeds`
 
 ---
 
