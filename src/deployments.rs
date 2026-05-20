@@ -105,6 +105,13 @@ pub struct DeploymentExecution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeTargetContext {
+    host: String,
+    port: u16,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationPolicy {
     pub tcp_required: bool,
     pub http_health_path: Option<String>,
@@ -251,6 +258,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     failure_stage: "preparing".into(),
                     failure_reason: message.clone(),
                     container_name: container_name.clone(),
+                    probe_target_host: None,
+                    probe_target_port: None,
+                    probe_target_path: None,
                     cleanup_recorded: false,
                     runtime_env_preview: Vec::new(),
                 })?;
@@ -292,6 +302,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "building",
                     &failure_reason,
+                    None,
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -318,6 +329,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "preparing",
                     &failure_reason,
+                    None,
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -352,6 +364,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 None,
                 "starting",
                 &failure_reason,
+                None,
                 &redacted_env_preview,
                 &secret_values,
             )?;
@@ -377,6 +390,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     None,
                     "validating_runtime",
                     &failure_reason,
+                    None,
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -396,6 +410,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 None,
                 "validating_runtime",
                 &failure_reason,
+                None,
                 &redacted_env_preview,
                 &secret_values,
             )?;
@@ -417,6 +432,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         None,
                         "validating_runtime",
                         &failure_reason,
+                        None,
                         &redacted_env_preview,
                         &secret_values,
                     )?;
@@ -506,6 +522,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 Some(route_subtree_id(record)),
                 "routing",
                 &err.to_string(),
+                None,
                 &redacted_env_preview,
                 &secret_values,
             )?;
@@ -540,6 +557,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ActivationMode::Direct => 3000,
             ActivationMode::Http { internal_port } => internal_port,
         };
+        let tcp_probe_target = ProbeTargetContext {
+            host: probe_host.to_string(),
+            port: internal_port,
+            path: None,
+        };
         if validation.tcp_required && !self.probes.probe_tcp(probe_host, internal_port)? {
             self.record_failed_generation(
                 env,
@@ -552,6 +574,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 None,
                 "validation",
                 "tcp probe failed",
+                Some(&tcp_probe_target),
                 redacted_env_preview,
                 secret_values,
             )?;
@@ -561,6 +584,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
 
         if let Some(path) = &validation.http_health_path {
             if !self.probes.probe_http(probe_host, internal_port, path)? {
+                let http_probe_target = ProbeTargetContext {
+                    host: probe_host.to_string(),
+                    port: internal_port,
+                    path: Some(path.clone()),
+                };
                 self.record_failed_generation(
                     env,
                     events,
@@ -572,6 +600,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     None,
                     "validation",
                     "http health probe failed",
+                    Some(&http_probe_target),
                     redacted_env_preview,
                     secret_values,
                 )?;
@@ -595,11 +624,15 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         generation: u64,
         failure_stage: &str,
         failure_reason: &str,
+        probe_target: Option<&ProbeTargetContext>,
         redacted_env_preview: &[String],
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
         diagnostics.write_failure_reason(failure_reason, secret_values)?;
         diagnostics.append_log_line(failure_reason, secret_values)?;
+        if let Some(probe_target) = probe_target {
+            diagnostics.append_log_line(&format_probe_target_log(probe_target), secret_values)?;
+        }
         append_redacted_event(
             events,
             record,
@@ -613,6 +646,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             failure_stage: failure_stage.into(),
             failure_reason: failure_reason.into(),
             container_name: String::new(),
+            probe_target_host: probe_target.map(|target| target.host.clone()),
+            probe_target_port: probe_target.map(|target| target.port),
+            probe_target_path: probe_target.and_then(|target| target.path.clone()),
             cleanup_recorded: false,
             runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
@@ -632,18 +668,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         route_subtree_id: Option<String>,
         failure_stage: &str,
         failure_reason: &str,
+        probe_target: Option<&ProbeTargetContext>,
         redacted_env_preview: &[String],
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
         diagnostics.write_failure_reason(failure_reason, secret_values)?;
         diagnostics.append_log_line(failure_reason, secret_values)?;
+        if let Some(probe_target) = probe_target {
+            diagnostics.append_log_line(&format_probe_target_log(probe_target), secret_values)?;
+        }
         append_redacted_event(
             events,
             record,
             generation,
             match failure_reason {
-                "tcp probe failed" => "TCP_PROBE_FAILED",
-                "http health probe failed" => "HTTP_PROBE_FAILED",
+                reason if reason.starts_with("tcp probe failed") => "TCP_PROBE_FAILED",
+                reason if reason.starts_with("http health probe failed") => "HTTP_PROBE_FAILED",
                 _ => "GENERATION_FAILED",
             },
             Some(failure_reason.into()),
@@ -662,6 +702,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             failure_stage: failure_stage.into(),
             failure_reason: failure_reason.into(),
             container_name: container_name.into(),
+            probe_target_host: probe_target.map(|target| target.host.clone()),
+            probe_target_port: probe_target.map(|target| target.port),
+            probe_target_path: probe_target.and_then(|target| target.path.clone()),
             cleanup_recorded: true,
             runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
@@ -1035,6 +1078,16 @@ fn generation_container_name(record: &DeploymentRecord, generation: u64) -> Stri
         other => other,
     };
     format!("{env}-{}-gen-{generation}", record.project_id)
+}
+
+fn format_probe_target_log(target: &ProbeTargetContext) -> String {
+    match &target.path {
+        Some(path) => format!(
+            "probe target: host={} port={} path={}",
+            target.host, target.port, path
+        ),
+        None => format!("probe target: host={} port={}", target.host, target.port),
+    }
 }
 
 fn route_subtree_id(record: &DeploymentRecord) -> String {
@@ -1705,6 +1758,63 @@ pub mod validation_probes_configured_network_ip {
             vec![("172.19.0.5".to_string(), 3000, "/health".to_string())]
         );
     }
+
+    #[test]
+    fn git_deploy_probe_targets_resolved_container_ip_and_port() {
+        let root = test_root("git-deploy-probe-target-ip-port");
+        let source_root = root.join("source-checkouts").join("api").join("abc123");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(source_root),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_network(
+                1,
+                &[("bridge", "172.17.0.2"), ("forge-net", "172.19.0.5")],
+            ),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Direct,
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: PathBuf::from("."),
+            dockerfile_path: PathBuf::from("./Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(probes.tcp_hosts, vec![("172.19.0.5".to_string(), 3000)]);
+        assert_eq!(
+            probes.http_hosts,
+            vec![("172.19.0.5".to_string(), 3000, "/health".to_string())]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1814,6 +1924,249 @@ pub mod deploy_loads_forge_yml {
             probes.http_hosts,
             vec![("172.18.0.2".to_string(), 4010, "/ready".to_string())]
         );
+    }
+
+    #[test]
+    fn git_deploy_uses_forge_yml_runtime_port() {
+        let root = test_root("git-deploy-uses-forge-yml-runtime-port");
+        let source_root = root.join("source-checkouts").join("api").join("abc123");
+        fs::create_dir_all(source_root.join("app")).unwrap();
+        fs::create_dir_all(source_root.join("deploy")).unwrap();
+        fs::write(
+            source_root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "\n",
+                "build:\n",
+                "  dockerfile: deploy/Dockerfile\n",
+                "  context: app\n",
+                "\n",
+                "runtime:\n",
+                "  port: 4010\n",
+                "  healthcheck:\n",
+                "    path: /ready\n",
+                "    expected_status: 200\n",
+                "\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /ready\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(source_root.clone()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_network(1, &[("bridge", "172.18.0.2")]),
+        ));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:4010".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("bridge".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(routing.updates[0].target, "172.18.0.2:4010");
+        assert_eq!(probes.tcp_hosts, vec![("172.18.0.2".to_string(), 4010)]);
+        assert_eq!(
+            probes.http_hosts,
+            vec![("172.18.0.2".to_string(), 4010, "/ready".to_string())]
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod git_deploy_non_api_project_staging {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn git_deploy_non_api_project_staging_validates_health() {
+        let root = test_root("git-deploy-non-api-project-staging");
+        let source_root = root.join("source-checkouts").join("web").join("abc123");
+        std::fs::create_dir_all(source_root.join("deploy")).unwrap();
+        std::fs::write(
+            source_root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: web\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: deploy/Dockerfile\n",
+                "  context: .\n",
+                "runtime:\n",
+                "  port: 4100\n",
+                "  healthcheck:\n",
+                "    path: /healthz\n",
+                "    expected_status: 200\n",
+                "invariants:\n",
+                "  - name: health\n",
+                "    path: /healthz\n",
+                "    expect_status: 200\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "web".into(),
+                environment: "staging".into(),
+                source_path: Some(source_root),
+                source_ref: Some("release".into()),
+                repo_url: Some("https://github.com/example/web.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            "image_ref=forge/web:staging-gen-1".into(),
+            "staging-web-gen-1".into(),
+            String::new(),
+            [
+                "name=/staging-web-gen-1",
+                "running=true",
+                "image=forge/web:staging-gen-1",
+                "restart_policy=no",
+                "network:forge-net=172.19.0.8",
+            ]
+            .join("\n"),
+        ]));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:web:staging".into(),
+                active_target: "172.19.0.8:4100".into(),
+                activation_verified: true,
+                health_checks_enabled: false,
+            }],
+        };
+
+        let execution = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(execution.container_name, "staging-web-gen-1");
+        assert_eq!(probes.tcp_hosts, vec![("172.19.0.8".to_string(), 4100)]);
+        assert_eq!(
+            probes.http_hosts,
+            vec![("172.19.0.8".to_string(), 4100, "/healthz".to_string())]
+        );
+        assert_eq!(routing.updates[0].subtree_id, "forge:web:staging");
+        assert_eq!(routing.updates[0].target, "172.19.0.8:4100");
+    }
+}
+
+#[cfg(test)]
+pub mod tcp_probe_failure_target_context {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn tcp_probe_failure_records_target_context() {
+        let root = test_root("tcp-probe-failure-target-context");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_network(1, &[("bridge", "172.18.0.2")]),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("bridge".into()),
+        })
+        .execute_next();
+
+        let summary =
+            fs::read_to_string(root.join(
+                "projects/api/environments/production/generations/1/diagnostics/summary.json",
+            ))
+            .unwrap();
+        let logs =
+            fs::read_to_string(root.join(
+                "projects/api/environments/production/generations/1/diagnostics/deployment.log",
+            ))
+            .unwrap();
+
+        assert!(summary.contains("\"probe_target_host\": \"172.18.0.2\""));
+        assert!(summary.contains("\"probe_target_port\": 3000"));
+        assert!(logs.contains("probe target: host=172.18.0.2 port=3000"));
     }
 }
 

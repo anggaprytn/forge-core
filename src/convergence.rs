@@ -1166,6 +1166,9 @@ fn persist_cleanup_state(
         failure_stage: "startup_recovery".into(),
         failure_reason: merged.failure_reason.clone(),
         container_name: merged.container_name.clone().unwrap_or_default(),
+        probe_target_host: None,
+        probe_target_port: None,
+        probe_target_path: None,
         cleanup_recorded: true,
         runtime_env_preview: Vec::new(),
     })?;

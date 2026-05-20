@@ -17,7 +17,7 @@ use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
 use forge_core::daemon::{Daemon, DeploymentWorkerSettings, run_deployment_worker_loop};
-use forge_core::deployments::{ActivationMode, ValidationPolicy};
+use forge_core::deployments::{ActivationMode, ExecutionConfig, ValidationPolicy};
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
 use forge_core::doctor::{DoctorOptions, run as run_doctor};
 use forge_core::events::EventRecord;
@@ -1039,6 +1039,11 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
             activation: ActivationMode::Http {
                 internal_port: 3000,
             },
+        },
+        execution: ExecutionConfig {
+            context_path: PathBuf::from("."),
+            dockerfile_path: PathBuf::from("./Dockerfile"),
+            network_name: Some("bridge".into()),
         },
         ..DeploymentWorkerSettings::default()
     };
