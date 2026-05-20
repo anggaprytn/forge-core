@@ -4,10 +4,49 @@ info:
   version: 1.0.0
   description: Forge v1 single-node runtime convergence control plane API.
 servers:
-  - url: https://forge.local
+  - url: http://localhost:8080
 security:
   - bearerAuth: []
 paths:
+  /healthz:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+  /readyz:
+    get:
+      summary: Readiness check
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus text exposition
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
   /deployments:
     post:
       summary: Enqueue a deployment operation
@@ -30,45 +69,31 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DeploymentAccepted'
+                $ref: '#/components/schemas/SuccessEnvelopeDeploymentAccepted'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/ErrorEnvelope'
         '401':
           description: Unauthorized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-    get:
-      summary: List deployments
-      operationId: listDeployments
-      parameters:
-        - in: query
-          name: project_id
-          schema:
-            type: string
-        - in: query
-          name: environment
-          schema:
-            $ref: '#/components/schemas/Environment'
-      responses:
-        '200':
-          description: Deployments
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: Idempotency conflict
           content:
             application/json:
               schema:
-                type: object
-                required:
-                  - deployments
-                properties:
-                  deployments:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Deployment'
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Daemon not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /deployments/{id}:
     get:
       summary: Get deployment details
@@ -79,42 +104,23 @@ paths:
           required: true
           schema:
             type: string
-            format: uuid
       responses:
         '200':
           description: Deployment details
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Deployment'
+                $ref: '#/components/schemas/SuccessEnvelopeDeploymentStatus'
         '404':
           description: Deployment not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-  /projects:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /logs/{id}:
     get:
-      summary: List projects
-      operationId: listProjects
-      responses:
-        '200':
-          description: Projects
-          content:
-            application/json:
-              schema:
-                type: object
-                required:
-                  - projects
-                properties:
-                  projects:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Project'
-  /projects/{id}:
-    get:
-      summary: Get project details
-      operationId: getProject
+      summary: Get logs for a deployment
+      operationId: getDeploymentLogs
       parameters:
         - in: path
           name: id
@@ -123,105 +129,32 @@ paths:
             type: string
       responses:
         '200':
-          description: Project details
+          description: Bounded diagnostic logs
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Project'
+                $ref: '#/components/schemas/SuccessEnvelopeDeploymentLogs'
         '404':
-          description: Project not found
+          description: Deployment not found
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
-  /projects/{id}/environments/{env}:
-    get:
-      summary: Get environment state
-      operationId: getProjectEnvironment
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-        - in: path
-          name: env
-          required: true
-          schema:
-            $ref: '#/components/schemas/Environment'
-      responses:
-        '200':
-          description: Environment state
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/EnvironmentState'
-        '404':
-          description: Project or environment not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/ErrorEnvelope'
   /events:
     get:
       summary: List events
       operationId: listEvents
-      parameters:
-        - in: query
-          name: project_id
-          schema:
-            type: string
-        - in: query
-          name: environment
-          schema:
-            $ref: '#/components/schemas/Environment'
-        - in: query
-          name: deployment_id
-          schema:
-            type: string
-            format: uuid
       responses:
         '200':
-          description: Events
+          description: Recent events
           content:
             application/json:
               schema:
-                type: object
-                required:
-                  - events
-                properties:
-                  events:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Event'
-  /logs/{deployment_id}/stream:
-    get:
-      summary: Stream logs for a deployment
-      operationId: streamDeploymentLogs
-      parameters:
-        - in: path
-          name: deployment_id
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        '200':
-          description: Log stream
-          content:
-            text/event-stream:
-              schema:
-                type: string
-        '404':
-          description: Deployment not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/SuccessEnvelopeEventList'
   /secrets:
     post:
       summary: Create or update a secret
-      operationId: putSecret
+      operationId: postSecret
       requestBody:
         required: true
         content:
@@ -234,18 +167,52 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required:
-                  - secret_id
-                properties:
-                  secret_id:
-                    type: string
+                $ref: '#/components/schemas/SuccessEnvelopeSecretWriteResult'
         '400':
           description: Invalid request
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Secret store unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /webhooks/github:
+    post:
+      summary: GitHub Webhook endpoint
+      security: []
+      parameters:
+        - in: header
+          name: X-GitHub-Delivery
+          required: true
+          schema:
+            type: string
+        - in: header
+          name: X-GitHub-Event
+          required: true
+          schema:
+            type: string
+        - in: header
+          name: X-Hub-Signature-256
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Webhook accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeWebhookResult'
+        '400':
+          description: Invalid request or signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
 components:
   securitySchemes:
     bearerAuth:
@@ -253,15 +220,16 @@ components:
       scheme: bearer
       bearerFormat: opaque
   schemas:
-    Environment:
-      type: string
-      enum:
-        - development
-        - staging
-        - production
+    HealthEnvelope:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: ok
     DeploymentRequest:
       type: object
-      additionalProperties: false
       required:
         - project_id
         - environment
@@ -269,225 +237,180 @@ components:
       properties:
         project_id:
           type: string
-          pattern: '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'
         environment:
-          $ref: '#/components/schemas/Environment'
-        commit_sha:
           type: string
-          pattern: '^[A-Fa-f0-9]{7,64}$'
-        image_digest:
-          type: string
-          pattern: '^sha256:[A-Fa-f0-9]{64}$'
+          enum: [development, staging, production]
         intent:
           type: string
-          enum:
-            - deploy
-            - redeploy
-            - rollback
-        runtime_override:
-          type: object
-          additionalProperties: true
-        metadata:
-          type: object
-          additionalProperties: false
-          properties:
-            reason:
-              type: string
-              maxLength: 512
-      allOf:
-        - not:
-            required:
-              - commit_sha
-              - image_digest
-        - if:
-            properties:
-              intent:
-                const: rollback
-          then:
-            not:
-              anyOf:
-                - required:
-                    - commit_sha
-                - required:
-                    - image_digest
-        - if:
-            properties:
-              intent:
-                enum:
-                  - deploy
-                  - redeploy
-          then:
-            anyOf:
-              - required:
-                  - commit_sha
-              - required:
-                  - image_digest
+          enum: [deploy, redeploy, rollback]
     DeploymentAccepted:
       type: object
       required:
         - deployment_id
-        - state
         - queue_position
       properties:
         deployment_id:
           type: string
-          format: uuid
-        state:
-          type: string
-          enum:
-            - queued
         queue_position:
           type: integer
-          minimum: 1
-    Deployment:
+    DeploymentStatus:
       type: object
       required:
         - deployment_id
         - project_id
         - environment
-        - generation
-        - intent
         - state
-        - created_at
       properties:
         deployment_id:
           type: string
-          format: uuid
         project_id:
           type: string
         environment:
-          $ref: '#/components/schemas/Environment'
-        generation:
-          type: integer
-          minimum: 1
-        intent:
           type: string
         state:
           type: string
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-    Project:
+    DeploymentLogs:
       type: object
       required:
-        - project_id
-        - subdomain
-        - environments
+        - deployment_id
+        - lines
       properties:
-        project_id:
+        deployment_id:
           type: string
-        subdomain:
-          type: string
-        environments:
+        lines:
           type: array
           items:
-            $ref: '#/components/schemas/Environment'
-    EnvironmentState:
+            type: string
+    EventList:
       type: object
       required:
+        - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventRecord'
+    EventRecord:
+      type: object
+      required:
+        - timestamp_unix
         - project_id
         - environment
-        - current_generation
+        - event_type
       properties:
+        timestamp_unix:
+          type: integer
+          format: int64
         project_id:
           type: string
         environment:
-          $ref: '#/components/schemas/Environment'
-        current_generation:
-          type: integer
-          minimum: 1
-        previous_generation:
-          type: integer
-          minimum: 1
-        state:
           type: string
-        route_target:
-          type: string
-    Event:
-      type: object
-      required:
-        - event_id
-        - timestamp
-        - project_id
-        - environment
-        - generation
-        - deployment_id
-        - correlation_id
-        - type
-        - severity
-        - payload
-        - redacted
-      properties:
-        event_id:
-          type: string
-          format: uuid
-        timestamp:
-          type: string
-          format: date-time
-        project_id:
-          type: string
-        environment:
-          $ref: '#/components/schemas/Environment'
         generation:
           type: integer
-          minimum: 1
+          format: int64
+          nullable: true
         deployment_id:
           type: string
-          format: uuid
-        correlation_id:
+          nullable: true
+        event_type:
           type: string
-          format: uuid
-        type:
+        reason:
           type: string
-        severity:
-          type: string
-          enum:
-            - debug
-            - info
-            - warn
-            - error
-        payload:
-          type: object
-          additionalProperties: true
-        redacted:
-          type: boolean
+          nullable: true
     SecretWriteRequest:
       type: object
-      additionalProperties: false
       required:
-        - scope
+        - project_id
+        - environment
         - key
         - value
       properties:
-        scope:
-          type: string
-          enum:
-            - global
-            - project
-            - environment
-            - deployment
         project_id:
           type: string
         environment:
-          $ref: '#/components/schemas/Environment'
+          type: string
         key:
           type: string
-          minLength: 1
         value:
           type: string
-          minLength: 1
-        sensitive:
-          type: boolean
-          default: false
-    Error:
+    SecretWriteResult:
       type: object
       required:
+        - secret_id
+      properties:
+        secret_id:
+          type: string
+    WebhookResult:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [accepted, ignored]
+        deployment_id:
+          type: string
+          nullable: true
+        queue_position:
+          type: integer
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+    SuccessEnvelopeDeploymentAccepted:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/DeploymentAccepted'}
+    SuccessEnvelopeDeploymentStatus:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/DeploymentStatus'}
+    SuccessEnvelopeDeploymentLogs:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/DeploymentLogs'}
+    SuccessEnvelopeEventList:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/EventList'}
+    SuccessEnvelopeSecretWriteResult:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/SecretWriteResult'}
+    SuccessEnvelopeWebhookResult:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/WebhookResult'}
+    ErrorEnvelope:
+      type: object
+      required:
+        - request_id
+        - correlation_id
         - code
         - message
       properties:
+        request_id:
+          type: string
+        correlation_id:
+          type: string
         code:
           type: string
         message:
