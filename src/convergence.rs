@@ -2177,11 +2177,25 @@ impl DockerRuntime for TestDockerRuntime {
         Ok(ContainerInspection {
             container_name: container_name.into(),
             running,
+            state_status: if running {
+                "running".into()
+            } else {
+                "exited".into()
+            },
+            exit_code: if running { Some(0) } else { Some(1) },
             image_ref: test_image_ref(container_name),
             labels: Default::default(),
             network_ips: self.inspection_network_ips(container_name),
             restart_policy: "no".into(),
         })
+    }
+
+    fn container_logs(
+        &mut self,
+        _container_name: &str,
+        _tail_lines: usize,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        Ok(String::new())
     }
 
     fn list_managed_containers(
@@ -2193,6 +2207,12 @@ impl DockerRuntime for TestDockerRuntime {
             .map(|(container_name, running)| ContainerInspection {
                 container_name: container_name.clone(),
                 running: *running,
+                state_status: if *running {
+                    "running".into()
+                } else {
+                    "exited".into()
+                },
+                exit_code: if *running { Some(0) } else { Some(1) },
                 image_ref: test_image_ref(container_name),
                 labels: std::collections::BTreeMap::from([
                     ("forge.managed".into(), "true".into()),

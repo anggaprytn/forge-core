@@ -1240,11 +1240,21 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(ContainerInspection {
             container_name: container_name.into(),
             running: true,
+            state_status: "running".into(),
+            exit_code: Some(0),
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: Default::default(),
             restart_policy: "no".into(),
         })
+    }
+
+    fn container_logs(
+        &mut self,
+        _container_name: &str,
+        _tail_lines: usize,
+    ) -> Result<String, DockerRuntimeError> {
+        Ok(String::new())
     }
 
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {

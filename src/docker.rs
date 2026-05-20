@@ -118,7 +118,9 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
             "--format".to_string(),
             [
                 "name={{.Name}}",
+                "status={{.State.Status}}",
                 "running={{.State.Running}}",
+                "exit_code={{.State.ExitCode}}",
                 "image={{.Config.Image}}",
                 "restart_policy={{.HostConfig.RestartPolicy.Name}}",
                 "{{range $key, $value := .Config.Labels}}",
@@ -133,6 +135,21 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         ];
         let output = self.runner.run("docker", &args)?;
         parse_inspection_output(&output)
+    }
+
+    fn container_logs(
+        &mut self,
+        container_name: &str,
+        tail_lines: usize,
+    ) -> Result<String, DockerRuntimeError> {
+        let command = format!(
+            "docker logs --tail {} {} 2>&1",
+            tail_lines,
+            shell_quote(container_name)
+        );
+        self.runner
+            .run("sh", &["-lc".to_string(), command])
+            .map(|output| output.trim().to_string())
     }
 
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
@@ -222,6 +239,8 @@ fn parse_built_image_ref(output: &str) -> Option<String> {
 fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRuntimeError> {
     let mut container_name = None;
     let mut running = None;
+    let mut state_status = None;
+    let mut exit_code = None;
     let mut image_ref = None;
     let mut restart_policy = None;
     let mut labels = BTreeMap::new();
@@ -233,7 +252,9 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
         };
         match key {
             "name" => container_name = Some(value.trim_start_matches('/').to_string()),
+            "status" => state_status = Some(value.to_string()),
             "running" => running = Some(value == "true"),
+            "exit_code" => exit_code = value.parse::<i32>().ok(),
             "image" => image_ref = Some(value.to_string()),
             "restart_policy" => restart_policy = Some(value.to_string()),
             _ if key.starts_with("label:") => {
@@ -257,6 +278,14 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing container name".into()))?,
         running: running
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing running state".into()))?,
+        state_status: state_status.unwrap_or_else(|| {
+            if running.unwrap_or(false) {
+                "running".into()
+            } else {
+                "exited".into()
+            }
+        }),
+        exit_code,
         image_ref: image_ref
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,
         labels,
@@ -348,6 +377,10 @@ impl<R> Display for DockerCliRuntime<R> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "docker-cli-runtime")
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]

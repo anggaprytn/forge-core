@@ -112,6 +112,12 @@ struct ProbeTargetContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationFailureContext {
+    inspection: Option<ContainerInspection>,
+    probe_target: Option<ProbeTargetContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationPolicy {
     pub tcp_required: bool,
     pub http_health_path: Option<String>,
@@ -416,29 +422,6 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             )?;
             return Err(err);
         }
-        let probe_host =
-            match resolve_validation_probe_host(&inspection, execution.network_name.as_deref()) {
-                Ok(probe_host) => probe_host,
-                Err(err) => {
-                    let failure_reason = err.to_string();
-                    self.record_failed_generation(
-                        &env,
-                        &events,
-                        &diagnostics,
-                        record,
-                        generation,
-                        &container_name,
-                        Some(&image_ref),
-                        None,
-                        "validating_runtime",
-                        &failure_reason,
-                        None,
-                        &redacted_env_preview,
-                        &secret_values,
-                    )?;
-                    return Err(err);
-                }
-            };
         let build_json = serde_json::to_string_pretty(&PersistedBuildInfo {
             deployment_id: record.deployment_id.clone(),
             image_ref: image_ref.clone(),
@@ -486,7 +469,6 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &env,
             &container_name,
             &image_ref,
-            &probe_host,
             &events,
             &diagnostics,
             record,
@@ -545,7 +527,6 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         env: &EnvironmentPaths,
         container_name: &str,
         image_ref: &str,
-        probe_host: &str,
         events: &EventStore,
         diagnostics: &DiagnosticsStore,
         record: &DeploymentRecord,
@@ -557,12 +538,44 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ActivationMode::Direct => 3000,
             ActivationMode::Http { internal_port } => internal_port,
         };
-        let tcp_probe_target = ProbeTargetContext {
-            host: probe_host.to_string(),
-            port: internal_port,
-            path: None,
+        let probe_path = validation.http_health_path.as_deref();
+        let inspection = match self.docker.inspect_container(container_name) {
+            Ok(inspection) => inspection,
+            Err(err) => {
+                let failure_reason =
+                    format!("container re-inspection failed before tcp probe: {err}");
+                self.record_failed_generation(
+                    env,
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    container_name,
+                    Some(image_ref),
+                    None,
+                    "validation",
+                    &failure_reason,
+                    None,
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(err.into());
+            }
         };
-        if validation.tcp_required && !self.probes.probe_tcp(probe_host, internal_port)? {
+        if validation.tcp_required && !inspection.running {
+            let failure_reason = container_exited_failure_reason("tcp probe", &inspection);
+            let context = ValidationFailureContext {
+                inspection: Some(inspection),
+                probe_target: None,
+            };
+            self.capture_validation_failure_diagnostics(
+                diagnostics,
+                container_name,
+                &context,
+                internal_port,
+                probe_path,
+                secret_values,
+            )?;
             self.record_failed_generation(
                 env,
                 events,
@@ -573,22 +586,120 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 Some(image_ref),
                 None,
                 "validation",
-                "tcp probe failed",
+                &failure_reason,
+                None,
+                redacted_env_preview,
+                secret_values,
+            )?;
+            return Err(DeploymentError::ValidationFailed(
+                "container exited before tcp probe",
+            ));
+        }
+        let probe_host = match resolve_validation_probe_host(
+            &inspection,
+            self.execution.network_name.as_deref(),
+        ) {
+            Ok(probe_host) => probe_host,
+            Err(err) => {
+                let failure_reason = err.to_string();
+                let context = ValidationFailureContext {
+                    inspection: Some(inspection),
+                    probe_target: None,
+                };
+                self.capture_validation_failure_diagnostics(
+                    diagnostics,
+                    container_name,
+                    &context,
+                    internal_port,
+                    probe_path,
+                    secret_values,
+                )?;
+                self.record_failed_generation(
+                    env,
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    container_name,
+                    Some(image_ref),
+                    None,
+                    "validation",
+                    &failure_reason,
+                    None,
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(err);
+            }
+        };
+        let tcp_probe_target = ProbeTargetContext {
+            host: probe_host.clone(),
+            port: internal_port,
+            path: None,
+        };
+        if validation.tcp_required && !self.probes.probe_tcp(&probe_host, internal_port)? {
+            let failure_inspection = self.docker.inspect_container(container_name).ok();
+            let failure_reason = failure_inspection
+                .as_ref()
+                .filter(|inspection| !inspection.running)
+                .map(|inspection| container_exited_failure_reason("tcp probe", inspection))
+                .unwrap_or_else(|| "tcp probe failed".to_string());
+            let context = ValidationFailureContext {
+                inspection: failure_inspection.or(Some(inspection)),
+                probe_target: Some(tcp_probe_target.clone()),
+            };
+            self.capture_validation_failure_diagnostics(
+                diagnostics,
+                container_name,
+                &context,
+                internal_port,
+                None,
+                secret_values,
+            )?;
+            self.record_failed_generation(
+                env,
+                events,
+                diagnostics,
+                record,
+                generation,
+                container_name,
+                Some(image_ref),
+                None,
+                "validation",
+                &failure_reason,
                 Some(&tcp_probe_target),
                 redacted_env_preview,
                 secret_values,
             )?;
-            return Err(DeploymentError::ValidationFailed("tcp probe failed"));
+            return Err(DeploymentError::ValidationFailed(
+                if failure_reason == "tcp probe failed" {
+                    "tcp probe failed"
+                } else {
+                    "container exited before tcp probe"
+                },
+            ));
         }
         diagnostics.append_log_line("tcp validation passed", secret_values)?;
 
         if let Some(path) = &validation.http_health_path {
-            if !self.probes.probe_http(probe_host, internal_port, path)? {
+            if !self.probes.probe_http(&probe_host, internal_port, path)? {
                 let http_probe_target = ProbeTargetContext {
                     host: probe_host.to_string(),
                     port: internal_port,
                     path: Some(path.clone()),
                 };
+                let context = ValidationFailureContext {
+                    inspection: self.docker.inspect_container(container_name).ok(),
+                    probe_target: Some(http_probe_target.clone()),
+                };
+                self.capture_validation_failure_diagnostics(
+                    diagnostics,
+                    container_name,
+                    &context,
+                    internal_port,
+                    Some(path),
+                    secret_values,
+                )?;
                 self.record_failed_generation(
                     env,
                     events,
@@ -652,6 +763,87 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             cleanup_recorded: false,
             runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
+        Ok(())
+    }
+
+    fn capture_validation_failure_diagnostics(
+        &mut self,
+        diagnostics: &DiagnosticsStore,
+        container_name: &str,
+        context: &ValidationFailureContext,
+        internal_port: u16,
+        probe_path: Option<&str>,
+        secret_values: &[String],
+    ) -> Result<(), DeploymentError> {
+        if let Some(inspection) = &context.inspection {
+            diagnostics.append_log_line(
+                &format!(
+                    "container state: status={} running={} exit_code={}",
+                    inspection.state_status,
+                    inspection.running,
+                    inspection
+                        .exit_code
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                ),
+                secret_values,
+            )?;
+            diagnostics.append_log_line(
+                &format!(
+                    "network map: {}",
+                    format_network_map(&inspection.network_ips)
+                ),
+                secret_values,
+            )?;
+        }
+
+        let logs_tail = self
+            .docker
+            .container_logs(container_name, 50)
+            .unwrap_or_else(|err| format!("container logs unavailable: {err}"));
+        if !logs_tail.trim().is_empty() {
+            diagnostics.append_log_line("container logs tail:", secret_values)?;
+            diagnostics.append_log_line(&logs_tail, secret_values)?;
+        }
+
+        let artifact = serde_json::json!({
+            "container_name": container_name,
+            "probe_target": {
+                "host": context.probe_target.as_ref().map(|target| target.host.clone()),
+                "port": context.probe_target.as_ref().map(|target| target.port).unwrap_or(internal_port),
+                "path": context
+                    .probe_target
+                    .as_ref()
+                    .and_then(|target| target.path.clone())
+                    .or_else(|| probe_path.map(|value| value.to_string())),
+            },
+            "inspect_state": context.inspection.as_ref().map(|inspection| {
+                serde_json::json!({
+                    "status": inspection.state_status,
+                    "running": inspection.running,
+                    "exit_code": inspection.exit_code,
+                    "restart_policy": inspection.restart_policy,
+                    "image_ref": inspection.image_ref,
+                })
+            }),
+            "network_map": context
+                .inspection
+                .as_ref()
+                .map(|inspection| inspection.network_ips.clone())
+                .unwrap_or_default(),
+            "container_logs_tail": logs_tail,
+        });
+        let artifact = serde_json::to_string_pretty(&artifact).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        diagnostics.write_artifact(
+            "validation_failure.json",
+            &format!("{artifact}\n"),
+            secret_values,
+        )?;
         Ok(())
     }
 
@@ -1090,6 +1282,30 @@ fn format_probe_target_log(target: &ProbeTargetContext) -> String {
     }
 }
 
+fn format_network_map(network_ips: &BTreeMap<String, String>) -> String {
+    if network_ips.is_empty() {
+        return "none".into();
+    }
+    network_ips
+        .iter()
+        .map(|(network, ip)| format!("{network}={ip}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn container_exited_failure_reason(probe_name: &str, inspection: &ContainerInspection) -> String {
+    match inspection.exit_code {
+        Some(exit_code) => format!(
+            "container exited before {probe_name} (status={} exit_code={exit_code})",
+            inspection.state_status
+        ),
+        None => format!(
+            "container exited before {probe_name} (status={})",
+            inspection.state_status
+        ),
+    }
+}
+
 fn route_subtree_id(record: &DeploymentRecord) -> String {
     format!("forge:{}:{}", record.project_id, record.environment)
 }
@@ -1244,24 +1460,41 @@ fn success_outputs(generation: u64) -> Vec<String> {
 
 #[cfg(test)]
 fn success_outputs_with_network(generation: u64, networks: &[(&str, &str)]) -> Vec<String> {
+    let inspection = inspection_output(generation, "running", true, 0, networks);
     vec![
         format!("image_ref=forge/api:production-gen-{generation}"),
         format!("prod-api-gen-{generation}"),
         String::new(),
-        std::iter::once(format!("name=prod-api-gen-{generation}"))
-            .chain(std::iter::once("running=true".into()))
-            .chain(std::iter::once(format!(
-                "image=forge/api:production-gen-{generation}"
-            )))
-            .chain(std::iter::once("restart_policy=no".into()))
-            .chain(
-                networks
-                    .iter()
-                    .map(|(name, ip)| format!("network:{name}={ip}")),
-            )
-            .collect::<Vec<_>>()
-            .join("\n"),
+        inspection.clone(),
+        inspection.clone(),
+        inspection,
+        String::new(),
     ]
+}
+
+#[cfg(test)]
+fn inspection_output(
+    generation: u64,
+    status: &str,
+    running: bool,
+    exit_code: i32,
+    networks: &[(&str, &str)],
+) -> String {
+    std::iter::once(format!("name=prod-api-gen-{generation}"))
+        .chain(std::iter::once(format!("status={status}")))
+        .chain(std::iter::once(format!("running={running}")))
+        .chain(std::iter::once(format!("exit_code={exit_code}")))
+        .chain(std::iter::once(format!(
+            "image=forge/api:production-gen-{generation}"
+        )))
+        .chain(std::iter::once("restart_policy=no".into()))
+        .chain(
+            networks
+                .iter()
+                .map(|(name, ip)| format!("network:{name}={ip}")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -2067,7 +2300,19 @@ pub mod git_deploy_non_api_project_staging {
             String::new(),
             [
                 "name=/staging-web-gen-1",
+                "status=running",
                 "running=true",
+                "exit_code=0",
+                "image=forge/web:staging-gen-1",
+                "restart_policy=no",
+                "network:forge-net=172.19.0.8",
+            ]
+            .join("\n"),
+            [
+                "name=/staging-web-gen-1",
+                "status=running",
+                "running=true",
+                "exit_code=0",
                 "image=forge/web:staging-gen-1",
                 "restart_policy=no",
                 "network:forge-net=172.19.0.8",
@@ -2167,6 +2412,240 @@ pub mod tcp_probe_failure_target_context {
         assert!(summary.contains("\"probe_target_host\": \"172.18.0.2\""));
         assert!(summary.contains("\"probe_target_port\": 3000"));
         assert!(logs.contains("probe target: host=172.18.0.2 port=3000"));
+    }
+}
+
+#[cfg(test)]
+pub mod tcp_probe_failure_preserves_container_logs {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn tcp_probe_failure_preserves_container_logs() {
+        let root = test_root("tcp-probe-failure-preserves-container-logs");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.3")]),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.3")]),
+            "boot line\nlisten failed".into(),
+        ]));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("bridge".into()),
+        })
+        .execute_next();
+
+        let diagnostics = fs::read_to_string(
+            root.join(
+                "projects/api/environments/production/generations/1/diagnostics/validation_failure.json",
+            ),
+        )
+        .unwrap();
+        assert!(diagnostics.contains("boot line"));
+        assert!(diagnostics.contains("listen failed"));
+    }
+}
+
+#[cfg(test)]
+pub mod tcp_probe_failure_records_network_map {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use std::fs;
+
+    #[test]
+    fn tcp_probe_failure_records_network_map() {
+        let root = test_root("tcp-probe-failure-records-network-map");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[("bridge", "172.17.0.4"), ("forge-net", "172.19.0.5")],
+            ),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[("bridge", "172.17.0.4"), ("forge-net", "172.19.0.6")],
+            ),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[("bridge", "172.17.0.4"), ("forge-net", "172.19.0.6")],
+            ),
+            "readying".into(),
+        ]));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next();
+
+        let diagnostics = fs::read_to_string(
+            root.join(
+                "projects/api/environments/production/generations/1/diagnostics/validation_failure.json",
+            ),
+        )
+        .unwrap();
+        assert!(diagnostics.contains("\"forge-net\": \"172.19.0.6\""));
+        assert!(diagnostics.contains("\"bridge\": \"172.17.0.4\""));
+    }
+}
+
+#[cfg(test)]
+pub mod tcp_probe_reinspects_container_before_probe {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn tcp_probe_reinspects_container_before_probe() {
+        let root = test_root("tcp-probe-reinspect-before-probe");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.7")]),
+        ]));
+        let mut probes = RecordingProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("bridge".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(probes.tcp_hosts, vec![("172.18.0.7".to_string(), 3000)]);
+    }
+}
+
+#[cfg(test)]
+pub mod exited_container_reports_exit_state_not_generic_tcp_failure {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::DiagnosticsStore;
+    use std::fs;
+
+    #[test]
+    fn exited_container_reports_exit_state_not_generic_tcp_failure() {
+        let root = test_root("exited-container-reports-exit-state");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
+            inspection_output(1, "exited", false, 137, &[("bridge", "172.18.0.2")]),
+            "panic: bind failed".into(),
+        ]));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("bridge".into()),
+        })
+        .execute_next();
+
+        assert!(matches!(
+            result,
+            Err(DeploymentError::ValidationFailed(
+                "container exited before tcp probe"
+            ))
+        ));
+        let diagnostics =
+            DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1);
+        let reason = diagnostics.read_failure_reason().unwrap().unwrap();
+        assert!(reason.contains("container exited before tcp probe"));
+        assert!(reason.contains("exit_code=137"));
+        assert!(!reason.contains("tcp probe failed"));
+
+        let summary =
+            fs::read_to_string(root.join(
+                "projects/api/environments/production/generations/1/diagnostics/summary.json",
+            ))
+            .unwrap();
+        assert!(summary.contains("container exited before tcp probe"));
     }
 }
 

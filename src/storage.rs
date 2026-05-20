@@ -516,6 +516,24 @@ impl DiagnosticsStore {
         atomic_write(path, bounded.as_bytes())
     }
 
+    pub fn write_artifact(
+        &self,
+        name: &str,
+        contents: &str,
+        secrets: &[String],
+    ) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        fs::create_dir_all(self.env.generation_dir(self.generation).join("diagnostics"))?;
+        let path = self
+            .env
+            .generation_dir(self.generation)
+            .join("diagnostics")
+            .join(name);
+        let redacted = redact_text(contents, secrets);
+        let bounded = truncate_to_recent_bytes(&redacted, DIAGNOSTIC_LOG_MAX_BYTES);
+        atomic_write(path, bounded.as_bytes())
+    }
+
     pub fn write_summary(&self, summary: &DiagnosticSummary) -> StorageResult<()> {
         self.env.ensure_exists()?;
         fs::create_dir_all(self.env.generation_dir(self.generation).join("diagnostics"))?;

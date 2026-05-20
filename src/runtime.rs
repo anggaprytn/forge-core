@@ -23,6 +23,8 @@ pub struct CreateContainerRequest {
 pub struct ContainerInspection {
     pub container_name: String,
     pub running: bool,
+    pub state_status: String,
+    pub exit_code: Option<i32>,
     pub image_ref: String,
     pub labels: BTreeMap<String, String>,
     pub network_ips: BTreeMap<String, String>,
@@ -78,6 +80,11 @@ pub trait DockerRuntime {
         &mut self,
         container_name: &str,
     ) -> Result<ContainerInspection, DockerRuntimeError>;
+    fn container_logs(
+        &mut self,
+        container_name: &str,
+        tail_lines: usize,
+    ) -> Result<String, DockerRuntimeError>;
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError>;
     fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError>;
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;

@@ -653,11 +653,21 @@ impl DockerRuntime for FakeDockerRuntime {
         Ok(ContainerInspection {
             container_name: container_name.to_string(),
             running: true,
+            state_status: "running".into(),
+            exit_code: Some(0),
             image_ref: "forge:test".into(),
             labels: fake_container_labels(container_name),
             network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(container_name))]),
             restart_policy: "no".into(),
         })
+    }
+
+    fn container_logs(
+        &mut self,
+        _container_name: &str,
+        _tail_lines: usize,
+    ) -> Result<String, DockerRuntimeError> {
+        Ok(String::new())
     }
 
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
@@ -667,6 +677,8 @@ impl DockerRuntime for FakeDockerRuntime {
             .map(|name| ContainerInspection {
                 container_name: name.clone(),
                 running: true,
+                state_status: "running".into(),
+                exit_code: Some(0),
                 image_ref: "forge:test".into(),
                 labels: fake_container_labels(name),
                 network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(name))]),
