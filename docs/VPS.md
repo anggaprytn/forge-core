@@ -107,16 +107,17 @@ FORGE_CADDY_PUBLIC_URL=https://api.forge.example.com
 
 `FORGE_MASTER_KEY` is required for secrets support.
 
-Future CLI login support will also require these env vars before `/login/cli` can progress past the placeholder page:
+Forge web login is the primary human-operator entrypoint and requires these env vars:
 
 ```bash
 FORGE_GITHUB_OAUTH_CLIENT_ID=...
 FORGE_GITHUB_OAUTH_CLIENT_SECRET=...
 FORGE_PUBLIC_URL=https://forge.example.com
-FORGE_CLI_TOKEN_SECRET=...
+FORGE_SESSION_SECRET=...
 ```
 
-GitHub OAuth callback handling and CLI token issuance are not implemented yet.
+`/login` starts the GitHub OAuth flow, `/app` requires the resulting session cookie, and `/login/cli` redirects to `/login`.
+CLI commands and bearer-token API auth remain available for automation and operator usage.
 
 ---
 

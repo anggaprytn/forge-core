@@ -267,9 +267,12 @@ forge secrets set <project> <env> <k> <v>    # Set runtime secrets
 
 ## HTTP Surface
 
-- `GET /` serves a tiny built-in landing page (`Forge Runtime`) so the root path does not 404.
-- `GET /login/cli` serves a placeholder Forge CLI login bootstrap page.
-- GitHub OAuth, callback handling, session storage, and Forge token issuance for CLI login are not implemented yet.
+- `GET /` serves a built-in landing page so the root path does not 404.
+- `GET /login` is the primary human-operator login entrypoint and starts a GitHub OAuth web session.
+- `GET /app` requires a signed HTTP-only session cookie and serves the minimal Forge Control page.
+- `GET /logout` and `POST /logout` clear the web session.
+- `GET /login/cli` redirects to `/login`.
+- CLI commands and bearer-token API auth remain available for automation and operator workflows.
 
 ---
 

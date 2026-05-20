@@ -4,12 +4,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use reqwest::Url;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use crate::api::{
     DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse,
@@ -32,12 +38,17 @@ const X_HUB_SIGNATURE_256: &str = "x-hub-signature-256";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const CORRELATION_ID_HEADER: &str = "x-correlation-id";
 const DEFAULT_LANDING_PAGE: &str = include_str!("../static/index.html");
-const CLI_LOGIN_REQUIRED_ENV_VARS: [&str; 4] = [
+const WEB_LOGIN_REQUIRED_ENV_VARS: [&str; 4] = [
     "FORGE_GITHUB_OAUTH_CLIENT_ID",
     "FORGE_GITHUB_OAUTH_CLIENT_SECRET",
     "FORGE_PUBLIC_URL",
-    "FORGE_CLI_TOKEN_SECRET",
+    "FORGE_SESSION_SECRET",
 ];
+const SESSION_COOKIE_NAME: &str = "forge_session";
+const OAUTH_STATE_COOKIE_NAME: &str = "forge_oauth_state";
+const GITHUB_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
+const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const GITHUB_USER_URL: &str = "https://api.github.com/user";
 
 pub trait ControlPlane: Send {
     fn is_ready(&self) -> bool;
@@ -104,6 +115,7 @@ pub struct HttpState {
     idempotency: IdempotencyStore,
     github_webhooks: Option<GitHubWebhookState>,
     secret_store: SecretStore,
+    web_auth: WebAuthState,
 }
 
 impl HttpState {
@@ -113,6 +125,7 @@ impl HttpState {
         idempotency: IdempotencyStore,
         github_webhooks: Option<GitHubWebhookState>,
         secret_store: SecretStore,
+        web_auth: WebAuthState,
     ) -> Self {
         Self {
             daemon,
@@ -120,8 +133,164 @@ impl HttpState {
             idempotency,
             github_webhooks,
             secret_store,
+            web_auth,
         }
     }
+}
+
+#[derive(Clone)]
+pub struct WebAuthState {
+    config: Option<WebAuthConfig>,
+    github_oauth: Arc<dyn GitHubOAuthProvider>,
+}
+
+impl WebAuthState {
+    pub fn from_env() -> Self {
+        Self {
+            config: load_web_auth_config_from_env(),
+            github_oauth: Arc::new(RealGitHubOAuthProvider),
+        }
+    }
+
+    #[cfg(test)]
+    fn unconfigured() -> Self {
+        Self {
+            config: None,
+            github_oauth: Arc::new(MockGitHubOAuthProvider::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn configured_for_tests(login: &str, user_id: u64) -> Self {
+        Self {
+            config: Some(WebAuthConfig {
+                public_url: "https://forge.example.com".into(),
+                client_id: "test-client-id".into(),
+                client_secret: "test-client-secret".into(),
+                session_secret: "test-session-secret".into(),
+                secure_cookies: true,
+            }),
+            github_oauth: Arc::new(MockGitHubOAuthProvider {
+                login: login.into(),
+                user_id,
+                fail: false,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WebAuthConfig {
+    public_url: String,
+    client_id: String,
+    client_secret: String,
+    session_secret: String,
+    secure_cookies: bool,
+}
+
+impl WebAuthConfig {
+    fn callback_url(&self) -> String {
+        format!(
+            "{}/oauth/github/callback",
+            self.public_url.trim_end_matches('/')
+        )
+    }
+}
+
+trait GitHubOAuthProvider: Send + Sync {
+    fn authenticate(&self, config: &WebAuthConfig, code: &str) -> Result<GitHubUser, String>;
+}
+
+struct RealGitHubOAuthProvider;
+
+impl GitHubOAuthProvider for RealGitHubOAuthProvider {
+    fn authenticate(&self, config: &WebAuthConfig, code: &str) -> Result<GitHubUser, String> {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("forge")
+            .build()
+            .map_err(|err| err.to_string())?;
+        let callback_url = config.callback_url();
+        let token = client
+            .post(GITHUB_ACCESS_TOKEN_URL)
+            .header(header::ACCEPT, "application/json")
+            .form(&[
+                ("client_id", config.client_id.as_str()),
+                ("client_secret", config.client_secret.as_str()),
+                ("code", code),
+                ("redirect_uri", callback_url.as_str()),
+            ])
+            .send()
+            .map_err(|err| err.to_string())?;
+        if !token.status().is_success() {
+            return Err(format!(
+                "github token exchange failed with {}",
+                token.status()
+            ));
+        }
+
+        let token: GitHubAccessTokenResponse = token.json().map_err(|err| err.to_string())?;
+        let user = client
+            .get(GITHUB_USER_URL)
+            .header(header::ACCEPT, "application/json")
+            .bearer_auth(token.access_token)
+            .send()
+            .map_err(|err| err.to_string())?;
+        if !user.status().is_success() {
+            return Err(format!("github user lookup failed with {}", user.status()));
+        }
+
+        user.json().map_err(|err| err.to_string())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MockGitHubOAuthProvider {
+    login: String,
+    user_id: u64,
+    fail: bool,
+}
+
+#[cfg(test)]
+impl GitHubOAuthProvider for MockGitHubOAuthProvider {
+    fn authenticate(&self, _config: &WebAuthConfig, _code: &str) -> Result<GitHubUser, String> {
+        if self.fail {
+            return Err("mock oauth failure".into());
+        }
+
+        Ok(GitHubUser {
+            login: self.login.clone(),
+            id: self.user_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GitHubAccessTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GitHubUser {
+    login: String,
+    id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OAuthStateQuery {
+    code: String,
+    state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OAuthStateCookie {
+    nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionCookie {
+    github_login: String,
+    github_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +450,12 @@ impl DeliveryStore {
 pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", get(get_root))
+        .route("/login", get(get_login))
         .route("/login/cli", get(get_login_cli))
+        .route("/oauth/github/start", get(get_oauth_github_start))
+        .route("/oauth/github/callback", get(get_oauth_github_callback))
+        .route("/app", get(get_app))
+        .route("/logout", get(get_logout).post(post_logout))
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
         .route("/metrics", get(get_metrics))
@@ -298,22 +472,28 @@ async fn get_root() -> Response {
     html_response(StatusCode::OK, DEFAULT_LANDING_PAGE)
 }
 
-async fn get_login_cli() -> Response {
-    let configured = cli_login_oauth_configured();
-    let body = if configured {
+async fn get_login(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Some(config) = &state.web_auth.config {
+        if read_session_cookie(&headers, config).is_some() {
+            return redirect_response("/app");
+        }
+    }
+
+    let body = if state.web_auth.config.is_some() {
         concat!(
             "<!doctype html>\n",
             "<html lang=\"en\">\n",
             "<head>\n",
             "  <meta charset=\"utf-8\">\n",
             "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
-            "  <title>Forge CLI Login</title>\n",
+            "  <title>Forge Login</title>\n",
             "</head>\n",
             "<body>\n",
             "  <main>\n",
-            "    <h1>Forge CLI Login</h1>\n",
-            "    <p>GitHub OAuth bootstrap is not implemented yet.</p>\n",
-            "    <p><a href=\"#\" aria-disabled=\"true\">Continue with GitHub</a></p>\n",
+            "    <h1>Forge Login</h1>\n",
+            "    <p>Forge web login is the primary operator entrypoint.</p>\n",
+            "    <p><a href=\"/oauth/github/start\">Continue with GitHub</a></p>\n",
+            "    <p>CLI and bearer-token API access remain available for automation.</p>\n",
             "  </main>\n",
             "</body>\n",
             "</html>\n",
@@ -327,11 +507,11 @@ async fn get_login_cli() -> Response {
                 "<head>\n",
                 "  <meta charset=\"utf-8\">\n",
                 "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
-                "  <title>Forge CLI Login</title>\n",
+                "  <title>Forge Login</title>\n",
                 "</head>\n",
                 "<body>\n",
                 "  <main>\n",
-                "    <h1>Forge CLI Login</h1>\n",
+                "    <h1>Forge Login</h1>\n",
                 "    <p>GitHub OAuth login is not configured yet.</p>\n",
                 "    <p>Expected env vars:</p>\n",
                 "    <ul>\n",
@@ -344,14 +524,185 @@ async fn get_login_cli() -> Response {
                 "</body>\n",
                 "</html>\n",
             ),
-            CLI_LOGIN_REQUIRED_ENV_VARS[0],
-            CLI_LOGIN_REQUIRED_ENV_VARS[1],
-            CLI_LOGIN_REQUIRED_ENV_VARS[2],
-            CLI_LOGIN_REQUIRED_ENV_VARS[3],
+            WEB_LOGIN_REQUIRED_ENV_VARS[0],
+            WEB_LOGIN_REQUIRED_ENV_VARS[1],
+            WEB_LOGIN_REQUIRED_ENV_VARS[2],
+            WEB_LOGIN_REQUIRED_ENV_VARS[3],
         )
     };
 
     html_response(StatusCode::OK, body)
+}
+
+async fn get_login_cli() -> Response {
+    redirect_response("/login")
+}
+
+async fn get_oauth_github_start(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let Some(config) = state.web_auth.config.as_ref() else {
+        return redirect_response("/login");
+    };
+    if read_session_cookie(&headers, config).is_some() {
+        return redirect_response("/app");
+    }
+
+    let nonce = generate_nonce();
+    let authorize_url = match Url::parse_with_params(
+        GITHUB_AUTHORIZE_URL,
+        &[
+            ("client_id", config.client_id.as_str()),
+            ("redirect_uri", config.callback_url().as_str()),
+            ("scope", "read:user"),
+            ("state", nonce.as_str()),
+        ],
+    ) {
+        Ok(url) => url.to_string(),
+        Err(_) => return html_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid oauth config"),
+    };
+    let state_cookie =
+        match encode_signed_value(&OAuthStateCookie { nonce }, &config.session_secret) {
+            Ok(cookie) => cookie,
+            Err(_) => {
+                return html_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid oauth config");
+            }
+        };
+
+    redirect_with_cookies(
+        StatusCode::SEE_OTHER,
+        &authorize_url,
+        &[build_cookie(
+            OAUTH_STATE_COOKIE_NAME,
+            &state_cookie,
+            config.secure_cookies,
+            Some(600),
+        )],
+    )
+}
+
+async fn get_oauth_github_callback(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<OAuthStateQuery>,
+) -> Response {
+    let Some(config) = state.web_auth.config.clone() else {
+        return redirect_response("/login");
+    };
+    let clear_state_cookie = build_clear_cookie(OAUTH_STATE_COOKIE_NAME, config.secure_cookies);
+    let Some(expected_state) = read_signed_cookie::<OAuthStateCookie>(
+        &headers,
+        OAUTH_STATE_COOKIE_NAME,
+        &config.session_secret,
+    ) else {
+        return html_response_with_cookies(
+            StatusCode::BAD_REQUEST,
+            "invalid oauth state",
+            &[clear_state_cookie],
+        );
+    };
+    if !bool::from(
+        expected_state
+            .nonce
+            .as_bytes()
+            .ct_eq(query.state.as_bytes()),
+    ) {
+        return html_response_with_cookies(
+            StatusCode::BAD_REQUEST,
+            "invalid oauth state",
+            &[clear_state_cookie],
+        );
+    }
+
+    let provider = state.web_auth.github_oauth.clone();
+    let code = query.code;
+    let auth_config = config.clone();
+    let user = match tokio::task::spawn_blocking(move || provider.authenticate(&auth_config, &code))
+        .await
+    {
+        Ok(Ok(user)) => user,
+        Ok(Err(_)) | Err(_) => {
+            return html_response_with_cookies(
+                StatusCode::BAD_GATEWAY,
+                "github login failed",
+                &[clear_state_cookie],
+            );
+        }
+    };
+
+    let session_cookie = match encode_signed_value(
+        &SessionCookie {
+            github_login: user.login,
+            github_id: user.id,
+        },
+        &config.session_secret,
+    ) {
+        Ok(cookie) => cookie,
+        Err(_) => {
+            return html_response_with_cookies(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session creation failed",
+                &[clear_state_cookie],
+            );
+        }
+    };
+
+    redirect_with_cookies(
+        StatusCode::SEE_OTHER,
+        "/app",
+        &[
+            clear_state_cookie,
+            build_cookie(
+                SESSION_COOKIE_NAME,
+                &session_cookie,
+                config.secure_cookies,
+                None,
+            ),
+        ],
+    )
+}
+
+async fn get_app(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let Some(config) = state.web_auth.config.as_ref() else {
+        return redirect_response("/login");
+    };
+    let Some(session) = read_session_cookie(&headers, config) else {
+        return redirect_response("/login");
+    };
+
+    let login = escape_html(&session.github_login);
+    html_response(
+        StatusCode::OK,
+        format!(
+            concat!(
+                "<!doctype html>\n",
+                "<html lang=\"en\">\n",
+                "<head>\n",
+                "  <meta charset=\"utf-8\">\n",
+                "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+                "  <title>Forge Control</title>\n",
+                "</head>\n",
+                "<body>\n",
+                "  <main>\n",
+                "    <h1>Forge Control</h1>\n",
+                "    <p>Signed in as {}.</p>\n",
+                "    <p>Forge web login is for human operators. CLI and bearer-token API access remain available for automation.</p>\n",
+                "    <form action=\"/logout\" method=\"post\">\n",
+                "      <button type=\"submit\">Log out</button>\n",
+                "    </form>\n",
+                "  </main>\n",
+                "</body>\n",
+                "</html>\n",
+            ),
+            login
+        ),
+    )
+}
+
+async fn get_logout(State(state): State<HttpState>) -> Response {
+    logout_response(&state)
+}
+
+async fn post_logout(State(state): State<HttpState>) -> Response {
+    logout_response(&state)
 }
 
 async fn get_healthz() -> impl IntoResponse {
@@ -949,10 +1300,151 @@ fn html_response(status: StatusCode, body: impl Into<String>) -> Response {
     response
 }
 
-fn cli_login_oauth_configured() -> bool {
-    CLI_LOGIN_REQUIRED_ENV_VARS
+fn html_response_with_cookies(
+    status: StatusCode,
+    body: impl Into<String>,
+    cookies: &[String],
+) -> Response {
+    let mut response = html_response(status, body);
+    for cookie in cookies {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_str(cookie).unwrap());
+    }
+    response
+}
+
+fn redirect_response(location: &str) -> Response {
+    redirect_with_cookies(StatusCode::SEE_OTHER, location, &[])
+}
+
+fn redirect_with_cookies(status: StatusCode, location: &str, cookies: &[String]) -> Response {
+    let mut response = status.into_response();
+    response
+        .headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_str(location).unwrap());
+    for cookie in cookies {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_str(cookie).unwrap());
+    }
+    response
+}
+
+fn load_web_auth_config_from_env() -> Option<WebAuthConfig> {
+    let client_id = std::env::var("FORGE_GITHUB_OAUTH_CLIENT_ID").ok()?;
+    let client_secret = std::env::var("FORGE_GITHUB_OAUTH_CLIENT_SECRET").ok()?;
+    let public_url = std::env::var("FORGE_PUBLIC_URL").ok()?;
+    let session_secret = std::env::var("FORGE_SESSION_SECRET").ok()?;
+    let secure_cookies = public_url.starts_with("https://");
+
+    Some(WebAuthConfig {
+        public_url,
+        client_id,
+        client_secret,
+        session_secret,
+        secure_cookies,
+    })
+}
+
+fn generate_nonce() -> String {
+    let bytes: [u8; 32] = rand::random();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn encode_signed_value<T>(value: &T, secret: &str) -> Result<String, String>
+where
+    T: Serialize,
+{
+    let payload = serde_json::to_vec(value).map_err(|err| err.to_string())?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let signature = sign_value(secret, &payload)?;
+    Ok(format!("{payload}.{signature}"))
+}
+
+fn sign_value(secret: &str, payload: &str) -> Result<String, String> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|err| err.to_string())?;
+    mac.update(payload.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn read_signed_cookie<T>(headers: &HeaderMap, name: &str, secret: &str) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    let raw = read_cookie(headers, name)?;
+    let (payload, signature) = raw.rsplit_once('.')?;
+    let expected = sign_value(secret, payload).ok()?;
+    if !bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
+        return None;
+    }
+
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn read_session_cookie(headers: &HeaderMap, config: &WebAuthConfig) -> Option<SessionCookie> {
+    read_signed_cookie(headers, SESSION_COOKIE_NAME, &config.session_secret)
+}
+
+fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
         .iter()
-        .all(|key| std::env::var_os(key).is_some())
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookie| cookie.split(';'))
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(cookie_name, cookie_value)| {
+            if cookie_name == name {
+                Some(cookie_value.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn build_cookie(name: &str, value: &str, secure: bool, max_age_seconds: Option<u64>) -> String {
+    let mut cookie = format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax");
+    if let Some(max_age_seconds) = max_age_seconds {
+        cookie.push_str(&format!("; Max-Age={max_age_seconds}"));
+    }
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn build_clear_cookie(name: &str, secure: bool) -> String {
+    build_cookie(name, "", secure, Some(0))
+}
+
+fn logout_response(state: &HttpState) -> Response {
+    let secure = state
+        .web_auth
+        .config
+        .as_ref()
+        .map(|config| config.secure_cookies)
+        .unwrap_or(false);
+    redirect_with_cookies(
+        StatusCode::SEE_OTHER,
+        "/login",
+        &[
+            build_clear_cookie(SESSION_COOKIE_NAME, secure),
+            build_clear_cookie(OAUTH_STATE_COOKIE_NAME, secure),
+        ],
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn json_response<T>(status: StatusCode, request_id: &str, body: Json<T>) -> Response
@@ -1158,6 +1650,7 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
             IdempotencyStore::new(root.join("idempotency")).unwrap(),
             None,
             SecretStore::new(root.join("secrets")).unwrap(),
+            WebAuthState::unconfigured(),
         ),
         root,
     )
@@ -1220,27 +1713,23 @@ pub mod root_endpoint_returns_html {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Forge Runtime"));
+        assert!(body.contains("Forge"));
     }
 }
 
 #[cfg(test)]
-pub mod login_cli_endpoint_returns_html {
+pub mod login_endpoint_returns_html {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
     #[tokio::test]
-    async fn login_cli_endpoint_returns_html() {
-        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
-            unsafe { std::env::remove_var(key) };
-        }
-
+    async fn login_endpoint_returns_html() {
         let app = router(build_state(true));
         let request = Request::builder()
             .method(axum::http::Method::GET)
-            .uri("/login/cli")
+            .uri("/login")
             .body(Body::empty())
             .unwrap();
 
@@ -1256,27 +1745,23 @@ pub mod login_cli_endpoint_returns_html {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Forge CLI Login"));
+        assert!(body.contains("Forge Login"));
     }
 }
 
 #[cfg(test)]
-pub mod login_cli_endpoint_mentions_missing_oauth_config_when_unconfigured {
+pub mod login_endpoint_mentions_missing_oauth_config_when_unconfigured {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
     #[tokio::test]
-    async fn login_cli_endpoint_mentions_missing_oauth_config_when_unconfigured() {
-        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
-            unsafe { std::env::remove_var(key) };
-        }
-
+    async fn login_endpoint_mentions_missing_oauth_config_when_unconfigured() {
         let app = router(build_state(true));
         let request = Request::builder()
             .method(axum::http::Method::GET)
-            .uri("/login/cli")
+            .uri("/login")
             .body(Body::empty())
             .unwrap();
 
@@ -1285,7 +1770,7 @@ pub mod login_cli_endpoint_mentions_missing_oauth_config_when_unconfigured {
         let body = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(body.contains("GitHub OAuth login is not configured yet"));
-        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
+        for key in WEB_LOGIN_REQUIRED_ENV_VARS {
             assert!(body.contains(key));
         }
     }
@@ -1294,16 +1779,12 @@ pub mod login_cli_endpoint_mentions_missing_oauth_config_when_unconfigured {
 #[cfg(test)]
 pub mod login_cli_endpoint_does_not_require_auth {
     use super::*;
-    use axum::body::{Body, to_bytes};
+    use axum::body::Body;
     use axum::http::Request;
     use tower::util::ServiceExt;
 
     #[tokio::test]
-    async fn login_cli_endpoint_does_not_require_auth() {
-        for key in CLI_LOGIN_REQUIRED_ENV_VARS {
-            unsafe { std::env::remove_var(key) };
-        }
-
+    async fn login_cli_endpoint_redirects_to_login() {
         let app = router(build_state(true));
         let request = Request::builder()
             .method(axum::http::Method::GET)
@@ -1312,11 +1793,189 @@ pub mod login_cli_endpoint_does_not_require_auth {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+}
 
+#[cfg(test)]
+pub mod login_endpoint_shows_continue_with_github_when_configured {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn login_endpoint_shows_continue_with_github_when_configured() {
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests("octocat", 1);
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/login")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Forge CLI Login"));
+
+        assert!(body.contains("Continue with GitHub"));
+    }
+}
+
+#[cfg(test)]
+pub mod oauth_start_redirects_to_github {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn oauth_start_redirects_to_github() {
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests("octocat", 1);
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/oauth/github/start")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(GITHUB_AUTHORIZE_URL)
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| {
+                    value
+                        .to_str()
+                        .unwrap()
+                        .starts_with(&format!("{OAUTH_STATE_COOKIE_NAME}="))
+                })
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod oauth_callback_creates_session_cookie {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn oauth_callback_creates_session_cookie() {
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state);
+        let state_value = "test-state";
+        let state_cookie = encode_signed_value(
+            &OAuthStateCookie {
+                nonce: state_value.into(),
+            },
+            &config.session_secret,
+        )
+        .unwrap();
+
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri(format!(
+                "/oauth/github/callback?code=test-code&state={state_value}"
+            ))
+            .header(
+                header::COOKIE,
+                format!("{OAUTH_STATE_COOKIE_NAME}={state_cookie}"),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/app");
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| {
+                    value
+                        .to_str()
+                        .unwrap()
+                        .starts_with(&format!("{SESSION_COOKIE_NAME}="))
+                })
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod app_requires_session {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn app_requires_session() {
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/app")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+}
+
+#[cfg(test)]
+pub mod logout_clears_session_cookie {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn logout_clears_session_cookie() {
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/logout")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| {
+                    let value = value.to_str().unwrap();
+                    value.starts_with(&format!("{SESSION_COOKIE_NAME}="))
+                        && value.contains("Max-Age=0")
+                })
+        );
     }
 }
 

@@ -18,7 +18,8 @@ use forge_core::doctor::{DoctorOptions, run as run_doctor};
 use forge_core::events::EventRecord;
 use forge_core::github::GitHubWebhookConfig;
 use forge_core::http::{
-    ControlPlane, DeliveryStore, GitHubWebhookState, HttpState, IdempotencyStore, router,
+    ControlPlane, DeliveryStore, GitHubWebhookState, HttpState, IdempotencyStore, WebAuthState,
+    router,
 };
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::queue::PersistentQueue;
@@ -560,6 +561,7 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
         github_webhooks,
         forge_core::secrets::SecretStore::new(config.storage_root.join("secrets"))
             .map_err(|err| CliError::Usage(err.to_string()))?,
+        WebAuthState::from_env(),
     );
     let app = router(state);
 

@@ -22,7 +22,7 @@ use forge_core::deployments::{
 };
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
 use forge_core::github::GitHubWebhookConfig;
-use forge_core::http::{ControlPlane, HttpState, IdempotencyStore, router};
+use forge_core::http::{ControlPlane, HttpState, IdempotencyStore, WebAuthState, router};
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
 use forge_core::runtime::{
@@ -748,6 +748,7 @@ impl E2eHarness {
             IdempotencyStore::new(self.runtime_root.join("idempotency")).unwrap(),
             self.github_webhook_state(),
             SecretStore::new(self.runtime_root.join("secrets")).unwrap(),
+            WebAuthState::from_env(),
         );
         let app = router(state);
         self.api_threads.push(spawn_http_server(self.api_port, app));
