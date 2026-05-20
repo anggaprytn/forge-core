@@ -77,6 +77,7 @@ where
         Command::Deploy {
             project_id,
             environment,
+            source_path,
         } => {
             let (base_url, token) = api_credentials.clone().unwrap();
             let client = ForgeClient::new(base_url, token);
@@ -84,6 +85,7 @@ where
                 project_id,
                 environment,
                 intent: "deploy".into(),
+                source_path,
             })?;
             print_json(&accepted)?;
         }
@@ -109,6 +111,7 @@ where
                 project_id,
                 environment,
                 intent: "rollback".into(),
+                source_path: None,
             })?;
             print_json(&accepted)?;
         }
@@ -236,7 +239,7 @@ struct ParsedArgs {
     command: Command,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Command {
     Doctor {
         config_path: PathBuf,
@@ -250,6 +253,7 @@ enum Command {
     Deploy {
         project_id: String,
         environment: String,
+        source_path: Option<PathBuf>,
     },
     Status {
         deployment_id: String,
@@ -394,10 +398,7 @@ fn parse_command(
         })),
         [cmd] if cmd == "init" => Ok(Command::Init { force: false }),
         [cmd, flag] if cmd == "init" && flag == "--force" => Ok(Command::Init { force: true }),
-        [cmd, project_id, environment] if cmd == "deploy" => Ok(Command::Deploy {
-            project_id: project_id.clone(),
-            environment: environment.clone(),
-        }),
+        [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
         [cmd, deployment_id] if cmd == "status" => Ok(Command::Status {
             deployment_id: deployment_id.clone(),
         }),
@@ -426,13 +427,34 @@ fn usage() -> String {
         "  forge [--config PATH] [--caddy-admin-url URL] [--metrics-url URL] doctor",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] daemon",
         "  forge init [--force]",
-        "  forge [--url URL] [--token TOKEN] deploy <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] deploy [--from PATH] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] secrets set <project_id> <environment> <key> <value>",
     ]
     .join("\n")
+}
+
+fn parse_deploy_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [project_id, environment] => Ok(Command::Deploy {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            source_path: None,
+        }),
+        [flag, path, project_id, environment] if flag == "--from" => Ok(Command::Deploy {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            source_path: Some(PathBuf::from(path)),
+        }),
+        [project_id, environment, flag, path] if flag == "--from" => Ok(Command::Deploy {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            source_path: Some(PathBuf::from(path)),
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -615,6 +637,56 @@ mod tests {
                 caddy_admin_url: "http://127.0.0.1:2019".into(),
                 caddy_public_url: "http://forge.local".into(),
             })
+        );
+    }
+
+    #[test]
+    fn deploy_command_accepts_from_before_positionals() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "deploy".into(),
+            "--from".into(),
+            "/srv/api".into(),
+            "api".into(),
+            "production".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::Deploy {
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(PathBuf::from("/srv/api")),
+            }
+        );
+    }
+
+    #[test]
+    fn deploy_command_accepts_from_after_positionals() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "deploy".into(),
+            "api".into(),
+            "production".into(),
+            "--from".into(),
+            "/srv/api".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::Deploy {
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(PathBuf::from("/srv/api")),
+            }
         );
     }
 }

@@ -81,7 +81,7 @@ Forge has been manually validated on a real VPS with the following:
 - **Single-service web apps**: Only one HTTP service per project.
 - **No stateful DB ownership**: Database volume/state management is not native yet.
 - **No multi-service orchestration**: No built-in cross-service dependency management.
-- **Manual deploy source**: `forge deploy` builds from the daemon's `WorkingDirectory`.
+- **Manual deploy source**: By default, `forge deploy` builds from the daemon's `WorkingDirectory`; prefer `forge deploy --from <path>` for explicit operator control.
 - **API Visibility**: API is localhost-bound by default; do not expose publicly.
 
 ---
@@ -258,7 +258,7 @@ These are intentionally separate systems.
 
 ```bash
 forge init                                   # Generate forge.yml
-forge deploy <project> <environment>         # Deploy using forge.yml
+forge deploy [--from PATH] <project> <environment> # Deploy using forge.yml
 forge status <deployment_id>                 # Check deployment status
 forge events                                 # View orchestration events
 forge rollback <project> <environment>       # Restore previous healthy generation
@@ -281,11 +281,12 @@ This generates a deterministic `forge.yml` in the current directory. `forge.yml`
 
 ```bash
 forge deploy api production
+forge deploy api production --from /path/to/project
 ```
 
-Forge reads the `forge.yml` from the current directory (or the daemon's working directory) and enqueues a deployment for the `api` project in the `production` environment.
+Forge reads `forge.yml` from the deploy source root and enqueues a deployment for the `api` project in the `production` environment.
 
-**Current Limitation**: The Forge daemon currently builds and deploys from its own `WorkingDirectory`. Ensure the daemon is started in the root of the project you intend to deploy manually.
+By default, the deploy source is the daemon's `WorkingDirectory`. For predictable manual operations, prefer `forge deploy api production --from /path/to/project`.
 
 ## 3. GitHub Webhook (Automated)
 

@@ -1,13 +1,16 @@
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentRecord {
     pub deployment_id: String,
     pub project_id: String,
     pub environment: String,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,13 +184,14 @@ impl PersistentQueue {
 }
 
 fn format_record(record: &DeploymentRecord) -> String {
-    format!(
-        "{}|{}|{}",
-        record.deployment_id, record.project_id, record.environment
-    )
+    serde_json::to_string(record).expect("deployment record should serialize")
 }
 
 fn parse_record(line: &str) -> Result<DeploymentRecord, QueueError> {
+    if let Ok(record) = serde_json::from_str::<DeploymentRecord>(line) {
+        return Ok(record);
+    }
+
     let parts: Vec<&str> = line.split('|').collect();
     if parts.len() != 3 || parts.iter().any(|part| part.trim().is_empty()) {
         return Err(QueueError::CorruptState(PathBuf::from(line)));
@@ -196,6 +200,7 @@ fn parse_record(line: &str) -> Result<DeploymentRecord, QueueError> {
         deployment_id: parts[0].to_string(),
         project_id: parts[1].to_string(),
         environment: parts[2].to_string(),
+        source_path: None,
     })
 }
 
@@ -226,6 +231,7 @@ pub mod only_one_active_deployment {
                 deployment_id: "d1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             })
             .unwrap();
         queue
@@ -233,6 +239,7 @@ pub mod only_one_active_deployment {
                 deployment_id: "d2".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             })
             .unwrap();
 
@@ -250,7 +257,7 @@ pub mod queued_deployments_survive_restart {
     use super::*;
 
     #[test]
-    fn queue_state_is_reloaded_from_disk() {
+    fn queued_deployment_persists_source_path() {
         let root = test_root("queue-survives-restart");
         let queue_path = root.join("queue");
         let queue = PersistentQueue::new(&queue_path).unwrap();
@@ -259,6 +266,7 @@ pub mod queued_deployments_survive_restart {
                 deployment_id: "d1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: Some(PathBuf::from("/srv/apps/api")),
             })
             .unwrap();
 
@@ -268,5 +276,9 @@ pub mod queued_deployments_survive_restart {
         assert_eq!(state.queued.len(), 1);
         assert!(state.active.is_none());
         assert_eq!(state.queued[0].deployment_id, "d1");
+        assert_eq!(
+            state.queued[0].source_path.as_deref(),
+            Some(Path::new("/srv/apps/api"))
+        );
     }
 }

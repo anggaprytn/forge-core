@@ -185,6 +185,7 @@ fn caddy_integration_failed_route_activation_does_not_advance_current() {
             deployment_id: "dep-2".into(),
             project_id: "api".into(),
             environment: "production".into(),
+            source_path: None,
         })
         .unwrap();
 

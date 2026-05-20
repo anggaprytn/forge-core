@@ -202,8 +202,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         &mut self,
         record: &DeploymentRecord,
     ) -> Result<DeploymentExecution, DeploymentError> {
-        let forge_yaml = load_optional_forge_yaml(&self.execution.context_path, &record.project_id)
+        let source_root = record
+            .source_path
+            .clone()
+            .unwrap_or_else(|| self.execution.context_path.clone());
+        let forge_yaml = load_optional_forge_yaml(&source_root, &record.project_id)
             .map_err(|err| DeploymentError::InvalidInspection(err.to_string()))?;
+        let default_execution = ExecutionConfig {
+            context_path: source_root.clone(),
+            dockerfile_path: source_root.join("Dockerfile"),
+            network_name: self.execution.network_name.clone(),
+        };
         let execution = forge_yaml
             .as_ref()
             .map(|config| {
@@ -211,7 +220,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 execution.network_name = self.execution.network_name.clone();
                 execution
             })
-            .unwrap_or_else(|| self.execution.clone());
+            .unwrap_or(default_execution);
         let validation = forge_yaml
             .as_ref()
             .map(|config| config.validation().clone())
@@ -1159,6 +1168,7 @@ fn queued_record(queue: &PersistentQueue) {
             deployment_id: "dep-1".into(),
             project_id: "api".into(),
             environment: "production".into(),
+            source_path: None,
         })
         .unwrap();
 }
@@ -1695,10 +1705,12 @@ pub mod deploy_loads_forge_yml {
     use std::fs;
 
     #[test]
-    fn deploy_loads_forge_yml() {
+    fn deploy_from_path_loads_forge_yml_from_source() {
         let root = test_root("deploy-loads-forge-yml");
+        let source_root = root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
         fs::write(
-            root.join("forge.yml"),
+            source_root.join("forge.yml"),
             concat!(
                 "version: 1\n",
                 "name: api\n",
@@ -1722,7 +1734,14 @@ pub mod deploy_loads_forge_yml {
         )
         .unwrap();
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
-        queued_record(&queue);
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(source_root.clone()),
+            })
+            .unwrap();
         let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
             success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
         ));
@@ -1780,6 +1799,113 @@ pub mod deploy_loads_forge_yml {
         assert_eq!(
             probes.http_hosts,
             vec![("172.18.0.2".to_string(), 4010, "/ready".to_string())]
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_from_path_uses_project_directory {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn deploy_from_path_uses_project_directory() {
+        let root = test_root("deploy-from-path-project-directory");
+        let source_root = root.join("source");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                source_path: Some(source_root.clone()),
+            })
+            .unwrap();
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: None,
+        })
+        .execute_next()
+        .unwrap();
+
+        let build_args = &docker.runner.commands[0].args;
+        assert!(
+            build_args
+                .iter()
+                .any(|arg| arg == &source_root.display().to_string())
+        );
+        assert!(
+            build_args
+                .windows(2)
+                .any(|pair| pair == ["-f", &source_root.join("Dockerfile").display().to_string()])
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_without_from_preserves_working_directory_behavior {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+
+    #[test]
+    fn deploy_without_from_preserves_working_directory_behavior() {
+        let root = test_root("deploy-without-from-working-directory");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: None,
+        })
+        .execute_next()
+        .unwrap();
+
+        let build_args = &docker.runner.commands[0].args;
+        assert!(
+            build_args
+                .iter()
+                .any(|arg| arg == &root.display().to_string())
+        );
+        assert!(
+            build_args
+                .windows(2)
+                .any(|pair| pair == ["-f", &root.join("Dockerfile").display().to_string()])
         );
     }
 }

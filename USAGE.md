@@ -99,7 +99,7 @@ systemctl start forge
 
 - **Storage Root**: The service user must own `/var/lib/forge` (or your configured `storage_root`).
 - **WorkingDirectory**: The service user must have read and execute (traversal) permissions for the `WorkingDirectory` defined in the systemd unit.
-- **Manual Deploys**: `forge deploy <project> <environment>` builds from the daemon's `WorkingDirectory`. For VPS setups, ensure this points to your application checkout.
+- **Manual Deploys**: By default, `forge deploy <project> <environment>` builds from the daemon's `WorkingDirectory`. Prefer `forge deploy --from <path> <project> <environment>` when you want an explicit source checkout.
 
 ---
 
@@ -203,6 +203,7 @@ A minimal getting-started flow:
 ```bash
 forge init
 forge deploy api production
+forge deploy api production --from /path/to/project
 ```
 
 `forge deploy` uses the `name`, build paths, runtime port, and healthcheck from `forge.yml`.
@@ -648,7 +649,7 @@ AI-generated apps deploy successfully without manual infrastructure repair
 | Action       | Command                          |
 | ------------ | -------------------------------- |
 | start daemon | `forge daemon`                   |
-| deploy       | `forge deploy <project> <env>`   |
+| deploy       | `forge deploy [--from PATH] <project> <env>` |
 | rollback     | `forge rollback <project> <env>` |
 | status       | `forge status <deployment_id>`   |
 | events       | `forge events`                   |

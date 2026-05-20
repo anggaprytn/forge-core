@@ -25,9 +25,9 @@ Example minimal Caddy config for local use:
 
 ## Important Current Limitation
 
-Manual `forge deploy <project> <environment>` builds from the Forge daemon process `WorkingDirectory`.
+By default, manual `forge deploy <project> <environment>` builds from the Forge daemon process `WorkingDirectory`.
 
-For the local loop below, start the daemon from the same project directory that contains the `Dockerfile` and `forge.yml` you want to deploy. If you use the provided systemd unit, update its `WorkingDirectory` first.
+For explicit operator control, prefer `forge deploy --from <path> <project> <environment>`. If you omit `--from`, start the daemon from the project directory that contains the `Dockerfile` and `forge.yml` you want to deploy.
 
 ## 1. Build Forge
 
@@ -110,6 +110,7 @@ From `tests/fixtures/sample-http-app` in a second shell:
 
 ```bash
 ../../../target/release/forge deploy api production
+../../../target/release/forge deploy api production --from "$(pwd)"
 ```
 
 The deploy response includes a `deployment_id`. Keep it for status and log lookups.

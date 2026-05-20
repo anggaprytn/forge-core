@@ -130,7 +130,7 @@ systemctl enable --now forge
 ```
 
 ### Manual Deployment Note
-Manual `forge deploy <project> <environment>` deployments build from the Forge daemon process `WorkingDirectory`. Update the systemd unit if you move your project checkout.
+By default, manual `forge deploy <project> <environment>` deployments build from the Forge daemon process `WorkingDirectory`. Prefer `forge deploy --from <path> <project> <environment>` when you want to target an explicit checkout.
 
 ---
 
@@ -157,6 +157,7 @@ Enqueue the deploy:
 
 ```bash
 forge deploy api production
+forge deploy api production --from /srv/forge/sample-http-app
 forge events
 ```
 

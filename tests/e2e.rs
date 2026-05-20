@@ -287,6 +287,7 @@ fn dogfood_restart_during_inflight_deploy_fails_or_recovers_deterministically() 
             deployment_id,
             project_id: "api".into(),
             environment: "production".into(),
+            source_path: None,
         }))
     );
     assert!(
@@ -393,6 +394,7 @@ fn dogfood_crash_during_deploy_recovers_without_orphan_container() {
             deployment_id,
             project_id: "api".into(),
             environment: "production".into(),
+            source_path: None,
         }))
     );
     assert!(!docker_container_exists("prod-api-gen-1"));
@@ -761,6 +763,7 @@ impl E2eHarness {
                 project_id: "api".into(),
                 environment: "production".into(),
                 intent: "deploy".into(),
+                source_path: None,
             })
             .send()
             .expect("deploy request should reach api");
@@ -913,6 +916,7 @@ impl E2eHarness {
             deployment_id: deployment_id.into(),
             project_id: "api".into(),
             environment: "production".into(),
+            source_path: None,
         };
         let env = EnvironmentPaths::new(&self.runtime_root, "api", "production");
         env.ensure_exists().unwrap();

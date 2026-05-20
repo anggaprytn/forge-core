@@ -1,4 +1,5 @@
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -169,10 +170,12 @@ where
         })?;
 
         let deployment_id = next_deployment_id();
+        let source_path = resolve_source_path(request.source_path.as_deref())?;
         let record = DeploymentRecord {
             deployment_id: deployment_id.clone(),
             project_id: request.project_id,
             environment: request.environment,
+            source_path,
         };
         queue.enqueue(record).map_err(queue_error_to_response)?;
         let queue_position = queue.queued_len().map_err(queue_error_to_response)?;
@@ -415,6 +418,32 @@ fn next_deployment_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("dep-{now}-{seq}")
+}
+
+fn resolve_source_path(
+    source_path: Option<&std::path::Path>,
+) -> Result<Option<PathBuf>, ErrorResponse> {
+    let Some(source_path) = source_path else {
+        return Ok(None);
+    };
+
+    let resolved = fs::canonicalize(source_path).map_err(|err| ErrorResponse {
+        code: "invalid_source_path".into(),
+        message: format!(
+            "source path `{}` is not accessible on the daemon host: {err}",
+            source_path.display()
+        ),
+    })?;
+    if !resolved.is_dir() {
+        return Err(ErrorResponse {
+            code: "invalid_source_path".into(),
+            message: format!(
+                "source path `{}` must be an existing directory",
+                resolved.display()
+            ),
+        });
+    }
+    Ok(Some(resolved))
 }
 
 struct PersistedDeployment {
@@ -737,6 +766,7 @@ pub mod daemon_refuses_api_commands_before_ready {
             project_id: "api".into(),
             environment: "production".into(),
             intent: "deploy".into(),
+            source_path: None,
         });
 
         assert_eq!(
@@ -763,6 +793,7 @@ pub mod daemon_recovers_queue_before_accepting_deploys {
                 deployment_id: "d1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             })
             .unwrap();
         queue.start_next().unwrap().unwrap();
@@ -782,6 +813,7 @@ pub mod daemon_recovers_queue_before_accepting_deploys {
                 deployment_id: "d1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             }))
         );
         assert_eq!(daemon.startup_steps()[1], StartupStep::BootstrapReady);
@@ -813,6 +845,7 @@ pub mod daemon_drains_shutdown_safely {
             project_id: "api".into(),
             environment: "production".into(),
             intent: "deploy".into(),
+            source_path: None,
         });
         assert!(response.is_err());
     }
@@ -832,6 +865,7 @@ pub mod daemon_does_not_start_health_loops_before_convergence_completes {
                 deployment_id: "d1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             })
             .unwrap();
         queue.start_next().unwrap().unwrap();
@@ -866,6 +900,7 @@ pub mod post_deployments_enqueues_job_and_persists_across_restart {
     #[test]
     fn valid_request_enqueues_and_survives_daemon_restart() {
         let root = test_root("daemon-post-deployments");
+        std::fs::create_dir_all(root.join("source")).unwrap();
         let mut daemon = Daemon::new(
             config_with_root(root.clone()),
             NoopDockerRuntime,
@@ -879,6 +914,7 @@ pub mod post_deployments_enqueues_job_and_persists_across_restart {
                 project_id: "api".into(),
                 environment: "production".into(),
                 intent: "deploy".into(),
+                source_path: Some(root.join("source")),
             })
             .unwrap();
 
@@ -887,7 +923,7 @@ pub mod post_deployments_enqueues_job_and_persists_across_restart {
         assert_eq!(daemon.queue().unwrap().queued_len().unwrap(), 1);
 
         let mut restarted = Daemon::new(
-            config_with_root(root),
+            config_with_root(root.clone()),
             NoopDockerRuntime,
             NoopRoutingRuntime,
             StaticDecider(true),
@@ -897,6 +933,39 @@ pub mod post_deployments_enqueues_job_and_persists_across_restart {
         let state = restarted.queue().unwrap().load_state().unwrap();
         assert_eq!(state.queued.len(), 1);
         assert_eq!(state.queued[0].deployment_id, accepted.deployment_id);
+        assert_eq!(
+            state.queued[0].source_path,
+            Some(root.join("source").canonicalize().unwrap())
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod deploy_from_path_rejects_missing_directory {
+    use super::*;
+
+    #[test]
+    fn deploy_from_path_rejects_missing_directory() {
+        let root = test_root("daemon-missing-source-path");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let response = daemon
+            .handle_post_deployments(DeploymentRequest {
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.join("missing")),
+            })
+            .unwrap_err();
+
+        assert_eq!(response.code, "invalid_source_path");
+        assert!(response.message.contains("missing"));
     }
 }
 
@@ -914,6 +983,7 @@ pub mod daemon_consumes_queued_deployment {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             })
             .unwrap();
 
@@ -956,6 +1026,7 @@ pub mod daemon_worker_leaves_no_active_queue_item_after_success_or_failure {
                 deployment_id: "dep-success".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             })
             .unwrap();
 
@@ -981,6 +1052,7 @@ pub mod daemon_worker_leaves_no_active_queue_item_after_success_or_failure {
                 deployment_id: "dep-failure".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                source_path: None,
             })
             .unwrap();
 

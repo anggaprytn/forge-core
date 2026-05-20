@@ -1,11 +1,14 @@
 use crate::events::EventRecord;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentRequest {
     pub project_id: String,
     pub environment: String,
     pub intent: String,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +64,24 @@ pub fn validate_deployment_request(request: &DeploymentRequest) -> Result<(), Er
         return Err(ErrorResponse {
             code: "invalid_intent".into(),
             message: "intent must be one of deploy, redeploy, rollback".into(),
+        });
+    }
+
+    if request
+        .source_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(ErrorResponse {
+            code: "invalid_source_path".into(),
+            message: "source_path must not be empty".into(),
+        });
+    }
+
+    if request.intent == "rollback" && request.source_path.is_some() {
+        return Err(ErrorResponse {
+            code: "invalid_source_path".into(),
+            message: "source_path is only supported for deploy intents".into(),
         });
     }
 

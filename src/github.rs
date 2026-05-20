@@ -150,6 +150,7 @@ pub fn resolve_webhook(
         project_id: manifest.project_id,
         environment: environment.into(),
         intent: "deploy".into(),
+        source_path: None,
     }))
 }
 
@@ -317,6 +318,7 @@ mod tests {
                 project_id: "api".into(),
                 environment: "production".into(),
                 intent: "deploy".into(),
+                source_path: None,
             })
         );
     }
