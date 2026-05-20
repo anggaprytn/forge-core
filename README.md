@@ -50,6 +50,13 @@ with minimal human intervention.
 
 ---
 
+# Getting Started
+
+- Local alpha loop: [docs/LOCAL_QUICKSTART.md](docs/LOCAL_QUICKSTART.md)
+- Linux/systemd host bootstrap: [install.sh](install.sh)
+
+---
+
 # Core Principles
 
 ## 1. Forge Is Authority
