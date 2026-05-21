@@ -2331,6 +2331,8 @@ mod tests {
             repo_url: None,
             commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
             source_path: None,
+            services: BTreeMap::new(),
+            startup_order: Vec::new(),
         })
         .unwrap();
         writer
@@ -2530,6 +2532,8 @@ mod tests {
             repo_url: None,
             commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
             source_path: None,
+            services: BTreeMap::new(),
+            startup_order: Vec::new(),
         })
         .unwrap();
         writer

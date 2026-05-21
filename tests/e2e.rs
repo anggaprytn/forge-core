@@ -1005,6 +1005,7 @@ impl E2eHarness {
                 labels: forge_labels(&record, generation),
                 environment: Default::default(),
                 network_name: Some(self.network_name.clone()),
+                command: None,
             })
             .unwrap();
         docker

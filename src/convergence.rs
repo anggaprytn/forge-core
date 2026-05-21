@@ -21,8 +21,8 @@ use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     GcActionRecord, GcStore, PersistedActivationMode, PersistedBuildInfo,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PersistedSecretReference, PointerStore, ProbeHistoryStore,
-    RuntimeHealthState, RuntimeStateStore, atomic_write, current_unix_timestamp,
+    PersistedRuntimeInfo, PersistedSecretReference, PersistedServiceRuntimeInfo, PointerStore,
+    ProbeHistoryStore, RuntimeHealthState, RuntimeStateStore, atomic_write, current_unix_timestamp,
     load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
@@ -451,35 +451,44 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
                 continue;
             };
 
-            let inspection = ensure_generation_container_running(
-                &self.storage_root,
-                &project_id,
-                &environment,
-                generation,
-                &build_info.deployment_id,
-                &build_info.image_ref,
-                &runtime_info.container_name,
-                runtime_info.network_name.clone(),
-                &runtime_info.environment_variables,
-                docker,
-            )?;
-
-            if let Some(route_recovery) = persisted_http_route_recovery(
-                &self.storage_root,
-                &runtime_info,
-                &project_id,
-                &environment,
-            )? {
-                ensure_http_route_matches_generation(
-                    routing,
-                    &route_recovery.subtree_id,
-                    &inspection,
-                    route_recovery.internal_port,
-                    runtime_info.network_name.as_deref(),
-                    route_recovery.domain,
-                    &route_recovery.target_source,
-                    route_recovery.probe_path,
+            let service_runtime = runtime_services(&runtime_info, &build_info.image_ref);
+            let mut inspections = BTreeMap::new();
+            for (service_id, service) in &service_runtime {
+                let inspection = ensure_generation_service_running(
+                    &self.storage_root,
+                    &project_id,
+                    &environment,
+                    generation,
+                    &build_info.deployment_id,
+                    service,
+                    docker,
                 )?;
+                inspections.insert(service_id.clone(), inspection);
+            }
+
+            for (service_id, service) in &service_runtime {
+                if !service.externally_exposed {
+                    continue;
+                }
+                if let Some(route_recovery) = persisted_http_route_recovery(
+                    &self.storage_root,
+                    service,
+                    &project_id,
+                    &environment,
+                    service_runtime.len(),
+                    Some(service_id.as_str()),
+                )? {
+                    ensure_http_route_matches_generation(
+                        routing,
+                        &route_recovery.subtree_id,
+                        inspections.get(service_id).expect("inspection collected"),
+                        route_recovery.internal_port,
+                        service.network_name.as_deref(),
+                        route_recovery.domain,
+                        &route_recovery.target_source,
+                        route_recovery.probe_path,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -897,7 +906,7 @@ where
         input: &TickInput,
         env: &EnvironmentPaths,
         current: Option<u64>,
-        internal_port: u16,
+        _internal_port: u16,
     ) -> Result<Option<u64>, ConvergenceError> {
         let Some(current_generation) = current else {
             return Ok(None);
@@ -908,28 +917,51 @@ where
         let Some(runtime_info) = load_generation_runtime_info(env, current_generation)? else {
             return Ok(None);
         };
-        let route_recovery = http_route_recovery_input(
-            &self.storage_root,
-            Some(&runtime_info),
-            &input.project_id,
-            &input.environment,
-            internal_port,
-            input.http_health_path.clone(),
-        )?;
-        let inspection = match self.docker.inspect_container(&runtime_info.container_name) {
-            Ok(inspection) if inspection.running => inspection,
-            _ => return Ok(None),
-        };
-        ensure_http_route_matches_generation(
-            self.routing,
-            &route_recovery.subtree_id,
-            &inspection,
-            route_recovery.internal_port,
-            runtime_info.network_name.as_deref(),
-            route_recovery.domain,
-            &route_recovery.target_source,
-            route_recovery.probe_path,
-        )?;
+        let build_info = load_generation_build_info(env, current_generation)?.ok_or_else(|| {
+            ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing build info",
+            )))
+        })?;
+        let service_runtime = runtime_services(&runtime_info, &build_info.image_ref);
+        for (service_id, service) in &service_runtime {
+            let inspection = ensure_generation_service_running(
+                &self.storage_root,
+                &input.project_id,
+                &input.environment,
+                current_generation,
+                &build_info.deployment_id,
+                service,
+                self.docker,
+            )?;
+            if !service.externally_exposed {
+                continue;
+            }
+            let route_recovery = persisted_http_route_recovery(
+                &self.storage_root,
+                service,
+                &input.project_id,
+                &input.environment,
+                service_runtime.len(),
+                Some(service_id.as_str()),
+            )?
+            .ok_or_else(|| {
+                ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing route metadata",
+                )))
+            })?;
+            ensure_http_route_matches_generation(
+                self.routing,
+                &route_recovery.subtree_id,
+                &inspection,
+                route_recovery.internal_port,
+                service.network_name.as_deref(),
+                route_recovery.domain,
+                &route_recovery.target_source,
+                route_recovery.probe_path,
+            )?;
+        }
         Ok(Some(current_generation))
     }
 
@@ -950,36 +982,58 @@ where
                 let Some(build_info) = load_generation_build_info(env, previous)? else {
                     return Ok(false);
                 };
-                let route_recovery = http_route_recovery_input(
-                    &self.storage_root,
-                    Some(&runtime_info),
-                    &input.project_id,
-                    &input.environment,
-                    internal_port,
-                    input.http_health_path.clone(),
-                )?;
-                let inspection = ensure_generation_container_running(
-                    &self.storage_root,
-                    &input.project_id,
-                    &input.environment,
-                    previous,
-                    &build_info.deployment_id,
-                    &build_info.image_ref,
-                    &runtime_info.container_name,
-                    runtime_info.network_name.clone(),
-                    &runtime_info.environment_variables,
-                    self.docker,
-                )?;
-                ensure_http_route_matches_generation(
-                    self.routing,
-                    &route_recovery.subtree_id,
-                    &inspection,
-                    route_recovery.internal_port,
-                    runtime_info.network_name.as_deref(),
-                    route_recovery.domain,
-                    &route_recovery.target_source,
-                    route_recovery.probe_path,
-                )?;
+                let service_runtime = runtime_services(&runtime_info, &build_info.image_ref);
+                for (service_id, service) in &service_runtime {
+                    let inspection = ensure_generation_service_running(
+                        &self.storage_root,
+                        &input.project_id,
+                        &input.environment,
+                        previous,
+                        &build_info.deployment_id,
+                        service,
+                        self.docker,
+                    )?;
+                    if !service.externally_exposed {
+                        continue;
+                    }
+                    let route_recovery = persisted_http_route_recovery(
+                        &self.storage_root,
+                        service,
+                        &input.project_id,
+                        &input.environment,
+                        service_runtime.len(),
+                        Some(service_id.as_str()),
+                    )?
+                    .or_else(|| {
+                        http_route_recovery_input(
+                            &self.storage_root,
+                            Some(service),
+                            &input.project_id,
+                            &input.environment,
+                            internal_port,
+                            input.http_health_path.clone(),
+                        )
+                        .ok()
+                    })
+                    .ok_or_else(|| {
+                        ConvergenceError::Storage(crate::storage::StorageError::Io(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "missing route metadata",
+                            ),
+                        ))
+                    })?;
+                    ensure_http_route_matches_generation(
+                        self.routing,
+                        &route_recovery.subtree_id,
+                        &inspection,
+                        route_recovery.internal_port,
+                        service.network_name.as_deref(),
+                        route_recovery.domain,
+                        &route_recovery.target_source,
+                        route_recovery.probe_path,
+                    )?;
+                }
                 PointerStore::new(env.clone()).swap_current(previous)?;
                 Ok(true)
             }
@@ -990,18 +1044,18 @@ where
                 let Some(build_info) = load_generation_build_info(env, previous)? else {
                     return Ok(false);
                 };
-                let _ = ensure_generation_container_running(
-                    &self.storage_root,
-                    &input.project_id,
-                    &input.environment,
-                    previous,
-                    &build_info.deployment_id,
-                    &build_info.image_ref,
-                    &runtime_info.container_name,
-                    runtime_info.network_name.clone(),
-                    &runtime_info.environment_variables,
-                    self.docker,
-                )?;
+                let service_runtime = runtime_services(&runtime_info, &build_info.image_ref);
+                for service in service_runtime.values() {
+                    let _ = ensure_generation_service_running(
+                        &self.storage_root,
+                        &input.project_id,
+                        &input.environment,
+                        previous,
+                        &build_info.deployment_id,
+                        service,
+                        self.docker,
+                    )?;
+                }
                 PointerStore::new(env.clone()).swap_current(previous)?;
                 Ok(true)
             }
@@ -1094,6 +1148,54 @@ fn route_subtree_id(project_id: &str, environment: &str) -> String {
     format!("forge:{project_id}:{environment}")
 }
 
+fn route_subtree_id_for_service(
+    project_id: &str,
+    environment: &str,
+    service_id: Option<&str>,
+    service_count: usize,
+) -> String {
+    if service_count <= 1 {
+        return route_subtree_id(project_id, environment);
+    }
+    format!(
+        "forge:{project_id}:{environment}:{}",
+        service_id.unwrap_or("default")
+    )
+}
+
+fn runtime_services(
+    runtime_info: &PersistedRuntimeInfo,
+    default_image_ref: &str,
+) -> BTreeMap<String, PersistedServiceRuntimeInfo> {
+    if !runtime_info.services.is_empty() {
+        return runtime_info.services.clone();
+    }
+    BTreeMap::from([(
+        "default".into(),
+        PersistedServiceRuntimeInfo {
+            service_id: "default".into(),
+            container_name: runtime_info.container_name.clone(),
+            image_ref: default_image_ref.to_string(),
+            running: runtime_info.running,
+            network_name: runtime_info.network_name.clone(),
+            probe_path: runtime_info.probe_path.clone(),
+            activation: runtime_info.activation.clone(),
+            command: None,
+            depends_on: Vec::new(),
+            required_for_promotion: true,
+            externally_exposed: matches!(
+                runtime_info.activation,
+                Some(PersistedActivationMode::Http { .. })
+            ),
+            environment_variables: runtime_info.environment_variables.clone(),
+            source_ref: runtime_info.source_ref.clone(),
+            repo_url: runtime_info.repo_url.clone(),
+            commit_sha: runtime_info.commit_sha.clone(),
+            source_path: runtime_info.source_path.clone(),
+        },
+    )])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HttpRouteRecoveryInput {
     subtree_id: String,
@@ -1105,9 +1207,11 @@ struct HttpRouteRecoveryInput {
 
 fn persisted_http_route_recovery(
     storage_root: &std::path::Path,
-    runtime_info: &PersistedRuntimeInfo,
+    runtime_info: &PersistedServiceRuntimeInfo,
     project_id: &str,
     environment: &str,
+    service_count: usize,
+    service_id: Option<&str>,
 ) -> Result<Option<HttpRouteRecoveryInput>, ConvergenceError> {
     match &runtime_info.activation {
         Some(PersistedActivationMode::Http {
@@ -1115,9 +1219,9 @@ fn persisted_http_route_recovery(
             route_subtree_id: persisted_subtree_id,
             target_source,
         }) => Ok(Some(HttpRouteRecoveryInput {
-            subtree_id: persisted_subtree_id
-                .clone()
-                .unwrap_or_else(|| route_subtree_id(project_id, environment)),
+            subtree_id: persisted_subtree_id.clone().unwrap_or_else(|| {
+                route_subtree_id_for_service(project_id, environment, service_id, service_count)
+            }),
             internal_port: *internal_port,
             domain: load_environment_domain(storage_root, project_id, environment)?,
             probe_path: runtime_info.probe_path.clone(),
@@ -1129,16 +1233,21 @@ fn persisted_http_route_recovery(
 
 fn http_route_recovery_input(
     storage_root: &std::path::Path,
-    runtime_info: Option<&PersistedRuntimeInfo>,
+    runtime_info: Option<&PersistedServiceRuntimeInfo>,
     project_id: &str,
     environment: &str,
     internal_port: u16,
     probe_path: Option<String>,
 ) -> Result<HttpRouteRecoveryInput, ConvergenceError> {
     if let Some(runtime_info) = runtime_info {
-        if let Some(mut persisted) =
-            persisted_http_route_recovery(storage_root, runtime_info, project_id, environment)?
-        {
+        if let Some(mut persisted) = persisted_http_route_recovery(
+            storage_root,
+            runtime_info,
+            project_id,
+            environment,
+            1,
+            None,
+        )? {
             if persisted.probe_path.is_none() {
                 persisted.probe_path = probe_path;
             }
@@ -1146,7 +1255,7 @@ fn http_route_recovery_input(
         }
 
         return Ok(HttpRouteRecoveryInput {
-            subtree_id: route_subtree_id(project_id, environment),
+            subtree_id: route_subtree_id_for_service(project_id, environment, None, 1),
             internal_port,
             domain: load_environment_domain(storage_root, project_id, environment)?,
             probe_path: runtime_info.probe_path.clone().or(probe_path),
@@ -1155,7 +1264,7 @@ fn http_route_recovery_input(
     }
 
     Ok(HttpRouteRecoveryInput {
-        subtree_id: route_subtree_id(project_id, environment),
+        subtree_id: route_subtree_id_for_service(project_id, environment, None, 1),
         internal_port,
         domain: load_environment_domain(storage_root, project_id, environment)?,
         probe_path,
@@ -2946,23 +3055,20 @@ fn list_environments(
     Ok(environments)
 }
 
-fn ensure_generation_container_running<RtD: DockerRuntime>(
+fn ensure_generation_service_running<RtD: DockerRuntime>(
     storage_root: &std::path::Path,
     project_id: &str,
     environment: &str,
     generation: u64,
     deployment_id: &str,
-    image_ref: &str,
-    container_name: &str,
-    network_name: Option<String>,
-    environment_variables: &BTreeMap<String, PersistedSecretReference>,
+    runtime: &PersistedServiceRuntimeInfo,
     docker: &mut RtD,
 ) -> Result<ContainerInspection, ConvergenceError> {
-    match docker.inspect_container(container_name) {
+    match docker.inspect_container(&runtime.container_name) {
         Ok(inspection) if inspection.running => return Ok(inspection),
         Ok(_) => {
-            docker.start_container(container_name)?;
-            return Ok(docker.inspect_container(container_name)?);
+            docker.start_container(&runtime.container_name)?;
+            return Ok(docker.inspect_container(&runtime.container_name)?);
         }
         Err(_) => {}
     }
@@ -2979,17 +3085,18 @@ fn ensure_generation_container_running<RtD: DockerRuntime>(
         project_id,
         environment,
         generation,
-        environment_variables,
+        &runtime.environment_variables,
     )?;
     docker.create_container(CreateContainerRequest {
-        container_name: container_name.to_string(),
-        image_ref: image_ref.to_string(),
+        container_name: runtime.container_name.to_string(),
+        image_ref: runtime.image_ref.to_string(),
         labels,
         environment,
-        network_name,
+        network_name: runtime.network_name.clone(),
+        command: runtime.command.clone(),
     })?;
-    docker.start_container(container_name)?;
-    Ok(docker.inspect_container(container_name)?)
+    docker.start_container(&runtime.container_name)?;
+    Ok(docker.inspect_container(&runtime.container_name)?)
 }
 
 fn resolve_recovery_environment(
@@ -5517,5 +5624,162 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
         StartupConvergence::new(&root, &queue, &ResumeDecider(true))
             .recover_active_deployment(&mut docker, &mut routing)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+pub mod multi_service_convergence_and_gc {
+    use super::*;
+    use crate::storage::{
+        PersistedActivationMode, PersistedBuildInfo, PersistedRouteTargetSource,
+        PersistedRuntimeInfo, PersistedServiceRuntimeInfo, SnapshotWriter,
+    };
+    use std::collections::BTreeMap;
+
+    fn setup_multi_service_generation(root: &std::path::Path, generation: u64) {
+        let env = EnvironmentPaths::new(root, "api", "production");
+        SnapshotWriter::new(env.clone(), generation)
+            .unwrap()
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
+        let build = serde_json::to_string_pretty(&PersistedBuildInfo {
+            deployment_id: format!("dep-{generation}"),
+            image_ref: format!("forge/api:production-gen-{generation}"),
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
+            source_path: None,
+        })
+        .unwrap();
+        crate::storage::atomic_write(
+            env.generation_dir(generation).join("build.json"),
+            format!("{build}\n").as_bytes(),
+        )
+        .unwrap();
+        let services = BTreeMap::from([
+            (
+                "api".into(),
+                PersistedServiceRuntimeInfo {
+                    service_id: "api".into(),
+                    container_name: format!("prod-api-api-gen-{generation}"),
+                    image_ref: format!("forge/api:production-gen-{generation}"),
+                    running: true,
+                    network_name: Some("forge-test".into()),
+                    probe_path: Some("/health".into()),
+                    activation: Some(PersistedActivationMode::Http {
+                        internal_port: 3000,
+                        route_subtree_id: Some("forge:api:production:api".into()),
+                        target_source: PersistedRouteTargetSource::ContainerIp,
+                    }),
+                    command: None,
+                    depends_on: vec!["redis".into()],
+                    required_for_promotion: true,
+                    externally_exposed: true,
+                    environment_variables: BTreeMap::new(),
+                    source_ref: None,
+                    repo_url: None,
+                    commit_sha: None,
+                    source_path: None,
+                },
+            ),
+            (
+                "worker".into(),
+                PersistedServiceRuntimeInfo {
+                    service_id: "worker".into(),
+                    container_name: format!("prod-api-worker-gen-{generation}"),
+                    image_ref: format!("forge/api:production-gen-{generation}"),
+                    running: true,
+                    network_name: Some("forge-test".into()),
+                    probe_path: None,
+                    activation: Some(PersistedActivationMode::Direct),
+                    command: Some(vec!["sh".into(), "-lc".into(), "node worker.js".into()]),
+                    depends_on: vec!["api".into()],
+                    required_for_promotion: true,
+                    externally_exposed: false,
+                    environment_variables: BTreeMap::new(),
+                    source_ref: None,
+                    repo_url: None,
+                    commit_sha: None,
+                    source_path: None,
+                },
+            ),
+        ]);
+        let runtime = serde_json::to_string_pretty(&PersistedRuntimeInfo {
+            container_name: format!("prod-api-api-gen-{generation}"),
+            running: true,
+            network_name: Some("forge-test".into()),
+            probe_path: Some("/health".into()),
+            activation: Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                route_subtree_id: Some("forge:api:production:api".into()),
+                target_source: PersistedRouteTargetSource::ContainerIp,
+            }),
+            environment_variables: BTreeMap::new(),
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
+            source_path: None,
+            services,
+            startup_order: vec!["redis".into(), "api".into(), "worker".into()],
+        })
+        .unwrap();
+        crate::storage::atomic_write(
+            env.generation_dir(generation).join("runtime.json"),
+            format!("{runtime}\n").as_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn convergence_repairs_partial_service_drift() {
+        let root = test_root("multi-service-convergence-repairs-drift");
+        register_project(&root, "api", "example.com");
+        setup_multi_service_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-api-gen-1".into(), true);
+        docker.network_ips.insert(
+            "prod-api-api-gen-1".into(),
+            BTreeMap::from([("forge-test".into(), "172.18.0.12".into())]),
+        );
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        assert!(
+            docker
+                .create_calls
+                .iter()
+                .any(|call| call == "prod-api-worker-gen-1")
+        );
+    }
+
+    #[test]
+    fn gc_preserves_multi_service_rollback_generation() {
+        let root = test_root("multi-service-gc-preserves-rollback");
+        setup_multi_service_generation(&root, 1);
+        setup_multi_service_generation(&root, 2);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
+        assert!(report.actions.iter().any(|action| {
+            action.generation == Some(1)
+                && action.outcome == "protected"
+                && action
+                    .protected
+                    .iter()
+                    .any(|reason| reason == "rollback-safe generation")
+        }));
     }
 }

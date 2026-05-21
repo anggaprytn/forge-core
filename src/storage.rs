@@ -125,6 +125,50 @@ pub enum PersistedActivationMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedServiceState {
+    Queued,
+    Building,
+    Starting,
+    Warming,
+    Validating,
+    Healthy,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedServiceRuntimeInfo {
+    pub service_id: String,
+    pub container_name: String,
+    pub image_ref: String,
+    pub running: bool,
+    #[serde(default)]
+    pub network_name: Option<String>,
+    #[serde(default)]
+    pub probe_path: Option<String>,
+    #[serde(default)]
+    pub activation: Option<PersistedActivationMode>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub required_for_promotion: bool,
+    #[serde(default)]
+    pub externally_exposed: bool,
+    #[serde(default)]
+    pub environment_variables: BTreeMap<String, PersistedSecretReference>,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSecretReference {
     pub scope: String,
     pub key: String,
@@ -153,6 +197,10 @@ pub struct PersistedRuntimeInfo {
     pub commit_sha: Option<String>,
     #[serde(default)]
     pub source_path: Option<PathBuf>,
+    #[serde(default)]
+    pub services: BTreeMap<String, PersistedServiceRuntimeInfo>,
+    #[serde(default)]
+    pub startup_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

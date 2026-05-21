@@ -2786,6 +2786,8 @@ fn seed_project_status_runtime(root: &Path, generation: u64) {
         repo_url: None,
         commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
         source_path: None,
+        services: std::collections::BTreeMap::new(),
+        startup_order: Vec::new(),
     })
     .unwrap();
     writer

@@ -65,6 +65,7 @@ fn docker_integration_real_adapter_honors_runtime_invariants() {
             labels: labels.clone(),
             environment: Default::default(),
             network_name: None,
+            command: None,
         })
         .expect("generation-named container should be created");
 

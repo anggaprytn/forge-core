@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::events::{EventRecord, redact_text};
-use crate::forge_yaml::load_optional_forge_yaml;
+use crate::forge_yaml::{ForgeServiceConfig, ForgeYamlConfig, load_optional_forge_yaml};
 use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
 use crate::projects::ProjectRegistryStore;
@@ -27,10 +27,11 @@ use crate::storage::{
     EnvironmentPaths, EventStore, GenerationAllocator, GenerationHistoryRecord, LifecycleStore,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedPromotionSummary,
-    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedValidationSummary, PointerStore,
-    ProbeHistoryStore, RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
-    SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
-    load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
+    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
+    PersistedServiceState, PersistedValidationSummary, PointerStore, ProbeHistoryStore,
+    RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
+    SnapshotWriter, StorageError, current_unix_timestamp, load_generation_build_info,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 #[derive(Debug)]
@@ -162,6 +163,13 @@ struct WarmupObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceWarmupObservation {
+    service_id: String,
+    state: PersistedServiceState,
+    validation_summary: PersistedValidationSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteActivationContext {
     route_id: String,
     domain: Option<String>,
@@ -289,6 +297,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .unwrap_or_else(|| self.execution.context_path.clone());
         let forge_yaml = load_optional_forge_yaml(&source_root, &record.project_id)
             .map_err(|err| DeploymentError::InvalidInspection(err.to_string()))?;
+        if forge_yaml.as_ref().is_some_and(is_multi_service_config) {
+            return self.execute_multi_service_record(record, &source_root, forge_yaml.as_ref());
+        }
         let default_execution = ExecutionConfig {
             context_path: source_root.clone(),
             dockerfile_path: source_root.join("Dockerfile"),
@@ -492,6 +503,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             labels: labels.clone(),
             environment: runtime_env.container_env.clone(),
             network_name: execution.network_name.clone(),
+            command: None,
         }) {
             Ok(_) => {}
             Err(err) => {
@@ -695,6 +707,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             repo_url: record.repo_url.clone(),
             commit_sha: record.commit_sha.clone(),
             source_path: record.source_path.clone(),
+            services: BTreeMap::new(),
+            startup_order: Vec::new(),
         })
         .map_err(|err| {
             StorageError::Io(std::io::Error::new(
@@ -858,58 +872,74 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .ok_or(DeploymentError::RollbackUnavailable)?;
         let runtime = load_generation_runtime_info(&env, target)?
             .ok_or(DeploymentError::RollbackUnavailable)?;
-        let inspection = self.docker.inspect_container(&runtime.container_name)?;
-        if !inspection.running {
-            return Err(DeploymentError::RollbackUnavailable);
+        let service_runtime = runtime_services(&runtime);
+        let mut inspections = BTreeMap::new();
+        for (service_id, service) in &service_runtime {
+            let inspection = self
+                .docker
+                .inspect_container(&service.container_name)
+                .map_err(|_| DeploymentError::RollbackUnavailable)?;
+            if !inspection.running {
+                return Err(DeploymentError::RollbackUnavailable);
+            }
+            inspections.insert(service_id.clone(), inspection);
         }
 
-        if let Some(PersistedActivationMode::Http {
-            internal_port,
-            route_subtree_id: persisted_subtree_id,
-            target_source,
-        }) = runtime.activation.as_ref()
-        {
+        let domain =
+            load_environment_domain(&self.storage_root, &record.project_id, &record.environment)?;
+        for (service_id, service) in &service_runtime {
+            let Some(PersistedActivationMode::Http {
+                internal_port,
+                route_subtree_id: persisted_subtree_id,
+                target_source,
+            }) = service.activation.as_ref()
+            else {
+                continue;
+            };
+            if !service.externally_exposed {
+                continue;
+            }
+            let inspection = inspections
+                .get(service_id)
+                .expect("inspection collected for every rollback service");
             let upstream_target = resolve_route_target(
-                &inspection,
+                inspection,
                 *internal_port,
-                runtime.network_name.as_deref(),
+                service.network_name.as_deref(),
                 target_source,
             )
             .ok_or_else(|| {
-                DeploymentError::InvalidInspection(match runtime.network_name.as_deref() {
+                DeploymentError::InvalidInspection(match service.network_name.as_deref() {
                     Some(network_name) => {
                         format!("container missing IP on docker network {network_name}")
                     }
                     None => "container missing network IP".into(),
                 })
             })?;
-            let subtree_id = persisted_subtree_id
-                .clone()
-                .unwrap_or_else(|| route_subtree_id(record));
-            let domain = load_environment_domain(
-                &self.storage_root,
-                &record.project_id,
-                &record.environment,
-            )?;
+            let subtree_id = persisted_subtree_id.clone().unwrap_or_else(|| {
+                route_subtree_id_for_service(record, service_id, service_runtime.len())
+            });
             self.routing.update_route(RouteUpdateRequest {
                 subtree_id: subtree_id.clone(),
                 target: upstream_target.clone(),
                 domain: domain.clone(),
                 health_checks_enabled: false,
-                probe_path: runtime.probe_path.clone(),
+                probe_path: service.probe_path.clone(),
             })?;
             let route_inspection = self.routing.inspect_route(&subtree_id)?;
-            let context = RouteActivationContext {
-                route_id: subtree_id,
-                domain,
-                upstream_target,
-                verification_url: route_inspection.verification_url.clone(),
-                verification_host: route_inspection.verification_host.clone(),
-                verification_status_code: route_inspection.verification_status_code,
-                verification_response_body: route_inspection.verification_response_body.clone(),
-                network_name: runtime.network_name.clone(),
-            };
-            validate_route_activation(&route_inspection, &context)?;
+            validate_route_activation(
+                &route_inspection,
+                &RouteActivationContext {
+                    route_id: subtree_id,
+                    domain: domain.clone(),
+                    upstream_target,
+                    verification_url: route_inspection.verification_url.clone(),
+                    verification_host: route_inspection.verification_host.clone(),
+                    verification_status_code: route_inspection.verification_status_code,
+                    verification_response_body: route_inspection.verification_response_body.clone(),
+                    network_name: service.network_name.clone(),
+                },
+            )?;
         }
 
         persist_lifecycle_transition(
@@ -975,6 +1005,564 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             image_ref: build.image_ref,
             container_name: runtime.container_name,
         })
+    }
+
+    fn execute_multi_service_record(
+        &mut self,
+        record: &DeploymentRecord,
+        source_root: &Path,
+        forge_yaml: Option<&ForgeYamlConfig>,
+    ) -> Result<DeploymentExecution, DeploymentError> {
+        let config = forge_yaml.ok_or_else(|| {
+            DeploymentError::InvalidInspection("multi-service deployment requires forge.yml".into())
+        })?;
+        let mut execution = config.execution().clone();
+        execution.network_name = self.execution.network_name.clone();
+        let env =
+            EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
+        let generation = GenerationAllocator::new(env.clone()).allocate()?;
+        let events = EventStore::new(env.clone(), generation);
+        let diagnostics = DiagnosticsStore::new(env.clone(), generation);
+        let lifecycle_store = LifecycleStore::new(env.clone(), generation);
+        let labels = forge_labels(record, generation);
+        let writer = SnapshotWriter::new(env.clone(), generation)?;
+        let validation_timeout_ms = config
+            .validation_timeout_ms()
+            .unwrap_or(DEFAULT_VALIDATION_TIMEOUT_MS);
+        update_generation_history(&env, generation, |history| {
+            history.deployment_id = Some(record.deployment_id.clone());
+            history.commit_sha = record.commit_sha.clone();
+            history.source_ref = record.source_ref.clone();
+            history.source_path = record.source_path.clone();
+            history.created_at_unix = history.created_at_unix.or(Some(current_unix_timestamp()));
+        })?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Queued,
+            "deployment dequeued for multi-service execution",
+            None,
+            None,
+        )?;
+        let domain =
+            load_environment_domain(&self.storage_root, &record.project_id, &record.environment)?;
+        let runtime_secrets = self.resolve_runtime_secrets(source_root, record)?;
+        let runtime_env = build_runtime_env_artifacts(
+            &RuntimeEnvMetadata {
+                project_id: record.project_id.clone(),
+                environment: record.environment.clone(),
+                generation,
+                deployment_id: record.deployment_id.clone(),
+                source_ref: record.source_ref.clone(),
+                commit_sha: record.commit_sha.clone(),
+                domain: domain.clone(),
+            },
+            config.environment(),
+            &runtime_secrets,
+            &BTreeMap::new(),
+        )?;
+        let redacted_env_preview = runtime_env.redacted_preview.clone();
+        let secret_values = runtime_env.redaction_values.clone();
+        append_event(&events, record, generation, "DEPLOYMENT_STARTED", None)?;
+        diagnostics.append_log_line(
+            &format!(
+                "multi-service deployment started for {}",
+                record.deployment_id
+            ),
+            &secret_values,
+        )?;
+
+        let requires_shared_build = config
+            .services()
+            .values()
+            .any(|service| service.image.is_none());
+        let shared_image_ref = if requires_shared_build {
+            persist_lifecycle_transition(
+                &lifecycle_store,
+                &record.project_id,
+                &record.environment,
+                generation,
+                DeploymentLifecycleState::Building,
+                "shared application image build started",
+                None,
+                None,
+            )?;
+            let image_tag = format!(
+                "forge/{}:{}-gen-{}",
+                record.project_id, record.environment, generation
+            );
+            let image_ref = self.docker.build_image(BuildImageRequest {
+                image_tag: image_tag.clone(),
+                context_path: execution.context_path.clone(),
+                dockerfile_path: execution.dockerfile_path.clone(),
+                labels: labels.clone(),
+            })?;
+            diagnostics
+                .append_log_line(&format!("shared image built: {image_ref}"), &secret_values)?;
+            update_generation_history(&env, generation, |history| {
+                history.image_ref = Some(image_ref.clone());
+            })?;
+            Some(image_ref)
+        } else {
+            None
+        };
+
+        if let Some(network_name) = execution.network_name.as_deref() {
+            self.docker.ensure_network(network_name)?;
+            diagnostics.append_log_line(
+                &format!("docker network ready: {network_name}"),
+                &secret_values,
+            )?;
+        }
+
+        let mut service_runtime = BTreeMap::new();
+        let mut warmed_services = Vec::new();
+        let mut route_ids = Vec::new();
+        for service_id in config.startup_order() {
+            let service = config
+                .services()
+                .get(service_id)
+                .expect("startup order references known service");
+            diagnostics.append_log_line(
+                &format!(
+                    "service `{service_id}` starting after dependencies: {}",
+                    if service.depends_on.is_empty() {
+                        "none".into()
+                    } else {
+                        service.depends_on.join(", ")
+                    }
+                ),
+                &secret_values,
+            )?;
+            let container_name = generation_service_container_name(
+                record,
+                generation,
+                service_id,
+                config.services().len(),
+            );
+            let image_ref = service
+                .image
+                .clone()
+                .or_else(|| shared_image_ref.clone())
+                .ok_or_else(|| {
+                    DeploymentError::InvalidInspection(format!(
+                        "service `{service_id}` has no runtime image and no shared build image"
+                    ))
+                })?;
+            let mut service_labels = labels.clone();
+            service_labels.insert("forge.service_id".into(), service_id.clone());
+            service_labels.insert(
+                "forge.route_id".into(),
+                route_subtree_id_for_service(record, service_id, config.services().len()),
+            );
+            self.docker.create_container(CreateContainerRequest {
+                container_name: container_name.clone(),
+                image_ref: image_ref.clone(),
+                labels: service_labels,
+                environment: runtime_env.container_env.clone(),
+                network_name: execution.network_name.clone(),
+                command: service_command(service),
+            })?;
+            self.docker.start_container(&container_name)?;
+            let inspection = self.docker.inspect_container(&container_name)?;
+            validate_inspection(&inspection, &container_name)?;
+            let warmup = self.validate_service_candidate(
+                service_id,
+                service,
+                validation_timeout_ms,
+                &env,
+                generation,
+                &container_name,
+                &events,
+                record,
+                &diagnostics,
+                &redacted_env_preview,
+                &secret_values,
+            )?;
+            warmed_services.push(warmup);
+            if service.externally_exposed {
+                route_ids.push(route_subtree_id_for_service(
+                    record,
+                    service_id,
+                    config.services().len(),
+                ));
+            }
+            service_runtime.insert(
+                service_id.clone(),
+                PersistedServiceRuntimeInfo {
+                    service_id: service_id.clone(),
+                    container_name: inspection.container_name.clone(),
+                    image_ref,
+                    running: inspection.running,
+                    network_name: execution.network_name.clone(),
+                    probe_path: service.validation.http_health_path.clone(),
+                    activation: Some(match service.validation.activation {
+                        ActivationMode::Direct => PersistedActivationMode::Direct,
+                        ActivationMode::Http { internal_port } => PersistedActivationMode::Http {
+                            internal_port,
+                            route_subtree_id: Some(route_subtree_id_for_service(
+                                record,
+                                service_id,
+                                config.services().len(),
+                            )),
+                            target_source: PersistedRouteTargetSource::ContainerIp,
+                        },
+                    }),
+                    command: service_command(service),
+                    depends_on: service.depends_on.clone(),
+                    required_for_promotion: service.required_for_promotion,
+                    externally_exposed: service.externally_exposed,
+                    environment_variables: runtime_env
+                        .snapshot
+                        .entries
+                        .iter()
+                        .filter_map(|(key, entry)| {
+                            entry
+                                .secret_reference
+                                .clone()
+                                .map(|reference| (key.clone(), reference))
+                        })
+                        .collect(),
+                    source_ref: record.source_ref.clone(),
+                    repo_url: record.repo_url.clone(),
+                    commit_sha: record.commit_sha.clone(),
+                    source_path: record.source_path.clone(),
+                },
+            );
+        }
+
+        let primary_service = select_primary_service(config, &service_runtime)?;
+        let primary_runtime = service_runtime
+            .get(&primary_service)
+            .expect("primary service exists");
+        let build_json = serde_json::to_string_pretty(&PersistedBuildInfo {
+            deployment_id: record.deployment_id.clone(),
+            image_ref: shared_image_ref
+                .clone()
+                .or_else(|| Some(primary_runtime.image_ref.clone()))
+                .unwrap_or_default(),
+            source_ref: record.source_ref.clone(),
+            repo_url: record.repo_url.clone(),
+            commit_sha: record.commit_sha.clone(),
+            source_path: record.source_path.clone(),
+        })
+        .map_err(json_storage_error)?;
+        writer.write_artifact("build.json", &format!("{build_json}\n"))?;
+        let runtime_json = serde_json::to_string_pretty(&PersistedRuntimeInfo {
+            container_name: primary_runtime.container_name.clone(),
+            running: primary_runtime.running,
+            network_name: primary_runtime.network_name.clone(),
+            probe_path: primary_runtime.probe_path.clone(),
+            activation: primary_runtime.activation.clone(),
+            environment_variables: primary_runtime.environment_variables.clone(),
+            source_ref: record.source_ref.clone(),
+            repo_url: record.repo_url.clone(),
+            commit_sha: record.commit_sha.clone(),
+            source_path: record.source_path.clone(),
+            services: service_runtime.clone(),
+            startup_order: config.startup_order().to_vec(),
+        })
+        .map_err(json_storage_error)?;
+        writer.write_artifact("runtime.json", &format!("{runtime_json}\n"))?;
+        let runtime_env_snapshot =
+            serde_json::to_string_pretty(&runtime_env.snapshot).map_err(json_storage_error)?;
+        writer.write_artifact(
+            "runtime_env_snapshot.json",
+            &format!("{runtime_env_snapshot}\n"),
+        )?;
+        let resolved_runtime =
+            serde_json::to_string_pretty(&runtime_env.resolved).map_err(json_storage_error)?;
+        writer.write_artifact("resolved_runtime.json", &format!("{resolved_runtime}\n"))?;
+        writer.finalize(
+            &record.project_id,
+            &record.environment,
+            SnapshotState::Healthy,
+        )?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Validating,
+            "all required services healthy; route activation starting",
+            None,
+            Some(PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                ..PersistedPromotionSummary::default()
+            }),
+        )?;
+
+        for (service_id, runtime) in &service_runtime {
+            if !runtime.externally_exposed {
+                continue;
+            }
+            let inspection = self.docker.inspect_container(&runtime.container_name)?;
+            let PersistedActivationMode::Http {
+                internal_port,
+                route_subtree_id,
+                target_source,
+            } = runtime.activation.clone().ok_or_else(|| {
+                DeploymentError::InvalidInspection(format!(
+                    "service `{service_id}` missing activation metadata"
+                ))
+            })?
+            else {
+                continue;
+            };
+            let target = resolve_route_target(
+                &inspection,
+                internal_port,
+                execution.network_name.as_deref(),
+                &target_source,
+            )
+            .ok_or_else(|| {
+                DeploymentError::InvalidInspection(format!(
+                    "service `{service_id}` missing network IP for route activation"
+                ))
+            })?;
+            let subtree_id = route_subtree_id.unwrap_or_else(|| {
+                route_subtree_id_for_service(record, service_id, config.services().len())
+            });
+            self.routing.update_route(RouteUpdateRequest {
+                subtree_id: subtree_id.clone(),
+                target: target.clone(),
+                domain: domain.clone(),
+                health_checks_enabled: false,
+                probe_path: runtime.probe_path.clone(),
+            })?;
+            let route_inspection = self.routing.inspect_route(&subtree_id)?;
+            validate_route_activation(
+                &route_inspection,
+                &RouteActivationContext {
+                    route_id: subtree_id,
+                    domain: domain.clone(),
+                    upstream_target: target,
+                    verification_url: route_inspection.verification_url.clone(),
+                    verification_host: route_inspection.verification_host.clone(),
+                    verification_status_code: route_inspection.verification_status_code,
+                    verification_response_body: route_inspection.verification_response_body.clone(),
+                    network_name: execution.network_name.clone(),
+                },
+            )?;
+        }
+
+        let referenced_secret_keys = runtime_env
+            .snapshot
+            .entries
+            .values()
+            .filter_map(|entry| {
+                entry.secret_reference.as_ref().and_then(|reference| {
+                    (reference.scope == "environment").then(|| reference.key.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        SecretStore::new(self.storage_root.join("secrets"))?.record_generation_references(
+            &record.project_id,
+            &record.environment,
+            generation,
+            &referenced_secret_keys,
+        )?;
+        PointerStore::new(env.clone()).swap_current(generation)?;
+        RuntimeStateStore::new(env.clone()).save(&RuntimeState {
+            active_generation: Some(generation),
+            health_state: RuntimeHealthState::Healthy,
+            failed_probe_count: 0,
+            successful_probe_count: 0,
+            restart_attempted: false,
+            degraded_since_unix: None,
+            last_transition: "promotion_completed".into(),
+            last_error_code: None,
+        })?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Promoted,
+            "multi-service generation promoted",
+            None,
+            Some(PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(current_unix_timestamp()),
+                gate_reason: None,
+            }),
+        )?;
+        diagnostics.append_log_line(
+            &format!("startup order: {}", config.startup_order().join(" -> ")),
+            &secret_values,
+        )?;
+        for runtime in service_runtime.values() {
+            self.capture_container_logs_tail(
+                &diagnostics,
+                &runtime.container_name,
+                &secret_values,
+            )?;
+        }
+        update_generation_history(&env, generation, |history| {
+            history.promoted_at_unix = Some(current_unix_timestamp());
+            history.finalized_state = Some("healthy".into());
+            history.finalized_at_unix = Some(current_unix_timestamp());
+        })?;
+        append_event(&events, record, generation, "GENERATION_PROMOTED", None)?;
+
+        Ok(DeploymentExecution {
+            deployment_id: record.deployment_id.clone(),
+            generation,
+            image_ref: primary_runtime.image_ref.clone(),
+            container_name: primary_runtime.container_name.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_service_candidate(
+        &mut self,
+        service_id: &str,
+        service: &ForgeServiceConfig,
+        validation_timeout_ms: u64,
+        env: &EnvironmentPaths,
+        generation: u64,
+        container_name: &str,
+        events: &EventStore,
+        record: &DeploymentRecord,
+        diagnostics: &DiagnosticsStore,
+        redacted_env_preview: &[String],
+        secret_values: &[String],
+    ) -> Result<ServiceWarmupObservation, DeploymentError> {
+        let internal_port = match service.validation.activation {
+            ActivationMode::Http { internal_port } => Some(internal_port),
+            ActivationMode::Direct => None,
+        };
+        if !service.validation.tcp_required && service.validation.http_health_path.is_none() {
+            diagnostics.append_log_line(
+                &format!("service `{service_id}` marked healthy without active probes"),
+                secret_values,
+            )?;
+            return Ok(ServiceWarmupObservation {
+                service_id: service_id.to_string(),
+                state: PersistedServiceState::Healthy,
+                validation_summary: PersistedValidationSummary {
+                    validation_succeeded: true,
+                    ..PersistedValidationSummary::default()
+                },
+            });
+        }
+
+        let inspection = self.docker.inspect_container(container_name)?;
+        let probe_host =
+            resolve_selected_network_host(&inspection, self.execution.network_name.as_deref())?;
+        let started = Instant::now();
+        let required_passes = service.validation.required_consecutive_probe_passes.max(1);
+        let mut tcp_passes = 0u32;
+        let mut http_passes = if service.validation.http_health_path.is_some() {
+            0
+        } else {
+            required_passes
+        };
+        let mut last_error = None;
+        let budget = Duration::from_millis(validation_timeout_ms);
+        loop {
+            let tcp_ok = if let Some(port) = internal_port {
+                let probe_started = Instant::now();
+                let ok = self.probes.probe_tcp(&probe_host, port).unwrap_or(false);
+                append_probe_history_entry(
+                    env,
+                    generation,
+                    PersistedProbeType::Tcp,
+                    ok,
+                    probe_started.elapsed().as_millis() as u64,
+                    (!ok).then(|| format!("service `{service_id}` tcp probe failed")),
+                )?;
+                ok
+            } else {
+                true
+            };
+            if tcp_ok {
+                tcp_passes += 1;
+                if let (Some(port), Some(path)) = (
+                    internal_port,
+                    service.validation.http_health_path.as_deref(),
+                ) {
+                    let probe_started = Instant::now();
+                    let ok = self
+                        .probes
+                        .probe_http(&probe_host, port, path)
+                        .unwrap_or(false);
+                    append_probe_history_entry(
+                        env,
+                        generation,
+                        PersistedProbeType::Http,
+                        ok,
+                        probe_started.elapsed().as_millis() as u64,
+                        (!ok).then(|| format!("service `{service_id}` http health probe failed")),
+                    )?;
+                    if ok {
+                        http_passes += 1;
+                    } else {
+                        http_passes = 0;
+                        last_error =
+                            Some(format!("service `{service_id}` http health probe failed"));
+                    }
+                }
+            } else {
+                tcp_passes = 0;
+                http_passes = 0;
+                last_error = Some(format!("service `{service_id}` tcp probe failed"));
+            }
+
+            if tcp_passes >= required_passes && http_passes >= required_passes {
+                append_event(events, record, generation, "VALIDATION_PASSED", None)?;
+                diagnostics
+                    .append_log_line(&format!("service `{service_id}` healthy"), secret_values)?;
+                return Ok(ServiceWarmupObservation {
+                    service_id: service_id.to_string(),
+                    state: PersistedServiceState::Healthy,
+                    validation_summary: PersistedValidationSummary {
+                        tcp_consecutive_passes: tcp_passes,
+                        http_consecutive_passes: http_passes,
+                        required_consecutive_passes: required_passes,
+                        observed_uptime_seconds: started.elapsed().as_secs(),
+                        validation_succeeded: true,
+                        ..PersistedValidationSummary::default()
+                    },
+                });
+            }
+
+            if started.elapsed() >= budget {
+                let failure_reason = last_error.unwrap_or_else(|| {
+                    format!("service `{service_id}` did not become healthy before timeout")
+                });
+                let probe_target = internal_port.map(|port| ProbeTargetContext {
+                    host: probe_host.clone(),
+                    port,
+                    path: service.validation.http_health_path.clone(),
+                });
+                self.record_failed_attempt(
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    "warming",
+                    &failure_reason,
+                    probe_target.as_ref(),
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(DeploymentError::ValidationFailed(
+                    "required service failed health gating",
+                ));
+            }
+
+            thread::sleep(Duration::from_millis(WARMUP_LOOP_INTERVAL_MS));
+        }
     }
 
     fn validate_candidate(
@@ -2329,6 +2917,24 @@ fn generation_container_name(record: &DeploymentRecord, generation: u64) -> Stri
     format!("{env}-{}-gen-{generation}", record.project_id)
 }
 
+fn generation_service_container_name(
+    record: &DeploymentRecord,
+    generation: u64,
+    service_id: &str,
+    service_count: usize,
+) -> String {
+    if service_count <= 1 && service_id == record.project_id {
+        return generation_container_name(record, generation);
+    }
+    let env = match record.environment.as_str() {
+        "production" => "prod",
+        "staging" => "staging",
+        "development" => "dev",
+        other => other,
+    };
+    format!("{env}-{}-{service_id}-gen-{generation}", record.project_id)
+}
+
 fn format_probe_target_log(target: &ProbeTargetContext) -> String {
     match &target.path {
         Some(path) => format!(
@@ -2391,6 +2997,87 @@ fn container_exited_failure_reason(probe_name: &str, inspection: &ContainerInspe
 
 fn route_subtree_id(record: &DeploymentRecord) -> String {
     format!("forge:{}:{}", record.project_id, record.environment)
+}
+
+fn route_subtree_id_for_service(
+    record: &DeploymentRecord,
+    service_id: &str,
+    service_count: usize,
+) -> String {
+    if service_count <= 1 {
+        return route_subtree_id(record);
+    }
+    format!(
+        "forge:{}:{}:{service_id}",
+        record.project_id, record.environment
+    )
+}
+
+fn service_command(service: &ForgeServiceConfig) -> Option<Vec<String>> {
+    service
+        .command
+        .as_ref()
+        .map(|command| vec!["sh".into(), "-lc".into(), command.clone()])
+}
+
+fn select_primary_service(
+    config: &ForgeYamlConfig,
+    runtime: &BTreeMap<String, PersistedServiceRuntimeInfo>,
+) -> Result<String, DeploymentError> {
+    config
+        .startup_order()
+        .iter()
+        .find(|service_id| {
+            runtime
+                .get(*service_id)
+                .is_some_and(|service| service.externally_exposed)
+        })
+        .cloned()
+        .or_else(|| config.startup_order().first().cloned())
+        .ok_or_else(|| DeploymentError::InvalidInspection("service topology is empty".into()))
+}
+
+fn is_multi_service_config(config: &ForgeYamlConfig) -> bool {
+    config.services().len() > 1
+}
+
+fn runtime_services(
+    runtime: &PersistedRuntimeInfo,
+) -> BTreeMap<String, PersistedServiceRuntimeInfo> {
+    if !runtime.services.is_empty() {
+        return runtime.services.clone();
+    }
+    BTreeMap::from([(
+        "default".into(),
+        PersistedServiceRuntimeInfo {
+            service_id: "default".into(),
+            container_name: runtime.container_name.clone(),
+            image_ref: String::new(),
+            running: runtime.running,
+            network_name: runtime.network_name.clone(),
+            probe_path: runtime.probe_path.clone(),
+            activation: runtime.activation.clone(),
+            command: None,
+            depends_on: Vec::new(),
+            required_for_promotion: true,
+            externally_exposed: matches!(
+                runtime.activation,
+                Some(PersistedActivationMode::Http { .. })
+            ),
+            environment_variables: runtime.environment_variables.clone(),
+            source_ref: runtime.source_ref.clone(),
+            repo_url: runtime.repo_url.clone(),
+            commit_sha: runtime.commit_sha.clone(),
+            source_path: runtime.source_path.clone(),
+        },
+    )])
+}
+
+fn json_storage_error(err: serde_json::Error) -> DeploymentError {
+    DeploymentError::Storage(StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        err.to_string(),
+    )))
 }
 
 fn load_environment_domain(
@@ -3767,6 +4454,8 @@ pub mod git_backed_rollback_status_correctness {
                     .join(project_id)
                     .join(commit_sha),
             ),
+            services: BTreeMap::new(),
+            startup_order: Vec::new(),
         })
         .unwrap();
         writer
@@ -6478,7 +7167,8 @@ pub mod deploy_rejects_missing_required_fields {
         .execute_next();
 
         assert!(
-            matches!(result, Err(DeploymentError::InvalidInspection(message)) if message.contains("missing field `port`"))
+            matches!(result, Err(DeploymentError::InvalidInspection(message)) if
+                message.contains("runtime.port") || message.contains("missing field `port`"))
         );
     }
 }
@@ -7353,5 +8043,406 @@ pub mod forge_owns_only_dedicated_route_subtree {
         .unwrap();
 
         assert_eq!(routing.updates[0].subtree_id, "forge:api:production");
+    }
+}
+
+#[cfg(test)]
+pub mod multi_service_orchestration {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    #[derive(Default)]
+    struct MultiServiceDockerRuntime {
+        containers: BTreeMap<String, bool>,
+        created: Vec<String>,
+        started: Vec<String>,
+    }
+
+    impl DockerRuntime for MultiServiceDockerRuntime {
+        fn build_image(
+            &mut self,
+            request: BuildImageRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            Ok(request.image_tag)
+        }
+
+        fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn create_container(
+            &mut self,
+            request: CreateContainerRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            self.created.push(request.container_name.clone());
+            self.containers
+                .insert(request.container_name.clone(), false);
+            Ok(request.container_name)
+        }
+
+        fn start_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
+            self.started.push(container_name.into());
+            self.containers.insert(container_name.into(), true);
+            Ok(())
+        }
+
+        fn inspect_container(
+            &mut self,
+            container_name: &str,
+        ) -> Result<ContainerInspection, DockerRuntimeError> {
+            let running = *self
+                .containers
+                .get(container_name)
+                .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing container".into()))?;
+            let service = container_name
+                .split("-gen-")
+                .next()
+                .and_then(|value| value.rsplit_once('-').map(|(_, service)| service))
+                .unwrap_or("api");
+            let ip = match service {
+                "redis" => "172.18.0.11",
+                "api" => "172.18.0.12",
+                "worker" => "172.18.0.13",
+                _ => "172.18.0.14",
+            };
+            Ok(ContainerInspection {
+                container_name: container_name.into(),
+                running,
+                state_status: if running {
+                    "running".into()
+                } else {
+                    "created".into()
+                },
+                exit_code: Some(0),
+                restart_count: 0,
+                started_at: Some("2026-05-22T00:00:00Z".into()),
+                image_ref: "forge/api:production-gen-1".into(),
+                labels: BTreeMap::new(),
+                network_ips: BTreeMap::from([(FORGE_MANAGED_DOCKER_NETWORK.into(), ip.into())]),
+                restart_policy: "no".into(),
+            })
+        }
+
+        fn container_logs(
+            &mut self,
+            _container_name: &str,
+            _tail_lines: usize,
+        ) -> Result<String, DockerRuntimeError> {
+            Ok(String::new())
+        }
+
+        fn list_managed_containers(
+            &mut self,
+        ) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_images(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedImage>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct HostProbeRuntime {
+        unhealthy_hosts: Vec<String>,
+    }
+
+    impl ProbeRuntime for HostProbeRuntime {
+        fn probe_tcp(&mut self, host: &str, _internal_port: u16) -> Result<bool, ProbeError> {
+            Ok(!self.unhealthy_hosts.iter().any(|value| value == host))
+        }
+
+        fn probe_http(
+            &mut self,
+            host: &str,
+            _internal_port: u16,
+            _path: &str,
+        ) -> Result<bool, ProbeError> {
+            Ok(!self.unhealthy_hosts.iter().any(|value| value == host))
+        }
+    }
+
+    fn write_multi_service_forge_yaml(root: &std::path::Path, worker_port: Option<u16>) {
+        let worker_runtime = worker_port.map_or_else(
+            || "    runtime:\n      command: node worker.js\n".to_string(),
+            |port| format!("    runtime:\n      command: node worker.js\n      port: {port}\n"),
+        );
+        fs::write(
+            root.join("forge.yml"),
+            format!(
+                "{}{}",
+                concat!(
+                    "version: 1\n",
+                    "name: api\n",
+                    "type: web\n",
+                    "build:\n",
+                    "  dockerfile: Dockerfile\n",
+                    "  context: .\n",
+                    "services:\n",
+                    "  redis:\n",
+                    "    runtime:\n",
+                    "      image: redis:7\n",
+                    "  api:\n",
+                    "    runtime:\n",
+                    "      port: 3000\n",
+                    "      depends_on:\n",
+                    "        - redis\n",
+                    "  worker:\n",
+                ),
+                format!(
+                    "{}{}",
+                    worker_runtime,
+                    concat!("      depends_on:\n", "        - api\n",)
+                )
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn multi_service_generation_promotes_only_when_all_required_services_healthy() {
+        let root = test_root("multi-service-promote-gated");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, Some(3100));
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime {
+            unhealthy_hosts: vec!["172.18.0.13".into()],
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next();
+
+        assert!(matches!(
+            result,
+            Err(DeploymentError::ValidationFailed(
+                "required service failed health gating"
+            ))
+        ));
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_dependency_ordering_respected() {
+        let root = test_root("multi-service-startup-order");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(
+            docker.started,
+            vec![
+                "prod-api-redis-gen-1".to_string(),
+                "prod-api-api-gen-1".to_string(),
+                "prod-api-worker-gen-1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn route_activation_skips_internal_services() {
+        let root = test_root("multi-service-route-skip-internal");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(routing.updates.len(), 1);
+        assert_eq!(routing.updates[0].subtree_id, "forge:api:production:api");
+    }
+
+    #[test]
+    fn rollback_restores_multi_service_topology() {
+        let root = test_root("multi-service-rollback-topology");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+            ],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            Some(1)
+        );
+        assert!(docker.containers.contains_key("prod-api-worker-gen-1"));
+        assert!(docker.containers.contains_key("prod-api-redis-gen-1"));
     }
 }

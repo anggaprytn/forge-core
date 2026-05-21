@@ -36,6 +36,8 @@ pub struct ForgeYamlConfig {
     validation: ValidationPolicy,
     validation_timeout_ms: Option<u64>,
     environment: BTreeMap<String, String>,
+    services: BTreeMap<String, ForgeServiceConfig>,
+    startup_order: Vec<String>,
 }
 
 impl ForgeYamlConfig {
@@ -54,37 +56,72 @@ impl ForgeYamlConfig {
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
+
+    pub fn services(&self) -> &BTreeMap<String, ForgeServiceConfig> {
+        &self.services
+    }
+
+    pub fn startup_order(&self) -> &[String] {
+        &self.startup_order
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeServiceConfig {
+    pub service_id: String,
+    pub image: Option<String>,
+    pub command: Option<String>,
+    pub depends_on: Vec<String>,
+    pub validation: ValidationPolicy,
+    pub required_for_promotion: bool,
+    pub externally_exposed: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawForgeYaml {
-    version: u64,
-    name: String,
+    #[serde(default)]
+    version: Option<u64>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(rename = "type")]
-    app_type: String,
+    #[serde(default)]
+    app_type: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
-    build: RawBuildConfig,
-    runtime: RawRuntimeConfig,
+    #[serde(default)]
+    build: Option<RawBuildConfig>,
+    #[serde(default)]
+    runtime: Option<RawRuntimeConfig>,
+    #[serde(default)]
     invariants: Vec<RawInvariant>,
+    #[serde(default)]
+    services: BTreeMap<String, RawServiceConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBuildConfig {
     dockerfile: PathBuf,
     context: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawRuntimeConfig {
-    port: u16,
-    healthcheck: RawHealthcheckConfig,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    healthcheck: Option<RawHealthcheckConfig>,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHealthcheckConfig {
     path: String,
@@ -99,6 +136,12 @@ struct RawInvariant {
     expect_status: u16,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServiceConfig {
+    runtime: RawRuntimeConfig,
 }
 
 pub fn load_optional_forge_yaml(
@@ -122,96 +165,303 @@ impl RawForgeYaml {
         root: &Path,
         expected_project_id: &str,
     ) -> Result<ForgeYamlConfig, ForgeYamlError> {
-        if self.version != 1 {
+        if self.services.is_empty() {
+            return self.validate_legacy(root, expected_project_id);
+        }
+        self.validate_multi_service(root, expected_project_id)
+    }
+
+    fn validate_legacy(
+        self,
+        root: &Path,
+        expected_project_id: &str,
+    ) -> Result<ForgeYamlConfig, ForgeYamlError> {
+        let version = self
+            .version
+            .ok_or_else(|| ForgeYamlError::Invalid("forge.yml version must equal 1".into()))?;
+        if version != 1 {
             return Err(ForgeYamlError::Invalid(
                 "forge.yml version must equal 1".into(),
             ));
         }
-        if self.name != expected_project_id {
+        let name = self
+            .name
+            .ok_or_else(|| ForgeYamlError::Invalid("forge.yml name is required".into()))?;
+        if name != expected_project_id {
             return Err(ForgeYamlError::Invalid(format!(
-                "forge.yml name `{}` does not match deployment project `{expected_project_id}`",
-                self.name
+                "forge.yml name `{name}` does not match deployment project `{expected_project_id}`"
             )));
         }
-        if self.app_type != "web" {
+        let app_type = self
+            .app_type
+            .ok_or_else(|| ForgeYamlError::Invalid("forge.yml type is required".into()))?;
+        if app_type != "web" {
             return Err(ForgeYamlError::Invalid(format!(
-                "unsupported forge.yml app type `{}`; only `web` is supported",
-                self.app_type
+                "unsupported forge.yml app type `{app_type}`; only `web` is supported"
             )));
         }
-        if self.build.context.as_os_str().is_empty() {
-            return Err(ForgeYamlError::Invalid(
-                "forge.yml build.context is required".into(),
-            ));
-        }
-        if self.build.context.is_absolute() {
-            return Err(ForgeYamlError::Invalid(
-                "forge.yml build.context must be relative to the project root".into(),
-            ));
-        }
-        if self.build.dockerfile.as_os_str().is_empty() {
-            return Err(ForgeYamlError::Invalid(
-                "forge.yml build.dockerfile is required".into(),
-            ));
-        }
-        if self.build.dockerfile.is_absolute() {
-            return Err(ForgeYamlError::Invalid(
-                "forge.yml build.dockerfile must be relative to the project root".into(),
-            ));
-        }
-        if self.runtime.port == 0 {
+        let build = self
+            .build
+            .ok_or_else(|| ForgeYamlError::Invalid("forge.yml build is required".into()))?;
+        validate_build(&build)?;
+        let runtime = self
+            .runtime
+            .ok_or_else(|| ForgeYamlError::Invalid("forge.yml runtime is required".into()))?;
+        let port = runtime.port.ok_or_else(|| {
+            ForgeYamlError::Invalid("forge.yml runtime.port must be a valid TCP port".into())
+        })?;
+        if port == 0 {
             return Err(ForgeYamlError::Invalid(
                 "forge.yml runtime.port must be a valid TCP port".into(),
             ));
         }
-        if !self.runtime.healthcheck.path.starts_with('/') {
-            return Err(ForgeYamlError::Invalid(
-                "forge.yml runtime.healthcheck.path must start with `/`".into(),
-            ));
-        }
-        if self.runtime.healthcheck.expected_status != 200 {
-            return Err(ForgeYamlError::Invalid(
-                "forge.yml runtime.healthcheck.expected_status must equal 200".into(),
-            ));
-        }
+        let healthcheck = runtime.healthcheck.clone().ok_or_else(|| {
+            ForgeYamlError::Invalid("forge.yml runtime.healthcheck is required".into())
+        })?;
+        validate_healthcheck(&healthcheck)?;
         if self.invariants.len() != 1 {
             return Err(ForgeYamlError::Invalid(
                 "forge.yml invariants must contain exactly one entry in v1".into(),
             ));
         }
-
         let invariant = &self.invariants[0];
         if invariant.name.trim().is_empty() {
             return Err(ForgeYamlError::Invalid(
                 "forge.yml invariants[0].name is required".into(),
             ));
         }
-        if invariant.path != self.runtime.healthcheck.path
-            || invariant.expect_status != self.runtime.healthcheck.expected_status
+        if invariant.path != healthcheck.path
+            || invariant.expect_status != healthcheck.expected_status
         {
             return Err(ForgeYamlError::Invalid(
                 "forge.yml invariants[0] must match runtime.healthcheck".into(),
             ));
         }
 
+        let validation = validation_for_runtime(&runtime, Some(healthcheck.path.clone()))?;
+        let service_id = expected_project_id.to_string();
+        let service = ForgeServiceConfig {
+            service_id: service_id.clone(),
+            image: None,
+            command: runtime.command.clone(),
+            depends_on: Vec::new(),
+            validation: validation.clone(),
+            required_for_promotion: true,
+            externally_exposed: matches!(validation.activation, ActivationMode::Http { .. }),
+        };
+
         Ok(ForgeYamlConfig {
             execution: ExecutionConfig {
-                context_path: root.join(self.build.context),
-                dockerfile_path: root.join(self.build.dockerfile),
+                context_path: root.join(build.context),
+                dockerfile_path: root.join(build.dockerfile),
                 network_name: None,
             },
-            validation: ValidationPolicy {
-                tcp_required: true,
-                http_health_path: Some(self.runtime.healthcheck.path),
-                activation: ActivationMode::Http {
-                    internal_port: self.runtime.port,
-                },
-                ..ValidationPolicy::default()
-            },
+            validation,
             validation_timeout_ms: invariant.timeout_ms,
             environment: self.env,
+            services: BTreeMap::from([(service_id.clone(), service)]),
+            startup_order: vec![service_id],
         })
     }
+
+    fn validate_multi_service(
+        self,
+        root: &Path,
+        expected_project_id: &str,
+    ) -> Result<ForgeYamlConfig, ForgeYamlError> {
+        if let Some(name) = self.name.as_deref() {
+            if name != expected_project_id {
+                return Err(ForgeYamlError::Invalid(format!(
+                    "forge.yml name `{name}` does not match deployment project `{expected_project_id}`"
+                )));
+            }
+        }
+        if let Some(version) = self.version {
+            if version != 1 {
+                return Err(ForgeYamlError::Invalid(
+                    "forge.yml version must equal 1".into(),
+                ));
+            }
+        }
+        if let Some(app_type) = self.app_type.as_deref() {
+            if app_type != "web" {
+                return Err(ForgeYamlError::Invalid(format!(
+                    "unsupported forge.yml app type `{app_type}`; only `web` is supported"
+                )));
+            }
+        }
+
+        let build = self.build.clone();
+        if let Some(build) = build.as_ref() {
+            validate_build(build)?;
+        }
+        if build.is_none()
+            && self
+                .services
+                .values()
+                .any(|service| service.runtime.image.is_none())
+        {
+            return Err(ForgeYamlError::Invalid(
+                "forge.yml build is required when a service does not declare runtime.image".into(),
+            ));
+        }
+
+        let startup_order = topological_service_order(&self.services)?;
+        let mut services = BTreeMap::new();
+        for service_id in &startup_order {
+            let raw = self.services.get(service_id).expect("topology validated");
+            let validation = validation_for_runtime(&raw.runtime, None)?;
+            let externally_exposed = matches!(validation.activation, ActivationMode::Http { .. });
+            services.insert(
+                service_id.clone(),
+                ForgeServiceConfig {
+                    service_id: service_id.clone(),
+                    image: raw.runtime.image.clone(),
+                    command: raw.runtime.command.clone(),
+                    depends_on: raw.runtime.depends_on.clone(),
+                    validation,
+                    required_for_promotion: true,
+                    externally_exposed,
+                },
+            );
+        }
+
+        let primary_service = services
+            .values()
+            .find(|service| service.externally_exposed)
+            .or_else(|| services.values().next())
+            .ok_or_else(|| ForgeYamlError::Invalid("forge.yml services cannot be empty".into()))?;
+        let execution = if let Some(build) = build {
+            ExecutionConfig {
+                context_path: root.join(build.context),
+                dockerfile_path: root.join(build.dockerfile),
+                network_name: None,
+            }
+        } else {
+            ExecutionConfig::default()
+        };
+
+        Ok(ForgeYamlConfig {
+            execution,
+            validation: primary_service.validation.clone(),
+            validation_timeout_ms: self.invariants.first().and_then(|value| value.timeout_ms),
+            environment: self.env,
+            services,
+            startup_order,
+        })
+    }
+}
+
+fn validate_build(build: &RawBuildConfig) -> Result<(), ForgeYamlError> {
+    if build.context.as_os_str().is_empty() {
+        return Err(ForgeYamlError::Invalid(
+            "forge.yml build.context is required".into(),
+        ));
+    }
+    if build.context.is_absolute() {
+        return Err(ForgeYamlError::Invalid(
+            "forge.yml build.context must be relative to the project root".into(),
+        ));
+    }
+    if build.dockerfile.as_os_str().is_empty() {
+        return Err(ForgeYamlError::Invalid(
+            "forge.yml build.dockerfile is required".into(),
+        ));
+    }
+    if build.dockerfile.is_absolute() {
+        return Err(ForgeYamlError::Invalid(
+            "forge.yml build.dockerfile must be relative to the project root".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_healthcheck(healthcheck: &RawHealthcheckConfig) -> Result<(), ForgeYamlError> {
+    if !healthcheck.path.starts_with('/') {
+        return Err(ForgeYamlError::Invalid(
+            "forge.yml runtime.healthcheck.path must start with `/`".into(),
+        ));
+    }
+    if healthcheck.expected_status != 200 {
+        return Err(ForgeYamlError::Invalid(
+            "forge.yml runtime.healthcheck.expected_status must equal 200".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validation_for_runtime(
+    runtime: &RawRuntimeConfig,
+    fallback_health_path: Option<String>,
+) -> Result<ValidationPolicy, ForgeYamlError> {
+    if let Some(port) = runtime.port {
+        if port == 0 {
+            return Err(ForgeYamlError::Invalid(
+                "forge.yml runtime.port must be a valid TCP port".into(),
+            ));
+        }
+    }
+    if let Some(healthcheck) = runtime.healthcheck.as_ref() {
+        validate_healthcheck(healthcheck)?;
+    }
+    let activation = match runtime.port {
+        Some(port) => ActivationMode::Http {
+            internal_port: port,
+        },
+        None => ActivationMode::Direct,
+    };
+    Ok(ValidationPolicy {
+        tcp_required: runtime.port.is_some(),
+        http_health_path: runtime
+            .healthcheck
+            .as_ref()
+            .map(|value| value.path.clone())
+            .or(fallback_health_path),
+        activation,
+        ..ValidationPolicy::default()
+    })
+}
+
+fn topological_service_order(
+    services: &BTreeMap<String, RawServiceConfig>,
+) -> Result<Vec<String>, ForgeYamlError> {
+    let mut pending = services
+        .iter()
+        .map(|(service_id, config)| (service_id.clone(), config.runtime.depends_on.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (service_id, depends_on) in &pending {
+        for dependency in depends_on {
+            if dependency == service_id {
+                return Err(ForgeYamlError::Invalid(format!(
+                    "service `{service_id}` cannot depend on itself"
+                )));
+            }
+            if !services.contains_key(dependency) {
+                return Err(ForgeYamlError::Invalid(format!(
+                    "service `{service_id}` depends on unknown service `{dependency}`"
+                )));
+            }
+        }
+    }
+
+    let mut order = Vec::new();
+    while !pending.is_empty() {
+        let ready = pending
+            .iter()
+            .filter(|(_, deps)| deps.iter().all(|dep| order.contains(dep)))
+            .map(|(service_id, _)| service_id.clone())
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return Err(ForgeYamlError::Invalid(
+                "service dependency graph contains a cycle".into(),
+            ));
+        }
+        for service_id in ready {
+            pending.remove(&service_id);
+            order.push(service_id);
+        }
+    }
+    Ok(order)
 }
 
 #[cfg(test)]

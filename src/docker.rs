@@ -115,6 +115,9 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
             args.push(key.clone());
         }
         args.push(request.image_ref.clone());
+        if let Some(command) = &request.command {
+            args.extend(command.iter().cloned());
+        }
 
         let _ = self
             .runner
@@ -472,6 +475,7 @@ pub mod docker_adapter_starts_generation_named_container {
                 labels: labels("api", "production", 42),
                 environment: Default::default(),
                 network_name: None,
+                command: None,
             })
             .unwrap();
         docker.start_container(&name).unwrap();
@@ -497,6 +501,7 @@ pub mod docker_adapter_disables_restart_policy {
                 labels: labels("api", "production", 42),
                 environment: Default::default(),
                 network_name: None,
+                command: None,
             })
             .unwrap();
 
