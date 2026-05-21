@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::events::EventRecord;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue};
+use crate::route_truth::resolve_route_target;
 use crate::runtime::{
     ContainerInspection, CreateContainerRequest, DockerRuntime, ManagedImage, ProbeRuntime,
     RouteInspection, RouteUpdateRequest, RoutingRuntime,
@@ -636,79 +637,18 @@ where
         match input.truth {
             ActiveTruth::HttpRouted { internal_port } => {
                 let current = PointerStore::new(env.clone()).read_pointer("current")?;
+                if let Some(current_generation) =
+                    self.repair_current_http_route(input, env, current, internal_port)?
+                {
+                    return Ok(Some(current_generation));
+                }
                 let route_generation = self.route_generation(input)?;
-                match (route_generation, current) {
-                    (Some(route_generation), _) if snapshot_is_finalized(env, route_generation) => {
+                match route_generation {
+                    Some(route_generation) if snapshot_is_finalized(env, route_generation) => {
                         if current != Some(route_generation) {
                             PointerStore::new(env.clone()).swap_current(route_generation)?;
                         }
                         Ok(Some(route_generation))
-                    }
-                    (Some(_), Some(current_generation))
-                        if snapshot_is_finalized(env, current_generation) =>
-                    {
-                        let runtime_info = load_generation_runtime_info(env, current_generation)?;
-                        let route_recovery = http_route_recovery_input(
-                            &self.storage_root,
-                            runtime_info.as_ref(),
-                            &input.project_id,
-                            &input.environment,
-                            internal_port,
-                            input.http_health_path.clone(),
-                        )?;
-                        let preferred_network = runtime_info
-                            .as_ref()
-                            .and_then(|info| info.network_name.as_deref());
-                        let container_name = generation_container_name(
-                            &input.environment,
-                            &input.project_id,
-                            current_generation,
-                        );
-                        let inspection = self.docker.inspect_container(&container_name)?;
-                        ensure_http_route_matches_generation(
-                            self.routing,
-                            &route_recovery.subtree_id,
-                            &inspection,
-                            route_recovery.internal_port,
-                            preferred_network,
-                            route_recovery.domain,
-                            &route_recovery.target_source,
-                            route_recovery.probe_path,
-                        )?;
-                        Ok(Some(current_generation))
-                    }
-                    (None, Some(current_generation))
-                        if snapshot_is_finalized(env, current_generation) =>
-                    {
-                        let runtime_info = load_generation_runtime_info(env, current_generation)?;
-                        let route_recovery = http_route_recovery_input(
-                            &self.storage_root,
-                            runtime_info.as_ref(),
-                            &input.project_id,
-                            &input.environment,
-                            internal_port,
-                            input.http_health_path.clone(),
-                        )?;
-                        let preferred_network = runtime_info
-                            .as_ref()
-                            .and_then(|info| info.network_name.as_deref());
-                        let container_name = generation_container_name(
-                            &input.environment,
-                            &input.project_id,
-                            current_generation,
-                        );
-                        let inspection = self.docker.inspect_container(&container_name)?;
-                        ensure_http_route_matches_generation(
-                            self.routing,
-                            &route_recovery.subtree_id,
-                            &inspection,
-                            route_recovery.internal_port,
-                            preferred_network,
-                            route_recovery.domain,
-                            &route_recovery.target_source,
-                            route_recovery.probe_path,
-                        )?;
-                        Ok(Some(current_generation))
                     }
                     _ => Ok(None),
                 }
@@ -755,6 +695,47 @@ where
             &inspection.active_target,
             &containers,
         ))
+    }
+
+    fn repair_current_http_route(
+        &mut self,
+        input: &TickInput,
+        env: &EnvironmentPaths,
+        current: Option<u64>,
+        internal_port: u16,
+    ) -> Result<Option<u64>, ConvergenceError> {
+        let Some(current_generation) = current else {
+            return Ok(None);
+        };
+        if !snapshot_is_finalized(env, current_generation) {
+            return Ok(None);
+        }
+        let Some(runtime_info) = load_generation_runtime_info(env, current_generation)? else {
+            return Ok(None);
+        };
+        let route_recovery = http_route_recovery_input(
+            &self.storage_root,
+            Some(&runtime_info),
+            &input.project_id,
+            &input.environment,
+            internal_port,
+            input.http_health_path.clone(),
+        )?;
+        let inspection = match self.docker.inspect_container(&runtime_info.container_name) {
+            Ok(inspection) if inspection.running => inspection,
+            _ => return Ok(None),
+        };
+        ensure_http_route_matches_generation(
+            self.routing,
+            &route_recovery.subtree_id,
+            &inspection,
+            route_recovery.internal_port,
+            runtime_info.network_name.as_deref(),
+            route_recovery.domain,
+            &route_recovery.target_source,
+            route_recovery.probe_path,
+        )?;
+        Ok(Some(current_generation))
     }
 
     fn rollback_to_previous(
@@ -939,31 +920,6 @@ fn resolve_generation_from_target(target: &str, containers: &[ContainerInspectio
         .find(|inspection| inspection.network_ips.values().any(|ip| ip == target_host))
         .and_then(container_identity)
         .map(|(_, _, generation)| generation)
-}
-
-fn resolve_route_target(
-    inspection: &ContainerInspection,
-    internal_port: u16,
-    preferred_network: Option<&str>,
-    target_source: &PersistedRouteTargetSource,
-) -> Option<String> {
-    match target_source {
-        PersistedRouteTargetSource::ContainerIp => {
-            if let Some(network_name) = preferred_network {
-                return inspection
-                    .network_ips
-                    .get(network_name)
-                    .filter(|ip| !ip.is_empty())
-                    .map(|ip| format!("{ip}:{internal_port}"));
-            }
-
-            inspection
-                .network_ips
-                .values()
-                .find(|ip| !ip.is_empty())
-                .map(|ip| format!("{ip}:{internal_port}"))
-        }
-    }
 }
 
 fn parse_route_identity(subtree_id: &str) -> Option<(String, String)> {
@@ -3583,6 +3539,160 @@ pub mod current_pointer_matches_active_route_after_restart {
 
         assert_eq!(outcome, TickOutcome::Healthy(2));
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(2));
+    }
+}
+
+#[cfg(test)]
+pub mod promoted_runtime_route_drift_is_repaired {
+    use super::*;
+
+    #[test]
+    fn convergence_repairs_route_target_drift_for_promoted_generation() {
+        let root = test_root("convergence-repairs-route-target-drift");
+        register_project(&root, "api", "api.example.com");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.19.0.99:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }),
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        };
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::HttpRouted {
+                    internal_port: 3000,
+                },
+                http_health_path: Some("/health".into()),
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        assert_eq!(routing.updates.len(), 1);
+        assert_eq!(routing.updates[0].target, "172.19.0.11:3000");
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn convergence_updates_route_when_container_ip_changes() {
+        let root = test_root("convergence-updates-route-when-container-ip-changes");
+        register_project(&root, "api", "api.example.com");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.network_ips.insert(
+            "prod-api-gen-1".into(),
+            BTreeMap::from([("forge-test".into(), "172.19.0.44".into())]),
+        );
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.19.0.11:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }),
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        };
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::HttpRouted {
+                    internal_port: 3000,
+                },
+                http_health_path: Some("/health".into()),
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Healthy(1));
+        assert_eq!(routing.updates.len(), 1);
+        assert_eq!(routing.updates[0].target, "172.19.0.44:3000");
+    }
+
+    #[test]
+    fn convergence_does_not_promote_incomplete_legacy_generation() {
+        let root = test_root("convergence-does-not-promote-incomplete-legacy-generation");
+        register_project(&root, "api", "api.example.com");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        fs::remove_file(env.generation_dir(1).join("runtime.json")).unwrap();
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::HttpRouted {
+                    internal_port: 3000,
+                },
+                http_health_path: Some("/health".into()),
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::NoActiveGeneration);
+        assert_eq!(
+            RuntimeStateStore::new(env)
+                .load()
+                .unwrap()
+                .active_generation,
+            None
+        );
     }
 }
 

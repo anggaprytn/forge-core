@@ -13,6 +13,7 @@ use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
+use crate::route_truth::resolve_route_target;
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
     DockerRuntimeError, ProbeError, ProbeRuntime, RouteInspection, RouteUpdateRequest,
@@ -680,12 +681,23 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         if let Some(PersistedActivationMode::Http {
             internal_port,
             route_subtree_id: persisted_subtree_id,
-            target_source: _,
+            target_source,
         }) = runtime.activation.as_ref()
         {
-            let target_host =
-                resolve_selected_network_host(&inspection, runtime.network_name.as_deref())?;
-            let upstream_target = format!("{target_host}:{internal_port}");
+            let upstream_target = resolve_route_target(
+                &inspection,
+                *internal_port,
+                runtime.network_name.as_deref(),
+                target_source,
+            )
+            .ok_or_else(|| {
+                DeploymentError::InvalidInspection(match runtime.network_name.as_deref() {
+                    Some(network_name) => {
+                        format!("container missing IP on docker network {network_name}")
+                    }
+                    None => "container missing network IP".into(),
+                })
+            })?;
             let subtree_id = persisted_subtree_id
                 .clone()
                 .unwrap_or_else(|| route_subtree_id(record));
@@ -1385,9 +1397,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             }
             ActivationMode::Http { internal_port } => {
                 let subtree_id = route_subtree_id(record);
-                let target_host =
-                    resolve_selected_network_host(inspection, execution.network_name.as_deref())?;
-                let target = format!("{target_host}:{internal_port}");
+                let target = resolve_route_target(
+                    inspection,
+                    internal_port,
+                    execution.network_name.as_deref(),
+                    &PersistedRouteTargetSource::ContainerIp,
+                )
+                .ok_or_else(|| {
+                    DeploymentError::InvalidInspection(
+                        execution.network_name.as_deref().map_or_else(
+                            || "container missing network IP".into(),
+                            |network_name| {
+                                format!("container missing IP on docker network {network_name}")
+                            },
+                        ),
+                    )
+                })?;
                 let domain = load_environment_domain(
                     &self.storage_root,
                     &record.project_id,
@@ -2667,7 +2692,6 @@ pub mod rollback_restores_previous_generation {
 #[cfg(test)]
 pub mod git_backed_rollback_status_correctness {
     use super::*;
-    use crate::runtime::ManagedImage;
     use crate::status::{load_project_environment_env_report, load_project_environment_status};
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -2724,7 +2748,9 @@ pub mod git_backed_rollback_status_correctness {
             Ok(self.inspections.values().cloned().collect())
         }
 
-        fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError> {
+        fn list_managed_images(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedImage>, DockerRuntimeError> {
             Ok(Vec::new())
         }
 
@@ -3766,7 +3792,7 @@ pub mod runtime_environment_snapshots {
     use super::*;
     use crate::docker::DockerCliRuntime;
     use crate::docker::RecordingCommandRunner;
-    use crate::status::load_project_environment_env_report;
+    use crate::status::{load_project_environment_env_report, load_project_environment_status};
     use crate::storage::{load_generation_resolved_runtime, load_generation_runtime_env_snapshot};
     use std::fs;
 
@@ -3794,6 +3820,73 @@ pub mod runtime_environment_snapshots {
         }
 
         fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {
+            Ok(())
+        }
+    }
+
+    struct InspectOnlyDockerRuntime {
+        inspection: ContainerInspection,
+    }
+
+    impl DockerRuntime for InspectOnlyDockerRuntime {
+        fn build_image(
+            &mut self,
+            _request: BuildImageRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            unreachable!()
+        }
+
+        fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn create_container(
+            &mut self,
+            _request: CreateContainerRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            unreachable!()
+        }
+
+        fn start_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn inspect_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<ContainerInspection, DockerRuntimeError> {
+            Ok(self.inspection.clone())
+        }
+
+        fn container_logs(
+            &mut self,
+            _container_name: &str,
+            _tail_lines: usize,
+        ) -> Result<String, DockerRuntimeError> {
+            Ok(String::new())
+        }
+
+        fn list_managed_containers(
+            &mut self,
+        ) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+            Ok(vec![self.inspection.clone()])
+        }
+
+        fn list_managed_images(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedImage>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
     }
@@ -3961,6 +4054,118 @@ pub mod runtime_environment_snapshots {
                 .values
                 .iter()
                 .any(|entry| entry.key == "FORGE_DEPLOYMENT_ID" && entry.value == "dep-1")
+        );
+    }
+
+    #[test]
+    fn new_deploy_writes_env_snapshot_and_status_reads_it() {
+        let root = test_root("new-deploy-writes-env-snapshot-and-status-reads-it");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.to_path_buf()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(1, &[("forge-net", "172.19.0.5")]),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.19.0.5:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next()
+        .unwrap();
+
+        let mut status_docker = InspectOnlyDockerRuntime {
+            inspection: ContainerInspection {
+                container_name: "prod-api-gen-1".into(),
+                running: true,
+                state_status: "running".into(),
+                exit_code: Some(0),
+                started_at: Some("2026-05-21T12:00:00Z".into()),
+                image_ref: "forge/api:production-gen-1".into(),
+                labels: BTreeMap::new(),
+                network_ips: BTreeMap::from([("forge-net".into(), "172.19.0.5".into())]),
+                restart_policy: "no".into(),
+            },
+        };
+        let mut status_routing = StickyRoutingRuntime {
+            inspection: RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.19.0.5:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            },
+        };
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut status_docker,
+            &mut status_routing,
+            "api",
+            "production",
+        )
+        .unwrap();
+
+        assert_eq!(status.status, "healthy");
+        assert_eq!(routing.updates[0].target, "172.19.0.5:3000");
+        assert_eq!(status.container_ip.as_deref(), Some("172.19.0.5"));
+        assert_eq!(
+            status
+                .runtime_env_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.deployment_id.as_str()),
+            Some("dep-1")
         );
     }
 

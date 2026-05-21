@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod probes;
 pub mod projects;
 pub mod queue;
+pub mod route_truth;
 pub mod runtime;
 pub mod runtime_env;
 pub mod secrets;

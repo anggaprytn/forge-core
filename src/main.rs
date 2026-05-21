@@ -1056,6 +1056,10 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
             snapshot.source_environment
         ));
         output.push_str(&format!("  Keys: {}\n", snapshot.total_keys));
+    } else if status.active_generation.is_some() {
+        output.push('\n');
+        output.push_str("Runtime Env Snapshot:\n");
+        output.push_str("  legacy metadata unavailable\n");
     }
     output
 }

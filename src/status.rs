@@ -12,6 +12,7 @@ use crate::api::{
 };
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{PersistentQueue, QueueError};
+use crate::route_truth::expected_route_for_runtime;
 use crate::runtime::{
     ContainerInspection, DockerRuntime, DockerRuntimeError, RouteInspection, RoutingRuntime,
     RoutingRuntimeError,
@@ -19,9 +20,9 @@ use crate::runtime::{
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, PersistedActivationMode, PersistedBuildInfo,
-    PersistedRouteTargetSource, PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo,
-    PersistedSnapshotMetadata, PointerStore, RuntimeState, RuntimeStateStore, StorageError,
-    load_generation_build_info, load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedSnapshotMetadata, PointerStore,
+    RuntimeState, RuntimeStateStore, StorageError, load_generation_build_info,
+    load_generation_runtime_env_snapshot, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
 
@@ -149,6 +150,7 @@ struct EnvironmentRuntimeTruth {
     latest_snapshot: Option<PersistedSnapshotMetadata>,
     latest_build: Option<PersistedBuildInfo>,
     promoted_runtime_env_snapshot: Option<PersistedRuntimeEnvSnapshot>,
+    promoted_generation_issue: Option<String>,
     container_running: bool,
     container_status: Option<String>,
     container_started_at: Option<String>,
@@ -260,6 +262,7 @@ where
     let status = if deploying {
         "deploying"
     } else if truth.active_generation.is_some()
+        && truth.promoted_generation_issue.is_none()
         && promoted_snapshot_healthy
         && truth.container_running
         && (!route_required || route_matches)
@@ -420,24 +423,27 @@ where
         RouteDiagnostics {
             route_required: details.route_required(),
             route_active: details.inspection.is_some(),
-            matches_expected: details.matches_truth(),
+            matches_expected: details.matches_truth() && truth.promoted_generation_issue.is_none(),
             current_target: details
                 .inspection
                 .as_ref()
                 .map(|inspection| inspection.active_target.clone()),
             expected_target: details.expected_target.clone(),
             domain: Some(details.expected_domain.clone()),
-            mismatch_reason: details.mismatch_reason(),
+            mismatch_reason: truth
+                .promoted_generation_issue
+                .clone()
+                .or_else(|| details.mismatch_reason()),
         }
     } else {
         RouteDiagnostics {
             route_required: false,
             route_active: false,
-            matches_expected: true,
+            matches_expected: truth.promoted_generation_issue.is_none(),
             current_target: None,
             expected_target: None,
             domain: Some(status.domain.clone()),
-            mismatch_reason: None,
+            mismatch_reason: truth.promoted_generation_issue.clone(),
         }
     };
 
@@ -514,7 +520,7 @@ pub fn load_project_environment_env_report(
     })?;
     let snapshot = load_generation_runtime_env_snapshot(&env, generation)?.ok_or_else(|| {
         ProjectStatusError::RuntimeEnvSnapshotUnavailable(
-            "runtime env snapshot unavailable for this generation; redeploy required".into(),
+            "runtime env snapshot unavailable for this promoted generation; legacy metadata unavailable, redeploy required".into(),
         )
     })?;
     let values = snapshot
@@ -622,6 +628,23 @@ where
         .map(|generation| load_generation_runtime_env_snapshot(env, generation))
         .transpose()?
         .flatten();
+    let promoted_generation_issue = active_generation.and_then(|generation| {
+        match (
+            promoted_runtime.as_ref(),
+            promoted_runtime_env_snapshot.as_ref(),
+        ) {
+            (None, None) => Some(format!(
+                "generation {generation} is a legacy promoted generation with incomplete runtime metadata and no runtime env snapshot"
+            )),
+            (None, Some(_)) => Some(format!(
+                "generation {generation} is a legacy promoted generation with incomplete runtime metadata"
+            )),
+            (Some(_), None) => Some(format!(
+                "generation {generation} is a legacy promoted generation; runtime env snapshot metadata unavailable"
+            )),
+            (Some(_), Some(_)) => None,
+        }
+    });
 
     let container_inspection = inspect_promoted_container(docker, promoted_runtime.as_ref());
     let container_running = container_inspection
@@ -671,6 +694,7 @@ where
         latest_snapshot,
         latest_build,
         promoted_runtime_env_snapshot,
+        promoted_generation_issue,
         container_running,
         container_status,
         container_started_at,
@@ -725,6 +749,7 @@ fn build_environment_status_from_truth(
     let status = if deploying {
         "deploying"
     } else if truth.active_generation.is_some()
+        && truth.promoted_generation_issue.is_none()
         && promoted_snapshot_healthy
         && truth.container_running
         && (!route_required || route_matches)
@@ -1091,9 +1116,8 @@ fn inspect_route_status<R: RoutingRuntime>(
 ) -> Option<RouteStatusDetails> {
     let runtime = runtime?;
     let PersistedActivationMode::Http {
-        internal_port,
         route_subtree_id: persisted_subtree_id,
-        target_source,
+        ..
     } = runtime.activation.as_ref()?
     else {
         return None;
@@ -1103,7 +1127,15 @@ fn inspect_route_status<R: RoutingRuntime>(
         .unwrap_or_else(|| route_subtree_id(project_id, environment));
     let inspection = routing.inspect_route(&subtree_id).ok();
     let expected_target = container.and_then(|container| {
-        resolve_route_target(container, *internal_port, network_name, target_source)
+        expected_route_for_runtime(
+            project_id,
+            environment,
+            Some(domain.to_string()),
+            runtime,
+            container,
+            network_name,
+        )
+        .map(|route| route.target)
     });
     Some(RouteStatusDetails {
         inspection,
@@ -1111,22 +1143,6 @@ fn inspect_route_status<R: RoutingRuntime>(
         expected_domain: domain.to_string(),
         route_required: true,
     })
-}
-
-fn resolve_route_target(
-    container: &ContainerInspection,
-    internal_port: u16,
-    network_name: Option<&str>,
-    target_source: &PersistedRouteTargetSource,
-) -> Option<String> {
-    match target_source {
-        PersistedRouteTargetSource::ContainerIp => {
-            let ip = network_name
-                .and_then(|network| container.network_ips.get(network))
-                .or_else(|| container.network_ips.values().next())?;
-            Some(format!("{ip}:{internal_port}"))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1140,8 +1156,8 @@ mod tests {
         BuildImageRequest, CreateContainerRequest, ManagedImage, RouteUpdateRequest,
     };
     use crate::storage::{
-        PersistedRuntimeInfo, PointerStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
-        SnapshotState, SnapshotWriter, atomic_write,
+        PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore, RuntimeHealthState,
+        RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter, atomic_write,
     };
 
     #[derive(Default)]
@@ -1845,7 +1861,51 @@ mod tests {
         assert_eq!(response.code, "runtime_env_snapshot_unavailable");
         assert_eq!(
             response.message,
-            "runtime env snapshot unavailable for this generation; redeploy required"
+            "runtime env snapshot unavailable for this promoted generation; legacy metadata unavailable, redeploy required"
+        );
+    }
+
+    #[test]
+    fn status_reports_legacy_generation_missing_env_snapshot_without_false_unknowns() {
+        let root = test_root("status-reports-legacy-generation-missing-env-snapshot");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        fs::remove_file(env.generation_dir(7).join("runtime_env_snapshot.json")).unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(status.active_generation, Some(7));
+        assert_eq!(status.status, "degraded");
+        assert_eq!(status.container_name.as_deref(), Some("staging-api-gen-7"));
+        assert_eq!(status.container_ip.as_deref(), Some("172.29.0.2"));
+        assert!(status.route_active);
+        assert!(status.runtime_env_snapshot.is_none());
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+        assert!(!diagnostics.route.matches_expected);
+        assert_eq!(
+            diagnostics.route.mismatch_reason.as_deref(),
+            Some(
+                "generation 7 is a legacy promoted generation; runtime env snapshot metadata unavailable"
+            )
         );
     }
 
@@ -2046,6 +2106,98 @@ mod tests {
         assert!(diagnostics.route.route_active);
         assert!(diagnostics.route.matches_expected);
         assert_eq!(diagnostics.status, "healthy");
+    }
+
+    #[test]
+    fn diagnose_and_status_share_route_truth() {
+        let root = test_root("diagnose-and-status-share-route-truth");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let mut status_docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut status_routing = StubRoutingRuntime {
+            inspection: Some(RouteInspection {
+                active_target: "172.29.0.99:3000".into(),
+                ..healthy_route()
+            }),
+        };
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut status_docker,
+            &mut status_routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        struct SingleInspectionRoutingRuntime {
+            inspection: Option<RouteInspection>,
+        }
+
+        impl RoutingRuntime for SingleInspectionRoutingRuntime {
+            fn update_route(
+                &mut self,
+                _request: RouteUpdateRequest,
+            ) -> Result<(), RoutingRuntimeError> {
+                Ok(())
+            }
+
+            fn inspect_route(
+                &mut self,
+                _subtree_id: &str,
+            ) -> Result<RouteInspection, RoutingRuntimeError> {
+                self.inspection
+                    .take()
+                    .ok_or_else(|| RoutingRuntimeError::InspectionFailed("missing route".into()))
+            }
+
+            fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
+                Ok(self.inspection.clone().into_iter().collect())
+            }
+
+            fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {
+                Ok(())
+            }
+        }
+
+        let mut diagnose_docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut diagnose_routing = SingleInspectionRoutingRuntime {
+            inspection: Some(RouteInspection {
+                active_target: "172.29.0.99:3000".into(),
+                ..healthy_route()
+            }),
+        };
+        let diagnostics = load_environment_diagnostics(
+            &root,
+            None,
+            &mut diagnose_docker,
+            &mut diagnose_routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(status.active_generation, diagnostics.active_generation);
+        assert_eq!(status.container_ip, diagnostics.container.container_ip);
+        assert_eq!(
+            diagnostics.route.current_target.as_deref(),
+            Some("172.29.0.99:3000")
+        );
+        assert_eq!(
+            diagnostics.route.expected_target.as_deref(),
+            Some("172.29.0.2:3000")
+        );
+        assert_eq!(
+            diagnostics.route.mismatch_reason.as_deref(),
+            Some("route target mismatch: current=172.29.0.99:3000 expected=172.29.0.2:3000")
+        );
+        assert_eq!(status.status, "degraded");
+        assert_eq!(diagnostics.status, "degraded");
     }
 
     #[test]

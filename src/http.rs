@@ -2566,6 +2566,30 @@ fn seed_project_status_runtime(root: &Path, generation: u64) {
         .write_artifact("runtime.json", &format!("{runtime}\n"))
         .unwrap();
     writer
+        .write_artifact(
+            "runtime_env_snapshot.json",
+            &format!(
+                concat!(
+                    "{{\n",
+                    "  \"snapshot_version\": 1,\n",
+                    "  \"project_id\": \"api\",\n",
+                    "  \"environment\": \"staging\",\n",
+                    "  \"generation\": {generation},\n",
+                    "  \"deployment_id\": \"dep-{generation}\",\n",
+                    "  \"source_environment\": \"staging\",\n",
+                    "  \"source_ref\": \"main\",\n",
+                    "  \"commit_sha\": \"340ac8108006d84dbf951d8c0bb04ecfaf0eccac\",\n",
+                    "  \"domain\": \"staging-api.example.com\",\n",
+                    "  \"entries\": {{\n",
+                    "    \"FORGE_PROJECT_ID\": {{ \"source\": \"forge_generated\", \"value\": \"api\", \"sensitive\": false, \"redacted\": false }}\n",
+                    "  }}\n",
+                    "}}\n"
+                ),
+                generation = generation,
+            ),
+        )
+        .unwrap();
+    writer
         .finalize("api", "staging", SnapshotState::Healthy)
         .unwrap();
     PointerStore::new(env.clone())
