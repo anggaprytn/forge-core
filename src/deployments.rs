@@ -579,6 +579,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         }
         append_event(&events, record, generation, "GENERATION_PROMOTED", None)?;
         diagnostics.append_log_line("generation promoted", &secret_values)?;
+        self.capture_container_logs_tail(&diagnostics, &container_name, &secret_values)?;
 
         Ok(DeploymentExecution {
             deployment_id: record.deployment_id.clone(),
@@ -1065,6 +1066,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .docker
             .container_logs(container_name, 50)
             .unwrap_or_else(|err| format!("container logs unavailable: {err}"));
+        diagnostics.write_artifact("container_logs_tail.log", &logs_tail, secret_values)?;
         if !logs_tail.trim().is_empty() {
             diagnostics.append_log_line("container logs tail:", secret_values)?;
             diagnostics.append_log_line(&logs_tail, secret_values)?;
@@ -1178,6 +1180,20 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &format!("{artifact}\n"),
             secret_values,
         )?;
+        Ok(())
+    }
+
+    fn capture_container_logs_tail(
+        &mut self,
+        diagnostics: &DiagnosticsStore,
+        container_name: &str,
+        secret_values: &[String],
+    ) -> Result<(), DeploymentError> {
+        let logs_tail = self
+            .docker
+            .container_logs(container_name, 50)
+            .unwrap_or_else(|err| format!("container logs unavailable: {err}"));
+        diagnostics.write_artifact("container_logs_tail.log", &logs_tail, secret_values)?;
         Ok(())
     }
 
@@ -1295,7 +1311,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         record: &DeploymentRecord,
         env: &EnvironmentPaths,
         generation: u64,
-        _container_name: &str,
+        container_name: &str,
         inspection: &ContainerInspection,
         diagnostics: &DiagnosticsStore,
         secret_values: &[String],
@@ -1334,6 +1350,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     network_name: execution.network_name.clone(),
                 };
                 if let Err(err) = validate_route_activation(&inspection, &context) {
+                    self.capture_container_logs_tail(diagnostics, container_name, secret_values)?;
                     self.capture_route_activation_failure_diagnostics(
                         diagnostics,
                         &inspection,

@@ -1,4 +1,5 @@
 use crate::events::{EventRecord, redact_text};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -593,6 +594,38 @@ impl DiagnosticsStore {
             .lines()
             .map(|value| value.to_string())
             .collect())
+    }
+
+    pub fn diagnostics_dir(&self) -> PathBuf {
+        self.env.generation_dir(self.generation).join("diagnostics")
+    }
+
+    pub fn artifact_path(&self, name: &str) -> PathBuf {
+        self.diagnostics_dir().join(name)
+    }
+
+    pub fn read_summary(&self) -> StorageResult<Option<DiagnosticSummary>> {
+        self.read_json_artifact("summary.json")
+    }
+
+    pub fn read_text_artifact(&self, name: &str) -> StorageResult<Option<String>> {
+        let path = self.artifact_path(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read_to_string(path)?))
+    }
+
+    pub fn read_json_artifact<T: DeserializeOwned>(&self, name: &str) -> StorageResult<Option<T>> {
+        let Some(raw) = self.read_text_artifact(name)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raw).map(Some).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })
     }
 }
 

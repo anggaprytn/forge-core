@@ -1,5 +1,6 @@
 use crate::events::EventRecord;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,7 +37,97 @@ pub struct DeploymentStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentLogs {
     pub deployment_id: String,
+    pub project_id: String,
+    pub environment: String,
+    #[serde(default)]
     pub lines: Vec<String>,
+    #[serde(default)]
+    pub lifecycle: Vec<String>,
+    #[serde(default)]
+    pub container_logs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_failure_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics_source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeTargetDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerRuntimeDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteDiagnostics {
+    pub route_required: bool,
+    pub route_active: bool,
+    pub matches_expected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatch_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentDeploymentFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+    pub generation: u64,
+    pub failure_stage: String,
+    pub failure_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_failure_summary: Option<String>,
+    pub diagnostics_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentDiagnostics {
+    pub project_id: String,
+    pub environment: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_deployment_id: Option<String>,
+    pub container: ContainerRuntimeDiagnostics,
+    pub route: RouteDiagnostics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_target: Option<ProbeTargetDiagnostics>,
+    #[serde(default)]
+    pub recent_failures: Vec<RecentDeploymentFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_validation_failure: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_route_activation_failure: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub likely_failure_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

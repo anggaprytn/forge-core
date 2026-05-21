@@ -59,6 +59,26 @@ fn cli_status_reads_deployment_status() {
 }
 
 #[test]
+fn cli_logs_reads_deployment_diagnostics() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"deployment_id":"dep-1","project_id":"api","environment":"staging","lines":["image built"],"lifecycle":["image built","generation promoted"],"container_logs":["Server is running on 0.0.0.0:3000"],"validation_failure_summary":"validating_runtime: http health probe failed","diagnostics_source":"projects/api/environments/staging/generations/1/diagnostics"}}"#,
+    );
+
+    let output = run_cli(&url, &["logs", "dep-1"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Deployment: dep-1"));
+    assert!(body.contains("Container Logs:"));
+    assert!(body.contains("Server is running on 0.0.0.0:3000"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/deployments/dep-1/logs");
+}
+
+#[test]
 fn cli_project_status_reads_authoritative_runtime_status() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
@@ -104,6 +124,29 @@ fn cli_project_status_json_reads_authoritative_runtime_status() {
     assert_eq!(
         request.path,
         "/api/projects/api/environments/staging/status"
+    );
+}
+
+#[test]
+fn cli_diagnose_reads_environment_diagnostics() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"staging","status":"degraded","active_generation":7,"last_deployment_id":"dep-8","container":{"container_name":"staging-api-gen-7","running":true,"state_status":"running","network_name":"forge-managed","container_ip":"172.29.0.2"},"route":{"route_required":true,"route_active":true,"matches_expected":false,"current_target":"172.29.0.99:3000","expected_target":"172.29.0.2:3000","domain":"staging-api.example.com","mismatch_reason":"route target mismatch: current=172.29.0.99:3000 expected=172.29.0.2:3000"},"probe_target":{"host":"172.29.0.2","port":3000,"path":"/health"},"recent_failures":[{"deployment_id":"dep-8","generation":8,"failure_stage":"validating_runtime","failure_reason":"http health probe failed","validation_failure_summary":"http health probe returned unhealthy (172.29.0.3:3000/health)","diagnostics_source":"projects/api/environments/staging/generations/8/diagnostics"}],"likely_failure_stage":"validating_runtime","diagnostics_source":"projects/api/environments/staging/generations/8/diagnostics"}}"#,
+    );
+
+    let output = run_cli(&url, &["diagnose", "api", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Likely Failure Stage:"));
+    assert!(body.contains("Route Mismatch:"));
+    assert!(body.contains("Recent Failures:"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/staging/diagnostics"
     );
 }
 

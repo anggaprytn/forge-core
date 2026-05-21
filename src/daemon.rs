@@ -6,8 +6,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse,
-    EventList, validate_deployment_request,
+    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus,
+    EnvironmentDiagnostics, ErrorResponse, EventList, validate_deployment_request,
 };
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
@@ -21,7 +21,9 @@ use crate::events::EventRecord;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
-use crate::status::{ProjectEnvironmentStatus, load_project_environment_status};
+use crate::status::{
+    ProjectEnvironmentStatus, load_environment_diagnostics, load_project_environment_status,
+};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
 };
@@ -273,6 +275,26 @@ where
         })
     }
 
+    pub fn get_project_environment_diagnostics(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<EnvironmentDiagnostics, ErrorResponse> {
+        load_environment_diagnostics(
+            &self.config.storage_root,
+            self.queue.as_ref(),
+            &mut self.docker_runtime,
+            &mut self.routing_runtime,
+            project_id,
+            environment,
+        )
+        .map_err(|err| {
+            let (status, response) = crate::status::project_status_error_response(err);
+            let _ = status;
+            response
+        })
+    }
+
     pub fn get_deployment_logs(
         &self,
         deployment_id: &str,
@@ -301,10 +323,47 @@ where
             code: "logs_unavailable".into(),
             message: err.to_string(),
         })?;
+        let diagnostics = DiagnosticsStore::new(
+            EnvironmentPaths::new(
+                &self.config.storage_root,
+                &entry.project_id,
+                &entry.environment,
+            ),
+            entry.generation,
+        );
+        let container_logs = diagnostics
+            .read_text_artifact("container_logs_tail.log")
+            .map_err(|err| ErrorResponse {
+                code: "logs_unavailable".into(),
+                message: err.to_string(),
+            })?
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let validation_failure_summary = diagnostics
+            .read_summary()
+            .map_err(|err| ErrorResponse {
+                code: "logs_unavailable".into(),
+                message: err.to_string(),
+            })?
+            .map(|summary| format!("{}: {}", summary.failure_stage, summary.failure_reason));
+        let lifecycle = lines.clone();
+
+        let diagnostics_source = format!(
+            "projects/{}/environments/{}/generations/{}/diagnostics",
+            entry.project_id, entry.environment, entry.generation
+        );
 
         Ok(Some(DeploymentLogs {
             deployment_id: entry.deployment_id,
+            project_id: entry.project_id,
+            environment: entry.environment,
             lines,
+            lifecycle,
+            container_logs,
+            validation_failure_summary,
+            diagnostics_source: Some(diagnostics_source),
         }))
     }
 

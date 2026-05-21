@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use forge_core::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentRequest, DeploymentStatus, ErrorResponse, EventList, ProjectList, ProjectRecord,
-    ProjectUpsertRequest,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics, ErrorResponse,
+    EventList, ProjectList, ProjectRecord, ProjectUpsertRequest,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -114,6 +114,19 @@ where
             let status = client.get_status(&deployment_id)?;
             print_json(&status)?;
         }
+        Command::Logs {
+            deployment_id,
+            json,
+        } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let logs = client.get_logs(&deployment_id)?;
+            if json {
+                print_json(&logs)?;
+            } else {
+                print!("{}", render_deployment_logs(&logs));
+            }
+        }
         Command::ProjectStatus {
             project_id,
             environment,
@@ -126,6 +139,21 @@ where
                 print_json(&status)?;
             } else {
                 print!("{}", render_project_environment_status(&status));
+            }
+        }
+        Command::Diagnose {
+            project_id,
+            environment,
+            json,
+        } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let diagnostics =
+                client.get_project_environment_diagnostics(&project_id, &environment)?;
+            if json {
+                print_json(&diagnostics)?;
+            } else {
+                print!("{}", render_environment_diagnostics(&diagnostics));
             }
         }
         Command::Events => {
@@ -239,6 +267,13 @@ impl ForgeClient {
         self.send_json(self.http.get(format!("{}/events", self.base_url)))
     }
 
+    fn get_logs(&self, deployment_id: &str) -> Result<DeploymentLogs, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/deployments/{deployment_id}/logs",
+            self.base_url
+        )))
+    }
+
     fn get_project_environment_status(
         &self,
         project_id: &str,
@@ -246,6 +281,17 @@ impl ForgeClient {
     ) -> Result<ProjectEnvironmentStatus, CliError> {
         self.send_json(self.http.get(format!(
             "{}/api/projects/{project_id}/environments/{environment}/status",
+            self.base_url
+        )))
+    }
+
+    fn get_project_environment_diagnostics(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<EnvironmentDiagnostics, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/diagnostics",
             self.base_url
         )))
     }
@@ -403,7 +449,16 @@ enum Command {
     Status {
         deployment_id: String,
     },
+    Logs {
+        deployment_id: String,
+        json: bool,
+    },
     ProjectStatus {
+        project_id: String,
+        environment: String,
+        json: bool,
+    },
+    Diagnose {
         project_id: String,
         environment: String,
         json: bool,
@@ -592,6 +647,8 @@ fn parse_command(
         [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
         [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
+        [cmd, rest @ ..] if cmd == "logs" => parse_logs_command(rest),
+        [cmd, rest @ ..] if cmd == "diagnose" => parse_diagnose_command(rest),
         [cmd] if cmd == "events" => Ok(Command::Events),
         [cmd, project_id, environment] if cmd == "rollback" => Ok(Command::Rollback {
             project_id: project_id.clone(),
@@ -631,7 +688,9 @@ fn usage() -> String {
         "  forge whoami",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
+        "  forge [--url URL] [--token TOKEN] logs [--json] <deployment_id>",
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] diagnose [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
@@ -704,6 +763,49 @@ fn parse_status_command(args: &[String]) -> Result<Command, CliError> {
             deployment_id: deployment_id.clone(),
         }),
         [project_id, environment] => Ok(Command::ProjectStatus {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_logs_command(args: &[String]) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+    }
+
+    match positionals.as_slice() {
+        [deployment_id] => Ok(Command::Logs {
+            deployment_id: deployment_id.clone(),
+            json,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_diagnose_command(args: &[String]) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+    }
+
+    match positionals.as_slice() {
+        [project_id, environment] => Ok(Command::Diagnose {
             project_id: project_id.clone(),
             environment: environment.clone(),
             json,
@@ -890,6 +992,143 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
         status.probe_path.as_deref().unwrap_or("unknown")
     ));
     output
+}
+
+fn render_deployment_logs(logs: &DeploymentLogs) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Deployment: {}\n", logs.deployment_id));
+    output.push_str(&format!("Project: {}\n", logs.project_id));
+    output.push_str(&format!("Environment: {}\n\n", logs.environment));
+    output.push_str("Lifecycle:\n");
+    if logs.lifecycle.is_empty() {
+        output.push_str("  unavailable\n");
+    } else {
+        for line in &logs.lifecycle {
+            output.push_str(&format!("  {line}\n"));
+        }
+    }
+    output.push('\n');
+    output.push_str("Container Logs:\n");
+    if logs.container_logs.is_empty() {
+        output.push_str("  unavailable\n");
+    } else {
+        for line in &logs.container_logs {
+            output.push_str(&format!("  {line}\n"));
+        }
+    }
+    if let Some(summary) = logs.validation_failure_summary.as_deref() {
+        output.push('\n');
+        output.push_str("Validation Failure:\n");
+        output.push_str(&format!("  {summary}\n"));
+    }
+    if let Some(source) = logs.diagnostics_source.as_deref() {
+        output.push('\n');
+        output.push_str("Diagnostics Source:\n");
+        output.push_str(&format!("  {source}\n"));
+    }
+    output
+}
+
+fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Project: {}\n", diagnostics.project_id));
+    output.push_str(&format!("Environment: {}\n", diagnostics.environment));
+    output.push_str(&format!("Status: {}\n\n", diagnostics.status));
+    output.push_str("Runtime Truth:\n");
+    output.push_str(&format!(
+        "  Active Generation: {}\n",
+        diagnostics
+            .active_generation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    ));
+    output.push_str(&format!(
+        "  Last Deployment: {}\n",
+        diagnostics
+            .last_deployment_id
+            .as_deref()
+            .unwrap_or("unknown")
+    ));
+    output.push_str(&format!(
+        "  Container: {}\n",
+        diagnostics
+            .container
+            .container_name
+            .as_deref()
+            .unwrap_or("unknown")
+    ));
+    output.push_str(&format!("  Running: {}\n", diagnostics.container.running));
+    output.push_str(&format!(
+        "  State: {}\n",
+        diagnostics
+            .container
+            .state_status
+            .as_deref()
+            .unwrap_or("unknown")
+    ));
+    output.push_str(&format!(
+        "  Route Target: {}\n",
+        diagnostics
+            .route
+            .current_target
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    output.push_str(&format!(
+        "  Expected Route Target: {}\n",
+        diagnostics
+            .route
+            .expected_target
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    output.push_str(&format!(
+        "  Probe Target: {}\n",
+        format_probe_target(diagnostics.probe_target.as_ref())
+    ));
+    if let Some(stage) = diagnostics.likely_failure_stage.as_deref() {
+        output.push('\n');
+        output.push_str("Likely Failure Stage:\n");
+        output.push_str(&format!("  {stage}\n"));
+    }
+    if let Some(reason) = diagnostics.route.mismatch_reason.as_deref() {
+        output.push('\n');
+        output.push_str("Route Mismatch:\n");
+        output.push_str(&format!("  {reason}\n"));
+    }
+    output.push('\n');
+    output.push_str("Recent Failures:\n");
+    if diagnostics.recent_failures.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for failure in &diagnostics.recent_failures {
+            output.push_str(&format!(
+                "  gen-{} {}: {}\n",
+                failure.generation, failure.failure_stage, failure.failure_reason
+            ));
+        }
+    }
+    if let Some(source) = diagnostics.diagnostics_source.as_deref() {
+        output.push('\n');
+        output.push_str("Diagnostics Source:\n");
+        output.push_str(&format!("  {source}\n"));
+    }
+    output
+}
+
+fn format_probe_target(target: Option<&forge_core::api::ProbeTargetDiagnostics>) -> String {
+    let Some(target) = target else {
+        return "unknown".into();
+    };
+    let host = target.host.as_deref().unwrap_or("unknown");
+    let port = target
+        .port
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    match target.path.as_deref() {
+        Some(path) => format!("{host}:{port}{path}"),
+        None => format!("{host}:{port}"),
+    }
 }
 
 fn run_login(server_url: String) -> Result<(), CliError> {

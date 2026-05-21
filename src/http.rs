@@ -20,8 +20,8 @@ use subtle::ConstantTimeEq;
 
 use crate::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, ErrorResponse, EventList, ProjectList,
-    ProjectUpsertRequest,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics, ErrorResponse,
+    EventList, ProjectList, ProjectUpsertRequest,
 };
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{
@@ -81,6 +81,11 @@ pub trait ControlPlane: Send {
         project_id: &str,
         environment: &str,
     ) -> Result<ProjectEnvironmentStatus, ErrorResponse>;
+    fn get_project_environment_diagnostics(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<EnvironmentDiagnostics, ErrorResponse>;
 }
 
 impl<D, R, A> ControlPlane for Daemon<D, R, A>
@@ -128,6 +133,14 @@ where
         environment: &str,
     ) -> Result<ProjectEnvironmentStatus, ErrorResponse> {
         Daemon::get_project_environment_status(self, project_id, environment)
+    }
+
+    fn get_project_environment_diagnostics(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<EnvironmentDiagnostics, ErrorResponse> {
+        Daemon::get_project_environment_diagnostics(self, project_id, environment)
     }
 }
 
@@ -719,9 +732,14 @@ pub fn router(state: HttpState) -> Router {
             "/api/projects/{project_id}/environments/{environment}/status",
             get(get_project_environment_status),
         )
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/diagnostics",
+            get(get_project_environment_diagnostics),
+        )
         .route("/secrets", post(post_secrets))
         .route("/webhooks/github", post(post_github_webhook))
         .route("/deployments/{id}", get(get_deployment))
+        .route("/api/deployments/{id}/logs", get(get_logs))
         .route("/logs/{id}", get(get_logs))
         .route("/events", get(get_events))
         .with_state(state)
@@ -1789,6 +1807,44 @@ async fn get_logs(
                 code: "deployment_not_found".into(),
                 message: "deployment not found".into(),
             },
+        ),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+    }
+}
+
+async fn get_project_environment_diagnostics(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let mut daemon = match state.daemon.lock() {
+        Ok(daemon) => daemon,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "daemon_lock_error".into(),
+                    message: "daemon lock poisoned".into(),
+                },
+            );
+        }
+    };
+
+    match daemon.get_project_environment_diagnostics(&project_id, &environment) {
+        Ok(diagnostics) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: diagnostics,
+            }),
         ),
         Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
     }
@@ -3370,6 +3426,186 @@ pub mod logs_endpoint_is_bounded {
         assert!(lines.len() <= 64);
         assert_eq!(lines.last().unwrap(), "line-199");
         assert_ne!(lines.first().unwrap(), "line-0");
+    }
+}
+
+#[cfg(test)]
+pub mod deployment_diagnostics_endpoints {
+    use super::*;
+    use crate::storage::{DiagnosticsStore, EnvironmentPaths};
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn logs_returns_persisted_deployment_log() {
+        let (state, root) = build_state_with_root(true);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let writer = crate::storage::SnapshotWriter::new(env.clone(), 1).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-logs-1\",\n  \"image_ref\": \"forge/api:staging-gen-1\"\n}\n",
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", crate::storage::SnapshotState::Healthy)
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env, 1);
+        diagnostics.append_log_line("image built", &[]).unwrap();
+        diagnostics
+            .append_log_line("generation promoted", &[])
+            .unwrap();
+        diagnostics
+            .write_artifact(
+                "container_logs_tail.log",
+                "Server is running on 0.0.0.0:3000\n",
+                &[],
+            )
+            .unwrap();
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/deployments/dep-logs-1/logs")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
+        assert_eq!(json["data"]["environment"], "staging");
+        assert_eq!(json["data"]["lifecycle"][0], "image built");
+        assert_eq!(
+            json["data"]["container_logs"][0],
+            "Server is running on 0.0.0.0:3000"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_redacts_sensitive_values() {
+        let (state, root) = build_state_with_root(true);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let writer = crate::storage::SnapshotWriter::new(env.clone(), 1).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-redacted-1\",\n  \"image_ref\": \"forge/api:staging-gen-1\"\n}\n",
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", crate::storage::SnapshotState::Failed)
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env, 1);
+        diagnostics
+            .append_log_line("Authorization: [REDACTED]", &[])
+            .unwrap();
+        diagnostics
+            .write_artifact("container_logs_tail.log", "Bearer [REDACTED]\n", &[])
+            .unwrap();
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/deployments/dep-redacted-1/logs")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let rendered = json["data"].to_string();
+        assert!(!rendered.contains("Authorization: secret"));
+        assert!(!rendered.contains("Bearer token"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_api_matches_persisted_artifacts() {
+        let (state, root) = build_state_with_root(true);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let writer = crate::storage::SnapshotWriter::new(env.clone(), 1).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-diag-1\",\n  \"image_ref\": \"forge/api:staging-gen-1\",\n  \"source_ref\": \"main\"\n}\n",
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime.json",
+                "{\n  \"container_name\": \"staging-api-gen-1\",\n  \"running\": true,\n  \"network_name\": \"forge-managed\",\n  \"probe_path\": \"/health\",\n  \"activation\": {\"Http\": {\"internal_port\": 3000, \"route_subtree_id\": \"forge:api:staging\", \"target_source\": \"ContainerIp\"}},\n  \"environment_variables\": {}\n}\n",
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", crate::storage::SnapshotState::Healthy)
+            .unwrap();
+        crate::storage::PointerStore::new(env.clone())
+            .swap_current(1)
+            .unwrap();
+        crate::storage::RuntimeStateStore::new(env.clone())
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(1),
+                health_state: crate::storage::RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env.clone(), 1);
+        diagnostics
+            .write_summary(&crate::storage::DiagnosticSummary {
+                deployment_id: Some("dep-diag-1".into()),
+                failure_stage: "validating_runtime".into(),
+                failure_reason: "http health probe failed".into(),
+                container_name: "staging-api-gen-1".into(),
+                probe_target_host: Some("172.18.0.2".into()),
+                probe_target_port: Some(3000),
+                probe_target_path: Some("/health".into()),
+                cleanup_recorded: true,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+        diagnostics
+            .write_artifact(
+                "validation_failure.json",
+                "{\n  \"probe_target\": {\"host\": \"172.18.0.2\", \"port\": 3000, \"path\": \"/health\"},\n  \"last_error\": \"http health probe returned unhealthy\"\n}\n",
+                &[],
+            )
+            .unwrap();
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/projects/api/environments/staging/diagnostics")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
+        assert_eq!(json["data"]["active_generation"], 1);
+        assert_eq!(json["data"]["probe_target"]["path"], "/health");
+        assert_eq!(
+            json["data"]["recent_failures"][0]["failure_reason"],
+            "http health probe failed"
+        );
+        assert_eq!(
+            json["data"]["latest_validation_failure"]["last_error"],
+            "http health probe returned unhealthy"
+        );
     }
 }
 
