@@ -1390,10 +1390,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         diagnostics: &DiagnosticsStore,
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
+        let pointers = PointerStore::new(env.clone());
+        let previous_authoritative = pointers.read_authoritative_pointer()?;
+
         match validation.activation {
             ActivationMode::Direct => {
-                PointerStore::new(env.clone()).swap_current(generation)?;
-                Ok(())
+                pointers.swap_current(generation)?;
             }
             ActivationMode::Http { internal_port } => {
                 let subtree_id = route_subtree_id(record);
@@ -1446,10 +1448,34 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     )?;
                     return Err(err);
                 }
-                PointerStore::new(env.clone()).swap_current(generation)?;
-                Ok(())
+                pointers.swap_current(generation)?;
             }
         }
+
+        diagnostics.append_log_line(
+            &format!(
+                "current pointer updated: {} -> {generation}",
+                previous_authoritative
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unset".into())
+            ),
+            secret_values,
+        )?;
+        diagnostics.append_log_line(
+            &format!("promotion pointer updated: {generation}"),
+            secret_values,
+        )?;
+        RuntimeStateStore::new(env.clone()).save(&RuntimeState {
+            active_generation: Some(generation),
+            health_state: RuntimeHealthState::Healthy,
+            failed_probe_count: 0,
+            successful_probe_count: 0,
+            restart_attempted: false,
+            degraded_since_unix: None,
+            last_transition: "promotion_completed".into(),
+            last_error_code: None,
+        })?;
+        Ok(())
     }
 
     fn resolve_runtime_secrets(
@@ -4199,6 +4225,28 @@ pub mod runtime_environment_snapshots {
             .unwrap();
         assert!(snapshot_line < promotion_line);
         assert!(log_lines[snapshot_line].contains(snapshot_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn successful_deploy_updates_current_pointer() {
+        let root = test_root("successful-deploy-updates-current-pointer");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+
+        execute_with_runtime_env(&root);
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+        assert_eq!(pointers.read_pointer("promoted").unwrap(), Some(1));
+        assert_eq!(pointers.read_authoritative_pointer().unwrap(), Some(1));
+        assert_eq!(
+            RuntimeStateStore::new(env)
+                .load()
+                .unwrap()
+                .active_generation,
+            Some(1)
+        );
     }
 
     #[test]

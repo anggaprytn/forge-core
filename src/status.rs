@@ -21,9 +21,8 @@ use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, PersistedActivationMode, PersistedBuildInfo,
     PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedSnapshotMetadata, PointerStore,
-    RuntimeState, RuntimeStateStore, StorageError, load_generation_build_info,
-    load_generation_runtime_env_snapshot, load_generation_runtime_info,
-    load_generation_snapshot_metadata,
+    StorageError, load_generation_build_info, load_generation_runtime_env_snapshot,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,12 +577,7 @@ fn load_environment_active_generation(
     env: &EnvironmentPaths,
 ) -> Result<Option<u64>, ProjectStatusError> {
     env.ensure_exists()?;
-    let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
-    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    Ok(resolve_active_generation(
-        current_generation,
-        &runtime_state,
-    ))
+    Ok(PointerStore::new(env.clone()).read_authoritative_pointer()?)
 }
 
 fn load_environment_runtime_truth<D, R>(
@@ -600,8 +594,7 @@ where
 {
     env.ensure_exists()?;
     let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
-    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    let active_generation = resolve_active_generation(current_generation, &runtime_state);
+    let active_generation = PointerStore::new(env.clone()).read_authoritative_pointer()?;
     let latest_generation = latest_generation(env)?;
 
     let promoted_snapshot = active_generation
@@ -930,13 +923,6 @@ fn load_failure_details_internal(
             diagnostics_source,
         },
     }))
-}
-
-fn resolve_active_generation(
-    current_generation: Option<u64>,
-    runtime_state: &RuntimeState,
-) -> Option<u64> {
-    runtime_state.active_generation.or(current_generation)
 }
 
 fn mark_failure_historical(
@@ -1910,17 +1896,18 @@ mod tests {
     }
 
     #[test]
-    fn env_report_prefers_runtime_active_generation_snapshot() {
-        let root = test_root("env-report-prefers-runtime-active-generation-snapshot");
+    fn status_reads_newest_promoted_generation() {
+        let root = test_root("status-reads-newest-promoted-generation");
         register_project(&root, "api", "api.example.com");
         write_generation(&root, 6);
         write_generation(&root, 7);
 
         let env = EnvironmentPaths::new(&root, "api", "staging");
         PointerStore::new(env.clone()).swap_current(6).unwrap();
+        atomic_write(env.promoted_pointer(), b"7\n").unwrap();
         RuntimeStateStore::new(env)
             .save(&RuntimeState {
-                active_generation: Some(7),
+                active_generation: Some(6),
                 health_state: RuntimeHealthState::Healthy,
                 failed_probe_count: 0,
                 successful_probe_count: 1,
@@ -1931,9 +1918,34 @@ mod tests {
             })
             .unwrap();
 
-        let report = load_project_environment_env_report(&root, "api", "staging").unwrap();
-        assert_eq!(report.generation, 7);
-        assert_eq!(report.deployment_id, "dep-7");
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(RouteInspection {
+                subtree_id: "forge:api:staging".into(),
+                active_target: "172.29.0.2:3000".into(),
+                domain: Some("staging-api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: Some(200),
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }),
+        };
+
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+        assert_eq!(status.active_generation, Some(7));
+        assert_eq!(status.last_deployment_id.as_deref(), Some("dep-7"));
     }
 
     #[test]
@@ -1945,9 +1957,10 @@ mod tests {
 
         let env = EnvironmentPaths::new(&root, "api", "staging");
         PointerStore::new(env.clone()).swap_current(6).unwrap();
+        atomic_write(env.promoted_pointer(), b"7\n").unwrap();
         RuntimeStateStore::new(env)
             .save(&RuntimeState {
-                active_generation: Some(7),
+                active_generation: Some(6),
                 health_state: RuntimeHealthState::Healthy,
                 failed_probe_count: 0,
                 successful_probe_count: 1,
@@ -1972,6 +1985,7 @@ mod tests {
 
         let env = EnvironmentPaths::new(&root, "api", "staging");
         PointerStore::new(env.clone()).swap_current(6).unwrap();
+        atomic_write(env.promoted_pointer(), b"7\n").unwrap();
         RuntimeStateStore::new(env)
             .save(&RuntimeState {
                 active_generation: Some(7),
@@ -2017,6 +2031,7 @@ mod tests {
 
         let env = EnvironmentPaths::new(&root, "api", "staging");
         PointerStore::new(env.clone()).swap_current(6).unwrap();
+        atomic_write(env.promoted_pointer(), b"7\n").unwrap();
         RuntimeStateStore::new(env)
             .save(&RuntimeState {
                 active_generation: Some(7),

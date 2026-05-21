@@ -295,6 +295,7 @@ impl EnvironmentPaths {
         fs::create_dir_all(self.generations_dir())?;
         self.ensure_pointer_file("current")?;
         self.ensure_pointer_file("previous")?;
+        self.ensure_pointer_file("promoted")?;
         if !self.generation_counter().exists() {
             atomic_write(&self.generation_counter(), b"0\n")?;
         }
@@ -319,6 +320,10 @@ impl EnvironmentPaths {
 
     pub fn previous_pointer(&self) -> PathBuf {
         self.root.join("previous")
+    }
+
+    pub fn promoted_pointer(&self) -> PathBuf {
+        self.root.join("promoted")
     }
 
     pub fn runtime_state_file(&self) -> PathBuf {
@@ -812,8 +817,9 @@ impl PointerStore {
             return Err(StorageError::InvalidPointer(self.env.current_pointer()));
         }
 
-        let current = self.read_pointer("current")?;
-        if let Some(previous_generation) = current {
+        let _guard = FileLock::acquire(self.env.root.join("pointers.lock"))?;
+        let current = self.read_authoritative_pointer()?;
+        if let Some(previous_generation) = current.filter(|current| *current != generation) {
             atomic_write(
                 self.env.previous_pointer(),
                 format!("{previous_generation}\n").as_bytes(),
@@ -823,7 +829,17 @@ impl PointerStore {
         atomic_write(
             self.env.current_pointer(),
             format!("{generation}\n").as_bytes(),
+        )?;
+        atomic_write(
+            self.env.promoted_pointer(),
+            format!("{generation}\n").as_bytes(),
         )
+    }
+
+    pub fn read_authoritative_pointer(&self) -> StorageResult<Option<u64>> {
+        self.read_pointer("promoted").and_then(|promoted| {
+            promoted.map_or_else(|| self.read_pointer("current"), |value| Ok(Some(value)))
+        })
     }
 
     pub fn read_pointer(&self, name: &str) -> StorageResult<Option<u64>> {
