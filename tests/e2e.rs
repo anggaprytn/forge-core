@@ -1247,6 +1247,7 @@ impl DockerRuntime for NoopDockerRuntime {
             running: true,
             state_status: "running".into(),
             exit_code: Some(0),
+            started_at: None,
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: Default::default(),

@@ -94,6 +94,16 @@ pub struct PersistedBuildInfo {
     pub source_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSnapshotMetadata {
+    pub snapshot_version: u64,
+    pub project_id: String,
+    pub environment: String,
+    pub generation: u64,
+    pub state: String,
+    pub finalized_at_unix: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PersistedRouteTargetSource {
     #[default]
@@ -381,6 +391,13 @@ pub fn load_generation_runtime_info(
     generation: u64,
 ) -> StorageResult<Option<PersistedRuntimeInfo>> {
     load_generation_json(env, generation, "runtime.json")
+}
+
+pub fn load_generation_snapshot_metadata(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> StorageResult<Option<PersistedSnapshotMetadata>> {
+    load_generation_json(env, generation, "snapshot.json")
 }
 
 impl EventStore {

@@ -139,6 +139,7 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
                 "status={{.State.Status}}",
                 "running={{.State.Running}}",
                 "exit_code={{.State.ExitCode}}",
+                "started_at={{.State.StartedAt}}",
                 "image={{.Config.Image}}",
                 "restart_policy={{.HostConfig.RestartPolicy.Name}}",
                 "{{range $key, $value := .Config.Labels}}",
@@ -259,6 +260,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
     let mut running = None;
     let mut state_status = None;
     let mut exit_code = None;
+    let mut started_at = None;
     let mut image_ref = None;
     let mut restart_policy = None;
     let mut labels = BTreeMap::new();
@@ -273,6 +275,11 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             "status" => state_status = Some(value.to_string()),
             "running" => running = Some(value == "true"),
             "exit_code" => exit_code = value.parse::<i32>().ok(),
+            "started_at" => {
+                if !value.is_empty() && value != "0001-01-01T00:00:00Z" {
+                    started_at = Some(value.to_string());
+                }
+            }
             "image" => image_ref = Some(value.to_string()),
             "restart_policy" => restart_policy = Some(value.to_string()),
             _ if key.starts_with("label:") => {
@@ -304,6 +311,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             }
         }),
         exit_code,
+        started_at,
         image_ref: image_ref
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,
         labels,

@@ -59,6 +59,55 @@ fn cli_status_reads_deployment_status() {
 }
 
 #[test]
+fn cli_project_status_reads_authoritative_runtime_status() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        concat!(
+            r#"{"data":{"project_id":"api","environment":"staging","status":"healthy","active_generation":7,"domain":"staging-api.example.com","commit_sha":"340ac8108006d84dbf951d8c0bb04ecfaf0eccac","source_ref":"main","container_name":"staging-api-gen-7","container_running":true,"network_name":"forge-managed","container_ip":"172.29.0.2","route_active":true,"probe_path":"/health","image_ref":"forge/api:staging-gen-7","last_deployment_id":"dep-7","deployed_at_unix":1779320528}}"#
+        ),
+    );
+
+    let output = run_cli(&url, &["status", "api", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Project: api"));
+    assert!(body.contains("Environment: staging"));
+    assert!(body.contains("Status: healthy"));
+    assert!(body.contains("https://staging-api.example.com"));
+    assert!(body.contains("Container: staging-api-gen-7"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/staging/status"
+    );
+}
+
+#[test]
+fn cli_project_status_json_reads_authoritative_runtime_status() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"staging","status":"degraded","active_generation":7,"domain":"staging-api.example.com","container_running":false,"route_active":false}}"#,
+    );
+
+    let output = run_cli(&url, &["status", "--json", "api", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"status\": \"degraded\""));
+    assert!(body.contains("\"route_active\": false"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/staging/status"
+    );
+}
+
+#[test]
 fn cli_events_reads_event_stream() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(

@@ -11,6 +11,7 @@ use crate::runtime::{
     RouteInspection, RouteUpdateRequest, RoutingRuntime,
 };
 use crate::secrets::SecretStore;
+use crate::status::derive_environment_domain;
 #[cfg(test)]
 use crate::storage::SnapshotState;
 use crate::storage::{
@@ -2021,15 +2022,6 @@ fn load_environment_domain(
     Ok(project.map(|project| derive_environment_domain(&project.base_domain, environment)))
 }
 
-fn derive_environment_domain(base_domain: &str, environment: &str) -> String {
-    match environment {
-        "production" => base_domain.to_string(),
-        "staging" => format!("staging-{base_domain}"),
-        "development" => format!("development-{base_domain}"),
-        other => format!("{other}-{base_domain}"),
-    }
-}
-
 fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
     routing: &mut RtR,
     subtree_id: &str,
@@ -2242,6 +2234,7 @@ impl DockerRuntime for TestDockerRuntime {
                 "exited".into()
             },
             exit_code: if running { Some(0) } else { Some(1) },
+            started_at: None,
             image_ref: test_image_ref(container_name),
             labels: Default::default(),
             network_ips: self.inspection_network_ips(container_name),
@@ -2272,6 +2265,7 @@ impl DockerRuntime for TestDockerRuntime {
                     "exited".into()
                 },
                 exit_code: if *running { Some(0) } else { Some(1) },
+                started_at: None,
                 image_ref: test_image_ref(container_name),
                 labels: std::collections::BTreeMap::from([
                     ("forge.managed".into(), "true".into()),

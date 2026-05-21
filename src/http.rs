@@ -31,6 +31,7 @@ use crate::metrics::render_prometheus;
 use crate::projects::{ProjectRegistryStore, project_registry_error_response};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
+use crate::status::ProjectEnvironmentStatus;
 use crate::storage::atomic_write;
 
 const AUTHORIZATION: &str = "authorization";
@@ -75,6 +76,11 @@ pub trait ControlPlane: Send {
     ) -> Result<Option<DeploymentLogs>, ErrorResponse>;
     fn list_events(&self) -> Result<EventList, ErrorResponse>;
     fn queue_depth(&self) -> Result<usize, ErrorResponse>;
+    fn get_project_environment_status(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<ProjectEnvironmentStatus, ErrorResponse>;
 }
 
 impl<D, R, A> ControlPlane for Daemon<D, R, A>
@@ -114,6 +120,14 @@ where
 
     fn queue_depth(&self) -> Result<usize, ErrorResponse> {
         Daemon::queue_depth(self)
+    }
+
+    fn get_project_environment_status(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<ProjectEnvironmentStatus, ErrorResponse> {
+        Daemon::get_project_environment_status(self, project_id, environment)
     }
 }
 
@@ -701,6 +715,10 @@ pub fn router(state: HttpState) -> Router {
         .route("/deployments", post(post_deployments))
         .route("/api/projects", post(post_projects).get(get_projects))
         .route("/api/projects/{project_id}", get(get_project))
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/status",
+            get(get_project_environment_status),
+        )
         .route("/secrets", post(post_secrets))
         .route("/webhooks/github", post(post_github_webhook))
         .route("/deployments/{id}", get(get_deployment))
@@ -1605,6 +1623,51 @@ async fn get_project(
     }
 }
 
+async fn get_project_environment_status(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let mut daemon = match state.daemon.lock() {
+        Ok(daemon) => daemon,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "daemon_lock_error".into(),
+                    message: "daemon lock poisoned".into(),
+                },
+            );
+        }
+    };
+
+    match daemon.get_project_environment_status(&project_id, &environment) {
+        Ok(status) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: status,
+            }),
+        ),
+        Err(err) => {
+            let status = match err.code.as_str() {
+                "project_not_found" => StatusCode::NOT_FOUND,
+                "invalid_environment" => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_response(status, &request_id, err)
+        }
+    }
+}
+
 async fn get_deployment(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -2162,6 +2225,7 @@ impl DockerRuntime for NoopDockerRuntime {
             running: true,
             state_status: "running".into(),
             exit_code: Some(0),
+            started_at: None,
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: std::collections::BTreeMap::from([(
@@ -2228,10 +2292,16 @@ impl RoutingRuntime for NoopRoutingRuntime {
         &mut self,
         subtree_id: &str,
     ) -> Result<crate::runtime::RouteInspection, crate::runtime::RoutingRuntimeError> {
+        let environment = subtree_id.rsplit(':').next().unwrap_or("production");
+        let domain = match environment {
+            "staging" => Some("staging-api.example.com".into()),
+            "development" => Some("development-api.example.com".into()),
+            _ => Some("api.example.com".into()),
+        };
         Ok(crate::runtime::RouteInspection {
             subtree_id: subtree_id.to_string(),
-            active_target: String::new(),
-            domain: None,
+            active_target: "172.18.0.2:3000".into(),
+            domain,
             activation_verified: true,
             verification_url: None,
             verification_host: None,
@@ -2336,6 +2406,72 @@ fn seed_test_project(root: &Path) {
             },
             None,
         )
+        .unwrap();
+}
+
+#[cfg(test)]
+fn seed_project_status_runtime(root: &Path, generation: u64) {
+    use crate::storage::{
+        EnvironmentPaths, PersistedActivationMode, PersistedRouteTargetSource,
+        PersistedRuntimeInfo, PointerStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
+        SnapshotState, SnapshotWriter,
+    };
+
+    let env = EnvironmentPaths::new(root, "api", "staging");
+    let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+    writer
+        .write_artifact(
+            "build.json",
+            &format!(
+                concat!(
+                    "{{\n",
+                    "  \"deployment_id\": \"dep-{}\",\n",
+                    "  \"image_ref\": \"forge/api:staging-gen-{}\",\n",
+                    "  \"source_ref\": \"main\",\n",
+                    "  \"commit_sha\": \"340ac8108006d84dbf951d8c0bb04ecfaf0eccac\"\n",
+                    "}}\n"
+                ),
+                generation, generation,
+            ),
+        )
+        .unwrap();
+    let runtime = serde_json::to_string_pretty(&PersistedRuntimeInfo {
+        container_name: format!("staging-api-gen-{generation}"),
+        running: true,
+        network_name: Some("forge-managed".into()),
+        probe_path: Some("/health".into()),
+        activation: Some(PersistedActivationMode::Http {
+            internal_port: 3000,
+            route_subtree_id: Some("forge:api:staging".into()),
+            target_source: PersistedRouteTargetSource::ContainerIp,
+        }),
+        environment_variables: std::collections::BTreeMap::new(),
+        source_ref: Some("main".into()),
+        repo_url: None,
+        commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
+        source_path: None,
+    })
+    .unwrap();
+    writer
+        .write_artifact("runtime.json", &format!("{runtime}\n"))
+        .unwrap();
+    writer
+        .finalize("api", "staging", SnapshotState::Healthy)
+        .unwrap();
+    PointerStore::new(env.clone())
+        .swap_current(generation)
+        .unwrap();
+    RuntimeStateStore::new(env)
+        .save(&RuntimeState {
+            active_generation: Some(generation),
+            health_state: RuntimeHealthState::Healthy,
+            failed_probe_count: 0,
+            successful_probe_count: 1,
+            restart_attempted: false,
+            degraded_since_unix: None,
+            last_transition: "healthy".into(),
+            last_error_code: None,
+        })
         .unwrap();
 }
 
@@ -3288,5 +3424,40 @@ pub mod project_registry_endpoints_round_trip {
         let show_json: Value = serde_json::from_slice(&show_body).unwrap();
         assert_eq!(show_json["data"]["base_domain"], "api.example.com");
         assert_eq!(show_json["data"]["domain_mode"], "explicit");
+    }
+}
+
+#[cfg(test)]
+pub mod project_environment_status_endpoint_reports_runtime_truth {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn project_environment_status_endpoint_reports_runtime_truth() {
+        let (state, root) = build_state_with_root(true);
+        seed_project_status_runtime(&root, 7);
+        let app = router(state);
+
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/projects/api/environments/staging/status")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
+        assert_eq!(json["data"]["environment"], "staging");
+        assert_eq!(json["data"]["status"], "healthy");
+        assert_eq!(json["data"]["active_generation"], 7);
+        assert_eq!(json["data"]["domain"], "staging-api.example.com");
+        assert_eq!(json["data"]["container_running"], true);
+        assert_eq!(json["data"]["route_active"], true);
     }
 }

@@ -32,6 +32,7 @@ use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
+use forge_core::status::ProjectEnvironmentStatus;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
@@ -112,6 +113,20 @@ where
             let client = ForgeClient::new(base_url, token);
             let status = client.get_status(&deployment_id)?;
             print_json(&status)?;
+        }
+        Command::ProjectStatus {
+            project_id,
+            environment,
+            json,
+        } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let status = client.get_project_environment_status(&project_id, &environment)?;
+            if json {
+                print_json(&status)?;
+            } else {
+                print!("{}", render_project_environment_status(&status));
+            }
         }
         Command::Events => {
             let (base_url, token) = api_credentials.clone().unwrap();
@@ -222,6 +237,17 @@ impl ForgeClient {
 
     fn get_events(&self) -> Result<EventList, CliError> {
         self.send_json(self.http.get(format!("{}/events", self.base_url)))
+    }
+
+    fn get_project_environment_status(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<ProjectEnvironmentStatus, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/status",
+            self.base_url
+        )))
     }
 
     fn post_secret(&self, request: SecretWriteRequest) -> Result<SecretWriteResult, CliError> {
@@ -376,6 +402,11 @@ enum Command {
     },
     Status {
         deployment_id: String,
+    },
+    ProjectStatus {
+        project_id: String,
+        environment: String,
+        json: bool,
     },
     Events,
     Rollback {
@@ -560,9 +591,7 @@ fn parse_command(
         [cmd] if cmd == "logout" => Ok(Command::Logout),
         [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
         [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
-        [cmd, deployment_id] if cmd == "status" => Ok(Command::Status {
-            deployment_id: deployment_id.clone(),
-        }),
+        [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
         [cmd] if cmd == "events" => Ok(Command::Events),
         [cmd, project_id, environment] if cmd == "rollback" => Ok(Command::Rollback {
             project_id: project_id.clone(),
@@ -602,6 +631,7 @@ fn usage() -> String {
         "  forge whoami",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
+        "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
@@ -652,6 +682,31 @@ fn parse_deploy_command(args: &[String]) -> Result<Command, CliError> {
             environment: environment.clone(),
             source_path,
             source_ref,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_status_command(args: &[String]) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+    }
+
+    match positionals.as_slice() {
+        [deployment_id] if !json => Ok(Command::Status {
+            deployment_id: deployment_id.clone(),
+        }),
+        [project_id, environment] => Ok(Command::ProjectStatus {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json,
         }),
         _ => Err(CliError::Usage(usage())),
     }
@@ -786,6 +841,55 @@ struct WhoAmIOutput {
     server_url: Option<String>,
     token_source: String,
     authenticated: String,
+}
+
+fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Project: {}\n", status.project_id));
+    output.push_str(&format!("Environment: {}\n", status.environment));
+    output.push_str(&format!("Status: {}\n\n", status.status));
+    output.push_str("Domain:\n");
+    output.push_str(&format!("  https://{}\n\n", status.domain));
+    output.push_str("Runtime:\n");
+    output.push_str(&format!(
+        "  Generation: {}\n",
+        status
+            .active_generation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    ));
+    output.push_str(&format!(
+        "  Commit: {}\n",
+        status
+            .commit_sha
+            .as_deref()
+            .map(|value| value.chars().take(16).collect::<String>())
+            .unwrap_or_else(|| "unknown".into())
+    ));
+    output.push_str(&format!(
+        "  Ref: {}\n",
+        status.source_ref.as_deref().unwrap_or("unknown")
+    ));
+    output.push_str(&format!(
+        "  Container: {}\n",
+        status.container_name.as_deref().unwrap_or("unknown")
+    ));
+    output.push_str(&format!("  Running: {}\n", status.container_running));
+    output.push_str(&format!(
+        "  Network: {}\n",
+        status.network_name.as_deref().unwrap_or("unknown")
+    ));
+    output.push_str(&format!(
+        "  IP: {}\n\n",
+        status.container_ip.as_deref().unwrap_or("unknown")
+    ));
+    output.push_str("Routing:\n");
+    output.push_str(&format!("  Route Active: {}\n", status.route_active));
+    output.push_str(&format!(
+        "  Probe Path: {}\n",
+        status.probe_path.as_deref().unwrap_or("unknown")
+    ));
+    output
 }
 
 fn run_login(server_url: String) -> Result<(), CliError> {

@@ -19,6 +19,7 @@ use crate::runtime::{
     RoutingRuntime, RoutingRuntimeError,
 };
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
+use crate::status::derive_environment_domain;
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     GenerationAllocator, PersistedActivationMode, PersistedBuildInfo, PersistedRouteTargetSource,
@@ -1576,15 +1577,6 @@ fn load_environment_domain(
             ))
         })?;
     Ok(project.map(|project| derive_environment_domain(&project.base_domain, environment)))
-}
-
-fn derive_environment_domain(base_domain: &str, environment: &str) -> String {
-    match environment {
-        "production" => base_domain.to_string(),
-        "staging" => format!("staging-{base_domain}"),
-        "development" => format!("development-{base_domain}"),
-        other => format!("{other}-{base_domain}"),
-    }
 }
 
 fn caddy_network_reachability_note(network_name: Option<&str>) -> Option<String> {

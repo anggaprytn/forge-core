@@ -25,6 +25,7 @@ pub struct ContainerInspection {
     pub running: bool,
     pub state_status: String,
     pub exit_code: Option<i32>,
+    pub started_at: Option<String>,
     pub image_ref: String,
     pub labels: BTreeMap<String, String>,
     pub network_ips: BTreeMap<String, String>,

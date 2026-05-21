@@ -21,6 +21,7 @@ use crate::events::EventRecord;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
+use crate::status::{ProjectEnvironmentStatus, load_project_environment_status};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
 };
@@ -249,6 +250,26 @@ where
                 message: err.to_string(),
             })?;
         Ok(EventList { events })
+    }
+
+    pub fn get_project_environment_status(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<ProjectEnvironmentStatus, ErrorResponse> {
+        load_project_environment_status(
+            &self.config.storage_root,
+            self.queue.as_ref(),
+            &mut self.docker_runtime,
+            &mut self.routing_runtime,
+            project_id,
+            environment,
+        )
+        .map_err(|err| {
+            let (status, response) = crate::status::project_status_error_response(err);
+            let _ = status;
+            response
+        })
     }
 
     pub fn get_deployment_logs(
@@ -640,6 +661,7 @@ impl DockerRuntime for NoopDockerRuntime {
             running: true,
             state_status: "running".into(),
             exit_code: Some(0),
+            started_at: None,
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: std::collections::BTreeMap::from([(
@@ -706,10 +728,16 @@ impl RoutingRuntime for NoopRoutingRuntime {
         &mut self,
         subtree_id: &str,
     ) -> Result<crate::runtime::RouteInspection, crate::runtime::RoutingRuntimeError> {
+        let environment = subtree_id.rsplit(':').next().unwrap_or("production");
+        let domain = match environment {
+            "staging" => Some("staging-api.example.com".into()),
+            "development" => Some("development-api.example.com".into()),
+            _ => Some("api.example.com".into()),
+        };
         Ok(crate::runtime::RouteInspection {
             subtree_id: subtree_id.to_string(),
-            active_target: String::new(),
-            domain: None,
+            active_target: "172.18.0.2:3000".into(),
+            domain,
             activation_verified: true,
             verification_url: None,
             verification_host: None,
