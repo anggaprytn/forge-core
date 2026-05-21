@@ -1,541 +1,135 @@
-# Forge
+MIT License
 
-Deterministic runtime convergence platform for AI-generated applications.
+Copyright (c) 2026 Forge Authors
 
-Forge is a single-node deployment and orchestration system designed around one core idea:
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-```txt
-running container != successful deployment
-```
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-A deployment is only considered successful after:
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+on the very first incoming request.
 
-```txt
-candidate
-→ validated
-→ finalized
-→ activated
-→ promoted
-```
+Existing orchestration solutions are mismatched for this problem:
+* **Kubernetes** is architecturally misaligned for single-node, fast-iteration agentic workflows. It introduces massive overhead to solve problems AI agents don't have yet.
+* **Traditional PaaS (Dokku, CapRover)** optimize for human operators, hiding the low-level infrastructure state that AI agents desperately need to debug failures.
+* **Serverless** abstracts away the runtime, breaking apps that rely on specific container behaviors or background processes.
 
-Forge separates deploy-time eligibility from steady-state correctness, allowing deterministic rollback, restart-safe recovery, and runtime convergence without Kubernetes-scale complexity.
+## The Forge Philosophy
 
----
+Forge acts as the **"safety rails" for AI engineers**. It provides a rigorous, fail-closed infrastructure layer that replaces the "deploy and pray" model with a deterministic state machine: `Candidate → Validated → Finalized → Activated → Promoted`.
 
-# Why Forge Exists
-
-AI-generated applications fail operationally in predictable ways:
-
-- bind to `127.0.0.1`
-- expose incorrect ports
-- fail health assumptions
-- leak secrets into logs
-- partially deploy
-- leave orphaned runtime state
-- require manual infrastructure repair
-
-Forge exists to make generated software operationally convergent.
-
-Goal:
-
-```txt
-git push
-→ deploy
-→ validate
-→ recover
-→ rollback
-```
-
-with minimal human intervention.
+If an AI agent generates a broken deployment, Forge catches it *before* traffic routing shifts, tears down the broken generation, and produces a mathematically clean, **secret-redacted diagnostic artifact** designed specifically for the AI to read, understand, and autonomous self-correct.
 
 ---
 
-# Getting Started
+## Key Capabilities
 
-- Local alpha loop: [docs/LOCAL_QUICKSTART.md](docs/LOCAL_QUICKSTART.md)
-- Linux/systemd host bootstrap: [install.sh](install.sh) (conservative and idempotent)
+### 1. Invariant-Driven Convergence
+Forge does not trust its underlying runtimes (Docker/Caddy). Instead, it maintains absolute authority via an immutable on-disk state. If the daemon crashes or the host reboots, Forge reconstructs its world-view entirely from atomic filesystem pointers and snapshot logs, reconciling the system back to the intended active generation.
 
----
+### 2. Zero-Downtime Atomic Promotions
+A generation only becomes active if it passes exhaustive lifecycle validation. Forge explicitly tests TCP reachability and HTTP health checks on the isolated container network before signaling Caddy to update routes. **Failed generations never receive traffic.**
 
-# Alpha Readiness Checklist
+### 3. AI-Native Diagnostic Artifacts
+When a deployment fails, Forge captures a deterministic "black box" diagnostic payload. This includes container exit codes, network topologies, reachability notes, and log tails—while rigorously **redacting all injected secrets**. This provides AI agents with high-signal context for debugging without leaking credentials.
 
-Forge has been manually validated on a real VPS with the following:
-
-- [x] **Install**: `install.sh` successfully sets up binary, config, and systemd.
-- [x] **Deploy**: `forge deploy` promotes a new generation successfully.
-- [x] **Rollback**: `forge rollback` restores the previous healthy generation.
-- [x] **Daemon Restart**: `systemctl restart forge` reconstructs state.
-- [x] **Caddy Restart**: `systemctl restart caddy` results in route repair.
-- [x] **Docker Restart**: `systemctl restart docker` results in container recovery.
-- [x] **Host Reboot**: VPS reboot results in full automatic recovery.
-- [x] **Route Recovery**: Routing remains stable across runtime churn.
-- [x] **Bounded Retention**: Old generations are cleaned up deterministically.
-- [x] **Orphan Cleanup**: Orphaned containers/routes are removed or tombstoned.
-- [x] **12h Soak**: Daemon remains healthy under idle and active convergence.
+### 4. Filesystem-as-Database
+Forge eschews heavy relational databases. All state—event logs, deployment snapshots, routing pointers—is persisted via atomic filesystem operations (`fsync` + `rename`). This guarantees crash-safety and zero state corruption without the operational overhead of managing PostgreSQL or SQLite.
 
 ---
 
-# Known Constraints (Alpha)
+## Architecture
 
-- **Single-node only**: Forge manages exactly one host.
-- **Single-service web apps**: Only one HTTP service per project.
-- **No stateful DB ownership**: Database volume/state management is not native yet.
-- **No multi-service orchestration**: No built-in cross-service dependency management.
-- **Registered project required for deploy-by-ref**: `forge deploy <project> <environment>` resolves the source from the registered project repository and `default_branch`. Use `--ref <ref>` to override or `--from <path>` for explicit local-path deploys.
-- **API Visibility**: API is localhost-bound by default; do not expose publicly.
+Forge is intentionally narrow in scope. It optimizes for **operational correctness first, not feature breadth**.
 
----
+* **Control Plane:** Rust-based daemon running a deterministic convergence loop.
+* **Execution:** Docker (via CLI bridging) for container lifecycle management.
+* **Routing:** Caddy (via API) for dynamic, hitless reverse-proxying.
+* **Storage:** Atomic filesystem directories representing discrete deployment generations.
 
-# Alpha Product Semantics
+### The Deployment Pipeline
 
-## Binary Model
-
-- `forge` is the operator/client CLI product surface.
-- `forged` is the planned server/runtime authority binary name.
-- The current implementation may temporarily continue to ship one binary while command taxonomy and packaging settle.
-- This is product direction for the next alpha phase, not a required immediate binary split in code.
-
-## Control-Plane Model
-
-- Forge server owns the deployment queue, source resolution, immutable snapshots, convergence, routes, rollback, and restart recovery.
-- The Forge CLI is a stateless operator/client surface.
-- The web UI is a visibility and control surface for humans.
-- The framework-free web assets live in `web/` and are embedded by the Rust server so auth and route gating stay server-side.
-- The API is the automation surface.
-- CLI, API, and web actions must converge into the same deployment queue and deployment state machine.
-
-## Source Model
-
-- Canonical long-term deployment source is `git repository + ref`.
-- Local `--from <path>` remains supported as alpha and developer mode.
-- Upload-style sources are not canonical product semantics.
-- Source acquisition resolves into a local immutable source checkout.
-- The deployment pipeline consumes that resolved source path regardless of whether the request originated from webhook, CLI, API, or web.
-- Forge does not maintain a separate Git-specific deployment FSM.
-
-## Source Revision Identity Chain
-
-```txt
-repository
-→ ref
-→ commit_sha
-→ source_checkout
-→ generation
-→ image_ref
-→ snapshot
-→ route activation
-```
-
-## Alpha Environments
-
-- Supported environments are fixed to `development`, `staging`, and `production`.
-- Default branch mapping is `development -> development`, `staging -> staging`, `production -> main`.
-- Custom environments are not part of alpha scope.
-
-## Planned Alpha Domain Derivation
-
-- `production -> <base_domain>`
-- `staging -> staging-<base_domain>`
-- `development -> development-<base_domain>`
-
-Example:
-
-- `api.example.com`
-- `staging-api.example.com`
-- `development-api.example.com`
-
-This is planned alpha product semantics and may land in implementation incrementally.
-
-## Project Registry
-
-Forge now includes a minimal server-owned project registry for repository metadata and stable base domains.
-
-- `forge project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]`
-- `forge project list`
-- `forge project show <project_id>`
-
-Registry behavior:
-
-- `--branch` defaults to `main`.
-- `project_id` is optional when `--repo` is provided. Forge infers it from the repository basename, normalizes it, and still validates it against the safe project ID rules.
-- `--domain` stores an explicit `base_domain`.
-- Omitting `--domain` creates a stable generated `base_domain` that prefers `<project_id>.<FORGE_APPS_DOMAIN>`.
-- If that clean domain is already used by another project, Forge falls back to `<project_id>-<shortid>.<FORGE_APPS_DOMAIN>`.
-- Generated domains are persisted once and are not regenerated by later repo or branch updates.
-- `FORGE_APPS_DOMAIN` is only required when Forge needs to generate a domain.
-
-Example generated domains:
-
-- `api.forge.anggaprytn.com`
-- `api-k7x9q2.forge.anggaprytn.com` (collision fallback)
-- `staging-api-k7x9q2.forge.anggaprytn.com`
-- `development-api-k7x9q2.forge.anggaprytn.com`
-
-Example project creation:
-
-- `forge project add --repo https://github.com/example/api.git`
-- `forge project add api --repo https://github.com/example/api.git`
-
-Forge now uses this registry metadata for deploy-by-ref source resolution. It clones or fetches repositories into `<storage_root>/repositories/<project_id>/` and reuses immutable source checkouts under `<storage_root>/source-checkouts/<project_id>/<commit_sha>/`.
-
-## Web Role And Deferred Scope
-
-- Web is not the primary deployment engine.
-- Initial web scope is login, projects, environments, current/previous generation visibility, and events/logs/diagnostics.
-- Deployment execution still goes through the same API, queue, and FSM as every other surface.
-
-Explicitly deferred:
-
-- custom environments
-- custom per-environment domains
-- preview environments
-- multi-service orchestration
-- RBAC and teams
-- DNS automation
-- Kubernetes or distributed scheduling
-- stateful database ownership
-- a web deploy button as the primary product surface
+1. **Allocate:** A new monotonically increasing generation ID is provisioned.
+2. **Build:** The container image is built (via Dockerfile).
+3. **Stage:** The container is started on a dedicated Forge Docker network.
+4. **Validate:** TCP and HTTP probes run against the container's internal IP.
+5. **Finalize:** If healthy, the snapshot is marked as immutable.
+6. **Activate:** Caddy routes are updated to point to the new generation.
+7. **Promote:** The active pointer is atomically swapped, completing the deploy.
 
 ---
 
-# Core Principles
+## Quick Start
 
-## 1. Forge Is Authority
-
-Docker executes.
-
-Caddy routes.
-
-Forge owns orchestration truth.
-
----
-
-## 2. Deterministic Activation Ordering
-
-Deployments follow strict ordering:
-
-```txt
-candidate generation
-→ validated generation
-→ finalized snapshot
-→ route activation verified
-→ current pointer update
-```
-
-Never the reverse.
-
----
-
-## 3. Current Pointer Represents Intent
-
-```txt
-current
-```
-
-is the intended active generation.
-
-Routes reconcile toward current.
-
-Not vice versa.
-
----
-
-## 4. Immutable Deployment Snapshots
-
-Each deployment generation is immutable and persisted.
-
-Snapshots are rollback artifacts, not runtime guesses.
-
----
-
-## 5. Runtime Convergence
-
-Forge continuously reconciles:
-
-- snapshots
-- routes
-- containers
-- runtime state
-- queue state
-
-toward correctness.
-
----
-
-# Features
-
-## Deployments
-
-- GitHub webhook deploys
-- Exact-commit manifest resolution
-- Queue-backed deployment execution
-- Deterministic generation allocation
-- Restart-safe orchestration
-
-## Runtime Validation
-
-- TCP validation
-- HTTP health validation
-- Runtime contract enforcement
-- Failed-generation isolation
-
-## Recovery
-
-- Automatic rollback
-- Restart reconstruction
-- Orphan cleanup
-- Tombstoning
-- Convergence repair loops
-
-## Secrets
-
-- API-managed secrets
-- Runtime injection
-- Redaction in events and diagnostics
-- Secret-safe failure handling
-
-## Observability
-
-- Structured deployment events
-- Persisted diagnostics
-- Runtime state persistence
-- Deployment/event API
-- CLI tooling
-
----
-
-# Architecture
-
-```txt
-GitHub Webhook
-        ↓
-HTTP API
-        ↓
-Persistent Queue
-        ↓
-Deployment Executor
-        ↓
-Docker Runtime
-        ↓
-Validation
-        ↓
-Snapshot Finalization
-        ↓
-Caddy Route Activation
-        ↓
-Current Pointer Promotion
-        ↓
-Steady-State Convergence
-```
-
----
-
-# Components
-
-| Component          | Responsibility                   |
-| ------------------ | -------------------------------- |
-| Forge Core         | Orchestration authority          |
-| Docker             | Container execution              |
-| Caddy              | HTTP routing                     |
-| Snapshot Store     | Immutable deployment state       |
-| Queue              | Persistent deployment sequencing |
-| Convergence Engine | Runtime repair/recovery          |
-| CLI                | Operator interface               |
-
----
-
-# Runtime Semantics
-
-## Deploy-Time
-
-Determines:
-
-```txt
-can this generation become active?
-```
-
-## Steady-State
-
-Determines:
-
-```txt
-should this generation remain active?
-```
-
-These are intentionally separate systems.
-
----
-
-# CLI
-
+### Installation
+Run the bootstrap script to install the Forge CLI and daemon:
 ```bash
-forge init                                   # Generate forge.yml
-forge login https://forge.example.com        # Approve CLI access in browser
-forge whoami                                 # Show configured server/auth status
-forge logout                                 # Remove saved CLI token
-forge deploy [--from PATH] <project> <environment> # Deploy using forge.yml
-forge status <deployment_id>                 # Check deployment status
-forge events                                 # View orchestration events
-forge rollback <project> <environment>       # Restore previous healthy generation
-forge secrets set <project> <env> <k> <v>    # Set runtime secrets
+curl -sSL https://raw.githubusercontent.com/forge/forge-core/main/install.sh | bash
 ```
 
-## HTTP Surface
-
-- `GET /` serves `web/index.html`.
-- `GET /login` is the primary human-operator login entrypoint and starts a GitHub OAuth web session.
-- `GET /app` requires a signed HTTP-only session cookie and serves `web/app.html`.
-- `GET /logout` and `POST /logout` clear the web session.
-- `POST /api/cli-login/start` creates a short-lived CLI login request.
-- `GET /login/cli?code=...` serves the browser approval page and reuses the existing web session.
-- `POST /login/cli` approves the waiting CLI session after GitHub login.
-- `POST /api/cli-login/poll` returns `pending`, `approved`, or `expired`, and returns the CLI token only once.
-- CLI commands and bearer-token API auth remain available for automation and operator workflows.
-
-`forge login <server_url>` starts the approval flow, opens or prints the approval URL, polls until approval, and saves `server_url` plus the CLI token in `~/.config/forge/config.toml`. `FORGE_URL` and `FORGE_TOKEN` still override the saved config when present.
-
----
-
-# Example Workflow
-
-## 1. Initialize Project
-
+### Initializing a Project
+Navigate to your application directory and initialize a Forge configuration.
 ```bash
 forge init
 ```
+This generates a `forge.yml` file, defining build contexts, exposed ports, and required health invariants.
 
-This generates a deterministic `forge.yml` in the current directory. `forge.yml` is the primary operator-facing deployment configuration.
-
-## 2. Deploy to Production
-
+### Deploying
+Forge queues the deployment, builds the artifact, and executes the convergence pipeline.
 ```bash
-forge deploy api production
-forge deploy api production --ref release-2026-05
-forge deploy api production --from /path/to/project
+forge deploy <project_id> <environment> --from ./
 ```
 
-Forge resolves `forge deploy api production` from the registered project repository using the project's `default_branch`, fetches updates into the server-side repository cache, resolves an immutable commit SHA, and deploys from the corresponding immutable checkout. `--ref` overrides the branch or tag, and `--from` preserves the explicit local-path operator flow.
-
-## 3. GitHub Webhook (Automated)
-
-For automated flows, pushing to a tracked branch triggers the same deterministic pipeline:
-
+### Inspecting State
 ```bash
-git push origin main
+forge status <deployment_id>
+forge events
 ```
 
 ---
 
-# Example Manifest (forge.yml)
+## Operational Constraints & Non-Goals
 
-Forge strictly validates `forge.yml`. Unsupported or unknown fields are rejected intentionally.
+To maintain its strict guarantees, Forge explicitly accepts the following tradeoffs:
 
-```yaml
-version: 1
-name: api
-type: web # Only single-service web apps supported currently
-
-build:
-  dockerfile: Dockerfile
-  context: .
-
-runtime:
-  port: 3000
-  healthcheck:
-    path: /health
-    expected_status: 200
-
-invariants:
-  - name: health
-    path: /health
-    expect_status: 200
-```
-
-Validated fields:
-- `version`: Manifest schema version.
-- `name`: Project identifier.
-- `type`: Service type (currently `web`).
-- `build.dockerfile`: Path to the Dockerfile.
-- `build.context`: Docker build context path.
-- `runtime.port`: The port the application binds to (0.0.0.0).
-- `runtime.healthcheck.path`: Endpoint for HTTP health validation.
-- `runtime.healthcheck.expected_status`: Expected HTTP status code.
-- `invariants`: Post-activation runtime assertions.
+* **Single-Node Only:** Forge does not manage multi-node clusters. It is designed for vertical scaling on large, single instances (VPS or bare metal).
+* **Stateless Compute:** Forge manages application runtimes, not stateful databases. You must connect your apps to external managed databases (e.g., Supabase, RDS, Neon) or manage volumes out-of-band.
+* **Single Service per Project:** Forge currently maps one repository to one exposed service. Complex microservice choreography within a single project is an anti-pattern here.
 
 ---
 
-# Development
+## Roadmap
 
-## Run Tests
+Forge is currently in **Alpha**. The core convergence engine and invariant enforcement are highly stable and production-minded, but the CLI and API surfaces are subject to change.
 
-```bash
-cargo test -q
-```
-
-## Run Integration Tests
-
-```bash
-FORGE_INTEGRATION=1 cargo test -- --nocapture
-```
-
-## Run Dogfood E2Es
-
-```bash
-FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
-```
+- [x] Deterministic FSM deployment pipeline
+- [x] AI-native diagnostic generation & secret redaction
+- [x] Filesystem-backed atomic state reconstruction
+- [x] Hitless routing via Caddy API
+- [ ] Automated rollback on post-deployment degradation
+- [ ] Native GitHub Webhook integration for GitOps
+- [ ] Integrated application metrics exposure
 
 ---
 
-# Status
+## Contributing
 
-Current maturity:
+We are building the foundational infrastructure for the AI engineering era. If you are interested in state machines, distributed systems theory applied to single nodes, or writing highly deterministic Rust, we welcome your contributions.
 
-```txt
-alpha
-```
+Please read `ARCHITECTURE.md` and `INVARIANTS.md` before submitting pull requests. If an implementation violates the core invariants, the implementation is wrong.
 
-Forge currently proves:
+## License
 
-- deterministic deployment ordering
-- rollback semantics
-- restart-safe recovery
-- Docker/Caddy orchestration
-- secret redaction
-- runtime convergence
-- AI-generated app deployment proofs
-
----
-
-# Non-Goals
-
-Forge intentionally avoids:
-
-- Kubernetes complexity
-- distributed scheduling
-- multi-region orchestration
-- premature multi-service abstractions
-- enterprise RBAC sprawl
-
-Forge optimizes for:
-
-```txt
-single-node operational correctness
-```
-
-first.
-
----
-
-# Vision
-
-Forge is designed for a future where software generation becomes cheap but operational correctness remains difficult.
-
-The long-term thesis:
-
-```txt
-AI-generated applications should converge toward operational correctness automatically.
-```
-
-Not just deploy.
-
-Converge.
+MIT License. See `LICENSE` for details.
