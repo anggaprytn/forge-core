@@ -12,7 +12,7 @@ use forge_core::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, ProjectList, ProjectRecord, ProjectUpsertRequest, SecretListResponse,
+    EventList, ProjectList, ProjectRecord, ProjectUpsertRequest, RetentionRole, SecretListResponse,
     SecretUnsetResponse,
 };
 use forge_core::caddy::CaddyApiRuntime;
@@ -1327,8 +1327,17 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
     if let Some(state) = status.lifecycle_state.as_ref() {
         output.push_str(&format!("  Lifecycle State: {}\n", state.as_str()));
     }
-    if let Some(promotion_state) = status.promotion_state.as_deref() {
-        output.push_str(&format!("  Promotion State: {promotion_state}\n"));
+    if status.lifecycle_state.is_some() || status.retention_role.is_some() {
+        output.push_str(&format!(
+            "  Status Label: {}\n",
+            render_status_label(
+                status.lifecycle_state.as_ref(),
+                status.retention_role.as_ref()
+            )
+        ));
+    }
+    if let Some(retention_role) = status.retention_role.as_ref() {
+        output.push_str(&format!("  Retention Role: {}\n", retention_role.as_str()));
     }
     if let Some(summary) = status.validation_summary.as_ref() {
         output.push_str(&format!(
@@ -1400,6 +1409,31 @@ fn render_deployment_logs(logs: &DeploymentLogs) -> String {
     output
 }
 
+fn render_status_label(
+    lifecycle_state: Option<&forge_core::storage::DeploymentLifecycleState>,
+    retention_role: Option<&RetentionRole>,
+) -> &'static str {
+    match retention_role {
+        Some(RetentionRole::Current) => "active",
+        Some(RetentionRole::RollbackTarget) => "rollback_target",
+        Some(RetentionRole::GcEligible) => "gc_eligible",
+        Some(RetentionRole::Retained) => match lifecycle_state {
+            Some(forge_core::storage::DeploymentLifecycleState::Promoted) => "historical_promoted",
+            Some(forge_core::storage::DeploymentLifecycleState::Failed) => "failed",
+            Some(forge_core::storage::DeploymentLifecycleState::Rollback) => "rollback",
+            Some(forge_core::storage::DeploymentLifecycleState::GcEligible) => "gc_eligible",
+            _ => "historical",
+        },
+        None => match lifecycle_state {
+            Some(forge_core::storage::DeploymentLifecycleState::Promoted) => "historical_promoted",
+            Some(forge_core::storage::DeploymentLifecycleState::Failed) => "failed",
+            Some(forge_core::storage::DeploymentLifecycleState::Rollback) => "rollback",
+            Some(forge_core::storage::DeploymentLifecycleState::GcEligible) => "gc_eligible",
+            _ => "historical",
+        },
+    }
+}
+
 fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> String {
     let mut output = String::new();
     output.push_str(&format!("Project: {}\n", diagnostics.project_id));
@@ -1460,8 +1494,17 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
     if let Some(state) = diagnostics.active_lifecycle_state.as_ref() {
         output.push_str(&format!("  Lifecycle State: {}\n", state.as_str()));
     }
-    if let Some(promotion_state) = diagnostics.promotion_state.as_deref() {
-        output.push_str(&format!("  Promotion State: {promotion_state}\n"));
+    if diagnostics.active_lifecycle_state.is_some() || diagnostics.retention_role.is_some() {
+        output.push_str(&format!(
+            "  Status Label: {}\n",
+            render_status_label(
+                diagnostics.active_lifecycle_state.as_ref(),
+                diagnostics.retention_role.as_ref()
+            )
+        ));
+    }
+    if let Some(retention_role) = diagnostics.retention_role.as_ref() {
+        output.push_str(&format!("  Retention Role: {}\n", retention_role.as_str()));
     }
     if let Some(summary) = diagnostics.validation_summary.as_ref() {
         output.push_str(&format!(
@@ -1659,18 +1702,17 @@ fn render_deployment_history(history: &DeploymentHistoryResponse) -> String {
     let mut output = String::new();
     for entry in &history.entries {
         output.push_str(&format!("Generation {}\n", entry.generation));
-        let status = if entry.rollback_target {
-            "rollback_target".to_string()
-        } else if let Some(state) = entry.lifecycle_state.as_ref() {
-            state.as_str().to_string()
-        } else if entry.eligible_for_gc {
-            "gc_eligible".to_string()
-        } else if entry.promoted_at_unix.is_some() {
-            "promoted".to_string()
-        } else {
-            "historical".to_string()
-        };
+        let status = render_status_label(
+            entry.lifecycle_state.as_ref(),
+            entry.retention_role.as_ref(),
+        );
         output.push_str(&format!("  status: {status}\n"));
+        if let Some(state) = entry.lifecycle_state.as_ref() {
+            output.push_str(&format!("  lifecycle_state: {}\n", state.as_str()));
+        }
+        if let Some(retention_role) = entry.retention_role.as_ref() {
+            output.push_str(&format!("  retention_role: {}\n", retention_role.as_str()));
+        }
         if let Some(summary) = entry.validation_summary.as_ref() {
             output.push_str(&format!("  uptime: {}s\n", summary.observed_uptime_seconds));
             output.push_str(&format!(

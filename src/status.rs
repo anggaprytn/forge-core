@@ -10,8 +10,8 @@ use crate::api::{
     ContainerRuntimeDiagnostics, DeploymentHistoryEntry, DeploymentHistoryResponse,
     EnvironmentDiagnostics, EnvironmentDiffEntry, EnvironmentDiffResponse, EnvironmentDiffSummary,
     EnvironmentValueChange, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
-    ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction, RouteDiagnostics,
-    RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic, SecretReferenceChange,
+    ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction, RetentionRole,
+    RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic, SecretReferenceChange,
 };
 use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::load_optional_manifest;
@@ -76,7 +76,7 @@ pub struct ProjectEnvironmentStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_state: Option<DeploymentLifecycleState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub promotion_state: Option<String>,
+    pub retention_role: Option<RetentionRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_summary: Option<PersistedValidationSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +222,7 @@ fn deployment_history_entry(record: GenerationHistoryRecord) -> DeploymentHistor
         missing_artifacts: record.missing_artifacts,
         retained_reasons: record.retained_reasons,
         lifecycle_state: None,
+        retention_role: None,
         entered_at_unix: None,
         transition_reason: None,
         validation_summary: None,
@@ -229,19 +230,49 @@ fn deployment_history_entry(record: GenerationHistoryRecord) -> DeploymentHistor
     }
 }
 
-fn promotion_state_for_lifecycle(
-    lifecycle: Option<&PersistedDeploymentLifecycle>,
-    rollback_target: bool,
-) -> Option<String> {
-    if rollback_target {
-        return Some("rollback_target".into());
+fn retention_role_for_generation(
+    references: &HistoryReferences,
+    generation: u64,
+    retained: bool,
+    eligible_for_gc: bool,
+) -> Option<RetentionRole> {
+    if references.current == Some(generation) || references.promoted == Some(generation) {
+        Some(RetentionRole::Current)
+    } else if references.previous == Some(generation) {
+        Some(RetentionRole::RollbackTarget)
+    } else if retained {
+        Some(RetentionRole::Retained)
+    } else if eligible_for_gc {
+        Some(RetentionRole::GcEligible)
+    } else {
+        None
     }
-    lifecycle.map(|lifecycle| match lifecycle.state {
-        DeploymentLifecycleState::Promoted => "promoted".into(),
-        DeploymentLifecycleState::Failed => "failed".into(),
-        DeploymentLifecycleState::Rollback => "rollback".into(),
-        _ => "pending".into(),
-    })
+}
+
+#[cfg(test)]
+fn status_label(
+    lifecycle_state: Option<&DeploymentLifecycleState>,
+    retention_role: Option<&RetentionRole>,
+) -> &'static str {
+    match retention_role {
+        Some(RetentionRole::Current) => "active",
+        Some(RetentionRole::RollbackTarget) => "rollback_target",
+        Some(RetentionRole::GcEligible) => "gc_eligible",
+        Some(RetentionRole::Retained) => match lifecycle_state {
+            Some(DeploymentLifecycleState::Promoted) => "historical_promoted",
+            Some(DeploymentLifecycleState::Failed) => "failed",
+            Some(DeploymentLifecycleState::Rollback) => "rollback",
+            Some(DeploymentLifecycleState::GcEligible) => "gc_eligible",
+            _ => "historical",
+        },
+        None => match lifecycle_state {
+            Some(DeploymentLifecycleState::Promoted) => "historical_promoted",
+            Some(DeploymentLifecycleState::Failed) => "failed",
+            Some(DeploymentLifecycleState::Rollback) => "rollback",
+            Some(DeploymentLifecycleState::GcEligible) => "gc_eligible",
+            _ => "historical",
+        },
+    }
 }
 
 fn merge_live_generation_metadata(
@@ -503,9 +534,18 @@ where
                 entry.validation_summary = lifecycle.validation_summary;
                 entry.promotion_summary = lifecycle.promotion_summary;
             }
+            if entry.promoted_at_unix.is_some() && entry.lifecycle_state.is_none() {
+                entry.lifecycle_state = Some(DeploymentLifecycleState::Promoted);
+            }
             if entry.eligible_for_gc && entry.lifecycle_state.is_none() {
                 entry.lifecycle_state = Some(DeploymentLifecycleState::GcEligible);
             }
+            entry.retention_role = retention_role_for_generation(
+                &references,
+                generation,
+                entry.retained,
+                entry.eligible_for_gc,
+            );
             Ok::<_, ProjectStatusError>(entry)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -709,7 +749,7 @@ where
             .as_ref()
             .map(runtime_env_snapshot_metadata),
         lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
-        promotion_state: promotion_state_for_lifecycle(visible_lifecycle, false),
+        retention_role: truth.active_generation.map(|_| RetentionRole::Current),
         validation_summary: visible_lifecycle
             .and_then(|lifecycle| lifecycle.validation_summary.clone()),
         promotion_summary: visible_lifecycle
@@ -952,10 +992,7 @@ where
         env_drift,
         recent_secret_mutations,
         active_lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
-        promotion_state: promotion_state_for_lifecycle(
-            visible_lifecycle,
-            history.entries.iter().any(|entry| entry.rollback_target),
-        ),
+        retention_role: truth.active_generation.map(|_| RetentionRole::Current),
         validation_summary,
         promotion_summary: visible_lifecycle
             .and_then(|lifecycle| lifecycle.promotion_summary.clone()),
@@ -1389,7 +1426,7 @@ fn build_environment_status_from_truth(
             .as_ref()
             .map(runtime_env_snapshot_metadata),
         lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
-        promotion_state: promotion_state_for_lifecycle(visible_lifecycle, false),
+        retention_role: truth.active_generation.map(|_| RetentionRole::Current),
         validation_summary: visible_lifecycle
             .and_then(|lifecycle| lifecycle.validation_summary.clone()),
         promotion_summary: visible_lifecycle
@@ -1981,8 +2018,9 @@ mod tests {
         BuildImageRequest, CreateContainerRequest, ManagedImage, RouteUpdateRequest,
     };
     use crate::storage::{
-        PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore, RuntimeHealthState,
-        RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter, atomic_write,
+        LifecycleStore, PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore,
+        RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
+        atomic_write,
     };
 
     #[derive(Default)]
@@ -2178,6 +2216,33 @@ mod tests {
             )
             .unwrap();
         writer
+            .write_artifact(
+                "resolved_runtime.json",
+                &format!(
+                    concat!(
+                        "{{\n",
+                        "  \"snapshot_version\": 1,\n",
+                        "  \"project_id\": \"api\",\n",
+                        "  \"environment\": \"staging\",\n",
+                        "  \"generation\": {generation},\n",
+                        "  \"deployment_id\": \"dep-{generation}\",\n",
+                        "  \"source_environment\": \"staging\",\n",
+                        "  \"source_ref\": \"main\",\n",
+                        "  \"commit_sha\": \"340ac8108006d84dbf951d8c0bb04ecfaf0eccac\",\n",
+                        "  \"domain\": \"staging-api.example.com\",\n",
+                        "  \"entries\": {{\n",
+                        "    \"FORGE_PROJECT_ID\": {{ \"source\": \"forge_generated\", \"value\": \"api\", \"sensitive\": false }},\n",
+                        "    \"FORGE_ENVIRONMENT\": {{ \"source\": \"forge_generated\", \"value\": \"staging\", \"sensitive\": false }},\n",
+                        "    \"API_BASE_URL\": {{ \"source\": \"forge_yaml\", \"value\": \"https://api.example.com\", \"sensitive\": false }},\n",
+                        "    \"DATABASE_URL\": {{ \"source\": \"project_environment_secret\", \"value\": \"<secret>\", \"sensitive\": true }}\n",
+                        "  }}\n",
+                        "}}\n"
+                    ),
+                    generation = generation,
+                ),
+            )
+            .unwrap();
+        writer
             .finalize("api", "staging", SnapshotState::Healthy)
             .unwrap();
         PointerStore::new(env.clone())
@@ -2193,6 +2258,30 @@ mod tests {
                 degraded_since_unix: None,
                 last_transition: "healthy".into(),
                 last_error_code: None,
+            })
+            .unwrap();
+    }
+
+    fn write_lifecycle_state(root: &Path, generation: u64, state: DeploymentLifecycleState) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        LifecycleStore::new(env, generation)
+            .write(&PersistedDeploymentLifecycle {
+                lifecycle_version: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation,
+                state: state.clone(),
+                entered_at_unix: generation,
+                transition_reason: format!("gen-{generation}-{state:?}").to_lowercase(),
+                validation_summary: None,
+                promotion_summary: None,
+                transitions: vec![crate::storage::DeploymentLifecycleTransition {
+                    state,
+                    entered_at_unix: generation,
+                    transition_reason: format!("gen-{generation}"),
+                    validation_summary: None,
+                    promotion_summary: None,
+                }],
             })
             .unwrap();
     }
@@ -2976,7 +3065,7 @@ mod tests {
             status.lifecycle_state,
             Some(DeploymentLifecycleState::Warming)
         );
-        assert_eq!(status.promotion_state.as_deref(), Some("pending"));
+        assert_eq!(status.retention_role, Some(RetentionRole::Current));
         let summary = status.validation_summary.unwrap();
         assert_eq!(summary.tcp_consecutive_passes, 2);
         assert_eq!(summary.required_consecutive_passes, 3);
@@ -3642,5 +3731,179 @@ mod tests {
         assert!(failed.retained);
         assert!(!eligible.retained);
         assert!(eligible.eligible_for_gc);
+    }
+
+    #[test]
+    fn diagnose_active_generation_not_reported_as_rollback_target() {
+        let root = test_root("diagnose-active-generation-not-reported-as-rollback-target");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 29);
+        write_generation(&root, 30);
+        write_lifecycle_state(&root, 29, DeploymentLifecycleState::Promoted);
+        write_lifecycle_state(&root, 30, DeploymentLifecycleState::Promoted);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        atomic_write(env.previous_pointer(), b"29\n").unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(30)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.active_generation, Some(30));
+        assert_eq!(
+            diagnostics.active_lifecycle_state,
+            Some(DeploymentLifecycleState::Promoted)
+        );
+        assert_eq!(diagnostics.retention_role, Some(RetentionRole::Current));
+        assert_eq!(
+            status_label(
+                diagnostics.active_lifecycle_state.as_ref(),
+                diagnostics.retention_role.as_ref()
+            ),
+            "active"
+        );
+    }
+
+    #[test]
+    fn history_distinguishes_current_promoted_from_historical_promoted() {
+        let root = test_root("history-distinguishes-current-promoted-from-historical-promoted");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 28);
+        write_generation(&root, 29);
+        write_generation(&root, 30);
+        write_lifecycle_state(&root, 28, DeploymentLifecycleState::Promoted);
+        write_lifecycle_state(&root, 29, DeploymentLifecycleState::Promoted);
+        write_lifecycle_state(&root, 30, DeploymentLifecycleState::Promoted);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        atomic_write(env.previous_pointer(), b"28\n").unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(30)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let history =
+            load_environment_history(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let current = history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == 30)
+            .unwrap();
+        let historical = history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == 29)
+            .unwrap();
+
+        assert_eq!(current.retention_role, Some(RetentionRole::Current));
+        assert_eq!(
+            status_label(
+                current.lifecycle_state.as_ref(),
+                current.retention_role.as_ref()
+            ),
+            "active"
+        );
+        assert_eq!(historical.retention_role, Some(RetentionRole::Retained));
+        assert_eq!(
+            status_label(
+                historical.lifecycle_state.as_ref(),
+                historical.retention_role.as_ref()
+            ),
+            "historical_promoted"
+        );
+    }
+
+    #[test]
+    fn rollback_target_only_applies_to_previous_generation() {
+        let root = test_root("rollback-target-only-applies-to-previous-generation");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 28);
+        write_generation(&root, 29);
+        write_generation(&root, 30);
+        write_lifecycle_state(&root, 28, DeploymentLifecycleState::Promoted);
+        write_lifecycle_state(&root, 29, DeploymentLifecycleState::Promoted);
+        write_lifecycle_state(&root, 30, DeploymentLifecycleState::Promoted);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        atomic_write(env.previous_pointer(), b"29\n").unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(30)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let history =
+            load_environment_history(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let rollback_targets = history
+            .entries
+            .iter()
+            .filter(|entry| entry.retention_role == Some(RetentionRole::RollbackTarget))
+            .map(|entry| entry.generation)
+            .collect::<Vec<_>>();
+        assert_eq!(rollback_targets, vec![29]);
+        assert!(
+            history
+                .entries
+                .iter()
+                .filter(|entry| entry.generation != 29)
+                .all(|entry| !entry.rollback_target)
+        );
+    }
+
+    #[test]
+    fn lifecycle_state_and_retention_role_are_separate() {
+        let root = test_root("lifecycle-state-and-retention-role-are-separate");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 29);
+        write_generation(&root, 30);
+        write_lifecycle_state(&root, 29, DeploymentLifecycleState::Promoted);
+        write_lifecycle_state(&root, 30, DeploymentLifecycleState::Promoted);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        atomic_write(env.previous_pointer(), b"29\n").unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(30)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+        let history =
+            load_environment_history(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(
+            diagnostics.active_lifecycle_state,
+            Some(DeploymentLifecycleState::Promoted)
+        );
+        assert_eq!(diagnostics.retention_role, Some(RetentionRole::Current));
+
+        let previous = history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == 29)
+            .unwrap();
+        assert_eq!(
+            previous.lifecycle_state,
+            Some(DeploymentLifecycleState::Promoted)
+        );
+        assert_eq!(previous.retention_role, Some(RetentionRole::RollbackTarget));
     }
 }

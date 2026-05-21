@@ -155,7 +155,7 @@ fn cli_history_reads_environment_history() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"data":{"project_id":"api","environment":"staging","entries":[{"generation":7,"deployment_id":"dep-7","commit_sha":"340ac8108006d84dbf951d8c0bb04ecfaf0eccac","source_ref":"main","image_ref":"forge/api:staging-gen-7","created_at_unix":1779320500,"promoted_at_unix":1779320528,"finalized_state":"healthy","finalized_at_unix":1779320520,"rollback_target":false,"restored_by_rollback":false,"retained":true,"eligible_for_gc":false,"missing_artifacts":false,"retained_reasons":["current/promoted generation"]}]}}"#,
+        r#"{"data":{"project_id":"api","environment":"staging","entries":[{"generation":7,"deployment_id":"dep-7","commit_sha":"340ac8108006d84dbf951d8c0bb04ecfaf0eccac","source_ref":"main","image_ref":"forge/api:staging-gen-7","created_at_unix":1779320500,"promoted_at_unix":1779320528,"finalized_state":"healthy","finalized_at_unix":1779320520,"rollback_target":false,"restored_by_rollback":false,"retained":true,"eligible_for_gc":false,"missing_artifacts":false,"retained_reasons":["current/promoted generation"],"lifecycle_state":"promoted","retention_role":"current"}]}}"#,
     );
 
     let output = run_cli(&url, &["history", "api", "staging"]);
@@ -163,6 +163,32 @@ fn cli_history_reads_environment_history() {
     let body = String::from_utf8_lossy(&output.stdout);
     assert!(body.contains("Generation 7"));
     assert!(body.contains("retained: yes"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/staging/history"
+    );
+}
+
+#[test]
+fn deployments_cli_renders_unambiguous_status_labels() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"staging","entries":[{"generation":30,"deployment_id":"dep-30","created_at_unix":1779320500,"promoted_at_unix":1779320528,"rollback_target":false,"restored_by_rollback":false,"retained":true,"eligible_for_gc":false,"missing_artifacts":false,"retained_reasons":["current/promoted generation"],"lifecycle_state":"promoted","retention_role":"current"},{"generation":29,"deployment_id":"dep-29","created_at_unix":1779320400,"promoted_at_unix":1779320428,"rollback_target":true,"restored_by_rollback":false,"retained":true,"eligible_for_gc":false,"missing_artifacts":false,"retained_reasons":["rollback-safe generation"],"lifecycle_state":"promoted","retention_role":"rollback_target"},{"generation":27,"deployment_id":"dep-27","created_at_unix":1779320200,"promoted_at_unix":1779320228,"rollback_target":false,"restored_by_rollback":false,"retained":true,"eligible_for_gc":false,"missing_artifacts":false,"retained_reasons":["recent healthy finalized generation"],"lifecycle_state":"promoted","retention_role":"retained"}]}}"#,
+    );
+
+    let output = run_cli(&url, &["history", "api", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("status: active"));
+    assert!(body.contains("status: rollback_target"));
+    assert!(body.contains("status: historical_promoted"));
+    assert!(body.contains("retention_role: current"));
+    assert!(body.contains("lifecycle_state: promoted"));
+    assert!(!body.contains("status: promoted\n"));
 
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.method, "GET");

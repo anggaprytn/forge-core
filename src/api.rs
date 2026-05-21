@@ -8,6 +8,26 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionRole {
+    Current,
+    RollbackTarget,
+    Retained,
+    GcEligible,
+}
+
+impl RetentionRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::RollbackTarget => "rollback_target",
+            Self::Retained => "retained",
+            Self::GcEligible => "gc_eligible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentRequest {
     pub project_id: String,
     pub environment: String,
@@ -233,7 +253,7 @@ pub struct EnvironmentDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_lifecycle_state: Option<DeploymentLifecycleState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub promotion_state: Option<String>,
+    pub retention_role: Option<RetentionRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_summary: Option<PersistedValidationSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,6 +352,8 @@ pub struct DeploymentHistoryEntry {
     pub retained_reasons: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_state: Option<DeploymentLifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_role: Option<RetentionRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entered_at_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
