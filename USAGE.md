@@ -117,6 +117,66 @@ Deploy-by-ref uses this registry metadata now. Forge clones or fetches repositor
 
 ---
 
+# Operator Workflow Examples
+
+### Basic Deployment
+Deploy a project to the production environment.
+```bash
+forge deploy my-app production
+```
+
+### Inspect Runtime Status
+Check the health and active generation of an environment.
+```bash
+forge status my-app production
+```
+
+### Diagnose Failures
+View detailed diagnostic information for a specific deployment or environment.
+```bash
+forge diagnose my-app production
+```
+
+### View Deployment History
+See a history of recent deployments for a project.
+```bash
+forge history my-app production
+```
+
+### List All Deployments
+List recent deployment attempts across the system.
+```bash
+forge deployments
+```
+
+### Manage Secrets
+List and modify runtime environment secrets.
+```bash
+forge secrets list my-app production
+forge secrets set my-app production API_KEY sk_live_...
+forge secrets unset my-app production OBSOLETE_KEY
+```
+
+### Environment Diff
+Compare the environment variables between the current and a candidate generation.
+```bash
+forge env diff my-app production
+```
+
+### Atomic Rollback
+Restore the previous healthy generation immediately.
+```bash
+forge rollback my-app production
+```
+
+### Garbage Collection Dry-Run
+Preview which generations would be removed by the GC.
+```bash
+forge gc --dry-run
+```
+
+---
+
 # Requirements
 
 Minimum runtime requirements:
@@ -378,30 +438,20 @@ forge logout
 
 ---
 
-# Alpha Core Loop v1 Validated (May 2026)
+# Alpha Core Loop v2 Validated (May 2026)
 
-The Forge Alpha Core Loop v1 milestone formalizes the first validated end-to-end Forge platform baseline after successful live staging and production deployments on VPS infrastructure.
+The Forge Alpha Core Loop v2 milestone formalizes the second validated operational maturity milestone for the Forge platform.
 
 ### Validated Capabilities
 
-- **forge login**: Mac CLI login to remote Forge server.
-- **forge project add --repo**: Project registration from GitHub repository.
-- **git-backed deploy by ref**: Source-controlled deployment from branches or tags.
-- **Environment targets**: Staging and production deployment workflows.
-- **Generated environment domains**: Automatic derivation of staging/production domains.
-- **Immutable source checkout**: Server-side source resolution and cache management.
-- **Managed Docker runtime network**: Isolated container networks with Forge-managed lifecycles.
-- **Runtime validation and health probing**: TCP reachability and HTTP health check enforcement.
-- **Route activation and convergence**: Atomic Caddy route updates following successful validation.
-- **forge status**: Project and environment health and runtime monitoring.
-- **forge diagnose**: Deep inspection of runtime state and failure reasons.
-- **forge env**: Inspection of generation-scoped runtime environment variables.
-- **Runtime env snapshots**: Authoritative, redacted snapshots of the effective runtime environment.
-- **Rollback**: Atomic restoration of the previous healthy generation and its specific metadata.
-- **Authoritative pointers**: Deterministic current/previous pointer semantics.
-- **Runtime metadata injection**: Automatic injection of Forge-scoped context (Project ID, Generation, etc.).
-- **Route drift repair**: Continuous convergence of routing state toward the authoritative generation.
-- **Deterministic recovery**: Reliable reconstruction of runtime state after daemon or host restarts.
+- **Progressive Deployment Lifecycle**: Deterministic state transitions from `queued` through `promoted`.
+- **Lifecycle Persistence**: Full per-generation lifecycle state tracking and recovery.
+- **Retention & GC**: Rollback-safe generation preservation with automatic cleanup of expired artifacts.
+- **Immutable Env Snapshots**: Fully resolved and sealed runtime environment snapshots per generation.
+- **Diagnostics & Logs**: Bounded, secret-redacted deployment logs and deep-inspection diagnostics.
+- **Secret Lifecycle**: Immutable secret snapshots with historical restoration during rollback.
+- **Probe Stability Semantics**: Hysteresis-aware health probing with flapping detection and stability windows.
+- **Convergence & Runtime Truth**: Continuous repair of routing and container state toward the promoted truth.
 
 ### Validated Deployment Example
 
@@ -428,17 +478,6 @@ forge diagnose my-app staging
 # 6. Rollback if needed
 forge rollback my-app staging
 ```
-
-### Validated Features
-- Mac CLI login to remote Forge server.
-- Project registration from GitHub repo.
-- Generated project domain with automatic staging/development derivation.
-- Git-backed deploy by ref (main, branch, or tag).
-- Immutable source checkout and metadata tracking.
-- Docker build and managed network validation.
-- Derived staging domain route activation.
-- Project/environment health monitoring.
-- Git-backed rollback with restored generation state.
 
 ### Known Alpha Constraints
 - Single-node deployments only.

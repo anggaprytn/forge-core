@@ -145,7 +145,16 @@ To maintain its strict guarantees, Forge explicitly accepts the following tradeo
 
 ## Status
 
-Forge is currently in **Alpha**. The core convergence engine is production-validated on VPS infrastructure. CLI and API surfaces are subject to change.
+Forge is currently in **Alpha**.
+
+**Alpha Core Loop v2 Validated (May 2026)**:
+The second operational maturity milestone freezes the core orchestration loop after validating:
+- Progressive deployment lifecycles (`queued` → `promoted`)
+- Persistent lifecycle state and recovery
+- Rollback-safe retention and automated GC
+- Immutable environment snapshots with secret sealing
+- Hysteresis-aware probe stability and flapping detection
+- Continuous convergence-driven runtime truth alignment
 
 → See [ROADMAP.md](./ROADMAP.md) for full milestone details.
 

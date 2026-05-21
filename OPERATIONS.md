@@ -39,56 +39,136 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 ---
 
-# Alpha Core Loop v1 Validated (May 2026)
+# Alpha Core Loop v2 Validated (May 2026)
 
-The Forge Alpha Core Loop v1 milestone formalizes the first validated end-to-end Forge platform baseline after successful live staging and production deployments on VPS infrastructure.
+The Forge Alpha Core Loop v2 milestone formalizes the second validated operational maturity milestone for the Forge platform. This milestone freezes the core orchestration loop after extensive validation of progressive lifecycles, lifecycle persistence, retention/GC, immutable environment snapshots, and convergence-driven runtime truth alignment.
 
 ### Validated Capabilities
 
-- **forge login**: Mac CLI login to remote Forge server.
-- **forge project add --repo**: Project registration from GitHub repository.
-- **git-backed deploy by ref**: Source-controlled deployment from branches or tags.
-- **Environment targets**: Staging and production deployment workflows.
-- **Generated environment domains**: Automatic derivation of staging/production domains.
-- **Immutable source checkout**: Server-side source resolution and cache management.
-- **Managed Docker runtime network**: Isolated container networks with Forge-managed lifecycles.
-- **Runtime validation and health probing**: TCP reachability and HTTP health check enforcement.
-- **Route activation and convergence**: Atomic Caddy route updates following successful validation.
-- **forge status**: Project and environment health and runtime monitoring.
-- **forge diagnose**: Deep inspection of runtime state and failure reasons.
-- **forge env**: Inspection of generation-scoped runtime environment variables.
-- **Runtime env snapshots**: Authoritative, redacted snapshots of the effective runtime environment.
-- **Rollback**: Atomic restoration of the previous healthy generation and its specific metadata.
-- **Authoritative pointers**: Deterministic current/previous pointer semantics.
-- **Runtime metadata injection**: Automatic injection of Forge-scoped context (Project ID, Generation, etc.).
-- **Route drift repair**: Continuous convergence of routing state toward the authoritative generation.
-- **Deterministic recovery**: Reliable reconstruction of runtime state after daemon or host restarts.
+- **Progressive Deployment Lifecycle**: Deterministic state transitions from `queued` through `promoted`.
+- **Lifecycle Persistence**: Full per-generation lifecycle state tracking and recovery.
+- **Retention & GC**: Rollback-safe generation preservation with automatic cleanup of expired artifacts.
+- **Immutable Env Snapshots**: Fully resolved and sealed runtime environment snapshots per generation.
+- **Diagnostics & Logs**: Bounded, secret-redacted deployment logs and deep-inspection diagnostics.
+- **Secret Lifecycle**: Immutable secret snapshots with historical restoration during rollback.
+- **Probe Stability Semantics**: Hysteresis-aware health probing with flapping detection and stability windows.
+- **Convergence & Runtime Truth**: Continuous repair of routing and container state toward the promoted truth.
 
-### Validated Deployment Example
+---
 
-```bash
-# 1. Login to your Forge server
-forge login https://forge.example.com
+# Validated Runtime Semantics
 
-# 2. Register a project from a GitHub repository
-forge project add \
-  --repo https://github.com/example/repo.git
+### Architecture Truth
 
-# 3. Deploy to staging from the main branch
-forge deploy my-app staging --ref main
+Forge is:
+- **Deterministic single-node deployment orchestration**: Designed for absolute correctness on one host.
+- **Immutable generation runtime system**: Every deployment is a frozen artifact.
+- **Convergence-driven control plane**: Continuous repair of runtime state toward intended truth.
+- **Route-verifying deployment engine**: Zero-downtime promotions backed by out-of-band verification.
 
-# 4. Inspect status and domains
-forge status my-app staging
-# Staging domain: staging-my-app.example.com
-# Production domain: my-app.example.com
+Forge is **NOT** yet:
+- **Distributed scheduler**: Does not manage clusters or multi-node placement.
+- **Kubernetes replacement**: Focuses on single-node simplicity, not enterprise sprawl.
+- **Multi-node orchestrator**: No cross-host workload awareness.
+- **Service mesh**: No mTLS, sidecars, or complex traffic shaping.
+- **Autoscaling platform**: Scaling is currently manual or vertical only.
 
-# 5. Inspect runtime environment and diagnostics
-forge env my-app staging
-forge diagnose my-app staging
+### Progressive Deployment Lifecycle
+Forge enforces a strict, linear state machine for every deployment:
+`queued → building → starting → warming → validating → promoted`.
+A generation must successfully pass every gate before traffic is allowed to reach it.
 
-# 6. Rollback if needed
-forge rollback my-app staging
-```
+### Lifecycle Persistence
+Every deployment's lifecycle is persisted in `lifecycle.json` within the generation directory. This allows the Forge daemon to resume or fail in-flight deployments deterministically after a restart, ensuring no generation is left in an undefined state.
+
+### Promotion Gates
+Promotion is guarded by three primary gates:
+1.  **Warmup**: TCP reachability and initial HTTP health probes.
+2.  **Validation**: A stability window where the container must remain healthy for a minimum uptime.
+3.  **Route Verification**: Final confirmation that the routing layer (Caddy) has correctly activated the new target before the deployment is marked as promoted.
+
+### Warmup Semantics
+During the `warming` phase, Forge executes high-frequency probes. A generation enters the `validating` state only after achieving a required streak of consecutive successful probes.
+
+### Route Verification Gates
+After Caddy routes are updated, Forge performs an out-of-band verification to ensure the public-facing route actually reaches the new generation's internal IP. This prevents "route shadowing" or misconfiguration from resulting in a successful deployment that is actually unreachable.
+
+### Probe History Persistence
+Probe results are recorded in `probe_history.json` for each generation. This history is used to calculate success rates, detect flapping, and provide a diagnostic trail for failing deployments.
+
+### Retention and GC
+Forge distinguishes between **Lifecycle State** and **Retention Role**. 
+- **GC Never removes rollback-safe generations**: The generation marked as `rollback_target` is protected from GC even if it is old.
+- **Diagnostic Tail**: A small number of recent `failed` generations are retained to allow for post-mortem analysis.
+
+### Runtime Env Snapshots
+The `runtime_env_snapshot.json` is the authoritative record of the environment variables used for a generation. It is created before the container starts and is treated as immutable once finalized.
+
+### Secret Lifecycle Semantics
+- **Finalized snapshots are immutable**: Secrets used during a deployment are "locked" into that generation's snapshot.
+- **Rollback restores historical runtime env**: Rolling back to a previous generation restores the exact secret values that were active when that generation was first promoted.
+- **Secrets only affect future deploys**: Changing a secret value via `forge secrets set` does not affect currently running generations until a redeploy or convergence-triggered restart occurs.
+
+### Convergence and Runtime Truth
+Forge does not assume its internal metadata matches reality. It performs "Runtime Truth" repair:
+- **Container Inspection**: Inspects live Docker labels to verify if the running container matches the intended generation.
+- **Route Inspection**: Queries the Caddy admin API to ensure routes point to the correct internal IPs.
+- **Deterministic Repair**: If drift is detected (e.g., container IP change after Docker restart), Forge automatically repairs the route or restarts the container to align with the `promoted` pointer.
+
+---
+
+# Deployment Lifecycle States
+
+Forge generations move through these authoritative states:
+
+| State | Description |
+| :--- | :--- |
+| `queued` | Deployment is waiting in the persistent queue for processing. |
+| `building` | The container image is being built from source. |
+| `starting` | The container is being created and started on the managed network. |
+| `warming` | Initial health probes are running to ensure the process is ready. |
+| `validating` | Stability window; container must maintain health for N consecutive seconds. |
+| `promoted` | Active, healthy, and receiving live traffic. |
+| `rollback` | This generation is being actively restored following a failure of a newer generation. |
+| `failed` | Deployment failed a validation gate and was stopped. |
+| `gc_eligible` | Marked for removal by the garbage collector. |
+
+---
+
+# Retention Roles
+
+A generation's **Retention Role** determines its protection from the Garbage Collector:
+
+- **current**: The currently promoted generation receiving traffic. (Protected)
+- **rollback_target**: The last known healthy generation before `current`. (Protected)
+- **retained**: Older generations or failed generations kept for a short diagnostic window.
+- **gc_eligible**: Generations that can be safely deleted to reclaim disk space.
+
+---
+
+# Probe Stability Semantics
+
+Forge uses `probe_history.json` to implement robust stability tracking:
+
+- **Hysteresis**: Prevents rapid state oscillations by requiring a "streak" of successes before recovery.
+- **Flapping Detection**: Monitors for alternating success/failure patterns that indicate an unstable runtime.
+- **Stability Windows**: Enforces a minimum "quiet period" where a generation must be perfectly healthy before promotion.
+- **Transient vs. Critical**: Single transient probe failures do not trigger an immediate rollback but are recorded in the history tail.
+
+---
+
+# Operational Invariants
+
+Explicit rules that the Forge engine must never violate:
+
+1.  **Finalized generations are immutable**: Once a snapshot is finalized, its binary, config, and env are locked.
+2.  **Rollback never recomputes runtime state**: It restores the exact `resolved_runtime.json` from the target generation.
+3.  **Convergence repairs drift toward promoted truth**: The engine always aligns the runtime (Docker/Caddy) with the `promoted` pointer.
+4.  **Route activation must match validated runtime target**: Never route traffic to a generation that hasn't passed its validation gates.
+5.  **GC never removes rollback-safe generations**: `current` and `rollback_target` are sacred.
+6.  **Runtime truth is container-inspected, not metadata-assumed**: Trust the Docker API over the internal cache.
+
+---
 
 ### Alpha Readiness Checklist
 

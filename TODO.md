@@ -74,6 +74,7 @@ Current runtime note: many runtime pieces already exist. The next alpha step is 
 
 # Current Completed Baseline
 
+- [x] **Alpha Core Loop v2 Validated (May 2026)**
 - [x] **Alpha Core Loop v1 Validated (May 2026)**
 - [x] Core architecture defined
 - [x] Implementation spec defined

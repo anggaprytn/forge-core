@@ -31,6 +31,21 @@ Current stage:
 alpha
 ```
 
+**Alpha Core Loop v2 Validated (May 2026)**:
+
+The Forge Alpha Core Loop v2 milestone formalizes the second validated operational maturity milestone for the Forge platform. This milestone freezes the core orchestration loop after extensive validation of progressive lifecycles, lifecycle persistence, retention/GC, immutable environment snapshots, and convergence-driven runtime truth alignment.
+
+### Validated Capabilities (v2)
+
+- **Progressive Deployment Lifecycle**: Deterministic state transitions from `queued` through `promoted`.
+- **Lifecycle Persistence**: Full per-generation lifecycle state tracking and recovery.
+- **Retention & GC**: Rollback-safe generation preservation with automatic cleanup of expired artifacts.
+- **Immutable Env Snapshots**: Fully resolved and sealed runtime environment snapshots per generation.
+- **Diagnostics & Logs**: Bounded, secret-redacted deployment logs and deep-inspection diagnostics.
+- **Secret Lifecycle**: Immutable secret snapshots with historical restoration during rollback.
+- **Probe Stability Semantics**: Hysteresis-aware health probing with flapping detection and stability windows.
+- **Convergence & Runtime Truth**: Continuous repair of routing and container state toward the promoted truth.
+
 **Alpha Core Loop v1 Validated (May 2026)**:
 
 The Forge Alpha Core Loop v1 milestone formalizes the first validated end-to-end Forge platform baseline after successful live staging and production deployments on VPS infrastructure.
