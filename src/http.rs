@@ -71,7 +71,11 @@ pub trait ControlPlane: Send {
         &self,
         deployment_id: &str,
     ) -> Result<Option<DeploymentStatus>, ErrorResponse>;
-    fn get_deployment_logs(&self, deployment_id: &str) -> Result<DeploymentLogs, ErrorResponse>;
+    fn get_deployment_logs(
+        &self,
+        deployment_id: &str,
+        service_id: Option<&str>,
+    ) -> Result<DeploymentLogs, ErrorResponse>;
     fn list_events(&self) -> Result<EventList, ErrorResponse>;
     fn queue_depth(&self) -> Result<usize, ErrorResponse>;
     fn get_project_environment_status(
@@ -127,8 +131,12 @@ where
         Daemon::get_deployment(self, deployment_id)
     }
 
-    fn get_deployment_logs(&self, deployment_id: &str) -> Result<DeploymentLogs, ErrorResponse> {
-        Daemon::get_deployment_logs(self, deployment_id)
+    fn get_deployment_logs(
+        &self,
+        deployment_id: &str,
+        service_id: Option<&str>,
+    ) -> Result<DeploymentLogs, ErrorResponse> {
+        Daemon::get_deployment_logs(self, deployment_id, service_id)
     }
 
     fn list_events(&self) -> Result<EventList, ErrorResponse> {
@@ -1840,6 +1848,7 @@ async fn get_logs(
     State(state): State<HttpState>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
+    Query(params): Query<DeploymentLogsQuery>,
 ) -> Response {
     let request_id = next_request_id();
     if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
@@ -1860,7 +1869,7 @@ async fn get_logs(
         }
     };
 
-    match daemon.get_deployment_logs(&id) {
+    match daemon.get_deployment_logs(&id, params.service.as_deref()) {
         Ok(logs) => json_response(
             StatusCode::OK,
             &request_id,
@@ -1873,11 +1882,18 @@ async fn get_logs(
         Err(err) => {
             let status = match err.code.as_str() {
                 "deployment_not_found" => StatusCode::NOT_FOUND,
+                "service_not_found" => StatusCode::NOT_FOUND,
                 _ => StatusCode::BAD_REQUEST,
             };
             error_response(status, &request_id, err)
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeploymentLogsQuery {
+    #[serde(default)]
+    service: Option<String>,
 }
 
 async fn get_project_environment_diagnostics(

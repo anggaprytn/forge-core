@@ -70,10 +70,24 @@ pub struct DeploymentLogs {
     pub lifecycle: Vec<String>,
     #[serde(default)]
     pub container_logs: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<ServiceLogGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_failure_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics_source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceLogGroup {
+    pub service_id: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(default)]
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +123,8 @@ pub struct ServiceRuntimeStatus {
     pub role: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub dns_aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,7 +139,15 @@ pub struct ServiceRuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_path: Option<String>,
+    pub route: String,
+    pub health: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub logs_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

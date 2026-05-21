@@ -13,7 +13,7 @@ use forge_core::api::{
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
     EventList, ProjectList, ProjectRecord, ProjectUpsertRequest, RetentionRole, SecretListResponse,
-    SecretUnsetResponse,
+    SecretUnsetResponse, ServiceRuntimeStatus,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -120,11 +120,12 @@ where
         }
         Command::Logs {
             deployment_id,
+            service,
             json,
         } => {
             let (base_url, token) = api_credentials.clone().unwrap();
             let client = ForgeClient::new(base_url, token);
-            let logs = client.get_logs(&deployment_id)?;
+            let logs = client.get_logs(&deployment_id, service.as_deref())?;
             if json {
                 print_json(&logs)?;
             } else {
@@ -357,11 +358,17 @@ impl ForgeClient {
         self.send_json(self.http.get(format!("{}/events", self.base_url)))
     }
 
-    fn get_logs(&self, deployment_id: &str) -> Result<DeploymentLogs, CliError> {
-        self.send_json(self.http.get(format!(
-            "{}/api/deployments/{deployment_id}/logs",
-            self.base_url
-        )))
+    fn get_logs(
+        &self,
+        deployment_id: &str,
+        service: Option<&str>,
+    ) -> Result<DeploymentLogs, CliError> {
+        let mut url = format!("{}/api/deployments/{deployment_id}/logs", self.base_url);
+        if let Some(service) = service {
+            url.push_str("?service=");
+            url.push_str(service);
+        }
+        self.send_json(self.http.get(url))
     }
 
     fn get_project_environment_status(
@@ -599,6 +606,7 @@ enum Command {
     },
     Logs {
         deployment_id: String,
+        service: Option<String>,
         json: bool,
     },
     ProjectStatus {
@@ -897,7 +905,7 @@ fn usage() -> String {
         "  forge whoami",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
-        "  forge [--url URL] [--token TOKEN] logs [--json] <deployment_id>",
+        "  forge [--url URL] [--token TOKEN] logs [--json] [--service SERVICE] <deployment_id>",
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] diagnose [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] history [--json] <project_id> <environment>",
@@ -1106,19 +1114,32 @@ fn parse_secret_list_command(args: &[String]) -> Result<Command, CliError> {
 
 fn parse_logs_command(args: &[String]) -> Result<Command, CliError> {
     let mut json = false;
+    let mut service = None;
     let mut positionals = Vec::new();
 
-    for arg in args {
-        match arg.as_str() {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
             "--json" => json = true,
+            "--service" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "logs requires --service <service_id>".into(),
+                    ));
+                };
+                service = Some(value.clone());
+            }
             value if value.starts_with("--") => return Err(CliError::Usage(usage())),
             value => positionals.push(value.to_string()),
         }
+        index += 1;
     }
 
     match positionals.as_slice() {
         [deployment_id] => Ok(Command::Logs {
             deployment_id: deployment_id.clone(),
+            service,
             json,
         }),
         _ => Err(CliError::Usage(usage())),
@@ -1278,6 +1299,55 @@ struct WhoAmIOutput {
     authenticated: String,
 }
 
+fn render_services_section(services: &[ServiceRuntimeStatus], include_logs: bool) -> String {
+    let mut output = String::new();
+    output.push_str("Services:\n");
+    for service in services {
+        output.push_str(&format!("  {}\n", service.service_id));
+        output.push_str(&format!("    role: {}\n", service.role));
+        output.push_str(&format!(
+            "    container: {}\n",
+            service.container_name.as_deref().unwrap_or("unknown")
+        ));
+        output.push_str(&format!("    running: {}\n", service.running));
+        if let Some(ip) = service.container_ip.as_deref() {
+            output.push_str(&format!("    ip: {ip}\n"));
+        }
+        if let Some(port) = service.internal_port {
+            output.push_str(&format!("    port: {port}\n"));
+        }
+        output.push_str(&format!("    route: {}\n", service.route));
+        output.push_str(&format!("    health: {}\n", service.health));
+        if !service.depends_on.is_empty() {
+            output.push_str(&format!(
+                "    depends_on: {}\n",
+                service.depends_on.join(", ")
+            ));
+        }
+        if !service.dns_aliases.is_empty() {
+            output.push_str(&format!(
+                "    dns_aliases: {}\n",
+                service.dns_aliases.join(", ")
+            ));
+        }
+        if let Some(reason) = service.failure_reason.as_deref() {
+            output.push_str(&format!("    failure_reason: {reason}\n"));
+        }
+        if include_logs {
+            output.push_str("    logs_tail:\n");
+            if service.logs_tail.is_empty() {
+                output.push_str("      unavailable\n");
+            } else {
+                for line in &service.logs_tail {
+                    output.push_str(&format!("      {line}\n"));
+                }
+            }
+        }
+        output.push('\n');
+    }
+    output
+}
+
 fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> String {
     let mut output = String::new();
     output.push_str(&format!("Project: {}\n", status.project_id));
@@ -1371,6 +1441,10 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
         output.push_str("Runtime Env Snapshot:\n");
         output.push_str("  legacy metadata unavailable\n");
     }
+    if status.services.len() > 1 {
+        output.push('\n');
+        output.push_str(&render_services_section(&status.services, false));
+    }
     output
 }
 
@@ -1388,12 +1462,31 @@ fn render_deployment_logs(logs: &DeploymentLogs) -> String {
         }
     }
     output.push('\n');
-    output.push_str("Container Logs:\n");
-    if logs.container_logs.is_empty() {
-        output.push_str("  unavailable\n");
+    if logs.services.len() > 1 || logs.selected_service.is_some() {
+        output.push_str("Service Logs:\n");
+        for service in &logs.services {
+            output.push_str(&format!("  {}\n", service.service_id));
+            output.push_str(&format!("    role: {}\n", service.role));
+            output.push_str(&format!(
+                "    container: {}\n",
+                service.container_name.as_deref().unwrap_or("unknown")
+            ));
+            if service.lines.is_empty() {
+                output.push_str("    unavailable\n");
+            } else {
+                for line in &service.lines {
+                    output.push_str(&format!("    {line}\n"));
+                }
+            }
+        }
     } else {
-        for line in &logs.container_logs {
-            output.push_str(&format!("  {line}\n"));
+        output.push_str("Container Logs:\n");
+        if logs.container_logs.is_empty() {
+            output.push_str("  unavailable\n");
+        } else {
+            for line in &logs.container_logs {
+                output.push_str(&format!("  {line}\n"));
+            }
         }
     }
     if let Some(summary) = logs.validation_failure_summary.as_deref() {
@@ -1573,6 +1666,15 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         output.push('\n');
         output.push_str("Route Mismatch:\n");
         output.push_str(&format!("  {reason}\n"));
+    }
+    if !diagnostics.startup_order.is_empty() {
+        output.push('\n');
+        output.push_str("Dependency Graph:\n");
+        output.push_str(&format!("  {}\n", diagnostics.startup_order.join(" -> ")));
+    }
+    if !diagnostics.services.is_empty() {
+        output.push('\n');
+        output.push_str(&render_services_section(&diagnostics.services, true));
     }
     output.push('\n');
     output.push_str("Recent Failures:\n");
@@ -2405,6 +2507,141 @@ mod tests {
                 caddy_public_url: "http://127.0.0.1".into(),
                 dry_run: true,
                 json: true,
+            }
+        );
+    }
+
+    #[test]
+    fn status_renders_multiservice_services_section() {
+        let rendered = render_project_environment_status(&ProjectEnvironmentStatus {
+            project_id: "forge-multiservice-test".into(),
+            environment: "staging".into(),
+            status: "healthy".into(),
+            active_generation: Some(1),
+            domain: "staging-api.example.com".into(),
+            commit_sha: None,
+            source_ref: None,
+            container_name: Some("staging-forge-multiservice-test-api-gen-1".into()),
+            container_running: true,
+            container_status: Some("running".into()),
+            network_name: Some("forge-managed".into()),
+            container_ip: Some("172.29.0.2".into()),
+            route_active: true,
+            probe_path: Some("/health".into()),
+            image_ref: None,
+            startup_order: vec!["api".into(), "worker".into()],
+            services: vec![
+                ServiceRuntimeStatus {
+                    service_id: "api".into(),
+                    role: "exposed".into(),
+                    depends_on: Vec::new(),
+                    dns_aliases: vec!["api".into()],
+                    container_name: Some("staging-forge-multiservice-test-api-gen-1".into()),
+                    image_ref: None,
+                    running: true,
+                    state_status: Some("running".into()),
+                    lifecycle_state: None,
+                    network_name: Some("forge-managed".into()),
+                    container_ip: Some("172.29.0.2".into()),
+                    internal_port: Some(3000),
+                    probe_path: Some("/health".into()),
+                    route: "active".into(),
+                    health: "healthy".into(),
+                    failure_reason: None,
+                    logs_tail: Vec::new(),
+                },
+                ServiceRuntimeStatus {
+                    service_id: "worker".into(),
+                    role: "internal".into(),
+                    depends_on: vec!["api".into()],
+                    dns_aliases: vec!["worker".into()],
+                    container_name: Some("staging-forge-multiservice-test-worker-gen-1".into()),
+                    image_ref: None,
+                    running: true,
+                    state_status: Some("running".into()),
+                    lifecycle_state: None,
+                    network_name: Some("forge-managed".into()),
+                    container_ip: Some("172.29.0.3".into()),
+                    internal_port: None,
+                    probe_path: None,
+                    route: "none".into(),
+                    health: "running".into(),
+                    failure_reason: None,
+                    logs_tail: Vec::new(),
+                },
+            ],
+            last_deployment_id: None,
+            deployed_at_unix: None,
+            container_started_at: None,
+            runtime_env_snapshot: None,
+            lifecycle_state: None,
+            retention_role: None,
+            validation_summary: None,
+            promotion_summary: None,
+            uptime_seconds: None,
+        });
+
+        assert!(rendered.contains("Services:"));
+        assert!(rendered.contains("role: exposed"));
+        assert!(rendered.contains("route: active"));
+        assert!(rendered.contains("worker"));
+        assert!(rendered.contains("depends_on: api"));
+        assert!(rendered.contains("health: running"));
+    }
+
+    #[test]
+    fn logs_group_multiservice_service_logs_by_default() {
+        let rendered = render_deployment_logs(&DeploymentLogs {
+            deployment_id: "dep-1".into(),
+            project_id: "forge-multiservice-test".into(),
+            environment: "staging".into(),
+            lines: vec!["generation promoted".into()],
+            lifecycle: vec!["generation promoted".into()],
+            container_logs: Vec::new(),
+            services: vec![
+                forge_core::api::ServiceLogGroup {
+                    service_id: "api".into(),
+                    role: "exposed".into(),
+                    container_name: Some("staging-api-gen-1".into()),
+                    lines: vec!["api log line".into()],
+                },
+                forge_core::api::ServiceLogGroup {
+                    service_id: "worker".into(),
+                    role: "internal".into(),
+                    container_name: Some("staging-worker-gen-1".into()),
+                    lines: vec!["worker log line".into()],
+                },
+            ],
+            selected_service: None,
+            validation_failure_summary: None,
+            diagnostics_source: None,
+        });
+
+        assert!(rendered.contains("Service Logs:"));
+        assert!(rendered.contains("api log line"));
+        assert!(rendered.contains("worker log line"));
+    }
+
+    #[test]
+    fn logs_command_accepts_service_selector() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "logs".into(),
+            "--service".into(),
+            "worker".into(),
+            "dep-1".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::Logs {
+                deployment_id: "dep-1".into(),
+                service: Some("worker".into()),
+                json: false,
             }
         );
     }

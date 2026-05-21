@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::api::{
     DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest,
     DeploymentStatus, EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport,
-    ErrorResponse, EventList, validate_deployment_request,
+    ErrorResponse, EventList, ServiceLogGroup, validate_deployment_request,
 };
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
@@ -27,7 +27,8 @@ use crate::status::{
     load_environment_history, load_project_environment_env_report, load_project_environment_status,
 };
 use crate::storage::{
-    DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
+    DiagnosticsStore, EnvironmentPaths, EventStore, PersistedActivationMode, PersistedRuntimeInfo,
+    RuntimeHealthState, RuntimeStateStore, load_generation_runtime_info,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,46 @@ pub enum StartupStep {
     BootstrapReady,
     QueueRecovered,
     HealthLoopsStarted,
+}
+
+fn service_log_groups_from_runtime(runtime: &PersistedRuntimeInfo) -> Vec<ServiceLogGroup> {
+    if runtime.services.is_empty() {
+        return vec![ServiceLogGroup {
+            service_id: "default".into(),
+            role: if matches!(
+                runtime.activation,
+                Some(PersistedActivationMode::Http { .. })
+            ) {
+                "exposed".into()
+            } else {
+                "internal".into()
+            },
+            container_name: Some(runtime.container_name.clone()),
+            lines: Vec::new(),
+        }];
+    }
+
+    let startup_order = if runtime.startup_order.is_empty() {
+        runtime.services.keys().cloned().collect::<Vec<_>>()
+    } else {
+        runtime.startup_order.clone()
+    };
+    startup_order
+        .into_iter()
+        .filter_map(|service_id| {
+            let service = runtime.services.get(&service_id)?;
+            Some(ServiceLogGroup {
+                service_id: service.service_id.clone(),
+                role: if service.externally_exposed {
+                    "exposed".into()
+                } else {
+                    "internal".into()
+                },
+                container_name: Some(service.container_name.clone()),
+                lines: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -354,6 +395,7 @@ where
     pub fn get_deployment_logs(
         &self,
         deployment_id: &str,
+        service_id: Option<&str>,
     ) -> Result<DeploymentLogs, ErrorResponse> {
         let Some(entry) = persisted_deployments(&self.config.storage_root)
             .map_err(|err| ErrorResponse {
@@ -369,37 +411,78 @@ where
             });
         };
 
-        let lines = DiagnosticsStore::new(
-            EnvironmentPaths::new(
-                &self.config.storage_root,
-                &entry.project_id,
-                &entry.environment,
-            ),
-            entry.generation,
-        )
-        .read_log_lines()
-        .map_err(|err| ErrorResponse {
+        let env = EnvironmentPaths::new(
+            &self.config.storage_root,
+            &entry.project_id,
+            &entry.environment,
+        );
+        let diagnostics = DiagnosticsStore::new(env.clone(), entry.generation);
+        let lines = diagnostics.read_log_lines().map_err(|err| ErrorResponse {
             code: "logs_unavailable".into(),
             message: err.to_string(),
         })?;
-        let diagnostics = DiagnosticsStore::new(
-            EnvironmentPaths::new(
-                &self.config.storage_root,
-                &entry.project_id,
-                &entry.environment,
-            ),
-            entry.generation,
-        );
-        let container_logs = diagnostics
-            .read_text_artifact("container_logs_tail.log")
-            .map_err(|err| ErrorResponse {
+        let runtime =
+            load_generation_runtime_info(&env, entry.generation).map_err(|err| ErrorResponse {
                 code: "logs_unavailable".into(),
                 message: err.to_string(),
-            })?
-            .unwrap_or_default()
-            .lines()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+            })?;
+        let mut services = runtime
+            .as_ref()
+            .map(service_log_groups_from_runtime)
+            .unwrap_or_default();
+        for group in &mut services {
+            let artifact_name = format!("service-{}-container_logs_tail.log", group.service_id);
+            group.lines = diagnostics
+                .read_text_artifact(&artifact_name)
+                .map_err(|err| ErrorResponse {
+                    code: "logs_unavailable".into(),
+                    message: err.to_string(),
+                })?
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.to_string())
+                .collect();
+        }
+        if services.is_empty() {
+            let container_logs = diagnostics
+                .read_text_artifact("container_logs_tail.log")
+                .map_err(|err| ErrorResponse {
+                    code: "logs_unavailable".into(),
+                    message: err.to_string(),
+                })?
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            services.push(ServiceLogGroup {
+                service_id: "default".into(),
+                role: "exposed".into(),
+                container_name: runtime.as_ref().map(|value| value.container_name.clone()),
+                lines: container_logs.clone(),
+            });
+        }
+        let selected_service = service_id.map(|value| value.to_string());
+        let services = if let Some(service_id) = service_id {
+            let Some(group) = services
+                .into_iter()
+                .find(|group| group.service_id == service_id)
+            else {
+                return Err(ErrorResponse {
+                    code: "service_not_found".into(),
+                    message: format!(
+                        "service `{service_id}` not found for deployment {deployment_id}"
+                    ),
+                });
+            };
+            vec![group]
+        } else {
+            services
+        };
+        let container_logs = if services.len() == 1 {
+            services[0].lines.clone()
+        } else {
+            Vec::new()
+        };
         let validation_failure_summary = diagnostics
             .read_summary()
             .map_err(|err| ErrorResponse {
@@ -421,6 +504,8 @@ where
             lines,
             lifecycle,
             container_logs,
+            services,
+            selected_service,
             validation_failure_summary,
             diagnostics_source: Some(diagnostics_source),
         })
@@ -1422,7 +1507,7 @@ pub mod deployment_status_reflects_runtime_state {
             StaticDecider(true),
         );
 
-        let err = daemon.get_deployment_logs("dep-missing").unwrap_err();
+        let err = daemon.get_deployment_logs("dep-missing", None).unwrap_err();
         assert_eq!(err.code, "deployment_not_found");
         assert!(
             err.message
@@ -1497,7 +1582,7 @@ pub mod deployment_status_reflects_runtime_state {
             NoopRoutingRuntime,
             StaticDecider(true),
         );
-        let logs = daemon.get_deployment_logs("dep-1").unwrap();
+        let logs = daemon.get_deployment_logs("dep-1", None).unwrap();
         assert_eq!(logs.deployment_id, "dep-1");
         assert!(
             logs.lines
@@ -1510,5 +1595,83 @@ pub mod deployment_status_reflects_runtime_state {
                 .unwrap()
                 .contains("topology")
         );
+    }
+
+    #[test]
+    fn logs_can_select_service_for_multiservice_deploy() {
+        let root = test_root("logs-can-select-service-for-multiservice-deploy");
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-ms-1\",\n  \"image_ref\": \"forge/api:staging-gen-1\"\n}\n",
+            )
+            .unwrap();
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .write_artifact(
+                "runtime.json",
+                concat!(
+                    "{\n",
+                    "  \"container_name\": \"staging-api-gen-1\",\n",
+                    "  \"running\": true,\n",
+                    "  \"services\": {\n",
+                    "    \"api\": {\n",
+                    "      \"service_id\": \"api\",\n",
+                    "      \"container_name\": \"staging-api-api-gen-1\",\n",
+                    "      \"image_ref\": \"forge/api:staging-gen-1\",\n",
+                    "      \"running\": true,\n",
+                    "      \"externally_exposed\": true,\n",
+                    "      \"activation\": {\"Http\": {\"internal_port\": 3000, \"route_subtree_id\": \"forge:api:staging:api\", \"target_source\": \"ContainerIp\"}}\n",
+                    "    },\n",
+                    "    \"worker\": {\n",
+                    "      \"service_id\": \"worker\",\n",
+                    "      \"container_name\": \"staging-api-worker-gen-1\",\n",
+                    "      \"image_ref\": \"forge/worker:staging-gen-1\",\n",
+                    "      \"running\": true,\n",
+                    "      \"depends_on\": [\"api\"],\n",
+                    "      \"activation\": \"Direct\"\n",
+                    "    }\n",
+                    "  },\n",
+                    "  \"startup_order\": [\"api\", \"worker\"],\n",
+                    "  \"activation\": {\"Http\": {\"internal_port\": 3000, \"route_subtree_id\": \"forge:api:staging\", \"target_source\": \"ContainerIp\"}},\n",
+                    "  \"environment_variables\": {}\n",
+                    "}\n"
+                ),
+            )
+            .unwrap();
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .finalize("api", "staging", SnapshotState::Healthy)
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env, 1);
+        diagnostics
+            .append_log_line("generation promoted", &[])
+            .unwrap();
+        diagnostics
+            .write_artifact("service-api-container_logs_tail.log", "api ready\n", &[])
+            .unwrap();
+        diagnostics
+            .write_artifact(
+                "service-worker-container_logs_tail.log",
+                "worker polling\n",
+                &[],
+            )
+            .unwrap();
+
+        let daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        let logs = daemon
+            .get_deployment_logs("dep-ms-1", Some("worker"))
+            .unwrap();
+        assert_eq!(logs.selected_service.as_deref(), Some("worker"));
+        assert_eq!(logs.services.len(), 1);
+        assert_eq!(logs.services[0].service_id, "worker");
+        assert_eq!(logs.services[0].lines, vec!["worker polling".to_string()]);
     }
 }

@@ -30,11 +30,12 @@ use crate::storage::{
     DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary, PersistedResolvedRuntime,
-    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedSnapshotMetadata,
-    PersistedValidationSummary, PointerStore, RetentionMetadata, RetentionStore, StorageError,
-    load_generation_build_info, load_generation_lifecycle, load_generation_probe_history,
-    load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
+    PersistedServiceState, PersistedSnapshotMetadata, PersistedValidationSummary, PointerStore,
+    RetentionMetadata, RetentionStore, StorageError, load_generation_build_info,
+    load_generation_lifecycle, load_generation_probe_history, load_generation_resolved_runtime,
+    load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    load_generation_snapshot_metadata,
 };
 
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
@@ -957,6 +958,12 @@ where
         .map(|generation| load_failure_details_internal(&env, generation))
         .transpose()?
         .flatten();
+    let services = enrich_services_with_diagnostics(
+        &env,
+        truth.active_generation.or(latest_failed_generation),
+        &truth.services,
+        latest_failure.as_ref(),
+    )?;
     let recent_failures = recent_failure_generations
         .into_iter()
         .map(|generation| load_failure_details(&env, generation))
@@ -1115,7 +1122,7 @@ where
         route,
         probe_target,
         startup_order: truth.startup_order.clone(),
-        services: truth.services.clone(),
+        services,
         recent_failures,
         latest_validation_failure: latest_failure
             .as_ref()
@@ -1425,8 +1432,15 @@ where
         .as_ref()
         .map(service_startup_order)
         .unwrap_or_default();
-    let services =
-        collect_service_runtime_truth(docker, promoted_runtime.as_ref(), promoted_build.as_ref());
+    let services = collect_service_runtime_truth(
+        docker,
+        routing,
+        project_id,
+        environment,
+        &domain,
+        promoted_runtime.as_ref(),
+        promoted_build.as_ref(),
+    );
     let route_details = inspect_route_status(
         routing,
         project_id,
@@ -1472,14 +1486,19 @@ fn service_startup_order(runtime: &PersistedRuntimeInfo) -> Vec<String> {
     }
 }
 
-fn collect_service_runtime_truth<D: DockerRuntime>(
+fn collect_service_runtime_truth<D: DockerRuntime, R: RoutingRuntime>(
     docker: &mut D,
+    routing: &mut R,
+    project_id: &str,
+    environment: &str,
+    domain: &str,
     promoted_runtime: Option<&PersistedRuntimeInfo>,
     promoted_build: Option<&PersistedBuildInfo>,
 ) -> Vec<ServiceRuntimeStatus> {
     let Some(runtime) = promoted_runtime else {
         return Vec::new();
     };
+    let is_multi_service = !runtime.services.is_empty();
     let services = if runtime.services.is_empty() {
         BTreeMap::from([(
             "default".into(),
@@ -1534,6 +1553,10 @@ fn collect_service_runtime_truth<D: DockerRuntime>(
                         .as_ref()
                         .and_then(|value| value.network_ips.values().next().cloned())
                 });
+            let running = inspection
+                .as_ref()
+                .map(|value| value.running)
+                .unwrap_or(service.running);
             Some(ServiceRuntimeStatus {
                 service_id: service.service_id.clone(),
                 role: if service.externally_exposed {
@@ -1542,23 +1565,92 @@ fn collect_service_runtime_truth<D: DockerRuntime>(
                     "internal".into()
                 },
                 depends_on: service.depends_on.clone(),
+                dns_aliases: vec![service.service_id.clone()],
                 container_name: Some(service.container_name.clone()),
                 image_ref: inspection
                     .as_ref()
                     .map(|value| value.image_ref.clone())
                     .or_else(|| Some(service.image_ref.clone())),
-                running: inspection
-                    .as_ref()
-                    .map(|value| value.running)
-                    .unwrap_or(service.running),
+                running,
                 state_status: inspection.as_ref().map(|value| value.state_status.clone()),
                 lifecycle_state: Some(service.state.clone()),
-                network_name,
+                network_name: network_name.clone(),
                 container_ip,
+                internal_port: service_internal_port(service),
                 probe_path: service.probe_path.clone(),
+                route: if is_multi_service {
+                    service_route_status(
+                        routing,
+                        project_id,
+                        environment,
+                        domain,
+                        service,
+                        inspection.as_ref(),
+                        network_name.as_deref(),
+                    )
+                } else if service.externally_exposed {
+                    "active".into()
+                } else {
+                    "none".into()
+                },
+                health: service_health_status(service, running),
+                failure_reason: None,
+                logs_tail: Vec::new(),
             })
         })
         .collect()
+}
+
+fn service_internal_port(service: &PersistedServiceRuntimeInfo) -> Option<u16> {
+    match service.activation.as_ref() {
+        Some(PersistedActivationMode::Http { internal_port, .. }) => Some(*internal_port),
+        Some(PersistedActivationMode::Direct) | None => None,
+    }
+}
+
+fn service_health_status(service: &PersistedServiceRuntimeInfo, running: bool) -> String {
+    if !running {
+        return "stopped".into();
+    }
+    if matches!(service.state, PersistedServiceState::Failed) {
+        return "failed".into();
+    }
+    if service.externally_exposed || service.probe_path.is_some() {
+        return "healthy".into();
+    }
+    "running".into()
+}
+
+fn service_route_status<R: RoutingRuntime>(
+    routing: &mut R,
+    project_id: &str,
+    environment: &str,
+    domain: &str,
+    service: &PersistedServiceRuntimeInfo,
+    inspection: Option<&ContainerInspection>,
+    network_name: Option<&str>,
+) -> String {
+    if !service.externally_exposed {
+        return "none".into();
+    }
+    let Some(details) = inspect_service_route_status(
+        routing,
+        project_id,
+        environment,
+        domain,
+        service,
+        inspection,
+        network_name,
+    ) else {
+        return "missing".into();
+    };
+    if details.matches_truth() {
+        "active".into()
+    } else if details.inspection.is_some() {
+        "mismatch".into()
+    } else {
+        "missing".into()
+    }
 }
 
 fn build_environment_status_from_truth(
@@ -1761,6 +1853,8 @@ fn list_recent_failure_generations(env: &EnvironmentPaths) -> Result<Vec<u64>, P
 struct FailureDetails {
     failure_stage: String,
     diagnostics_source: String,
+    failed_service_name: Option<String>,
+    failure_reason: String,
     probe_target: Option<ProbeTargetDiagnostics>,
     validation_failure: Option<Value>,
     route_activation_failure: Option<Value>,
@@ -1792,6 +1886,8 @@ fn load_failure_details_internal(
     Ok(Some(FailureDetails {
         failure_stage: summary.failure_stage.clone(),
         diagnostics_source: diagnostics_source.clone(),
+        failed_service_name: summary.failed_service_name.clone(),
+        failure_reason: summary.failure_reason.clone(),
         probe_target: Some(ProbeTargetDiagnostics {
             host: summary.probe_target_host.clone(),
             port: summary.probe_target_port,
@@ -1836,6 +1932,60 @@ fn diagnostics_dir_source(env: &EnvironmentPaths, generation: u64) -> String {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
     )
+}
+
+fn service_logs_artifact_name(service_id: &str) -> String {
+    format!("service-{service_id}-container_logs_tail.log")
+}
+
+fn load_service_logs_tail(
+    diagnostics: &DiagnosticsStore,
+    service_id: &str,
+) -> Result<Vec<String>, ProjectStatusError> {
+    let artifact_name = service_logs_artifact_name(service_id);
+    let logs = diagnostics
+        .read_text_artifact(&artifact_name)?
+        .or(if service_id == "default" {
+            diagnostics.read_text_artifact("container_logs_tail.log")?
+        } else {
+            None
+        })
+        .unwrap_or_default();
+    Ok(logs.lines().map(|line| line.to_string()).collect())
+}
+
+fn enrich_services_with_diagnostics(
+    env: &EnvironmentPaths,
+    generation: Option<u64>,
+    services: &[ServiceRuntimeStatus],
+    latest_failure: Option<&FailureDetails>,
+) -> Result<Vec<ServiceRuntimeStatus>, ProjectStatusError> {
+    let Some(generation) = generation else {
+        return Ok(services.to_vec());
+    };
+    let diagnostics = DiagnosticsStore::new(env.clone(), generation);
+    services
+        .iter()
+        .cloned()
+        .map(|mut service| {
+            service.logs_tail = load_service_logs_tail(&diagnostics, &service.service_id)?;
+            service.failure_reason = match latest_failure {
+                Some(failure)
+                    if failure.failed_service_name.as_deref() == Some(&service.service_id) =>
+                {
+                    Some(failure.failure_reason.clone())
+                }
+                _ if service.health == "failed" => Some(
+                    service
+                        .state_status
+                        .clone()
+                        .unwrap_or_else(|| "service reported failed state".into()),
+                ),
+                _ => None,
+            };
+            Ok(service)
+        })
+        .collect()
 }
 
 fn runtime_env_snapshot_metadata(
@@ -2285,6 +2435,62 @@ fn inspect_route_status<R: RoutingRuntime>(
     })
 }
 
+fn inspect_service_route_status<R: RoutingRuntime>(
+    routing: &mut R,
+    project_id: &str,
+    environment: &str,
+    domain: &str,
+    service: &PersistedServiceRuntimeInfo,
+    container: Option<&ContainerInspection>,
+    network_name: Option<&str>,
+) -> Option<RouteStatusDetails> {
+    let PersistedActivationMode::Http {
+        route_subtree_id: persisted_subtree_id,
+        ..
+    } = service.activation.as_ref()?
+    else {
+        return None;
+    };
+    let inspection = routing
+        .inspect_route(
+            persisted_subtree_id
+                .as_deref()
+                .unwrap_or(&route_subtree_id(project_id, environment)),
+        )
+        .ok();
+    let service_runtime = PersistedRuntimeInfo {
+        container_name: service.container_name.clone(),
+        running: service.running,
+        network_name: service.network_name.clone(),
+        probe_path: service.probe_path.clone(),
+        activation: service.activation.clone(),
+        environment_variables: service.environment_variables.clone(),
+        source_ref: service.source_ref.clone(),
+        repo_url: service.repo_url.clone(),
+        commit_sha: service.commit_sha.clone(),
+        source_path: service.source_path.clone(),
+        services: BTreeMap::new(),
+        startup_order: Vec::new(),
+    };
+    let expected_target = container.and_then(|container| {
+        expected_route_for_runtime(
+            project_id,
+            environment,
+            Some(domain.to_string()),
+            &service_runtime,
+            container,
+            network_name,
+        )
+        .map(|route| route.target)
+    });
+    Some(RouteStatusDetails {
+        inspection,
+        expected_target,
+        expected_domain: domain.to_string(),
+        route_required: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2296,8 +2502,9 @@ mod tests {
         BuildImageRequest, CreateContainerRequest, ManagedImage, RouteUpdateRequest,
     };
     use crate::storage::{
-        LifecycleStore, PersistedProbeHistory, PersistedProbeHistoryEntry, PersistedProbeType,
-        PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore, ProbeHistoryStore,
+        DiagnosticSummary, LifecycleStore, PersistedProbeHistory, PersistedProbeHistoryEntry,
+        PersistedProbeType, PersistedRouteTargetSource, PersistedRuntimeInfo,
+        PersistedServiceRuntimeInfo, PersistedServiceState, PointerStore, ProbeHistoryStore,
         RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
         atomic_write,
     };
@@ -2540,6 +2747,131 @@ mod tests {
                 last_transition: "healthy".into(),
                 last_error_code: None,
             })
+            .unwrap();
+    }
+
+    fn write_multiservice_generation(root: &Path, generation: u64) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                &format!(
+                    concat!(
+                        "{{\n",
+                        "  \"deployment_id\": \"dep-ms-{generation}\",\n",
+                        "  \"image_ref\": \"forge/api:staging-gen-{generation}\",\n",
+                        "  \"services\": {{\n",
+                        "    \"api\": {{\"service_id\": \"api\", \"image_ref\": \"forge/api:staging-gen-{generation}\"}},\n",
+                        "    \"worker\": {{\"service_id\": \"worker\", \"image_ref\": \"forge/worker:staging-gen-{generation}\"}}\n",
+                        "  }}\n",
+                        "}}\n"
+                    ),
+                    generation = generation,
+                ),
+            )
+            .unwrap();
+        let runtime = PersistedRuntimeInfo {
+            container_name: format!("staging-api-gen-{generation}"),
+            running: true,
+            network_name: Some("forge-managed".into()),
+            probe_path: Some("/health".into()),
+            activation: Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                route_subtree_id: Some("forge:api:staging:api".into()),
+                target_source: PersistedRouteTargetSource::ContainerIp,
+            }),
+            environment_variables: BTreeMap::new(),
+            source_ref: Some("main".into()),
+            repo_url: None,
+            commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
+            source_path: None,
+            services: BTreeMap::from([
+                (
+                    "api".into(),
+                    PersistedServiceRuntimeInfo {
+                        service_id: "api".into(),
+                        container_name: format!("staging-api-api-gen-{generation}"),
+                        image_ref: format!("forge/api:staging-gen-{generation}"),
+                        running: true,
+                        state: PersistedServiceState::Healthy,
+                        network_name: Some("forge-managed".into()),
+                        probe_path: Some("/health".into()),
+                        activation: Some(PersistedActivationMode::Http {
+                            internal_port: 3000,
+                            route_subtree_id: Some("forge:api:staging:api".into()),
+                            target_source: PersistedRouteTargetSource::ContainerIp,
+                        }),
+                        command: None,
+                        depends_on: Vec::new(),
+                        required_for_promotion: true,
+                        externally_exposed: true,
+                        environment_variables: BTreeMap::new(),
+                        source_ref: Some("main".into()),
+                        repo_url: None,
+                        commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
+                        source_path: None,
+                    },
+                ),
+                (
+                    "worker".into(),
+                    PersistedServiceRuntimeInfo {
+                        service_id: "worker".into(),
+                        container_name: format!("staging-api-worker-gen-{generation}"),
+                        image_ref: format!("forge/worker:staging-gen-{generation}"),
+                        running: true,
+                        state: PersistedServiceState::Healthy,
+                        network_name: Some("forge-managed".into()),
+                        probe_path: None,
+                        activation: Some(PersistedActivationMode::Direct),
+                        command: None,
+                        depends_on: vec!["api".into()],
+                        required_for_promotion: false,
+                        externally_exposed: false,
+                        environment_variables: BTreeMap::new(),
+                        source_ref: Some("main".into()),
+                        repo_url: None,
+                        commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
+                        source_path: None,
+                    },
+                ),
+            ]),
+            startup_order: vec!["api".into(), "worker".into()],
+        };
+        writer
+            .write_artifact(
+                "runtime.json",
+                &format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", SnapshotState::Healthy)
+            .unwrap();
+        PointerStore::new(env.clone())
+            .swap_current(generation)
+            .unwrap();
+        RuntimeStateStore::new(env.clone())
+            .save(&RuntimeState {
+                active_generation: Some(generation),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env, generation);
+        diagnostics
+            .write_artifact("service-api-container_logs_tail.log", "api ready\n", &[])
+            .unwrap();
+        diagnostics
+            .write_artifact(
+                "service-worker-container_logs_tail.log",
+                "worker polling\n",
+                &[],
+            )
             .unwrap();
     }
 
@@ -4716,5 +5048,126 @@ mod tests {
             Some(DeploymentLifecycleState::Promoted)
         );
         assert_eq!(previous.retention_role, Some(RetentionRole::RollbackTarget));
+    }
+
+    #[test]
+    fn diagnose_reports_internal_worker_service() {
+        let root = test_root("diagnose-reports-internal-worker-service");
+        register_project(&root, "api", "api.example.com");
+        write_multiservice_generation(&root, 7);
+        DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "staging"), 7)
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some("dep-ms-7".into()),
+                failure_stage: "warming".into(),
+                failure_reason: "worker queue disconnected".into(),
+                container_name: "staging-api-worker-gen-7".into(),
+                failed_service_name: Some("worker".into()),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: Some("api<-none; worker<-api".into()),
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(ContainerInspection {
+                container_name: "staging-api-api-gen-7".into(),
+                running: true,
+                state_status: "running".into(),
+                exit_code: None,
+                restart_count: 0,
+                started_at: None,
+                image_ref: "forge/api:staging-gen-7".into(),
+                labels: BTreeMap::new(),
+                network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
+                restart_policy: "always".into(),
+            }),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(RouteInspection {
+                subtree_id: "forge:api:staging:api".into(),
+                domain: Some("staging-api.example.com".into()),
+                active_target: "172.29.0.2:3000".into(),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }),
+        };
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+        let worker = diagnostics
+            .services
+            .iter()
+            .find(|service| service.service_id == "worker")
+            .unwrap();
+        assert_eq!(worker.role, "internal");
+        assert_eq!(worker.route, "none");
+        assert_eq!(worker.health, "running");
+        assert_eq!(worker.depends_on, vec!["api".to_string()]);
+        assert_eq!(worker.dns_aliases, vec!["worker".to_string()]);
+        assert_eq!(
+            worker.failure_reason.as_deref(),
+            Some("worker queue disconnected")
+        );
+        assert_eq!(worker.logs_tail, vec!["worker polling".to_string()]);
+    }
+
+    #[test]
+    fn internal_service_has_no_route() {
+        let root = test_root("internal-service-has-no-route");
+        register_project(&root, "api", "api.example.com");
+        write_multiservice_generation(&root, 9);
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(ContainerInspection {
+                container_name: "staging-api-api-gen-9".into(),
+                running: true,
+                state_status: "running".into(),
+                exit_code: None,
+                restart_count: 0,
+                started_at: None,
+                image_ref: "forge/api:staging-gen-9".into(),
+                labels: BTreeMap::new(),
+                network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
+                restart_policy: "always".into(),
+            }),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(RouteInspection {
+                subtree_id: "forge:api:staging:api".into(),
+                domain: Some("staging-api.example.com".into()),
+                active_target: "172.29.0.2:3000".into(),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }),
+        };
+
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+        let worker = status
+            .services
+            .iter()
+            .find(|service| service.service_id == "worker")
+            .unwrap();
+        assert_eq!(worker.route, "none");
+        assert_eq!(worker.health, "running");
     }
 }

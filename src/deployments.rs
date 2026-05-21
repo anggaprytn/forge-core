@@ -936,6 +936,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         update_generation_history(&env, generation, |history| {
             history.promoted_at_unix = Some(current_unix_timestamp());
         })?;
+        self.capture_service_container_logs_tail(
+            &diagnostics,
+            "default",
+            &container_name,
+            &secret_values,
+        )?;
         self.capture_container_logs_tail(&diagnostics, &container_name, &secret_values)?;
 
         Ok(DeploymentExecution {
@@ -1630,12 +1636,18 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             }),
         )?;
         for runtime in service_runtime.values() {
-            self.capture_container_logs_tail(
+            self.capture_service_container_logs_tail(
                 &diagnostics,
+                &runtime.service_id,
                 &runtime.container_name,
                 &secret_values,
             )?;
         }
+        self.capture_container_logs_tail(
+            &diagnostics,
+            &primary_runtime.container_name,
+            &secret_values,
+        )?;
         update_generation_history(&env, generation, |history| {
             history.promoted_at_unix = Some(current_unix_timestamp());
             history.finalized_state = Some("healthy".into());
@@ -1774,6 +1786,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     port,
                     path: service.validation.http_health_path.clone(),
                 });
+                self.capture_service_container_logs_tail(
+                    diagnostics,
+                    service_id,
+                    container_name,
+                    secret_values,
+                )?;
                 self.record_failed_attempt(
                     events,
                     diagnostics,
@@ -2671,6 +2689,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
     ) -> Result<(), DeploymentError> {
         let logs_tail = self.read_container_logs_tail(container_name);
         diagnostics.write_artifact("container_logs_tail.log", &logs_tail, secret_values)?;
+        Ok(())
+    }
+
+    fn capture_service_container_logs_tail(
+        &mut self,
+        diagnostics: &DiagnosticsStore,
+        service_id: &str,
+        container_name: &str,
+        secret_values: &[String],
+    ) -> Result<(), DeploymentError> {
+        let logs_tail = self.read_container_logs_tail(container_name);
+        diagnostics.write_artifact(
+            &format!("service-{service_id}-container_logs_tail.log"),
+            &logs_tail,
+            secret_values,
+        )?;
         Ok(())
     }
 
