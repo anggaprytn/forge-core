@@ -1,6 +1,7 @@
 use crate::events::EventRecord;
 use crate::storage::{
-    DeploymentLifecycleState, PersistedPromotionSummary, PersistedValidationSummary,
+    DeploymentLifecycleState, PersistedPromotionSummary, PersistedServiceState,
+    PersistedValidationSummary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -100,6 +101,29 @@ pub struct ContainerRuntimeDiagnostics {
     pub container_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceRuntimeStatus {
+    pub service_id: String,
+    pub role: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<PersistedServiceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +259,10 @@ pub struct EnvironmentDiagnostics {
     pub route: RouteDiagnostics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target: Option<ProbeTargetDiagnostics>,
+    #[serde(default)]
+    pub startup_order: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<ServiceRuntimeStatus>,
     #[serde(default)]
     pub recent_failures: Vec<RecentDeploymentFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

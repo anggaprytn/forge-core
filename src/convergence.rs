@@ -1177,6 +1177,7 @@ fn runtime_services(
             container_name: runtime_info.container_name.clone(),
             image_ref: default_image_ref.to_string(),
             running: runtime_info.running,
+            state: crate::storage::PersistedServiceState::Healthy,
             network_name: runtime_info.network_name.clone(),
             probe_path: runtime_info.probe_path.clone(),
             activation: runtime_info.activation.clone(),
@@ -5648,6 +5649,7 @@ pub mod multi_service_convergence_and_gc {
         let build = serde_json::to_string_pretty(&PersistedBuildInfo {
             deployment_id: format!("dep-{generation}"),
             image_ref: format!("forge/api:production-gen-{generation}"),
+            services: BTreeMap::new(),
             source_ref: None,
             repo_url: None,
             commit_sha: None,
@@ -5667,6 +5669,7 @@ pub mod multi_service_convergence_and_gc {
                     container_name: format!("prod-api-api-gen-{generation}"),
                     image_ref: format!("forge/api:production-gen-{generation}"),
                     running: true,
+                    state: crate::storage::PersistedServiceState::Healthy,
                     network_name: Some("forge-test".into()),
                     probe_path: Some("/health".into()),
                     activation: Some(PersistedActivationMode::Http {
@@ -5692,6 +5695,7 @@ pub mod multi_service_convergence_and_gc {
                     container_name: format!("prod-api-worker-gen-{generation}"),
                     image_ref: format!("forge/api:production-gen-{generation}"),
                     running: true,
+                    state: crate::storage::PersistedServiceState::Healthy,
                     network_name: Some("forge-test".into()),
                     probe_path: None,
                     activation: Some(PersistedActivationMode::Direct),

@@ -49,6 +49,7 @@ fn docker_integration_real_adapter_honors_runtime_invariants() {
             image_tag: image_tag.clone(),
             context_path: fixture.clone(),
             dockerfile_path: fixture.join("Dockerfile"),
+            build_args: BTreeMap::new(),
             labels: labels.clone(),
         })
         .expect("sample image should build through the real docker adapter");

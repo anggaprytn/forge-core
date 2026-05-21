@@ -63,6 +63,10 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
             "-t".to_string(),
             request.image_tag.clone(),
         ];
+        for (key, value) in &request.build_args {
+            args.push("--build-arg".to_string());
+            args.push(format!("{key}={value}"));
+        }
         for (key, value) in &request.labels {
             args.push("--label".to_string());
             args.push(format!("{key}={value}"));
@@ -448,6 +452,7 @@ pub mod docker_adapter_builds_image_with_labels {
                 image_tag: "forge:test".into(),
                 context_path: PathBuf::from("."),
                 dockerfile_path: PathBuf::from("./Dockerfile"),
+                build_args: BTreeMap::new(),
                 labels: labels("api", "production", 42),
             })
             .unwrap();

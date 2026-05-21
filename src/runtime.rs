@@ -7,6 +7,7 @@ pub struct BuildImageRequest {
     pub image_tag: String,
     pub context_path: PathBuf,
     pub dockerfile_path: PathBuf,
+    pub build_args: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
 }
 

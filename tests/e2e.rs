@@ -996,6 +996,7 @@ impl E2eHarness {
                 image_tag: format!("forge/e2e-staged:{}-{generation}", deployment_id),
                 context_path: fixture.to_path_buf(),
                 dockerfile_path: fixture.join("Dockerfile"),
+                build_args: BTreeMap::new(),
                 labels: forge_labels(&record, generation),
             })
             .unwrap();

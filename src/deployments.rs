@@ -27,11 +27,11 @@ use crate::storage::{
     EnvironmentPaths, EventStore, GenerationAllocator, GenerationHistoryRecord, LifecycleStore,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedPromotionSummary,
-    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
-    PersistedServiceState, PersistedValidationSummary, PointerStore, ProbeHistoryStore,
-    RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
-    SnapshotWriter, StorageError, current_unix_timestamp, load_generation_build_info,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedServiceBuildInfo,
+    PersistedServiceRuntimeInfo, PersistedServiceState, PersistedValidationSummary, PointerStore,
+    ProbeHistoryStore, RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
+    SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
+    load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 #[derive(Debug)]
@@ -517,6 +517,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             image_tag: image_tag.clone(),
             context_path: execution.context_path.clone(),
             dockerfile_path: execution.dockerfile_path.clone(),
+            build_args: BTreeMap::new(),
             labels: labels.clone(),
         }) {
             Ok(image_ref) => image_ref,
@@ -761,6 +762,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let build_json = serde_json::to_string_pretty(&PersistedBuildInfo {
             deployment_id: record.deployment_id.clone(),
             image_ref: image_ref.clone(),
+            services: BTreeMap::new(),
             source_ref: record.source_ref.clone(),
             repo_url: record.repo_url.clone(),
             commit_sha: record.commit_sha.clone(),
@@ -1238,70 +1240,6 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &secret_values,
         )?;
 
-        let requires_shared_build = config
-            .services()
-            .values()
-            .any(|service| service.image.is_none());
-        let shared_image_ref = if requires_shared_build {
-            persist_lifecycle_transition(
-                &lifecycle_store,
-                &record.project_id,
-                &record.environment,
-                generation,
-                DeploymentLifecycleState::Building,
-                "shared application image build started",
-                None,
-                None,
-            )?;
-            let image_tag = format!(
-                "forge/{}:{}-gen-{}",
-                record.project_id, record.environment, generation
-            );
-            let image_ref = match self.docker.build_image(BuildImageRequest {
-                image_tag: image_tag.clone(),
-                context_path: execution.context_path.clone(),
-                dockerfile_path: execution.dockerfile_path.clone(),
-                labels: labels.clone(),
-            }) {
-                Ok(image_ref) => image_ref,
-                Err(err) => {
-                    let message = format!("shared image build failed: {err}");
-                    self.record_preparation_failure(
-                        record,
-                        &DeploymentArtifacts {
-                            env: env.clone(),
-                            generation,
-                            events: EventStore::new(env.clone(), generation),
-                            diagnostics: DiagnosticsStore::new(env.clone(), generation),
-                            lifecycle_store: LifecycleStore::new(env.clone(), generation),
-                            writer: SnapshotWriter::new(env.clone(), generation)?,
-                        },
-                        "building",
-                        &message,
-                        generation_service_container_name(
-                            record,
-                            generation,
-                            "api",
-                            config.services().len(),
-                        ),
-                        None,
-                        Some(dependency_graph_summary.clone()),
-                        &redacted_env_preview,
-                        &secret_values,
-                    )?;
-                    return Err(err.into());
-                }
-            };
-            diagnostics
-                .append_log_line(&format!("shared image built: {image_ref}"), &secret_values)?;
-            update_generation_history(&env, generation, |history| {
-                history.image_ref = Some(image_ref.clone());
-            })?;
-            Some(image_ref)
-        } else {
-            None
-        };
-
         if let Some(network_name) = execution.network_name.as_deref() {
             if let Err(err) = self.docker.ensure_network(network_name) {
                 let message = format!("docker network ensure failed for {network_name}: {err}");
@@ -1336,16 +1274,25 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             )?;
         }
 
+        let mut service_builds = BTreeMap::new();
         let mut service_runtime = BTreeMap::new();
         for service_id in config.startup_order() {
             let service = config
                 .services()
                 .get(service_id)
                 .expect("startup order references known service");
-            diagnostics
-                .append_log_line(&format!("== service `{service_id}` =="), &secret_values)?;
             diagnostics.append_log_line(
-                &format!("depends_on: {}", service_dependency_list(service)),
+                &format!(
+                    "[service:{service_id}] role: {}",
+                    service_role_label(service)
+                ),
+                &secret_values,
+            )?;
+            diagnostics.append_log_line(
+                &format!(
+                    "[service:{service_id}] depends_on: {}",
+                    service_dependency_list(service)
+                ),
                 &secret_values,
             )?;
             let container_name = generation_service_container_name(
@@ -1354,21 +1301,95 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 service_id,
                 config.services().len(),
             );
-            let image_ref = service
-                .image
-                .clone()
-                .or_else(|| shared_image_ref.clone())
-                .ok_or_else(|| {
-                    DeploymentError::InvalidInspection(format!(
-                        "service `{service_id}` has no runtime image and no shared build image"
-                    ))
-                })?;
+            let build_config = service
+                .build
+                .as_ref()
+                .or_else(|| config.default_service_build());
+            let image_ref = if let Some(image_ref) = service.image.clone() {
+                diagnostics.append_log_line(
+                    &format!("[service:{service_id}] using runtime image {image_ref}"),
+                    &secret_values,
+                )?;
+                image_ref
+            } else if let Some(build_config) = build_config {
+                persist_lifecycle_transition(
+                    &lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Building,
+                    format!("service `{service_id}` image build started"),
+                    None,
+                    None,
+                )?;
+                diagnostics
+                    .append_log_line(&format!("[service:{service_id}] building"), &secret_values)?;
+                let mut build_labels = labels.clone();
+                build_labels.insert("forge.service_id".into(), service_id.clone());
+                let image_ref = match self.docker.build_image(BuildImageRequest {
+                    image_tag: format!(
+                        "forge/{}:{}-gen-{}-{}",
+                        record.project_id, record.environment, generation, service_id
+                    ),
+                    context_path: build_config.context_path.clone(),
+                    dockerfile_path: build_config.dockerfile_path.clone(),
+                    build_args: build_config.build_args.clone(),
+                    labels: build_labels,
+                }) {
+                    Ok(image_ref) => image_ref,
+                    Err(err) => {
+                        let message = format!("service `{service_id}` build failed: {err}");
+                        self.record_preparation_failure(
+                            record,
+                            &DeploymentArtifacts {
+                                env: env.clone(),
+                                generation,
+                                events: EventStore::new(env.clone(), generation),
+                                diagnostics: DiagnosticsStore::new(env.clone(), generation),
+                                lifecycle_store: LifecycleStore::new(env.clone(), generation),
+                                writer: SnapshotWriter::new(env.clone(), generation)?,
+                            },
+                            "building",
+                            &message,
+                            container_name.clone(),
+                            Some(service_id.clone()),
+                            Some(dependency_graph_summary.clone()),
+                            &redacted_env_preview,
+                            &secret_values,
+                        )?;
+                        return Err(err.into());
+                    }
+                };
+                diagnostics.append_log_line(
+                    &format!("[service:{service_id}] built image {image_ref}"),
+                    &secret_values,
+                )?;
+                image_ref
+            } else {
+                return Err(DeploymentError::InvalidInspection(format!(
+                    "service `{service_id}` has no runtime image and no build configuration"
+                )));
+            };
+            service_builds.insert(
+                service_id.clone(),
+                PersistedServiceBuildInfo {
+                    service_id: service_id.clone(),
+                    image_ref: image_ref.clone(),
+                    context_path: build_config.map(|config| config.context_path.clone()),
+                    dockerfile_path: build_config.map(|config| config.dockerfile_path.clone()),
+                    build_args: build_config
+                        .map(|config| config.build_args.clone())
+                        .unwrap_or_default(),
+                },
+            );
             let mut service_labels = labels.clone();
             service_labels.insert("forge.service_id".into(), service_id.clone());
             service_labels.insert(
                 "forge.route_id".into(),
                 route_subtree_id_for_service(record, service_id, config.services().len()),
             );
+            diagnostics
+                .append_log_line(&format!("[service:{service_id}] starting"), &secret_values)?;
             self.docker.create_container(CreateContainerRequest {
                 container_name: container_name.clone(),
                 image_ref: image_ref.clone(),
@@ -1381,7 +1402,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             self.docker.start_container(&container_name)?;
             let inspection = self.docker.inspect_container(&container_name)?;
             validate_inspection(&inspection, &container_name)?;
-            self.validate_service_candidate(
+            diagnostics.append_log_line(
+                &format!("[service:{service_id}] validating"),
+                &secret_values,
+            )?;
+            let warmup = self.validate_service_candidate(
                 service_id,
                 service,
                 validation_timeout_ms,
@@ -1401,6 +1426,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     container_name: inspection.container_name.clone(),
                     image_ref,
                     running: inspection.running,
+                    state: warmup.state,
                     network_name: execution.network_name.clone(),
                     probe_path: service.validation.http_health_path.clone(),
                     activation: Some(match service.validation.activation {
@@ -1442,12 +1468,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let primary_runtime = service_runtime
             .get(&primary_service)
             .expect("primary service exists");
+        update_generation_history(&env, generation, |history| {
+            history.image_ref = Some(primary_runtime.image_ref.clone());
+        })?;
         let build_json = serde_json::to_string_pretty(&PersistedBuildInfo {
             deployment_id: record.deployment_id.clone(),
-            image_ref: shared_image_ref
-                .clone()
-                .or_else(|| Some(primary_runtime.image_ref.clone()))
-                .unwrap_or_default(),
+            image_ref: primary_runtime.image_ref.clone(),
+            services: service_builds,
             source_ref: record.source_ref.clone(),
             repo_url: record.repo_url.clone(),
             commit_sha: record.commit_sha.clone(),
@@ -3335,6 +3362,14 @@ fn service_dependency_list(service: &ForgeServiceConfig) -> String {
     }
 }
 
+fn service_role_label(service: &ForgeServiceConfig) -> &'static str {
+    if service.externally_exposed {
+        "exposed"
+    } else {
+        "internal"
+    }
+}
+
 fn format_dependency_graph_summary(config: &ForgeYamlConfig) -> String {
     config
         .startup_order()
@@ -3392,6 +3427,7 @@ fn runtime_services(
             container_name: runtime.container_name.clone(),
             image_ref: String::new(),
             running: runtime.running,
+            state: PersistedServiceState::Healthy,
             network_name: runtime.network_name.clone(),
             probe_path: runtime.probe_path.clone(),
             activation: runtime.activation.clone(),
@@ -4761,6 +4797,7 @@ pub mod git_backed_rollback_status_correctness {
         let build = serde_json::to_string_pretty(&PersistedBuildInfo {
             deployment_id: format!("dep-{generation}"),
             image_ref: image_ref.clone(),
+            services: BTreeMap::new(),
             source_ref: Some(source_ref.into()),
             repo_url: Some(format!("https://github.com/example/{project_id}.git")),
             commit_sha: Some(commit_sha.into()),
@@ -8388,13 +8425,18 @@ pub mod forge_owns_only_dedicated_route_subtree {
 #[cfg(test)]
 pub mod multi_service_orchestration {
     use super::*;
-    use crate::storage::{PersistedActivationMode, load_generation_runtime_info};
+    use crate::storage::{
+        PersistedActivationMode, PersistedServiceState, load_generation_build_info,
+        load_generation_runtime_info,
+    };
     use std::collections::BTreeMap;
     use std::fs;
 
     #[derive(Default)]
     struct MultiServiceDockerRuntime {
         containers: BTreeMap<String, bool>,
+        container_images: BTreeMap<String, String>,
+        build_requests: Vec<BuildImageRequest>,
         created: Vec<String>,
         create_requests: Vec<CreateContainerRequest>,
         started: Vec<String>,
@@ -8405,6 +8447,7 @@ pub mod multi_service_orchestration {
             &mut self,
             request: BuildImageRequest,
         ) -> Result<String, DockerRuntimeError> {
+            self.build_requests.push(request.clone());
             Ok(request.image_tag)
         }
 
@@ -8418,6 +8461,8 @@ pub mod multi_service_orchestration {
         ) -> Result<String, DockerRuntimeError> {
             self.create_requests.push(request.clone());
             self.created.push(request.container_name.clone());
+            self.container_images
+                .insert(request.container_name.clone(), request.image_ref.clone());
             self.containers
                 .insert(request.container_name.clone(), false);
             Ok(request.container_name)
@@ -8448,6 +8493,11 @@ pub mod multi_service_orchestration {
                 "worker" => "172.18.0.13",
                 _ => "172.18.0.14",
             };
+            let image_ref = self
+                .container_images
+                .get(container_name)
+                .cloned()
+                .unwrap_or_else(|| "forge/api:production-gen-1".into());
             Ok(ContainerInspection {
                 container_name: container_name.into(),
                 running,
@@ -8459,7 +8509,7 @@ pub mod multi_service_orchestration {
                 exit_code: Some(0),
                 restart_count: 0,
                 started_at: Some("2026-05-22T00:00:00Z".into()),
-                image_ref: "forge/api:production-gen-1".into(),
+                image_ref,
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([(FORGE_MANAGED_DOCKER_NETWORK.into(), ip.into())]),
                 restart_policy: "no".into(),
@@ -8576,6 +8626,38 @@ pub mod multi_service_orchestration {
                 "    runtime:\n",
                 "      depends_on:\n",
                 "        - api\n",
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_service_build_forge_yaml(root: &std::path::Path) {
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "services:\n",
+                "  api:\n",
+                "    build:\n",
+                "      dockerfile: Dockerfile\n",
+                "      context: .\n",
+                "    runtime:\n",
+                "      port: 3000\n",
+                "      healthcheck:\n",
+                "        path: /health\n",
+                "        expected_status: 200\n",
+                "    expose: true\n",
+                "  worker:\n",
+                "    build:\n",
+                "      dockerfile: Dockerfile.worker\n",
+                "      context: .\n",
+                "    runtime:\n",
+                "      command: node worker.js\n",
+                "    depends_on:\n",
+                "      - api\n",
+                "    expose: false\n",
             ),
         )
         .unwrap();
@@ -8904,6 +8986,175 @@ pub mod multi_service_orchestration {
     }
 
     #[test]
+    fn service_specific_dockerfile_builds_correctly() {
+        let root = test_root("service-specific-dockerfile-builds-correctly");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        fs::write(root.join("Dockerfile.worker"), "FROM busybox\n").unwrap();
+        write_service_build_forge_yaml(&root);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(docker.build_requests.len(), 2);
+        assert_eq!(
+            docker.build_requests[0].dockerfile_path,
+            root.join("Dockerfile")
+        );
+        assert_eq!(
+            docker.build_requests[1].dockerfile_path,
+            root.join("Dockerfile.worker")
+        );
+        assert_eq!(
+            docker.build_requests[0].image_tag,
+            "forge/api:production-gen-1-api"
+        );
+        assert_eq!(
+            docker.build_requests[1].image_tag,
+            "forge/api:production-gen-1-worker"
+        );
+    }
+
+    #[test]
+    fn deployments_persist_per_service_runtime_metadata() {
+        let root = test_root("deployments-persist-per-service-runtime-metadata");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        fs::write(root.join("Dockerfile.worker"), "FROM busybox\n").unwrap();
+        write_service_build_forge_yaml(&root);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let build = load_generation_build_info(&env, 1).unwrap().unwrap();
+        let runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        assert_eq!(
+            build.services["api"].image_ref,
+            "forge/api:production-gen-1-api"
+        );
+        assert_eq!(
+            build.services["worker"].image_ref,
+            "forge/api:production-gen-1-worker"
+        );
+        assert_eq!(
+            runtime.startup_order,
+            vec!["api".to_string(), "worker".to_string()]
+        );
+        assert_eq!(
+            runtime.services["worker"].depends_on,
+            vec!["api".to_string()]
+        );
+        assert_eq!(
+            runtime.services["api"].state,
+            PersistedServiceState::Healthy
+        );
+        assert!(runtime.services["api"].externally_exposed);
+        assert!(!runtime.services["worker"].externally_exposed);
+    }
+
+    #[test]
+    fn diagnostics_render_service_build_sections() {
+        let root = test_root("diagnostics-render-service-build-sections");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        fs::write(root.join("Dockerfile.worker"), "FROM busybox\n").unwrap();
+        write_service_build_forge_yaml(&root);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let log =
+            fs::read_to_string(root.join(
+                "projects/api/environments/production/generations/1/diagnostics/deployment.log",
+            ))
+            .unwrap();
+        assert!(log.contains("[service:api] building"));
+        assert!(log.contains("[service:worker] starting"));
+    }
+
+    #[test]
     fn rollback_restores_multi_service_topology() {
         let root = test_root("multi-service-rollback-topology");
         register_project(&root, "api", "example.com");
@@ -9007,5 +9258,127 @@ pub mod multi_service_orchestration {
         );
         assert!(docker.containers.contains_key("prod-api-worker-gen-1"));
         assert!(docker.containers.contains_key("prod-api-redis-gen-1"));
+    }
+
+    #[test]
+    fn rollback_restores_service_image_refs() {
+        let root = test_root("rollback-restores-service-image-refs");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        fs::write(root.join("Dockerfile.worker"), "FROM busybox\n").unwrap();
+        write_service_build_forge_yaml(&root);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+            ],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+
+        let execution = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let build = load_generation_build_info(&env, 1).unwrap().unwrap();
+        let runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        assert_eq!(execution.generation, 1);
+        assert_eq!(execution.image_ref, "forge/api:production-gen-1-api");
+        assert_eq!(
+            build.services["api"].image_ref,
+            "forge/api:production-gen-1-api"
+        );
+        assert_eq!(
+            build.services["worker"].image_ref,
+            "forge/api:production-gen-1-worker"
+        );
+        assert_eq!(
+            runtime.services["api"].image_ref,
+            "forge/api:production-gen-1-api"
+        );
+        assert_eq!(
+            runtime.services["worker"].image_ref,
+            "forge/api:production-gen-1-worker"
+        );
     }
 }

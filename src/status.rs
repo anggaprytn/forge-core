@@ -12,7 +12,7 @@ use crate::api::{
     EnvironmentValueChange, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
     ProbeStabilityDiagnostics, ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction,
     RetentionRole, RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic,
-    SecretReferenceChange,
+    SecretReferenceChange, ServiceRuntimeStatus,
 };
 use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::load_optional_manifest;
@@ -208,6 +208,10 @@ pub struct ProjectEnvironmentStatus {
     pub probe_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+    #[serde(default)]
+    pub startup_order: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<ServiceRuntimeStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_deployment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +329,8 @@ struct EnvironmentRuntimeTruth {
     network_name: Option<String>,
     container_ip: Option<String>,
     image_ref: Option<String>,
+    startup_order: Vec<String>,
+    services: Vec<ServiceRuntimeStatus>,
     route_details: Option<RouteStatusDetails>,
 }
 
@@ -872,6 +878,8 @@ where
             .as_ref()
             .and_then(|runtime| runtime.probe_path.clone()),
         image_ref: truth.image_ref,
+        startup_order: truth.startup_order.clone(),
+        services: truth.services.clone(),
         last_deployment_id: truth
             .promoted_build
             .as_ref()
@@ -1106,6 +1114,8 @@ where
         },
         route,
         probe_target,
+        startup_order: truth.startup_order.clone(),
+        services: truth.services.clone(),
         recent_failures,
         latest_validation_failure: latest_failure
             .as_ref()
@@ -1411,6 +1421,12 @@ where
         .as_ref()
         .map(|inspection| inspection.image_ref.clone())
         .or_else(|| promoted_build.as_ref().map(|build| build.image_ref.clone()));
+    let startup_order = promoted_runtime
+        .as_ref()
+        .map(service_startup_order)
+        .unwrap_or_default();
+    let services =
+        collect_service_runtime_truth(docker, promoted_runtime.as_ref(), promoted_build.as_ref());
     let route_details = inspect_route_status(
         routing,
         project_id,
@@ -1440,8 +1456,109 @@ where
         network_name,
         container_ip,
         image_ref,
+        startup_order,
+        services,
         route_details,
     })
+}
+
+fn service_startup_order(runtime: &PersistedRuntimeInfo) -> Vec<String> {
+    if !runtime.startup_order.is_empty() {
+        runtime.startup_order.clone()
+    } else if runtime.services.is_empty() {
+        vec!["default".into()]
+    } else {
+        runtime.services.keys().cloned().collect()
+    }
+}
+
+fn collect_service_runtime_truth<D: DockerRuntime>(
+    docker: &mut D,
+    promoted_runtime: Option<&PersistedRuntimeInfo>,
+    promoted_build: Option<&PersistedBuildInfo>,
+) -> Vec<ServiceRuntimeStatus> {
+    let Some(runtime) = promoted_runtime else {
+        return Vec::new();
+    };
+    let services = if runtime.services.is_empty() {
+        BTreeMap::from([(
+            "default".into(),
+            crate::storage::PersistedServiceRuntimeInfo {
+                service_id: "default".into(),
+                container_name: runtime.container_name.clone(),
+                image_ref: promoted_build
+                    .map(|build| build.image_ref.clone())
+                    .unwrap_or_default(),
+                running: runtime.running,
+                state: crate::storage::PersistedServiceState::Healthy,
+                network_name: runtime.network_name.clone(),
+                probe_path: runtime.probe_path.clone(),
+                activation: runtime.activation.clone(),
+                command: None,
+                depends_on: Vec::new(),
+                required_for_promotion: true,
+                externally_exposed: matches!(
+                    runtime.activation,
+                    Some(PersistedActivationMode::Http { .. })
+                ),
+                environment_variables: runtime.environment_variables.clone(),
+                source_ref: runtime.source_ref.clone(),
+                repo_url: runtime.repo_url.clone(),
+                commit_sha: runtime.commit_sha.clone(),
+                source_path: runtime.source_path.clone(),
+            },
+        )])
+    } else {
+        runtime.services.clone()
+    };
+
+    service_startup_order(runtime)
+        .into_iter()
+        .filter_map(|service_id| {
+            let service = services.get(&service_id)?;
+            let inspection = docker.inspect_container(&service.container_name).ok();
+            let network_name = service.network_name.clone().or_else(|| {
+                inspection
+                    .as_ref()
+                    .and_then(|value| value.network_ips.keys().next().cloned())
+            });
+            let container_ip = network_name
+                .as_deref()
+                .and_then(|network| {
+                    inspection
+                        .as_ref()
+                        .and_then(|value| value.network_ips.get(network).cloned())
+                })
+                .or_else(|| {
+                    inspection
+                        .as_ref()
+                        .and_then(|value| value.network_ips.values().next().cloned())
+                });
+            Some(ServiceRuntimeStatus {
+                service_id: service.service_id.clone(),
+                role: if service.externally_exposed {
+                    "exposed".into()
+                } else {
+                    "internal".into()
+                },
+                depends_on: service.depends_on.clone(),
+                container_name: Some(service.container_name.clone()),
+                image_ref: inspection
+                    .as_ref()
+                    .map(|value| value.image_ref.clone())
+                    .or_else(|| Some(service.image_ref.clone())),
+                running: inspection
+                    .as_ref()
+                    .map(|value| value.running)
+                    .unwrap_or(service.running),
+                state_status: inspection.as_ref().map(|value| value.state_status.clone()),
+                lifecycle_state: Some(service.state.clone()),
+                network_name,
+                container_ip,
+                probe_path: service.probe_path.clone(),
+            })
+        })
+        .collect()
 }
 
 fn build_environment_status_from_truth(
@@ -1559,6 +1676,8 @@ fn build_environment_status_from_truth(
             .as_ref()
             .and_then(|runtime| runtime.probe_path.clone()),
         image_ref: truth.image_ref.clone(),
+        startup_order: truth.startup_order.clone(),
+        services: truth.services.clone(),
         last_deployment_id: truth
             .promoted_build
             .as_ref()

@@ -33,6 +33,7 @@ impl From<std::io::Error> for ForgeYamlError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeYamlConfig {
     execution: ExecutionConfig,
+    default_service_build: Option<ForgeBuildConfig>,
     validation: ValidationPolicy,
     validation_timeout_ms: Option<u64>,
     environment: BTreeMap<String, String>,
@@ -43,6 +44,10 @@ pub struct ForgeYamlConfig {
 impl ForgeYamlConfig {
     pub fn execution(&self) -> &ExecutionConfig {
         &self.execution
+    }
+
+    pub fn default_service_build(&self) -> Option<&ForgeBuildConfig> {
+        self.default_service_build.as_ref()
     }
 
     pub fn validation(&self) -> &ValidationPolicy {
@@ -67,8 +72,16 @@ impl ForgeYamlConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeBuildConfig {
+    pub context_path: PathBuf,
+    pub dockerfile_path: PathBuf,
+    pub build_args: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeServiceConfig {
     pub service_id: String,
+    pub build: Option<ForgeBuildConfig>,
     pub image: Option<String>,
     pub command: Option<String>,
     pub depends_on: Vec<String>,
@@ -104,6 +117,8 @@ struct RawForgeYaml {
 struct RawBuildConfig {
     dockerfile: PathBuf,
     context: PathBuf,
+    #[serde(default)]
+    args: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -141,7 +156,13 @@ struct RawInvariant {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawServiceConfig {
+    #[serde(default)]
+    build: Option<RawBuildConfig>,
     runtime: RawRuntimeConfig,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    expose: Option<bool>,
 }
 
 pub fn load_optional_forge_yaml(
@@ -242,6 +263,7 @@ impl RawForgeYaml {
         let service_id = expected_project_id.to_string();
         let service = ForgeServiceConfig {
             service_id: service_id.clone(),
+            build: None,
             image: None,
             command: runtime.command.clone(),
             depends_on: Vec::new(),
@@ -249,13 +271,20 @@ impl RawForgeYaml {
             required_for_promotion: true,
             externally_exposed: matches!(validation.activation, ActivationMode::Http { .. }),
         };
+        let context_path = root.join(build.context.clone());
+        let dockerfile_path = root.join(build.dockerfile.clone());
 
         Ok(ForgeYamlConfig {
             execution: ExecutionConfig {
-                context_path: root.join(build.context),
-                dockerfile_path: root.join(build.dockerfile),
+                context_path: context_path.clone(),
+                dockerfile_path: dockerfile_path.clone(),
                 network_name: None,
             },
+            default_service_build: Some(ForgeBuildConfig {
+                context_path,
+                dockerfile_path,
+                build_args: build.args,
+            }),
             validation,
             validation_timeout_ms: invariant.timeout_ms,
             environment: self.env,
@@ -295,15 +324,15 @@ impl RawForgeYaml {
         if let Some(build) = build.as_ref() {
             validate_build(build)?;
         }
-        if build.is_none()
-            && self
-                .services
-                .values()
-                .any(|service| service.runtime.image.is_none())
-        {
-            return Err(ForgeYamlError::Invalid(
-                "forge.yml build is required when a service does not declare runtime.image".into(),
-            ));
+        for (service_id, service) in &self.services {
+            if let Some(service_build) = service.build.as_ref() {
+                validate_build(service_build)?;
+            }
+            if build.is_none() && service.build.is_none() && service.runtime.image.is_none() {
+                return Err(ForgeYamlError::Invalid(format!(
+                    "service `{service_id}` requires either services.{service_id}.build, runtime.image, or root forge.yml build"
+                )));
+            }
         }
 
         let startup_order = topological_service_order(&self.services)?;
@@ -311,14 +340,22 @@ impl RawForgeYaml {
         for service_id in &startup_order {
             let raw = self.services.get(service_id).expect("topology validated");
             let validation = validation_for_runtime(&raw.runtime, None)?;
-            let externally_exposed = matches!(validation.activation, ActivationMode::Http { .. });
+            let externally_exposed = raw
+                .expose
+                .unwrap_or(matches!(validation.activation, ActivationMode::Http { .. }));
+            let depends_on = service_depends_on(raw);
             services.insert(
                 service_id.clone(),
                 ForgeServiceConfig {
                     service_id: service_id.clone(),
+                    build: raw.build.clone().map(|build| ForgeBuildConfig {
+                        context_path: root.join(build.context),
+                        dockerfile_path: root.join(build.dockerfile),
+                        build_args: build.args,
+                    }),
                     image: raw.runtime.image.clone(),
                     command: raw.runtime.command.clone(),
-                    depends_on: raw.runtime.depends_on.clone(),
+                    depends_on,
                     validation,
                     required_for_promotion: true,
                     externally_exposed,
@@ -331,18 +368,23 @@ impl RawForgeYaml {
             .find(|service| service.externally_exposed)
             .or_else(|| services.values().next())
             .ok_or_else(|| ForgeYamlError::Invalid("forge.yml services cannot be empty".into()))?;
-        let execution = if let Some(build) = build {
-            ExecutionConfig {
-                context_path: root.join(build.context),
-                dockerfile_path: root.join(build.dockerfile),
+        let default_service_build = build.map(|build| ForgeBuildConfig {
+            context_path: root.join(build.context.clone()),
+            dockerfile_path: root.join(build.dockerfile.clone()),
+            build_args: build.args.clone(),
+        });
+        let execution = default_service_build
+            .as_ref()
+            .map(|build| ExecutionConfig {
+                context_path: build.context_path.clone(),
+                dockerfile_path: build.dockerfile_path.clone(),
                 network_name: None,
-            }
-        } else {
-            ExecutionConfig::default()
-        };
+            })
+            .unwrap_or_default();
 
         Ok(ForgeYamlConfig {
             execution,
+            default_service_build,
             validation: primary_service.validation.clone(),
             validation_timeout_ms: self.invariants.first().and_then(|value| value.timeout_ms),
             environment: self.env,
@@ -427,7 +469,7 @@ fn topological_service_order(
 ) -> Result<Vec<String>, ForgeYamlError> {
     let mut pending = services
         .iter()
-        .map(|(service_id, config)| (service_id.clone(), config.runtime.depends_on.clone()))
+        .map(|(service_id, config)| (service_id.clone(), service_depends_on(config)))
         .collect::<BTreeMap<_, _>>();
     for (service_id, depends_on) in &pending {
         for dependency in depends_on {
@@ -462,6 +504,14 @@ fn topological_service_order(
         }
     }
     Ok(order)
+}
+
+fn service_depends_on(service: &RawServiceConfig) -> Vec<String> {
+    if service.depends_on.is_empty() {
+        service.runtime.depends_on.clone()
+    } else {
+        service.depends_on.clone()
+    }
 }
 
 #[cfg(test)]
@@ -525,6 +575,68 @@ mod tests {
 
         let err = load_optional_forge_yaml(&root, "api").unwrap_err();
         assert!(err.to_string().contains("only `web` is supported"));
+    }
+
+    #[test]
+    fn multiservice_manifest_accepts_build_and_runtime() {
+        let root = test_root("multiservice-manifest-accepts-build-and-runtime");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "services:\n",
+                "  api:\n",
+                "    build:\n",
+                "      dockerfile: Dockerfile\n",
+                "      context: .\n",
+                "    runtime:\n",
+                "      port: 3000\n",
+                "      healthcheck:\n",
+                "        path: /health\n",
+                "        expected_status: 200\n",
+                "    expose: true\n",
+                "  worker:\n",
+                "    build:\n",
+                "      dockerfile: Dockerfile.worker\n",
+                "      context: .\n",
+                "    runtime:\n",
+                "      command: node worker.js\n",
+                "    depends_on:\n",
+                "      - api\n",
+                "    expose: false\n",
+            ),
+        )
+        .unwrap();
+
+        let config = load_optional_forge_yaml(&root, "api").unwrap().unwrap();
+        assert_eq!(
+            config.startup_order(),
+            &["api".to_string(), "worker".to_string()]
+        );
+        assert_eq!(
+            config.services()["api"]
+                .build
+                .as_ref()
+                .unwrap()
+                .dockerfile_path,
+            root.join("Dockerfile")
+        );
+        assert_eq!(
+            config.services()["worker"]
+                .build
+                .as_ref()
+                .unwrap()
+                .dockerfile_path,
+            root.join("Dockerfile.worker")
+        );
+        assert_eq!(
+            config.services()["worker"].depends_on,
+            vec!["api".to_string()]
+        );
+        assert!(config.services()["api"].externally_exposed);
+        assert!(!config.services()["worker"].externally_exposed);
     }
 
     fn test_root(name: &str) -> PathBuf {

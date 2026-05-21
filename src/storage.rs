@@ -83,9 +83,23 @@ pub struct RuntimeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedServiceBuildInfo {
+    pub service_id: String,
+    pub image_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub build_args: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedBuildInfo {
     pub deployment_id: String,
     pub image_ref: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, PersistedServiceBuildInfo>,
     #[serde(default)]
     pub source_ref: Option<String>,
     #[serde(default)]
@@ -136,12 +150,20 @@ pub enum PersistedServiceState {
     Failed,
 }
 
+impl Default for PersistedServiceState {
+    fn default() -> Self {
+        Self::Healthy
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedServiceRuntimeInfo {
     pub service_id: String,
     pub container_name: String,
     pub image_ref: String,
     pub running: bool,
+    #[serde(default)]
+    pub state: PersistedServiceState,
     #[serde(default)]
     pub network_name: Option<String>,
     #[serde(default)]
