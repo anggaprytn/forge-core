@@ -621,6 +621,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &record.environment,
             SnapshotState::Healthy,
         )?;
+        let referenced_secret_keys = runtime_env
+            .snapshot
+            .entries
+            .values()
+            .filter_map(|entry| {
+                entry.secret_reference.as_ref().and_then(|reference| {
+                    (reference.scope == "environment").then(|| reference.key.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        SecretStore::new(self.storage_root.join("secrets"))?.record_generation_references(
+            &record.project_id,
+            &record.environment,
+            generation,
+            &referenced_secret_keys,
+        )?;
         let snapshot = load_generation_snapshot_metadata(&env, generation)?;
         update_generation_history(&env, generation, |history| {
             history.finalized_state = Some("healthy".into());
@@ -3271,6 +3287,73 @@ pub mod git_backed_rollback_status_correctness {
     }
 
     #[test]
+    fn rollback_restores_historical_env_snapshot() {
+        let root = test_root("rollback-restores-historical-env-snapshot");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            2,
+            SnapshotState::Healthy,
+            "release",
+            "bbb222",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue.enqueue(rollback_record("api", "production")).unwrap();
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(
+                generation_container_name("production", "api", 1),
+                container_inspection("api", "production", 1, "172.29.0.11"),
+            )]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![route_inspection(
+                "api",
+                "production",
+                "172.29.0.11",
+                Some("api.example.com"),
+            )],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let report = load_project_environment_env_report(&root, "api", "production").unwrap();
+        assert_eq!(report.generation, 1);
+        assert!(
+            report
+                .values
+                .iter()
+                .any(|entry| entry.key == "FORGE_COMMIT_SHA" && entry.value == "aaa111")
+        );
+    }
+
+    #[test]
     fn failed_git_deploy_does_not_replace_current() {
         let root = test_root("failed-git-deploy-does-not-replace-current");
         let source_root = root.join("source-checkouts").join("api").join("bbb222");
@@ -4136,6 +4219,48 @@ pub mod runtime_environment_snapshots {
                 .iter()
                 .any(|entry| entry.key == "FORGE_DEPLOYMENT_ID" && entry.value == "dep-1")
         );
+    }
+
+    #[test]
+    fn secret_unset_does_not_mutate_historical_generation() {
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        let root = test_root("secret-unset-does-not-mutate-historical-generation");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        write_secret_manifest(&root, "DATABASE_URL", "DATABASE_URL");
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        store
+            .write_environment_secret(&crate::secrets::SecretWriteRequest {
+                project_id: "api".into(),
+                environment: "production".into(),
+                key: "DATABASE_URL".into(),
+                value: "postgres://historical-secret".into(),
+            })
+            .unwrap();
+
+        execute_with_runtime_env(&root);
+        store
+            .unset_environment_secret("api", "production", "DATABASE_URL")
+            .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let snapshot = load_generation_runtime_env_snapshot(&env, 1)
+            .unwrap()
+            .unwrap();
+        let resolved = load_generation_resolved_runtime(&env, 1).unwrap().unwrap();
+        let restored = crate::runtime_env::restore_runtime_env(&resolved).unwrap();
+
+        assert!(snapshot.entries["DATABASE_URL"].redacted);
+        assert_eq!(
+            restored.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://historical-secret")
+        );
+        assert!(!store.has_environment_secret("api", "production", "DATABASE_URL"));
     }
 
     #[test]

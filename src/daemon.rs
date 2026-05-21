@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
     DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest,
-    DeploymentStatus, EnvironmentDiagnostics, EnvironmentVariableReport, ErrorResponse, EventList,
-    validate_deployment_request,
+    DeploymentStatus, EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport,
+    ErrorResponse, EventList, validate_deployment_request,
 };
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
@@ -23,8 +23,8 @@ use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
 use crate::status::{
-    ProjectEnvironmentStatus, load_environment_diagnostics, load_environment_history,
-    load_project_environment_env_report, load_project_environment_status,
+    ProjectEnvironmentStatus, load_environment_diagnostics, load_environment_diff,
+    load_environment_history, load_project_environment_env_report, load_project_environment_status,
 };
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
@@ -328,6 +328,27 @@ where
                 let _ = status;
                 response
             })
+    }
+
+    pub fn get_project_environment_env_diff(
+        &self,
+        project_id: &str,
+        environment: &str,
+        from_generation: u64,
+        to_generation: u64,
+    ) -> Result<EnvironmentDiffResponse, ErrorResponse> {
+        load_environment_diff(
+            &self.config.storage_root,
+            project_id,
+            environment,
+            from_generation,
+            to_generation,
+        )
+        .map_err(|err| {
+            let (status, response) = crate::status::project_status_error_response(err);
+            let _ = status;
+            response
+        })
     }
 
     pub fn get_deployment_logs(

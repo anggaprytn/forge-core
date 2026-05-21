@@ -357,6 +357,83 @@ fn cli_secrets_set_writes_secret_without_echoing_value() {
 }
 
 #[test]
+fn cli_secrets_list_reads_redacted_secret_inventory() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"production","secrets":[{"key":"DATABASE_URL","value":"<secret>","created_at_unix":1,"updated_at_unix":2,"referenced_by_generations":[1]}]}}"#,
+    );
+
+    let output = run_cli(&url, &["secrets", "list", "api", "production"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("DATABASE_URL=<secret>"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/production/secrets"
+    );
+}
+
+#[test]
+fn cli_secrets_unset_deletes_secret() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"secret_id":"api:production:DATABASE_URL","removed":true}}"#,
+    );
+
+    let output = run_cli(
+        &url,
+        &["secrets", "unset", "api", "production", "DATABASE_URL"],
+    );
+    assert!(output.status.success());
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "DELETE");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/production/secrets/DATABASE_URL"
+    );
+}
+
+#[test]
+fn cli_env_diff_reads_generation_diff() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"production","from_generation":28,"to_generation":29,"added":[{"key":"FEATURE_FLAG","value":"true"}],"removed":[{"key":"OLD_API_URL","value":"https://old.example.com"}],"changed_values":[{"key":"DATABASE_URL","before":"<secret changed>","after":"<secret changed>"}],"changed_secret_references":[]}}"#,
+    );
+
+    let output = run_cli(
+        &url,
+        &[
+            "env",
+            "diff",
+            "api",
+            "production",
+            "--generation",
+            "28",
+            "--generation",
+            "29",
+        ],
+    );
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("+ FEATURE_FLAG=true"));
+    assert!(body.contains("~ DATABASE_URL=<secret changed>"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/production/env/diff?generation=28&generation=29"
+    );
+}
+
+#[test]
 fn cli_doctor_reports_local_diagnostics() {
     let root = test_root("cli-doctor");
     fs::create_dir_all(root.join("queue")).unwrap();

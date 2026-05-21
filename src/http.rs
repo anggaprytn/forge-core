@@ -8,7 +8,7 @@ use axum::body::Bytes;
 use axum::extract::{Form, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -21,8 +21,8 @@ use subtle::ConstantTimeEq;
 use crate::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
-    EnvironmentDiagnostics, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectUpsertRequest,
+    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
+    EventList, ProjectList, ProjectUpsertRequest, SecretListResponse, SecretUnsetResponse,
 };
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{
@@ -94,6 +94,13 @@ pub trait ControlPlane: Send {
         project_id: &str,
         environment: &str,
     ) -> Result<EnvironmentVariableReport, ErrorResponse>;
+    fn get_project_environment_env_diff(
+        &self,
+        project_id: &str,
+        environment: &str,
+        from_generation: u64,
+        to_generation: u64,
+    ) -> Result<EnvironmentDiffResponse, ErrorResponse>;
 }
 
 impl<D, R, A> ControlPlane for Daemon<D, R, A>
@@ -162,6 +169,22 @@ where
         environment: &str,
     ) -> Result<EnvironmentVariableReport, ErrorResponse> {
         Daemon::get_project_environment_env(self, project_id, environment)
+    }
+
+    fn get_project_environment_env_diff(
+        &self,
+        project_id: &str,
+        environment: &str,
+        from_generation: u64,
+        to_generation: u64,
+    ) -> Result<EnvironmentDiffResponse, ErrorResponse> {
+        Daemon::get_project_environment_env_diff(
+            self,
+            project_id,
+            environment,
+            from_generation,
+            to_generation,
+        )
     }
 }
 
@@ -378,6 +401,12 @@ struct CliLoginQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CliLoginApproveForm {
     code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct EnvDiffQuery {
+    #[serde(default, rename = "generation")]
+    generations: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -764,6 +793,18 @@ pub fn router(state: HttpState) -> Router {
         .route(
             "/api/projects/{project_id}/environments/{environment}/env",
             get(get_project_environment_env),
+        )
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/env/diff",
+            get(get_project_environment_env_diff),
+        )
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/secrets",
+            get(get_environment_secrets),
+        )
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/secrets/{key}",
+            delete(delete_environment_secret),
         )
         .route("/secrets", post(post_secrets))
         .route("/webhooks/github", post(post_github_webhook))
@@ -1967,6 +2008,121 @@ async fn get_project_environment_env(
     }
 }
 
+async fn get_project_environment_env_diff(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+    Query(query): Query<EnvDiffQuery>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+    if query.generations.len() != 2 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &request_id,
+            ErrorResponse {
+                code: "invalid_generation_query".into(),
+                message: "exactly two generation query parameters are required".into(),
+            },
+        );
+    }
+
+    let daemon = match state.daemon.lock() {
+        Ok(daemon) => daemon,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "daemon_lock_error".into(),
+                    message: "daemon lock poisoned".into(),
+                },
+            );
+        }
+    };
+
+    match daemon.get_project_environment_env_diff(
+        &project_id,
+        &environment,
+        query.generations[0],
+        query.generations[1],
+    ) {
+        Ok(diff) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: diff,
+            }),
+        ),
+        Err(err) => {
+            let status = match err.code.as_str() {
+                "project_not_found" | "runtime_env_snapshot_unavailable" => StatusCode::NOT_FOUND,
+                "invalid_environment" | "invalid_generation_query" => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_response(status, &request_id, err)
+        }
+    }
+}
+
+async fn get_environment_secrets(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state
+        .secret_store
+        .list_environment_secrets(&project_id, &environment)
+    {
+        Ok(secrets) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope::<SecretListResponse> {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: secrets,
+            }),
+        ),
+        Err(err) => secret_error_response(&request_id, err),
+    }
+}
+
+async fn delete_environment_secret(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment, key)): AxumPath<(String, String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state
+        .secret_store
+        .unset_environment_secret(&project_id, &environment, &key)
+    {
+        Ok(result) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope::<SecretUnsetResponse> {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: result,
+            }),
+        ),
+        Err(err) => secret_error_response(&request_id, err),
+    }
+}
+
 fn ensure_authorized(
     state: &HttpState,
     headers: &HeaderMap,
@@ -2061,16 +2217,22 @@ fn secret_error_response(request_id: &str, err: SecretError) -> Response {
                 message: err.to_string(),
             },
         ),
-        SecretError::MissingSecret(_) | SecretError::Crypto(_) | SecretError::Io(_) => {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                request_id,
-                ErrorResponse {
-                    code: "secret_store_error".into(),
-                    message: err.to_string(),
-                },
-            )
-        }
+        SecretError::MissingSecret(_) => error_response(
+            StatusCode::NOT_FOUND,
+            request_id,
+            ErrorResponse {
+                code: "secret_not_found".into(),
+                message: err.to_string(),
+            },
+        ),
+        SecretError::Crypto(_) | SecretError::Io(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            ErrorResponse {
+                code: "secret_store_error".into(),
+                message: err.to_string(),
+            },
+        ),
     }
 }
 

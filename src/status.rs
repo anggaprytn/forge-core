@@ -8,10 +8,13 @@ use serde_json::Value;
 
 use crate::api::{
     ContainerRuntimeDiagnostics, DeploymentHistoryEntry, DeploymentHistoryResponse,
-    EnvironmentDiagnostics, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
+    EnvironmentDiagnostics, EnvironmentDiffEntry, EnvironmentDiffResponse, EnvironmentDiffSummary,
+    EnvironmentValueChange, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
     ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction, RouteDiagnostics,
-    RuntimeEnvSnapshotMetadata,
+    RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic, SecretReferenceChange,
 };
+use crate::forge_yaml::load_optional_forge_yaml;
+use crate::manifest::load_optional_manifest;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{PersistentQueue, QueueError};
 use crate::route_truth::expected_route_for_runtime;
@@ -19,12 +22,15 @@ use crate::runtime::{
     ContainerInspection, DockerRuntime, DockerRuntimeError, RouteInspection, RoutingRuntime,
     RoutingRuntimeError,
 };
+use crate::runtime_env::restore_runtime_env;
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
+use crate::secrets::SecretStore;
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord, PersistedActivationMode,
-    PersistedBuildInfo, PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo,
-    PersistedSnapshotMetadata, PointerStore, RetentionMetadata, RetentionStore, StorageError,
-    load_generation_build_info, load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    PersistedBuildInfo, PersistedResolvedRuntime, PersistedRuntimeEnvSnapshot,
+    PersistedRuntimeInfo, PersistedSnapshotMetadata, PointerStore, RetentionMetadata,
+    RetentionStore, StorageError, load_generation_build_info, load_generation_resolved_runtime,
+    load_generation_runtime_env_snapshot, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
 
@@ -778,6 +784,27 @@ where
             protected: action.protected,
         })
         .collect::<Vec<_>>();
+    let missing_required_secrets =
+        missing_required_secrets(storage_root, project_id, environment, &truth)?;
+    let env_drift = match (
+        truth.active_generation,
+        history.entries.iter().find(|entry| entry.rollback_target),
+    ) {
+        (Some(active_generation), Some(rollback_target))
+            if rollback_target.generation != active_generation =>
+        {
+            Some(summarize_environment_diff(&load_environment_diff(
+                storage_root,
+                project_id,
+                environment,
+                rollback_target.generation,
+                active_generation,
+            )?))
+        }
+        _ => None,
+    };
+    let recent_secret_mutations =
+        recent_secret_mutations(storage_root, project_id, environment, &truth)?;
     Ok(EnvironmentDiagnostics {
         project_id: project_id.to_string(),
         environment: environment.to_string(),
@@ -834,6 +861,9 @@ where
             .find(|entry| entry.rollback_target)
             .map(|entry| entry.generation),
         recent_gc_actions,
+        missing_required_secrets,
+        env_drift,
+        recent_secret_mutations,
     })
 }
 
@@ -888,6 +918,64 @@ pub fn load_project_environment_env_report(
         domain: snapshot.domain,
         values,
     })
+}
+
+pub fn load_environment_diff(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+    from_generation: u64,
+    to_generation: u64,
+) -> Result<EnvironmentDiffResponse, ProjectStatusError> {
+    if !matches!(environment, "development" | "staging" | "production") {
+        return Err(ProjectStatusError::InvalidEnvironment);
+    }
+
+    ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ProjectStatusError::ProjectLookup(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?
+        .ok_or(ProjectStatusError::ProjectNotFound)?;
+
+    let env = EnvironmentPaths::new(storage_root, project_id, environment);
+    env.ensure_exists()?;
+    let from_snapshot =
+        load_generation_runtime_env_snapshot(&env, from_generation)?.ok_or_else(|| {
+            ProjectStatusError::RuntimeEnvSnapshotUnavailable(format!(
+                "runtime env snapshot unavailable for generation {from_generation}"
+            ))
+        })?;
+    let to_snapshot =
+        load_generation_runtime_env_snapshot(&env, to_generation)?.ok_or_else(|| {
+            ProjectStatusError::RuntimeEnvSnapshotUnavailable(format!(
+                "runtime env snapshot unavailable for generation {to_generation}"
+            ))
+        })?;
+    let from_resolved =
+        load_generation_resolved_runtime(&env, from_generation)?.ok_or_else(|| {
+            ProjectStatusError::RuntimeEnvSnapshotUnavailable(format!(
+                "resolved runtime unavailable for generation {from_generation}"
+            ))
+        })?;
+    let to_resolved = load_generation_resolved_runtime(&env, to_generation)?.ok_or_else(|| {
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable(format!(
+            "resolved runtime unavailable for generation {to_generation}"
+        ))
+    })?;
+
+    compute_environment_diff(
+        project_id,
+        environment,
+        from_generation,
+        to_generation,
+        &from_snapshot,
+        &to_snapshot,
+        &from_resolved,
+        &to_resolved,
+    )
 }
 
 fn latest_generation(env: &EnvironmentPaths) -> Result<Option<u64>, ProjectStatusError> {
@@ -1337,6 +1425,273 @@ fn runtime_env_source_name(source: &crate::storage::PersistedRuntimeEnvSource) -
     }
 }
 
+fn compute_environment_diff(
+    project_id: &str,
+    environment: &str,
+    from_generation: u64,
+    to_generation: u64,
+    from_snapshot: &PersistedRuntimeEnvSnapshot,
+    to_snapshot: &PersistedRuntimeEnvSnapshot,
+    from_resolved: &PersistedResolvedRuntime,
+    to_resolved: &PersistedResolvedRuntime,
+) -> Result<EnvironmentDiffResponse, ProjectStatusError> {
+    let from_values = restore_runtime_env(from_resolved).map_err(|err| {
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable(format!(
+            "failed to restore generation {from_generation} runtime env: {err}"
+        ))
+    })?;
+    let to_values = restore_runtime_env(to_resolved).map_err(|err| {
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable(format!(
+            "failed to restore generation {to_generation} runtime env: {err}"
+        ))
+    })?;
+
+    let mut keys = BTreeSet::new();
+    keys.extend(from_snapshot.entries.keys().cloned());
+    keys.extend(to_snapshot.entries.keys().cloned());
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed_values = Vec::new();
+    let mut changed_secret_references = Vec::new();
+
+    for key in keys {
+        let left = from_snapshot.entries.get(&key);
+        let right = to_snapshot.entries.get(&key);
+        match (left, right) {
+            (None, Some(entry)) => added.push(EnvironmentDiffEntry {
+                key,
+                value: render_snapshot_value(entry),
+            }),
+            (Some(entry), None) => removed.push(EnvironmentDiffEntry {
+                key,
+                value: render_snapshot_value(entry),
+            }),
+            (Some(left_entry), Some(right_entry)) => {
+                let left_reference = left_entry
+                    .secret_reference
+                    .as_ref()
+                    .map(secret_reference_name);
+                let right_reference = right_entry
+                    .secret_reference
+                    .as_ref()
+                    .map(secret_reference_name);
+                if left_reference != right_reference {
+                    changed_secret_references.push(SecretReferenceChange {
+                        key: key.clone(),
+                        before_reference: left_reference,
+                        after_reference: right_reference,
+                        before: render_diff_value(left_entry, "<secret reference changed>"),
+                        after: render_diff_value(right_entry, "<secret reference changed>"),
+                    });
+                    continue;
+                }
+
+                let left_value = from_values.get(&key).cloned().unwrap_or_default();
+                let right_value = to_values.get(&key).cloned().unwrap_or_default();
+                if left_value != right_value {
+                    changed_values.push(EnvironmentValueChange {
+                        key,
+                        before: render_diff_value(left_entry, "<secret changed>"),
+                        after: render_diff_value(right_entry, "<secret changed>"),
+                    });
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    Ok(EnvironmentDiffResponse {
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        from_generation,
+        to_generation,
+        added,
+        removed,
+        changed_values,
+        changed_secret_references,
+    })
+}
+
+fn render_diff_value(
+    entry: &crate::storage::PersistedRuntimeEnvEntry,
+    secret_label: &str,
+) -> String {
+    if entry.redacted {
+        secret_label.into()
+    } else {
+        entry.value.clone().unwrap_or_default()
+    }
+}
+
+fn secret_reference_name(reference: &crate::storage::PersistedSecretReference) -> String {
+    format!("{}:{}", reference.scope, reference.key)
+}
+
+fn summarize_environment_diff(diff: &EnvironmentDiffResponse) -> EnvironmentDiffSummary {
+    EnvironmentDiffSummary {
+        from_generation: diff.from_generation,
+        to_generation: diff.to_generation,
+        added: diff.added.len(),
+        removed: diff.removed.len(),
+        changed_values: diff.changed_values.len(),
+        changed_secret_references: diff.changed_secret_references.len(),
+    }
+}
+
+fn missing_required_secrets(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+    truth: &EnvironmentRuntimeTruth,
+) -> Result<Vec<String>, ProjectStatusError> {
+    let project = ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ProjectStatusError::ProjectLookup(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?
+        .ok_or(ProjectStatusError::ProjectNotFound)?;
+    let mut contexts = Vec::new();
+    if let Some(path) = truth
+        .latest_build
+        .as_ref()
+        .and_then(|build| build.source_path.clone())
+    {
+        contexts.push(path);
+    }
+    if let Some(path) = truth
+        .promoted_build
+        .as_ref()
+        .and_then(|build| build.source_path.clone())
+    {
+        contexts.push(path);
+    }
+    let repo_path = Path::new(&project.repo_url);
+    if repo_path.exists() {
+        contexts.push(repo_path.to_path_buf());
+    }
+
+    let store = SecretStore::new(storage_root.join("secrets")).map_err(|err| {
+        ProjectStatusError::Storage(StorageError::Io(std::io::Error::other(err.to_string())))
+    })?;
+
+    for context in contexts {
+        if let Some(manifest) = load_optional_manifest(&context)
+            .map_err(|err| ProjectStatusError::ProjectLookup(err.to_string()))?
+        {
+            let mut missing = manifest
+                .environment_variables
+                .into_iter()
+                .filter(|(_, reference)| reference.scope == "environment")
+                .filter_map(|(_, reference)| {
+                    (!store.has_environment_secret(project_id, environment, &reference.key))
+                        .then_some(reference.key)
+                })
+                .collect::<Vec<_>>();
+            missing.sort();
+            missing.dedup();
+            return Ok(missing);
+        }
+        if let Some(forge_yaml) = load_optional_forge_yaml(&context, project_id)
+            .map_err(|err| ProjectStatusError::ProjectLookup(err.to_string()))?
+        {
+            let mut missing = forge_yaml
+                .environment()
+                .keys()
+                .filter(|key| crate::runtime_env::is_sensitive_key(key))
+                .filter(|key| !store.has_environment_secret(project_id, environment, key))
+                .cloned()
+                .collect::<Vec<_>>();
+            missing.sort();
+            missing.dedup();
+            return Ok(missing);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn recent_secret_mutations(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+    truth: &EnvironmentRuntimeTruth,
+) -> Result<Vec<SecretMutationDiagnostic>, ProjectStatusError> {
+    let Some(active_generation) = truth.active_generation else {
+        return Ok(Vec::new());
+    };
+    let Some(active_snapshot) = truth.promoted_runtime_env_snapshot.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let env = EnvironmentPaths::new(storage_root, project_id, environment);
+    let Some(active_resolved) = load_generation_resolved_runtime(&env, active_generation)? else {
+        return Ok(Vec::new());
+    };
+    let active_values = restore_runtime_env(&active_resolved).map_err(|err| {
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable(format!(
+            "failed to restore generation {active_generation} runtime env: {err}"
+        ))
+    })?;
+    let store = SecretStore::new(storage_root.join("secrets")).map_err(|err| {
+        ProjectStatusError::Storage(StorageError::Io(std::io::Error::other(err.to_string())))
+    })?;
+    let finalized_at = truth
+        .promoted_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.finalized_at_unix)
+        .unwrap_or_default();
+
+    let mut diagnostics = Vec::new();
+    for (env_key, entry) in &active_snapshot.entries {
+        let Some(reference) = entry.secret_reference.as_ref() else {
+            continue;
+        };
+        if reference.scope != "environment" {
+            continue;
+        }
+        let Some((updated_at, mutations)) = store
+            .metadata_for_secret(project_id, environment, &reference.key)
+            .map_err(|err| {
+                ProjectStatusError::Storage(StorageError::Io(std::io::Error::other(
+                    err.to_string(),
+                )))
+            })?
+        else {
+            continue;
+        };
+        if updated_at <= finalized_at {
+            continue;
+        }
+        let current_value = store
+            .current_secret_value(project_id, environment, &reference.key)
+            .map_err(|err| {
+                ProjectStatusError::Storage(StorageError::Io(std::io::Error::other(
+                    err.to_string(),
+                )))
+            })?;
+        let active_value = active_values.get(env_key).cloned().unwrap_or_default();
+        let mutation = match current_value {
+            None => "unset",
+            Some(ref value) if *value != active_value => "rotated",
+            Some(_) => mutations
+                .last()
+                .map(|mutation| mutation.action.as_str())
+                .unwrap_or("updated"),
+        };
+        diagnostics.push(SecretMutationDiagnostic {
+            key: reference.key.clone(),
+            mutation: mutation.to_string(),
+            updated_at_unix: updated_at,
+            active_generation,
+        });
+    }
+    diagnostics.sort_by(|left, right| right.updated_at_unix.cmp(&left.updated_at_unix));
+    diagnostics.dedup_by(|left, right| left.key == right.key);
+    Ok(diagnostics)
+}
+
 fn validation_failure_summary(value: &Value) -> Option<String> {
     let probe = value.get("probe_target")?;
     let host = probe
@@ -1698,6 +2053,127 @@ mod tests {
                 last_transition: "healthy".into(),
                 last_error_code: None,
             })
+            .unwrap();
+    }
+
+    fn write_generation_with_runtime(
+        root: &Path,
+        generation: u64,
+        api_base_url: &str,
+        secret_key: &str,
+        secret_value: &str,
+    ) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                &format!(
+                    concat!(
+                        "{{\n",
+                        "  \"deployment_id\": \"dep-{}\",\n",
+                        "  \"image_ref\": \"forge/api:staging-gen-{}\",\n",
+                        "  \"source_ref\": \"main\",\n",
+                        "  \"commit_sha\": \"340ac8108006d84dbf951d8c0bb04ecfaf0eccac\"\n",
+                        "}}\n"
+                    ),
+                    generation, generation,
+                ),
+            )
+            .unwrap();
+        let runtime = serde_json::to_string_pretty(&PersistedRuntimeInfo {
+            container_name: format!("staging-api-gen-{generation}"),
+            running: true,
+            network_name: Some("forge-managed".into()),
+            probe_path: Some("/health".into()),
+            activation: Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                route_subtree_id: Some("forge:api:staging".into()),
+                target_source: PersistedRouteTargetSource::ContainerIp,
+            }),
+            environment_variables: BTreeMap::new(),
+            source_ref: Some("main".into()),
+            repo_url: None,
+            commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
+            source_path: None,
+        })
+        .unwrap();
+        writer
+            .write_artifact("runtime.json", &format!("{runtime}\n"))
+            .unwrap();
+        let snapshot = serde_json::json!({
+            "snapshot_version": 1,
+            "project_id": "api",
+            "environment": "staging",
+            "generation": generation,
+            "deployment_id": format!("dep-{generation}"),
+            "source_environment": "staging",
+            "source_ref": "main",
+            "commit_sha": "340ac8108006d84dbf951d8c0bb04ecfaf0eccac",
+            "domain": "staging-api.example.com",
+            "entries": {
+                "API_BASE_URL": {
+                    "source": "forge_yaml",
+                    "value": api_base_url,
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "DATABASE_URL": {
+                    "source": "project_environment_secret",
+                    "secret_reference": {
+                        "scope": "environment",
+                        "key": secret_key,
+                        "secret_id": format!("api:staging:{secret_key}"),
+                        "sensitive": true
+                    },
+                    "sensitive": true,
+                    "redacted": true
+                }
+            }
+        });
+        writer
+            .write_artifact(
+                "runtime_env_snapshot.json",
+                &format!("{}\n", serde_json::to_string_pretty(&snapshot).unwrap()),
+            )
+            .unwrap();
+        let resolved = serde_json::json!({
+            "snapshot_version": 1,
+            "project_id": "api",
+            "environment": "staging",
+            "generation": generation,
+            "deployment_id": format!("dep-{generation}"),
+            "source_environment": "staging",
+            "source_ref": "main",
+            "commit_sha": "340ac8108006d84dbf951d8c0bb04ecfaf0eccac",
+            "domain": "staging-api.example.com",
+            "entries": {
+                "API_BASE_URL": {
+                    "source": "forge_yaml",
+                    "value": api_base_url,
+                    "sensitive": false
+                },
+                "DATABASE_URL": {
+                    "source": "project_environment_secret",
+                    "secret_reference": {
+                        "scope": "environment",
+                        "key": secret_key,
+                        "secret_id": format!("api:staging:{secret_key}"),
+                        "sensitive": true
+                    },
+                    "sealed_value": crate::secrets::seal_value(secret_value).unwrap(),
+                    "sensitive": true
+                }
+            }
+        });
+        writer
+            .write_artifact(
+                "resolved_runtime.json",
+                &format!("{}\n", serde_json::to_string_pretty(&resolved).unwrap()),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", SnapshotState::Healthy)
             .unwrap();
     }
 
@@ -2604,6 +3080,216 @@ mod tests {
         assert!(diagnostics.likely_failure_stage.is_none());
         assert!(diagnostics.diagnostics_source.is_none());
         assert!(diagnostics.latest_validation_failure.is_none());
+    }
+
+    #[test]
+    fn env_diff_reports_added_removed_changed_keys() {
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        let root = test_root("env-diff-added-removed-changed");
+        register_project(&root, "api", "api.example.com");
+        write_generation_with_runtime(
+            &root,
+            1,
+            "https://api-v1.example.com",
+            "DATABASE_URL",
+            "postgres://db-v1",
+        );
+        write_generation_with_runtime(
+            &root,
+            2,
+            "https://api-v2.example.com",
+            "DATABASE_URL",
+            "postgres://db-v2",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let snapshot = load_generation_runtime_env_snapshot(&env, 2)
+            .unwrap()
+            .unwrap();
+        let mut snapshot_value = snapshot;
+        snapshot_value.entries.remove("API_BASE_URL");
+        snapshot_value.entries.insert(
+            "FEATURE_FLAG".into(),
+            crate::storage::PersistedRuntimeEnvEntry {
+                source: crate::storage::PersistedRuntimeEnvSource::ForgeYaml,
+                value: Some("true".into()),
+                secret_reference: None,
+                sensitive: false,
+                redacted: false,
+            },
+        );
+        atomic_write(
+            env.generation_dir(2).join("runtime_env_snapshot.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&snapshot_value).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let resolved = load_generation_resolved_runtime(&env, 2).unwrap().unwrap();
+        let mut resolved_value = resolved;
+        resolved_value.entries.remove("API_BASE_URL");
+        resolved_value.entries.insert(
+            "FEATURE_FLAG".into(),
+            crate::storage::PersistedResolvedRuntimeEntry {
+                source: crate::storage::PersistedRuntimeEnvSource::ForgeYaml,
+                value: Some("true".into()),
+                secret_reference: None,
+                sealed_value: None,
+                sensitive: false,
+            },
+        );
+        atomic_write(
+            env.generation_dir(2).join("resolved_runtime.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&resolved_value).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let diff = load_environment_diff(&root, "api", "staging", 1, 2).unwrap();
+
+        assert!(diff.added.iter().any(|entry| entry.key == "FEATURE_FLAG"));
+        assert!(diff.removed.iter().any(|entry| entry.key == "API_BASE_URL"));
+        assert!(
+            diff.changed_values
+                .iter()
+                .any(|entry| entry.key == "DATABASE_URL")
+        );
+    }
+
+    #[test]
+    fn env_diff_redacts_secret_values() {
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        let root = test_root("env-diff-redacts-secret-values");
+        register_project(&root, "api", "api.example.com");
+        write_generation_with_runtime(
+            &root,
+            1,
+            "https://api.example.com",
+            "DATABASE_URL",
+            "postgres://db-v1",
+        );
+        write_generation_with_runtime(
+            &root,
+            2,
+            "https://api.example.com",
+            "DATABASE_URL",
+            "postgres://db-v2",
+        );
+
+        let diff = load_environment_diff(&root, "api", "staging", 1, 2).unwrap();
+        let changed = diff
+            .changed_values
+            .iter()
+            .find(|entry| entry.key == "DATABASE_URL")
+            .unwrap();
+        let rendered = serde_json::to_string(&diff).unwrap();
+
+        assert_eq!(changed.before, "<secret changed>");
+        assert_eq!(changed.after, "<secret changed>");
+        assert!(!rendered.contains("postgres://db-v1"));
+        assert!(!rendered.contains("postgres://db-v2"));
+    }
+
+    #[test]
+    fn diagnose_reports_future_secret_drift() {
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        let root = test_root("diagnose-reports-future-secret-drift");
+        register_project(&root, "api", "api.example.com");
+        write_generation_with_runtime(
+            &root,
+            1,
+            "https://api.example.com",
+            "DATABASE_URL",
+            "postgres://db-v1",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        atomic_write(
+            env.generation_dir(1).join("snapshot.json"),
+            concat!(
+                "{\n",
+                "  \"snapshot_version\": 1,\n",
+                "  \"project_id\": \"api\",\n",
+                "  \"environment\": \"staging\",\n",
+                "  \"generation\": 1,\n",
+                "  \"state\": \"healthy\",\n",
+                "  \"finalized_at_unix\": 1\n",
+                "}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        store
+            .write_environment_secret(&crate::secrets::SecretWriteRequest {
+                project_id: "api".into(),
+                environment: "staging".into(),
+                key: "DATABASE_URL".into(),
+                value: "postgres://db-v2".into(),
+            })
+            .unwrap();
+
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("forge.project.json"),
+            r#"{
+  "project_id": "api",
+  "secrets": {
+    "environment_variables": {
+      "DATABASE_URL": { "scope": "environment", "key": "DATABASE_URL", "sensitive": true }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        ProjectRegistryStore::new(&root)
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("api".into()),
+                    repo_url: repo.to_string_lossy().into_owned(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(1)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(
+            diagnostics
+                .recent_secret_mutations
+                .iter()
+                .any(|mutation| mutation.key == "DATABASE_URL" && mutation.mutation == "rotated")
+        );
     }
 
     #[test]

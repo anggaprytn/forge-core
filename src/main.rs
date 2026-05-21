@@ -11,8 +11,9 @@ use std::time::Duration;
 use forge_core::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
-    EnvironmentDiagnostics, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectRecord, ProjectUpsertRequest,
+    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
+    EventList, ProjectList, ProjectRecord, ProjectUpsertRequest, SecretListResponse,
+    SecretUnsetResponse,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -187,6 +188,27 @@ where
                 print!("{}", render_environment_variables(&report));
             }
         }
+        Command::EnvDiff {
+            project_id,
+            environment,
+            from_generation,
+            to_generation,
+            json,
+        } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let report = client.get_project_environment_env_diff(
+                &project_id,
+                &environment,
+                from_generation,
+                to_generation,
+            )?;
+            if json {
+                print_json(&report)?;
+            } else {
+                print!("{}", render_environment_diff(&report));
+            }
+        }
         Command::Events => {
             let (base_url, token) = api_credentials.clone().unwrap();
             let client = ForgeClient::new(base_url, token);
@@ -263,6 +285,30 @@ where
                 key,
                 value,
             })?;
+            print_json(&result)?;
+        }
+        Command::SecretsList {
+            project_id,
+            environment,
+            json,
+        } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let result = client.get_secrets(&project_id, &environment)?;
+            if json {
+                print_json(&result)?;
+            } else {
+                print!("{}", render_secret_list(&result));
+            }
+        }
+        Command::SecretsUnset {
+            project_id,
+            environment,
+            key,
+        } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let result = client.delete_secret(&project_id, &environment, &key)?;
             print_json(&result)?;
         }
     }
@@ -362,12 +408,48 @@ impl ForgeClient {
         )))
     }
 
+    fn get_project_environment_env_diff(
+        &self,
+        project_id: &str,
+        environment: &str,
+        from_generation: u64,
+        to_generation: u64,
+    ) -> Result<EnvironmentDiffResponse, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/env/diff?generation={from_generation}&generation={to_generation}",
+            self.base_url
+        )))
+    }
+
     fn post_secret(&self, request: SecretWriteRequest) -> Result<SecretWriteResult, CliError> {
         self.send_json(
             self.http
                 .post(format!("{}/secrets", self.base_url))
                 .json(&request),
         )
+    }
+
+    fn get_secrets(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<SecretListResponse, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/secrets",
+            self.base_url
+        )))
+    }
+
+    fn delete_secret(
+        &self,
+        project_id: &str,
+        environment: &str,
+        key: &str,
+    ) -> Result<SecretUnsetResponse, CliError> {
+        self.send_json(self.http.delete(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/secrets/{key}",
+            self.base_url
+        )))
     }
 
     fn post_project(&self, request: ProjectUpsertRequest) -> Result<ProjectRecord, CliError> {
@@ -539,6 +621,13 @@ enum Command {
         environment: String,
         json: bool,
     },
+    EnvDiff {
+        project_id: String,
+        environment: String,
+        from_generation: u64,
+        to_generation: u64,
+        json: bool,
+    },
     Events,
     Gc {
         config_path: PathBuf,
@@ -566,6 +655,16 @@ enum Command {
         environment: String,
         key: String,
         value: String,
+    },
+    SecretsList {
+        project_id: String,
+        environment: String,
+        json: bool,
+    },
+    SecretsUnset {
+        project_id: String,
+        environment: String,
+        key: String,
     },
 }
 
@@ -733,6 +832,9 @@ fn parse_command(
         [cmd, rest @ ..] if cmd == "logs" => parse_logs_command(rest),
         [cmd, rest @ ..] if cmd == "diagnose" => parse_diagnose_command(rest),
         [cmd, rest @ ..] if cmd == "history" => parse_history_command(rest),
+        [cmd, action, rest @ ..] if cmd == "env" && action == "diff" => {
+            parse_env_diff_command(rest)
+        }
         [cmd, rest @ ..] if cmd == "env" => parse_env_command(rest),
         [cmd] if cmd == "events" => Ok(Command::Events),
         [cmd] if cmd == "gc" => Ok(Command::Gc {
@@ -768,6 +870,18 @@ fn parse_command(
                 value: value.clone(),
             })
         }
+        [group, action, rest @ ..] if group == "secrets" && action == "list" => {
+            parse_secret_list_command(rest)
+        }
+        [group, action, project_id, environment, key]
+            if group == "secrets" && action == "unset" =>
+        {
+            Ok(Command::SecretsUnset {
+                project_id: project_id.clone(),
+                environment: environment.clone(),
+                key: key.clone(),
+            })
+        }
         _ => Err(CliError::Usage(usage())),
     }
 }
@@ -788,13 +902,16 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] diagnose [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] history [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] env [--json] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] env diff [--json] <project_id> <environment> --generation <from> --generation <to>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] gc [--dry-run] [--json]",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
         "  forge [--url URL] [--token TOKEN] project list",
         "  forge [--url URL] [--token TOKEN] project show <project_id>",
+        "  forge [--url URL] [--token TOKEN] secrets list [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] secrets set <project_id> <environment> <key> <value>",
+        "  forge [--url URL] [--token TOKEN] secrets unset <project_id> <environment> <key>",
     ]
     .join("\n")
 }
@@ -926,6 +1043,61 @@ fn parse_env_command(args: &[String]) -> Result<Command, CliError> {
             project_id: project_id.clone(),
             environment: environment.clone(),
             json,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_env_diff_command(args: &[String]) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut generations = Vec::new();
+    let mut positionals = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--generation" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "env diff requires --generation <value>".into(),
+                    ));
+                };
+                let generation = value.parse::<u64>().map_err(|_| {
+                    CliError::Usage("env diff generation must be an integer".into())
+                })?;
+                generations.push(generation);
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+        index += 1;
+    }
+
+    match (positionals.as_slice(), generations.as_slice()) {
+        ([project_id, environment], [from_generation, to_generation]) => Ok(Command::EnvDiff {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            from_generation: *from_generation,
+            to_generation: *to_generation,
+            json,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_secret_list_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [project_id, environment] => Ok(Command::SecretsList {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json: false,
+        }),
+        [flag, project_id, environment] if flag == "--json" => Ok(Command::SecretsList {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json: true,
         }),
         _ => Err(CliError::Usage(usage())),
     }
@@ -1305,6 +1477,41 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         }
     }
     output.push('\n');
+    output.push_str("Secret Checks:\n");
+    if diagnostics.missing_required_secrets.is_empty() {
+        output.push_str("  Missing Required Secrets: none\n");
+    } else {
+        for key in &diagnostics.missing_required_secrets {
+            output.push_str(&format!("  Missing Required Secret: {key}\n"));
+        }
+    }
+    if let Some(drift) = diagnostics.env_drift.as_ref() {
+        output.push_str(&format!(
+            "  Env Drift: gen-{} -> gen-{} (added={}, removed={}, changed={}, secret_ref_changes={})\n",
+            drift.from_generation,
+            drift.to_generation,
+            drift.added,
+            drift.removed,
+            drift.changed_values,
+            drift.changed_secret_references
+        ));
+    } else {
+        output.push_str("  Env Drift: none\n");
+    }
+    if diagnostics.recent_secret_mutations.is_empty() {
+        output.push_str("  Recent Secret Mutations: none\n");
+    } else {
+        for mutation in &diagnostics.recent_secret_mutations {
+            output.push_str(&format!(
+                "  Secret Mutation: {} {} after gen-{} at {}\n",
+                mutation.key,
+                mutation.mutation,
+                mutation.active_generation,
+                mutation.updated_at_unix
+            ));
+        }
+    }
+    output.push('\n');
     output.push_str("Retention:\n");
     output.push_str(&format!(
         "  Rollback-safe Generation: {}\n",
@@ -1344,6 +1551,38 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
                 action.outcome
             ));
         }
+    }
+    output
+}
+
+fn render_environment_diff(diff: &EnvironmentDiffResponse) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Project: {}\nEnvironment: {}\nGenerations: {} -> {}\n\n",
+        diff.project_id, diff.environment, diff.from_generation, diff.to_generation
+    ));
+    for entry in &diff.added {
+        output.push_str(&format!("+ {}={}\n", entry.key, entry.value));
+    }
+    for entry in &diff.removed {
+        output.push_str(&format!("- {}", entry.key));
+        if !entry.value.is_empty() {
+            output.push_str(&format!("={}", entry.value));
+        }
+        output.push('\n');
+    }
+    for entry in &diff.changed_values {
+        output.push_str(&format!("~ {}={}\n", entry.key, entry.after));
+    }
+    for entry in &diff.changed_secret_references {
+        output.push_str(&format!("~ {}={}\n", entry.key, entry.after));
+    }
+    if diff.added.is_empty()
+        && diff.removed.is_empty()
+        && diff.changed_values.is_empty()
+        && diff.changed_secret_references.is_empty()
+    {
+        output.push_str("No runtime env changes.\n");
     }
     output
 }
@@ -1462,6 +1701,32 @@ fn render_environment_variables(report: &EnvironmentVariableReport) -> String {
     let mut output = String::new();
     for value in &report.values {
         output.push_str(&format!("{}={}\n", value.key, value.value));
+    }
+    output
+}
+
+fn render_secret_list(response: &SecretListResponse) -> String {
+    let mut output = String::new();
+    for secret in &response.secrets {
+        output.push_str(&format!("{}={}\n", secret.key, secret.value));
+        output.push_str(&format!("  created_at: {}\n", secret.created_at_unix));
+        output.push_str(&format!("  updated_at: {}\n", secret.updated_at_unix));
+        if secret.referenced_by_generations.is_empty() {
+            output.push_str("  referenced_by_generations: none\n");
+        } else {
+            output.push_str(&format!(
+                "  referenced_by_generations: {}\n",
+                secret
+                    .referenced_by_generations
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if response.secrets.is_empty() {
+        output.push_str("No secrets configured.\n");
     }
     output
 }

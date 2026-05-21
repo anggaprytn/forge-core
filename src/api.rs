@@ -109,6 +109,88 @@ pub struct RecentDeploymentFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretListEntry {
+    pub key: String,
+    pub value: String,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+    #[serde(default)]
+    pub referenced_by_generations: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretListResponse {
+    pub project_id: String,
+    pub environment: String,
+    #[serde(default)]
+    pub secrets: Vec<SecretListEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretUnsetResponse {
+    pub secret_id: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentDiffEntry {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentValueChange {
+    pub key: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretReferenceChange {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_reference: Option<String>,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentDiffResponse {
+    pub project_id: String,
+    pub environment: String,
+    pub from_generation: u64,
+    pub to_generation: u64,
+    #[serde(default)]
+    pub added: Vec<EnvironmentDiffEntry>,
+    #[serde(default)]
+    pub removed: Vec<EnvironmentDiffEntry>,
+    #[serde(default)]
+    pub changed_values: Vec<EnvironmentValueChange>,
+    #[serde(default)]
+    pub changed_secret_references: Vec<SecretReferenceChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentDiffSummary {
+    pub from_generation: u64,
+    pub to_generation: u64,
+    pub added: usize,
+    pub removed: usize,
+    pub changed_values: usize,
+    pub changed_secret_references: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretMutationDiagnostic {
+    pub key: String,
+    pub mutation: String,
+    pub updated_at_unix: u64,
+    pub active_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentDiagnostics {
     pub project_id: String,
     pub environment: String,
@@ -139,6 +221,12 @@ pub struct EnvironmentDiagnostics {
     pub rollback_safe_generation: Option<u64>,
     #[serde(default)]
     pub recent_gc_actions: Vec<RecentGcAction>,
+    #[serde(default)]
+    pub missing_required_secrets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_drift: Option<EnvironmentDiffSummary>,
+    #[serde(default)]
+    pub recent_secret_mutations: Vec<SecretMutationDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
