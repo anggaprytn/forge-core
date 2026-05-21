@@ -18,13 +18,15 @@ use crate::status::derive_environment_domain;
 use crate::storage::SnapshotState;
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
-    PersistedActivationMode, PersistedRouteTargetSource, PersistedRuntimeInfo,
-    PersistedSecretReference, PointerStore, RuntimeHealthState, RuntimeStateStore,
+    GcActionRecord, GcStore, PersistedActivationMode, PersistedBuildInfo,
+    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedSecretReference, PointerStore,
+    RuntimeHealthState, RuntimeStateStore, atomic_write, current_unix_timestamp,
     load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
 
 // Beyond current/previous, retain only a small recent diagnostic tail of failed generations.
+const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
 const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +67,11 @@ pub enum TickOutcome {
     RolledBack(u64),
     Unavailable,
     NoActiveGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GarbageCollectionReport {
+    pub actions: Vec<GcActionRecord>,
 }
 
 #[derive(Debug)]
@@ -185,6 +192,7 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
             _ => None,
         };
         self.scan_runtime_orphans(resumable_active, docker, routing)?;
+        repair_missing_previous_generation(&self.storage_root)?;
         self.recover_finalized_current_generations(docker, routing)?;
         Ok(outcome)
     }
@@ -207,6 +215,9 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
         managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
         let queue_state = self.queue.load_state()?;
         let active_record = resumable_active.or(queue_state.active.as_ref());
+        if active_record.is_some() {
+            return Ok(());
+        }
         let mut attempted_cleanup = BTreeSet::new();
 
         let environments = cleanup_scan_environments(
@@ -549,6 +560,9 @@ where
         let mut managed_routes = self.routing.list_managed_routes()?;
         managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
         let queue_state = self.queue.load_state()?;
+        if queue_state.active.is_some() {
+            return Ok(());
+        }
         let mut attempted_cleanup = BTreeSet::new();
 
         retry_tombstoned_cleanup(
@@ -1227,6 +1241,239 @@ fn cleanup_scan_environments(
     Ok(environments)
 }
 
+fn project_environment_paths(
+    storage_root: &std::path::Path,
+) -> Result<Vec<(String, String, EnvironmentPaths)>, ConvergenceError> {
+    let mut environments = Vec::new();
+    let projects_root = storage_root.join("projects");
+    if !projects_root.exists() {
+        return Ok(environments);
+    }
+    for project in fs::read_dir(projects_root)? {
+        let project = project?;
+        if !project.file_type()?.is_dir() {
+            continue;
+        }
+        let project_id = project.file_name().to_string_lossy().to_string();
+        let envs_root = project.path().join("environments");
+        if !envs_root.exists() {
+            continue;
+        }
+        for environment in fs::read_dir(envs_root)? {
+            let environment = environment?;
+            if !environment.file_type()?.is_dir() {
+                continue;
+            }
+            let env_name = environment.file_name().to_string_lossy().to_string();
+            environments.push((
+                project_id.clone(),
+                env_name.clone(),
+                EnvironmentPaths::new(storage_root, &project_id, &env_name),
+            ));
+        }
+    }
+    Ok(environments)
+}
+
+fn repair_missing_previous_generation(
+    storage_root: &std::path::Path,
+) -> Result<(), ConvergenceError> {
+    for (_, _, env) in project_environment_paths(storage_root)? {
+        env.ensure_exists()?;
+        let pointers = PointerStore::new(env.clone());
+        let Some(previous) = pointers.read_pointer("previous")? else {
+            continue;
+        };
+        if env.generation_dir(previous).join("snapshot.json").exists() {
+            continue;
+        }
+        let current = pointers.read_pointer("current")?;
+        let fallback = list_generation_numbers(&env)?
+            .into_iter()
+            .rev()
+            .find(|generation| {
+                Some(*generation) != current && snapshot_is_finalized(&env, *generation)
+            });
+        let contents = fallback
+            .map(|generation| format!("{generation}\n"))
+            .unwrap_or_else(|| "\n".into());
+        atomic_write(env.previous_pointer(), contents.as_bytes())?;
+    }
+    Ok(())
+}
+
+pub fn garbage_collect<RtD, RtR>(
+    storage_root: &std::path::Path,
+    queue: &PersistentQueue,
+    docker: &mut RtD,
+    routing: &mut RtR,
+    dry_run: bool,
+) -> Result<GarbageCollectionReport, ConvergenceError>
+where
+    RtD: DockerRuntime,
+    RtR: RoutingRuntime,
+{
+    let mut managed_containers = docker.list_managed_containers()?;
+    managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
+    let mut managed_images = docker.list_managed_images()?;
+    managed_images.sort_by(|left, right| left.image_ref.cmp(&right.image_ref));
+    let mut managed_routes = routing.list_managed_routes()?;
+    managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
+    let queue_state = queue.load_state()?;
+    if queue_state.active.is_some() {
+        return Ok(GarbageCollectionReport {
+            actions: vec![GcActionRecord {
+                timestamp_unix: current_unix_timestamp(),
+                project_id: "*".into(),
+                environment: "*".into(),
+                generation: None,
+                dry_run,
+                action: "GC_SKIPPED".into(),
+                reason: "deployment in progress".into(),
+                outcome: "protected".into(),
+                deleted: Vec::new(),
+                protected: vec!["active deployment".into()],
+            }],
+        });
+    }
+
+    let environments = cleanup_scan_environments(
+        storage_root,
+        &managed_containers,
+        &managed_images,
+        &managed_routes,
+    )?;
+    let mut actions = Vec::new();
+
+    for (project_id, environment, env) in &environments {
+        let references = environment_runtime_references(
+            env,
+            project_id,
+            environment,
+            None,
+            &managed_containers,
+            &managed_routes,
+        )?;
+        let generations = list_generation_numbers(env)?;
+        let retained_healthy = retained_healthy_generations(env, &references, &generations)?;
+        let retained_failed = retained_failed_generations(env, &references, &generations)?;
+
+        for generation in generations {
+            if references.contains(generation)
+                || retained_healthy.contains(&generation)
+                || retained_failed.contains(&generation)
+            {
+                let mut protected = Vec::new();
+                if references.current == Some(generation) {
+                    protected.push("current/promoted generation".into());
+                }
+                if references.previous == Some(generation) {
+                    protected.push("rollback-safe generation".into());
+                }
+                if retained_healthy.contains(&generation) {
+                    protected.push("recent healthy finalized generation".into());
+                }
+                if retained_failed.contains(&generation) {
+                    protected.push("recent failed generation with diagnostics".into());
+                }
+                if !protected.is_empty() {
+                    actions.push(GcActionRecord {
+                        timestamp_unix: current_unix_timestamp(),
+                        project_id: project_id.clone(),
+                        environment: environment.clone(),
+                        generation: Some(generation),
+                        dry_run,
+                        action: "GENERATION_PROTECTED".into(),
+                        reason: "retained by policy".into(),
+                        outcome: "protected".into(),
+                        deleted: Vec::new(),
+                        protected,
+                    });
+                }
+                continue;
+            }
+
+            let mut deleted = vec![env.generation_dir(generation).display().to_string()];
+            if let Some(build) = load_generation_build_info(env, generation)? {
+                deleted.push(build.image_ref);
+                if let Some(source_path) = build.source_path {
+                    deleted.push(source_path.display().to_string());
+                }
+            }
+            actions.push(GcActionRecord {
+                timestamp_unix: current_unix_timestamp(),
+                project_id: project_id.clone(),
+                environment: environment.clone(),
+                generation: Some(generation),
+                dry_run,
+                action: if dry_run {
+                    "GENERATION_GC_DRY_RUN".into()
+                } else {
+                    "GENERATION_GC".into()
+                },
+                reason: "eligible by retention policy".into(),
+                outcome: if dry_run {
+                    "would_remove".into()
+                } else {
+                    "planned".into()
+                },
+                deleted,
+                protected: Vec::new(),
+            });
+        }
+    }
+
+    if !dry_run {
+        let mut attempted_cleanup = BTreeSet::new();
+        for (project_id, environment, env) in &environments {
+            retry_tombstoned_cleanup(
+                docker,
+                routing,
+                project_id,
+                environment,
+                env,
+                None,
+                &managed_containers,
+                &managed_images,
+                &managed_routes,
+                &mut attempted_cleanup,
+            )?;
+            let _ = cleanup_orphaned_containers(
+                docker,
+                storage_root,
+                None,
+                &managed_containers,
+                &managed_images,
+                &managed_routes,
+                &mut attempted_cleanup,
+            )?;
+            cleanup_orphaned_images(
+                docker,
+                storage_root,
+                None,
+                &managed_containers,
+                &managed_images,
+                &managed_routes,
+                &mut attempted_cleanup,
+            )?;
+            enforce_generation_retention(
+                docker,
+                routing,
+                project_id,
+                environment,
+                env,
+                None,
+                &managed_containers,
+                &managed_images,
+                &managed_routes,
+                &mut attempted_cleanup,
+            )?;
+        }
+    }
+
+    Ok(GarbageCollectionReport { actions })
+}
+
 fn persist_cleanup_state(
     env: &EnvironmentPaths,
     generation: u64,
@@ -1330,6 +1577,32 @@ fn append_retention_event(
     Ok(())
 }
 
+fn append_gc_action(
+    env: &EnvironmentPaths,
+    project_id: &str,
+    environment: &str,
+    generation: Option<u64>,
+    action: &str,
+    reason: &str,
+    outcome: &str,
+    deleted: Vec<String>,
+    protected: Vec<String>,
+) -> Result<(), ConvergenceError> {
+    GcStore::new(env.clone()).append(GcActionRecord {
+        timestamp_unix: current_unix_timestamp(),
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        generation,
+        dry_run: false,
+        action: action.to_string(),
+        reason: reason.to_string(),
+        outcome: outcome.to_string(),
+        deleted,
+        protected,
+    })?;
+    Ok(())
+}
+
 fn attempt_cleanup<RtD, RtR>(
     docker: &mut RtD,
     routing: &mut RtR,
@@ -1401,6 +1674,41 @@ where
             success_event
         },
         Some(cleanup.failure_reason.clone()),
+    )?;
+    append_gc_action(
+        env,
+        project_id,
+        environment,
+        Some(generation),
+        if cleanup.tombstoned {
+            tombstone_event
+        } else {
+            success_event
+        },
+        &cleanup.failure_reason,
+        if cleanup.tombstoned {
+            "tombstoned"
+        } else {
+            "removed"
+        },
+        [
+            cleanup
+                .container_removed
+                .then(|| cleanup.container_name.clone())
+                .flatten(),
+            cleanup
+                .route_removed
+                .then(|| cleanup.route_subtree_id.clone())
+                .flatten(),
+            cleanup
+                .image_removed
+                .then(|| cleanup.image_ref.clone())
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        Vec::new(),
     )?;
     Ok(cleanup)
 }
@@ -1705,10 +2013,14 @@ where
         managed_routes,
     )?;
     let generations = list_generation_numbers(env)?;
+    let retained_healthy = retained_healthy_generations(env, &references, &generations)?;
     let retained_failed = retained_failed_generations(env, &references, &generations)?;
 
     for generation in generations {
-        if references.contains(generation) || retained_failed.contains(&generation) {
+        if references.contains(generation)
+            || retained_healthy.contains(&generation)
+            || retained_failed.contains(&generation)
+        {
             continue;
         }
         let cleanup = retention_cleanup_generation(
@@ -1744,6 +2056,33 @@ fn retained_failed_generations(
         }
         retained.insert(generation);
         if retained.len() >= FAILED_GENERATION_RETENTION_LIMIT {
+            break;
+        }
+    }
+    Ok(retained)
+}
+
+fn retained_healthy_generations(
+    env: &EnvironmentPaths,
+    references: &RuntimeReferences,
+    generations: &[u64],
+) -> Result<BTreeSet<u64>, ConvergenceError> {
+    let mut retained = BTreeSet::new();
+    let authoritative_ceiling = references.current;
+    for generation in generations.iter().rev().copied() {
+        if authoritative_ceiling.is_some_and(|ceiling| generation > ceiling)
+            && !references.contains(generation)
+        {
+            continue;
+        }
+        let Some(snapshot) = load_generation_snapshot_metadata(env, generation)? else {
+            continue;
+        };
+        if snapshot.state != "healthy" {
+            continue;
+        }
+        retained.insert(generation);
+        if retained.len() >= HEALTHY_FINALIZED_RETENTION_LIMIT {
             break;
         }
     }
@@ -1786,6 +2125,92 @@ fn list_generation_numbers(env: &EnvironmentPaths) -> Result<Vec<u64>, Convergen
     }
     generations.sort_unstable();
     Ok(generations)
+}
+
+fn storage_root_from_env(env: &EnvironmentPaths) -> Option<PathBuf> {
+    env.root
+        .parent()?
+        .parent()?
+        .parent()?
+        .parent()
+        .map(|path| path.to_path_buf())
+}
+
+fn checkout_is_still_referenced(
+    storage_root: &std::path::Path,
+    project_id: &str,
+    generation_to_skip: u64,
+    checkout_path: &std::path::Path,
+) -> Result<bool, ConvergenceError> {
+    let environments_root = storage_root
+        .join("projects")
+        .join(project_id)
+        .join("environments");
+    if !environments_root.exists() {
+        return Ok(false);
+    }
+    for environment in fs::read_dir(environments_root)? {
+        let environment = environment?;
+        let generations_root = environment.path().join("generations");
+        if !generations_root.exists() {
+            continue;
+        }
+        for generation in fs::read_dir(generations_root)? {
+            let generation = generation?;
+            if !generation.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(candidate_generation) =
+                generation.file_name().to_string_lossy().parse::<u64>().ok()
+            else {
+                continue;
+            };
+            if candidate_generation == generation_to_skip {
+                continue;
+            }
+            let env = EnvironmentPaths {
+                root: environment.path(),
+            };
+            let referenced = load_generation_build_info(&env, candidate_generation)?
+                .and_then(|build| build.source_path)
+                .or_else(|| {
+                    load_generation_runtime_info(&env, candidate_generation)
+                        .ok()
+                        .flatten()
+                        .and_then(|runtime| runtime.source_path)
+                });
+            if referenced.as_deref() == Some(checkout_path) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn cleanup_source_checkout_if_unreferenced(
+    env: &EnvironmentPaths,
+    project_id: &str,
+    generation: u64,
+    build_info: Option<&PersistedBuildInfo>,
+) -> Result<Option<String>, ConvergenceError> {
+    let Some(source_path) = build_info.and_then(|build| build.source_path.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(storage_root) = storage_root_from_env(env) else {
+        return Ok(None);
+    };
+    let checkouts_root = storage_root.join("source-checkouts").join(project_id);
+    if !source_path.starts_with(&checkouts_root) {
+        return Ok(None);
+    }
+    if checkout_is_still_referenced(&storage_root, project_id, generation, source_path)? {
+        return Ok(None);
+    }
+    match fs::remove_dir_all(source_path) {
+        Ok(()) => Ok(Some(source_path.display().to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn retention_cleanup_generation<RtD, RtR>(
@@ -1889,16 +2314,33 @@ where
         return Ok(cleanup);
     }
 
+    let removed_checkout =
+        cleanup_source_checkout_if_unreferenced(env, project_id, generation, build_info.as_ref())?;
     match fs::remove_dir_all(env.generation_dir(generation)) {
-        Ok(()) => append_retention_event(
-            env,
-            references,
-            project_id,
-            environment,
-            generation,
-            "GENERATION_RETENTION_REMOVED",
-            Some("retention cleanup".into()),
-        )?,
+        Ok(()) => {
+            append_retention_event(
+                env,
+                references,
+                project_id,
+                environment,
+                generation,
+                "GENERATION_RETENTION_REMOVED",
+                Some("retention cleanup".into()),
+            )?;
+            append_gc_action(
+                env,
+                project_id,
+                environment,
+                Some(generation),
+                "GENERATION_RETENTION_REMOVED",
+                "retention cleanup",
+                "removed",
+                std::iter::once(env.generation_dir(generation).display().to_string())
+                    .chain(removed_checkout.into_iter())
+                    .collect(),
+                Vec::new(),
+            )?;
+        }
         Err(err) => {
             let cleanup = CleanupRecord {
                 failure_reason: format!("retention directory removal failed: {err}"),
@@ -1914,6 +2356,17 @@ where
                 generation,
                 "GENERATION_RETENTION_TOMBSTONED",
                 Some(cleanup.failure_reason.clone()),
+            )?;
+            append_gc_action(
+                env,
+                project_id,
+                environment,
+                Some(generation),
+                "GENERATION_RETENTION_TOMBSTONED",
+                &cleanup.failure_reason,
+                "tombstoned",
+                Vec::new(),
+                Vec::new(),
             )?;
             return Ok(cleanup);
         }
@@ -4195,5 +4648,181 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
         assert!(cleanup.container_removed);
         assert!(cleanup.route_removed);
         assert!(!cleanup.tombstoned);
+    }
+
+    #[test]
+    fn retention_preserves_current_generation() {
+        let root = test_root("retention-preserves-current-generation");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(2).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        garbage_collect(&root, &queue, &mut docker, &mut routing, false).unwrap();
+
+        assert!(env.generation_dir(2).exists());
+    }
+
+    #[test]
+    fn retention_preserves_previous_rollback_generation() {
+        let root = test_root("retention-preserves-previous-rollback-generation");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(3).unwrap();
+        atomic_write(env.previous_pointer(), b"2\n").unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        for generation in 1..=3 {
+            docker
+                .containers
+                .insert(format!("prod-api-gen-{generation}"), true);
+        }
+        let mut routing = TestRoutingRuntime::default();
+
+        garbage_collect(&root, &queue, &mut docker, &mut routing, false).unwrap();
+
+        assert!(env.generation_dir(2).exists());
+        assert_eq!(
+            PointerStore::new(env).read_pointer("previous").unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn gc_removes_orphaned_images() {
+        let root = test_root("gc-removes-orphaned-images");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        docker.seed_image("api", "production", 2, "forge/api:production-gen-2");
+        let mut routing = TestRoutingRuntime::default();
+
+        garbage_collect(&root, &queue, &mut docker, &mut routing, false).unwrap();
+
+        assert!(
+            docker
+                .image_remove_calls
+                .iter()
+                .any(|image| image == "forge/api:production-gen-2")
+        );
+    }
+
+    #[test]
+    fn gc_removes_unreferenced_checkouts() {
+        let root = test_root("gc-removes-unreferenced-checkouts");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(3).unwrap();
+        let checkout = root.join("source-checkouts/api/sha-old");
+        fs::create_dir_all(&checkout).unwrap();
+        atomic_write(
+            env.generation_dir(1).join("build.json"),
+            format!(
+                "{{\n  \"deployment_id\": \"dep-1\",\n  \"image_ref\": \"forge/api:production-gen-1\",\n  \"source_path\": \"{}\"\n}}\n",
+                checkout.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        garbage_collect(&root, &queue, &mut docker, &mut routing, false).unwrap();
+
+        assert!(!checkout.exists());
+    }
+
+    #[test]
+    fn gc_does_not_break_rollback() {
+        let root = test_root("gc-does-not-break-rollback");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(3).unwrap();
+        atomic_write(env.previous_pointer(), b"2\n").unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        for generation in 1..=3 {
+            docker
+                .containers
+                .insert(format!("prod-api-gen-{generation}"), true);
+        }
+        let mut routing = TestRoutingRuntime::default();
+
+        garbage_collect(&root, &queue, &mut docker, &mut routing, false).unwrap();
+
+        assert_eq!(
+            PointerStore::new(env.clone())
+                .read_pointer("previous")
+                .unwrap(),
+            Some(2)
+        );
+        assert!(env.generation_dir(2).join("snapshot.json").exists());
+    }
+
+    #[test]
+    fn convergence_handles_missing_gc_generation() {
+        let root = test_root("convergence-handles-missing-gc-generation");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(3).unwrap();
+        atomic_write(env.previous_pointer(), b"2\n").unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        assert_eq!(
+            PointerStore::new(env).read_pointer("previous").unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn gc_dry_run_reports_actions_without_mutation() {
+        let root = test_root("gc-dry-run-reports-actions-without-mutation");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|action| { action.generation == Some(1) && action.outcome == "would_remove" })
+        );
+        assert!(env.generation_dir(1).exists());
+        assert!(docker.remove_calls.is_empty());
     }
 }

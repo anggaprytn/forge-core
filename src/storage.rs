@@ -259,6 +259,76 @@ pub struct DiagnosticSummary {
     pub runtime_env_preview: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GenerationHistoryRecord {
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_state: Option<String>,
+    #[serde(default)]
+    pub restored_by_rollback: bool,
+    #[serde(default)]
+    pub rollback_target: bool,
+    #[serde(default)]
+    pub retained: bool,
+    #[serde(default)]
+    pub eligible_for_gc: bool,
+    #[serde(default)]
+    pub missing_artifacts: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RetentionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix: Option<u64>,
+    #[serde(default)]
+    pub generations: Vec<GenerationHistoryRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GcActionRecord {
+    pub timestamp_unix: u64,
+    pub project_id: String,
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub dry_run: bool,
+    pub action: String,
+    pub reason: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GcMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix: Option<u64>,
+    #[serde(default)]
+    pub actions: Vec<GcActionRecord>,
+}
+
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
@@ -328,6 +398,14 @@ impl EnvironmentPaths {
 
     pub fn runtime_state_file(&self) -> PathBuf {
         self.root.join("runtime_state.json")
+    }
+
+    pub fn retention_file(&self) -> PathBuf {
+        self.root.join("retention.json")
+    }
+
+    pub fn gc_file(&self) -> PathBuf {
+        self.root.join("gc.json")
     }
 
     fn ensure_pointer_file(&self, name: &str) -> StorageResult<()> {
@@ -426,6 +504,14 @@ pub struct EventStore {
 pub struct DiagnosticsStore {
     env: EnvironmentPaths,
     generation: u64,
+}
+
+pub struct RetentionStore {
+    env: EnvironmentPaths,
+}
+
+pub struct GcStore {
+    env: EnvironmentPaths,
 }
 
 impl RuntimeStateStore {
@@ -723,6 +809,70 @@ impl DiagnosticsStore {
     }
 }
 
+impl RetentionStore {
+    pub fn new(env: EnvironmentPaths) -> Self {
+        Self { env }
+    }
+
+    pub fn read(&self) -> StorageResult<RetentionMetadata> {
+        let path = self.env.retention_file();
+        if !path.exists() {
+            return Ok(RetentionMetadata::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        serde_json::from_str(&raw).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })
+    }
+
+    pub fn write(&self, metadata: &RetentionMetadata) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let bytes = serde_json::to_vec_pretty(metadata).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(self.env.retention_file(), &bytes)
+    }
+}
+
+impl GcStore {
+    pub fn new(env: EnvironmentPaths) -> Self {
+        Self { env }
+    }
+
+    pub fn read(&self) -> StorageResult<GcMetadata> {
+        let path = self.env.gc_file();
+        if !path.exists() {
+            return Ok(GcMetadata::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        serde_json::from_str(&raw).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })
+    }
+
+    pub fn append(&self, action: GcActionRecord) -> StorageResult<()> {
+        let mut metadata = self.read()?;
+        metadata.updated_at_unix = Some(action.timestamp_unix);
+        metadata.actions.push(action);
+        let bytes = serde_json::to_vec_pretty(&metadata).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(self.env.gc_file(), &bytes)
+    }
+}
+
 impl CleanupRecord {
     pub fn new(
         failure_reason: impl Into<String>,
@@ -912,6 +1062,13 @@ pub(crate) fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> StorageRe
     fs::rename(&temp_path, path)?;
     sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
     Ok(())
+}
+
+pub fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn load_generation_json<T: for<'de> Deserialize<'de>>(

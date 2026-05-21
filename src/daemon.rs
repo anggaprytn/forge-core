@@ -6,8 +6,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    DeploymentAccepted, DeploymentLogs, DeploymentRequest, DeploymentStatus,
-    EnvironmentDiagnostics, EnvironmentVariableReport, ErrorResponse, EventList,
+    DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest,
+    DeploymentStatus, EnvironmentDiagnostics, EnvironmentVariableReport, ErrorResponse, EventList,
     validate_deployment_request,
 };
 use crate::bootstrap::{BootstrapContext, BootstrapState};
@@ -23,8 +23,8 @@ use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
 use crate::status::{
-    ProjectEnvironmentStatus, load_environment_diagnostics, load_project_environment_env_report,
-    load_project_environment_status,
+    ProjectEnvironmentStatus, load_environment_diagnostics, load_environment_history,
+    load_project_environment_env_report, load_project_environment_status,
 };
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, RuntimeHealthState, RuntimeStateStore,
@@ -283,6 +283,26 @@ where
         environment: &str,
     ) -> Result<EnvironmentDiagnostics, ErrorResponse> {
         load_environment_diagnostics(
+            &self.config.storage_root,
+            self.queue.as_ref(),
+            &mut self.docker_runtime,
+            &mut self.routing_runtime,
+            project_id,
+            environment,
+        )
+        .map_err(|err| {
+            let (status, response) = crate::status::project_status_error_response(err);
+            let _ = status;
+            response
+        })
+    }
+
+    pub fn get_project_environment_history(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<DeploymentHistoryResponse, ErrorResponse> {
+        load_environment_history(
             &self.config.storage_root,
             self.queue.as_ref(),
             &mut self.docker_runtime,

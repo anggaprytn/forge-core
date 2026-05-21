@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
@@ -6,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{
-    ContainerRuntimeDiagnostics, EnvironmentDiagnostics, EnvironmentVariableReport,
-    EnvironmentVariableValue, ErrorResponse, ProbeTargetDiagnostics, RecentDeploymentFailure,
-    RouteDiagnostics, RuntimeEnvSnapshotMetadata,
+    ContainerRuntimeDiagnostics, DeploymentHistoryEntry, DeploymentHistoryResponse,
+    EnvironmentDiagnostics, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
+    ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction, RouteDiagnostics,
+    RuntimeEnvSnapshotMetadata,
 };
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{PersistentQueue, QueueError};
@@ -19,11 +21,15 @@ use crate::runtime::{
 };
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::storage::{
-    DiagnosticsStore, EnvironmentPaths, PersistedActivationMode, PersistedBuildInfo,
-    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedSnapshotMetadata, PointerStore,
-    StorageError, load_generation_build_info, load_generation_runtime_env_snapshot,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord, PersistedActivationMode,
+    PersistedBuildInfo, PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo,
+    PersistedSnapshotMetadata, PointerStore, RetentionMetadata, RetentionStore, StorageError,
+    load_generation_build_info, load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    load_generation_snapshot_metadata,
 };
+
+const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
+const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectEnvironmentStatus {
@@ -157,6 +163,300 @@ struct EnvironmentRuntimeTruth {
     container_ip: Option<String>,
     image_ref: Option<String>,
     route_details: Option<RouteStatusDetails>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HistoryReferences {
+    current: Option<u64>,
+    previous: Option<u64>,
+    promoted: Option<u64>,
+    route_generation: Option<u64>,
+    converging_generation: Option<u64>,
+}
+
+impl HistoryReferences {
+    fn contains(&self, generation: u64) -> bool {
+        self.current == Some(generation)
+            || self.previous == Some(generation)
+            || self.promoted == Some(generation)
+            || self.route_generation == Some(generation)
+            || self.converging_generation == Some(generation)
+    }
+}
+
+fn deployment_history_entry(record: GenerationHistoryRecord) -> DeploymentHistoryEntry {
+    DeploymentHistoryEntry {
+        generation: record.generation,
+        deployment_id: record.deployment_id,
+        commit_sha: record.commit_sha,
+        source_ref: record.source_ref,
+        image_ref: record.image_ref,
+        created_at_unix: record.created_at_unix,
+        promoted_at_unix: record.promoted_at_unix,
+        finalized_state: record.finalized_state,
+        finalized_at_unix: record.finalized_at_unix,
+        rollback_target: record.rollback_target,
+        restored_by_rollback: record.restored_by_rollback,
+        retained: record.retained,
+        eligible_for_gc: record.eligible_for_gc,
+        missing_artifacts: record.missing_artifacts,
+        retained_reasons: record.retained_reasons,
+    }
+}
+
+fn merge_live_generation_metadata(
+    env: &EnvironmentPaths,
+    record: &mut GenerationHistoryRecord,
+) -> Result<(), ProjectStatusError> {
+    if let Some(build) = load_generation_build_info(env, record.generation)? {
+        if record.deployment_id.is_none() {
+            record.deployment_id = Some(build.deployment_id);
+        }
+        if record.image_ref.is_none() {
+            record.image_ref = Some(build.image_ref);
+        }
+        if record.source_ref.is_none() {
+            record.source_ref = build.source_ref;
+        }
+        if record.commit_sha.is_none() {
+            record.commit_sha = build.commit_sha;
+        }
+        if record.source_path.is_none() {
+            record.source_path = build.source_path;
+        }
+    }
+    if let Some(runtime) = load_generation_runtime_info(env, record.generation)? {
+        if record.source_ref.is_none() {
+            record.source_ref = runtime.source_ref;
+        }
+        if record.commit_sha.is_none() {
+            record.commit_sha = runtime.commit_sha;
+        }
+        if record.source_path.is_none() {
+            record.source_path = runtime.source_path;
+        }
+    }
+    if let Some(snapshot) = load_generation_snapshot_metadata(env, record.generation)? {
+        record.finalized_state = Some(snapshot.state);
+        record.finalized_at_unix = Some(snapshot.finalized_at_unix);
+    }
+    Ok(())
+}
+
+fn generation_has_failure_diagnostics(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> Result<bool, ProjectStatusError> {
+    let diagnostics = env.generation_dir(generation).join("diagnostics");
+    let summary_path = diagnostics.join("summary.json");
+    if summary_path.exists() {
+        let raw = fs::read_to_string(summary_path)?;
+        let summary: crate::storage::DiagnosticSummary =
+            serde_json::from_str(&raw).map_err(|err| {
+                ProjectStatusError::Storage(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                )))
+            })?;
+        if summary.failure_stage != "startup_recovery" {
+            return Ok(true);
+        }
+    }
+    Ok(diagnostics.join("failure_reason.log").exists()
+        || diagnostics.join("deployment.log").exists())
+}
+
+fn compute_history_references(
+    env: &EnvironmentPaths,
+    route_generation: Option<u64>,
+    converging_generation: Option<u64>,
+) -> Result<HistoryReferences, ProjectStatusError> {
+    let pointers = PointerStore::new(env.clone());
+    Ok(HistoryReferences {
+        current: pointers.read_pointer("current")?,
+        previous: pointers.read_pointer("previous")?,
+        promoted: pointers.read_pointer("promoted")?,
+        route_generation,
+        converging_generation,
+    })
+}
+
+fn retained_healthy_generations(
+    records: &[GenerationHistoryRecord],
+    references: &HistoryReferences,
+) -> BTreeSet<u64> {
+    records
+        .iter()
+        .filter(|record| {
+            !references.current.is_some_and(|current| {
+                record.generation > current && !references.contains(record.generation)
+            })
+        })
+        .filter(|record| record.finalized_state.as_deref() == Some("healthy"))
+        .map(|record| record.generation)
+        .rev()
+        .take(HEALTHY_FINALIZED_RETENTION_LIMIT)
+        .collect()
+}
+
+fn retained_failed_generations(
+    env: &EnvironmentPaths,
+    records: &[GenerationHistoryRecord],
+    references: &HistoryReferences,
+) -> Result<BTreeSet<u64>, ProjectStatusError> {
+    let mut retained = BTreeSet::new();
+    for generation in records.iter().map(|record| record.generation).rev() {
+        if references.contains(generation) {
+            continue;
+        }
+        if !generation_has_failure_diagnostics(env, generation)? {
+            continue;
+        }
+        retained.insert(generation);
+        if retained.len() >= FAILED_GENERATION_RETENTION_LIMIT {
+            break;
+        }
+    }
+    Ok(retained)
+}
+
+fn refresh_history_metadata(
+    env: &EnvironmentPaths,
+    references: &HistoryReferences,
+) -> Result<RetentionMetadata, ProjectStatusError> {
+    let store = RetentionStore::new(env.clone());
+    let mut metadata = store.read()?;
+    let mut by_generation = metadata
+        .generations
+        .into_iter()
+        .map(|record| (record.generation, record))
+        .collect::<BTreeMap<_, _>>();
+
+    for generation in list_generation_numbers(env)? {
+        let record = by_generation
+            .entry(generation)
+            .or_insert_with(|| GenerationHistoryRecord {
+                generation,
+                ..GenerationHistoryRecord::default()
+            });
+        merge_live_generation_metadata(env, record)?;
+    }
+
+    let mut records = by_generation.into_values().collect::<Vec<_>>();
+    records.sort_by_key(|record| record.generation);
+
+    let healthy_retained = retained_healthy_generations(&records, references);
+    let failed_retained = retained_failed_generations(env, &records, references)?;
+
+    for record in &mut records {
+        let generation_dir_exists = env.generation_dir(record.generation).exists();
+        record.rollback_target = references.previous == Some(record.generation);
+        record.missing_artifacts = record.retained && !generation_dir_exists;
+        let mut reasons = Vec::new();
+        if references.current == Some(record.generation)
+            || references.promoted == Some(record.generation)
+        {
+            reasons.push("current/promoted generation".into());
+        }
+        if references.previous == Some(record.generation) {
+            reasons.push("rollback-safe generation".into());
+        }
+        if references.route_generation == Some(record.generation) {
+            reasons.push("route reference".into());
+        }
+        if references.converging_generation == Some(record.generation) {
+            reasons.push("deployment in progress".into());
+        }
+        if healthy_retained.contains(&record.generation) {
+            reasons.push("recent healthy finalized generation".into());
+        }
+        if failed_retained.contains(&record.generation) {
+            reasons.push("recent failed generation with diagnostics".into());
+        }
+        record.retained = !reasons.is_empty();
+        record.eligible_for_gc = !record.retained;
+        record.missing_artifacts = record.retained && !generation_dir_exists;
+        record.retained_reasons = reasons;
+        if !generation_dir_exists && record.archived_at_unix.is_none() {
+            record.archived_at_unix = record
+                .finalized_at_unix
+                .or(record.promoted_at_unix)
+                .or(record.created_at_unix);
+        }
+    }
+
+    metadata.updated_at_unix = Some(crate::storage::current_unix_timestamp());
+    metadata.generations = records;
+    store.write(&metadata)?;
+    Ok(metadata)
+}
+
+pub fn load_environment_history<D, R>(
+    storage_root: &Path,
+    queue: Option<&PersistentQueue>,
+    docker: &mut D,
+    routing: &mut R,
+    project_id: &str,
+    environment: &str,
+) -> Result<DeploymentHistoryResponse, ProjectStatusError>
+where
+    D: DockerRuntime,
+    R: RoutingRuntime,
+{
+    if !matches!(environment, "development" | "staging" | "production") {
+        return Err(ProjectStatusError::InvalidEnvironment);
+    }
+    let project = ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ProjectStatusError::ProjectLookup(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?
+        .ok_or(ProjectStatusError::ProjectNotFound)?;
+    let domain = derive_environment_domain(&project.base_domain, environment);
+    let env = EnvironmentPaths::new(storage_root, project_id, environment);
+    let truth =
+        load_environment_runtime_truth(&env, docker, routing, project_id, environment, &domain)?;
+    let route_generation = truth
+        .route_details
+        .as_ref()
+        .and_then(|details| details.inspection.as_ref())
+        .and_then(|inspection| inspection.active_target.rsplit("-gen-").next())
+        .and_then(|suffix| suffix.split(':').next())
+        .and_then(|value| value.parse::<u64>().ok());
+    let converging_generation =
+        queue
+            .map(|queue| queue.load_state())
+            .transpose()?
+            .and_then(|state| {
+                state.active.and_then(|record| {
+                    (record.project_id == project_id && record.environment == environment)
+                        .then(|| list_generation_numbers(&env).ok())
+                        .flatten()
+                        .and_then(|generations| {
+                            generations.into_iter().rev().find(|generation| {
+                                load_generation_snapshot_metadata(&env, *generation)
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                            })
+                        })
+                })
+            });
+    let references = compute_history_references(&env, route_generation, converging_generation)?;
+    let metadata = refresh_history_metadata(&env, &references)?;
+    let mut entries = metadata
+        .generations
+        .into_iter()
+        .map(deployment_history_entry)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.generation.cmp(&left.generation));
+    Ok(DeploymentHistoryResponse {
+        project_id: project_id.into(),
+        environment: environment.into(),
+        entries,
+    })
 }
 
 pub fn project_status_error_response(
@@ -447,6 +747,31 @@ where
     };
 
     let status_value = status.status.clone();
+    let history = load_environment_history(
+        storage_root,
+        queue,
+        docker,
+        routing,
+        project_id,
+        environment,
+    )?;
+    let recent_gc_actions = GcStore::new(env.clone())
+        .read()?
+        .actions
+        .into_iter()
+        .rev()
+        .take(5)
+        .map(|action| RecentGcAction {
+            timestamp_unix: action.timestamp_unix,
+            generation: action.generation,
+            action: action.action,
+            reason: action.reason,
+            outcome: action.outcome,
+            dry_run: action.dry_run,
+            deleted: action.deleted,
+            protected: action.protected,
+        })
+        .collect::<Vec<_>>();
     Ok(EnvironmentDiagnostics {
         project_id: project_id.to_string(),
         environment: environment.to_string(),
@@ -491,6 +816,18 @@ where
             .promoted_runtime_env_snapshot
             .as_ref()
             .map(runtime_env_snapshot_metadata),
+        retained_generations: history
+            .entries
+            .iter()
+            .filter(|entry| entry.retained)
+            .cloned()
+            .collect(),
+        rollback_safe_generation: history
+            .entries
+            .iter()
+            .find(|entry| entry.rollback_target)
+            .map(|entry| entry.generation),
+        recent_gc_actions,
     })
 }
 
@@ -2311,5 +2648,91 @@ mod tests {
             diagnostics.recent_failures[0].failure_stage,
             "startup_recovery"
         );
+    }
+
+    #[test]
+    fn history_reports_retention_state() {
+        let root = test_root("history-reports-retention-state");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 4);
+        write_generation(&root, 6);
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let failed = SnapshotWriter::new(env.clone(), 5).unwrap();
+        failed
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-5\",\n  \"image_ref\": \"forge/api:staging-gen-5\",\n  \"source_ref\": \"main\",\n  \"commit_sha\": \"deadbeef\"\n}\n",
+            )
+            .unwrap();
+        failed
+            .finalize("api", "staging", SnapshotState::Failed)
+            .unwrap();
+        DiagnosticsStore::new(env.clone(), 5)
+            .write_summary(&crate::storage::DiagnosticSummary {
+                deployment_id: Some("dep-5".into()),
+                failure_stage: "validation".into(),
+                failure_reason: "http health probe failed".into(),
+                container_name: "staging-api-gen-5".into(),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                cleanup_recorded: false,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+        PointerStore::new(env.clone()).swap_current(7).unwrap();
+        atomic_write(env.previous_pointer(), b"6\n").unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let history =
+            load_environment_history(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let current = history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == 7)
+            .unwrap();
+        let previous = history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == 6)
+            .unwrap();
+        let failed = history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == 5)
+            .unwrap();
+        let eligible = history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == 4)
+            .unwrap();
+
+        assert!(current.retained);
+        assert!(previous.retained);
+        assert!(previous.rollback_target);
+        assert!(failed.retained);
+        assert!(!eligible.retained);
+        assert!(eligible.eligible_for_gc);
     }
 }

@@ -20,8 +20,9 @@ use subtle::ConstantTimeEq;
 
 use crate::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
-    EnvironmentVariableReport, ErrorResponse, EventList, ProjectList, ProjectUpsertRequest,
+    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
+    EnvironmentDiagnostics, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
+    ProjectUpsertRequest,
 };
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{
@@ -83,6 +84,11 @@ pub trait ControlPlane: Send {
         project_id: &str,
         environment: &str,
     ) -> Result<EnvironmentDiagnostics, ErrorResponse>;
+    fn get_project_environment_history(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<DeploymentHistoryResponse, ErrorResponse>;
     fn get_project_environment_env(
         &self,
         project_id: &str,
@@ -140,6 +146,14 @@ where
         environment: &str,
     ) -> Result<EnvironmentDiagnostics, ErrorResponse> {
         Daemon::get_project_environment_diagnostics(self, project_id, environment)
+    }
+
+    fn get_project_environment_history(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<DeploymentHistoryResponse, ErrorResponse> {
+        Daemon::get_project_environment_history(self, project_id, environment)
     }
 
     fn get_project_environment_env(
@@ -742,6 +756,10 @@ pub fn router(state: HttpState) -> Router {
         .route(
             "/api/projects/{project_id}/environments/{environment}/diagnostics",
             get(get_project_environment_diagnostics),
+        )
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/history",
+            get(get_project_environment_history),
         )
         .route(
             "/api/projects/{project_id}/environments/{environment}/env",
@@ -1856,6 +1874,51 @@ async fn get_project_environment_diagnostics(
             }),
         ),
         Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+    }
+}
+
+async fn get_project_environment_history(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let mut daemon = match state.daemon.lock() {
+        Ok(daemon) => daemon,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "daemon_lock_error".into(),
+                    message: "daemon lock poisoned".into(),
+                },
+            );
+        }
+    };
+
+    match daemon.get_project_environment_history(&project_id, &environment) {
+        Ok(history) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: history,
+            }),
+        ),
+        Err(err) => {
+            let status = match err.code.as_str() {
+                "project_not_found" => StatusCode::NOT_FOUND,
+                "invalid_environment" => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_response(status, &request_id, err)
+        }
     }
 }
 

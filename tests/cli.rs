@@ -151,6 +151,28 @@ fn cli_diagnose_reads_environment_diagnostics() {
 }
 
 #[test]
+fn cli_history_reads_environment_history() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"staging","entries":[{"generation":7,"deployment_id":"dep-7","commit_sha":"340ac8108006d84dbf951d8c0bb04ecfaf0eccac","source_ref":"main","image_ref":"forge/api:staging-gen-7","created_at_unix":1779320500,"promoted_at_unix":1779320528,"finalized_state":"healthy","finalized_at_unix":1779320520,"rollback_target":false,"restored_by_rollback":false,"retained":true,"eligible_for_gc":false,"missing_artifacts":false,"retained_reasons":["current/promoted generation"]}]}}"#,
+    );
+
+    let output = run_cli(&url, &["history", "api", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Generation 7"));
+    assert!(body.contains("retained: yes"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/staging/history"
+    );
+}
+
+#[test]
 fn cli_env_reports_redacted_secret_keys() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(

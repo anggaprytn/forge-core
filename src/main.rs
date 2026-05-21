@@ -10,13 +10,14 @@ use std::time::Duration;
 
 use forge_core::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
-    EnvironmentVariableReport, ErrorResponse, EventList, ProjectList, ProjectRecord,
-    ProjectUpsertRequest,
+    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
+    EnvironmentDiagnostics, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
+    ProjectRecord, ProjectUpsertRequest,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
+use forge_core::convergence::garbage_collect;
 use forge_core::daemon::{Daemon, DeploymentWorkerSettings, run_deployment_worker_loop};
 use forge_core::deployments::{
     ActivationMode, ExecutionConfig, FORGE_MANAGED_DOCKER_NETWORK, ValidationPolicy,
@@ -60,6 +61,7 @@ where
         parsed.command,
         Command::Doctor { .. }
             | Command::Daemon(_)
+            | Command::Gc { .. }
             | Command::Init { .. }
             | Command::Login { .. }
             | Command::Logout
@@ -157,6 +159,20 @@ where
                 print!("{}", render_environment_diagnostics(&diagnostics));
             }
         }
+        Command::History {
+            project_id,
+            environment,
+            json,
+        } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let history = client.get_project_environment_history(&project_id, &environment)?;
+            if json {
+                print_json(&history)?;
+            } else {
+                print!("{}", render_deployment_history(&history));
+            }
+        }
         Command::Env {
             project_id,
             environment,
@@ -177,6 +193,12 @@ where
             let events = client.get_events()?;
             print_json(&events.events)?;
         }
+        Command::Gc {
+            config_path,
+            caddy_admin_url,
+            caddy_public_url,
+            dry_run,
+        } => run_gc_command(config_path, caddy_admin_url, caddy_public_url, dry_run)?,
         Command::Rollback {
             project_id,
             environment,
@@ -307,6 +329,17 @@ impl ForgeClient {
     ) -> Result<EnvironmentDiagnostics, CliError> {
         self.send_json(self.http.get(format!(
             "{}/api/projects/{project_id}/environments/{environment}/diagnostics",
+            self.base_url
+        )))
+    }
+
+    fn get_project_environment_history(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<DeploymentHistoryResponse, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/history",
             self.base_url
         )))
     }
@@ -489,12 +522,23 @@ enum Command {
         environment: String,
         json: bool,
     },
+    History {
+        project_id: String,
+        environment: String,
+        json: bool,
+    },
     Env {
         project_id: String,
         environment: String,
         json: bool,
     },
     Events,
+    Gc {
+        config_path: PathBuf,
+        caddy_admin_url: String,
+        caddy_public_url: String,
+        dry_run: bool,
+    },
     Rollback {
         project_id: String,
         environment: String,
@@ -680,8 +724,21 @@ fn parse_command(
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
         [cmd, rest @ ..] if cmd == "logs" => parse_logs_command(rest),
         [cmd, rest @ ..] if cmd == "diagnose" => parse_diagnose_command(rest),
+        [cmd, rest @ ..] if cmd == "history" => parse_history_command(rest),
         [cmd, rest @ ..] if cmd == "env" => parse_env_command(rest),
         [cmd] if cmd == "events" => Ok(Command::Events),
+        [cmd] if cmd == "gc" => Ok(Command::Gc {
+            config_path,
+            caddy_admin_url,
+            caddy_public_url,
+            dry_run: false,
+        }),
+        [cmd, flag] if cmd == "gc" && flag == "--dry-run" => Ok(Command::Gc {
+            config_path,
+            caddy_admin_url,
+            caddy_public_url,
+            dry_run: true,
+        }),
         [cmd, project_id, environment] if cmd == "rollback" => Ok(Command::Rollback {
             project_id: project_id.clone(),
             environment: environment.clone(),
@@ -723,8 +780,10 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] logs [--json] <deployment_id>",
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] diagnose [--json] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] history [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] env [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] events",
+        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] gc [--dry-run]",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
         "  forge [--url URL] [--token TOKEN] project list",
@@ -732,6 +791,22 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] secrets set <project_id> <environment> <key> <value>",
     ]
     .join("\n")
+}
+
+fn parse_history_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [project_id, environment] => Ok(Command::History {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json: false,
+        }),
+        [flag, project_id, environment] if flag == "--json" => Ok(Command::History {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json: true,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
 }
 
 fn parse_deploy_command(args: &[String]) -> Result<Command, CliError> {
@@ -1199,6 +1274,141 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
             output.push_str(&format!("  {key}={value}\n"));
         }
     }
+    output.push('\n');
+    output.push_str("Retention:\n");
+    output.push_str(&format!(
+        "  Rollback-safe Generation: {}\n",
+        diagnostics
+            .rollback_safe_generation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    ));
+    if diagnostics.retained_generations.is_empty() {
+        output.push_str("  Retained Generations: none\n");
+    } else {
+        for generation in &diagnostics.retained_generations {
+            output.push_str(&format!("  gen-{}", generation.generation));
+            if generation.rollback_target {
+                output.push_str(" [rollback-safe]");
+            }
+            if generation.restored_by_rollback {
+                output.push_str(" [restored]");
+            }
+            output.push('\n');
+        }
+    }
+    output.push('\n');
+    output.push_str("Recent GC Actions:\n");
+    if diagnostics.recent_gc_actions.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for action in &diagnostics.recent_gc_actions {
+            output.push_str(&format!(
+                "  {} gen-{} {}: {}\n",
+                action.timestamp_unix,
+                action
+                    .generation
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                action.action,
+                action.outcome
+            ));
+        }
+    }
+    output
+}
+
+fn render_deployment_history(history: &DeploymentHistoryResponse) -> String {
+    let mut output = String::new();
+    for entry in &history.entries {
+        output.push_str(&format!("Generation {}\n", entry.generation));
+        let status = if entry.rollback_target {
+            "rollback_target"
+        } else if entry.retained {
+            if entry.promoted_at_unix.is_some() {
+                "active"
+            } else {
+                "historical"
+            }
+        } else if entry.eligible_for_gc {
+            "gc-eligible"
+        } else {
+            "historical"
+        };
+        output.push_str(&format!("  status: {status}\n"));
+        if let Some(commit_sha) = entry.commit_sha.as_deref() {
+            output.push_str(&format!("  commit: {commit_sha}\n"));
+        }
+        if let Some(deployment_id) = entry.deployment_id.as_deref() {
+            output.push_str(&format!("  deployment: {deployment_id}\n"));
+        }
+        if let Some(created_at) = entry.created_at_unix {
+            output.push_str(&format!("  created: {created_at}\n"));
+        }
+        if let Some(finalized_state) = entry.finalized_state.as_deref() {
+            output.push_str(&format!("  finalized: {finalized_state}\n"));
+        }
+        if let Some(promoted_at) = entry.promoted_at_unix {
+            output.push_str(&format!("  promoted: {promoted_at}\n"));
+        }
+        output.push_str(&format!(
+            "  retained: {}\n",
+            if entry.retained { "yes" } else { "no" }
+        ));
+        if entry.rollback_target {
+            output.push_str("  rollback_target: true\n");
+        }
+        if entry.restored_by_rollback {
+            output.push_str("  restored: true\n");
+        }
+        if entry.missing_artifacts {
+            output.push_str("  missing_artifacts: true\n");
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn render_gc_report(
+    report: &forge_core::convergence::GarbageCollectionReport,
+    dry_run: bool,
+) -> String {
+    let mut output = String::new();
+    if report.actions.is_empty() {
+        output.push_str(if dry_run {
+            "No GC actions would run.\n"
+        } else {
+            "No GC actions ran.\n"
+        });
+        return output;
+    }
+    for action in &report.actions {
+        output.push_str(&format!(
+            "{} {} {}\n",
+            action.project_id,
+            action.environment,
+            action
+                .generation
+                .map(|value| format!("gen-{value}"))
+                .unwrap_or_else(|| "global".into())
+        ));
+        output.push_str(&format!("  action: {}\n", action.action));
+        output.push_str(&format!("  reason: {}\n", action.reason));
+        output.push_str(&format!("  outcome: {}\n", action.outcome));
+        if !action.deleted.is_empty() {
+            output.push_str("  deleted:\n");
+            for entry in &action.deleted {
+                output.push_str(&format!("    {entry}\n"));
+            }
+        }
+        if !action.protected.is_empty() {
+            output.push_str("  protected:\n");
+            for entry in &action.protected {
+                output.push_str(&format!("    {entry}\n"));
+            }
+        }
+        output.push('\n');
+    }
     output
 }
 
@@ -1303,6 +1513,30 @@ fn run_whoami(parsed: &ParsedArgs) -> Result<(), CliError> {
         },
         authenticated: authenticated.into(),
     })
+}
+
+fn run_gc_command(
+    config_path: PathBuf,
+    caddy_admin_url: String,
+    caddy_public_url: String,
+    dry_run: bool,
+) -> Result<(), CliError> {
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let queue = PersistentQueue::new(config.storage_root.join("queue"))
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
+    let mut routing = CaddyApiRuntime::new(caddy_admin_url, caddy_public_url);
+    let report = garbage_collect(
+        &config.storage_root,
+        &queue,
+        &mut docker,
+        &mut routing,
+        dry_run,
+    )
+    .map_err(|err| CliError::Usage(err.to_string()))?;
+    print!("{}", render_gc_report(&report, dry_run));
+    Ok(())
 }
 
 fn load_saved_cli_config() -> Result<SavedCliConfig, CliError> {

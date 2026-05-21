@@ -133,6 +133,12 @@ pub struct EnvironmentDiagnostics {
     pub diagnostics_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_env_snapshot: Option<RuntimeEnvSnapshotMetadata>,
+    #[serde(default)]
+    pub retained_generations: Vec<DeploymentHistoryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_safe_generation: Option<u64>,
+    #[serde(default)]
+    pub recent_gc_actions: Vec<RecentGcAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +188,63 @@ pub struct EnvironmentVariableReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventList {
     pub events: Vec<EventRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentHistoryEntry {
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_at_unix: Option<u64>,
+    #[serde(default)]
+    pub rollback_target: bool,
+    #[serde(default)]
+    pub restored_by_rollback: bool,
+    #[serde(default)]
+    pub retained: bool,
+    #[serde(default)]
+    pub eligible_for_gc: bool,
+    #[serde(default)]
+    pub missing_artifacts: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentHistoryResponse {
+    pub project_id: String,
+    pub environment: String,
+    #[serde(default)]
+    pub entries: Vec<DeploymentHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentGcAction {
+    pub timestamp_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub action: String,
+    pub reason: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub deleted: Vec<String>,
+    #[serde(default)]
+    pub protected: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -24,10 +24,11 @@ use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::status::derive_environment_domain;
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
-    GenerationAllocator, PersistedActivationMode, PersistedBuildInfo, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PointerStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
-    SnapshotState, SnapshotWriter, StorageError, load_generation_build_info,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    GenerationAllocator, GenerationHistoryRecord, PersistedActivationMode, PersistedBuildInfo,
+    PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore, RetentionStore,
+    RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
+    StorageError, current_unix_timestamp, load_generation_build_info, load_generation_runtime_info,
+    load_generation_snapshot_metadata,
 };
 
 #[derive(Debug)]
@@ -294,6 +295,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             record.project_id, record.environment, generation
         );
         let writer = SnapshotWriter::new(env.clone(), generation)?;
+        update_generation_history(&env, generation, |history| {
+            history.deployment_id = Some(record.deployment_id.clone());
+            history.commit_sha = record.commit_sha.clone();
+            history.source_ref = record.source_ref.clone();
+            history.source_path = record.source_path.clone();
+            history.created_at_unix = history.created_at_unix.or(Some(current_unix_timestamp()));
+        })?;
         let domain =
             load_environment_domain(&self.storage_root, &record.project_id, &record.environment)?;
         let runtime_secrets = match self.resolve_runtime_secrets(&execution.context_path, record) {
@@ -378,6 +386,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         };
         append_event(&events, record, generation, "IMAGE_BUILT", None)?;
         diagnostics.append_log_line(&format!("image built: {image_ref}"), &secret_values)?;
+        update_generation_history(&env, generation, |history| {
+            history.image_ref = Some(image_ref.clone());
+        })?;
         if let Some(network_name) = execution.network_name.as_deref() {
             if let Err(err) = self.docker.ensure_network(network_name) {
                 let failure_reason =
@@ -610,6 +621,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &record.environment,
             SnapshotState::Healthy,
         )?;
+        let snapshot = load_generation_snapshot_metadata(&env, generation)?;
+        update_generation_history(&env, generation, |history| {
+            history.finalized_state = Some("healthy".into());
+            history.finalized_at_unix = snapshot.as_ref().map(|value| value.finalized_at_unix);
+        })?;
         append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
         diagnostics.append_log_line("snapshot finalized", &secret_values)?;
         if let Err(err) = self.activate_generation(
@@ -642,6 +658,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         }
         append_event(&events, record, generation, "GENERATION_PROMOTED", None)?;
         diagnostics.append_log_line("generation promoted", &secret_values)?;
+        update_generation_history(&env, generation, |history| {
+            history.promoted_at_unix = Some(current_unix_timestamp());
+        })?;
         self.capture_container_logs_tail(&diagnostics, &container_name, &secret_values)?;
 
         Ok(DeploymentExecution {
@@ -728,6 +747,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         }
 
         pointers.swap_current(target)?;
+        update_generation_history(&env, target, |history| {
+            history.restored_by_rollback = true;
+            history.promoted_at_unix = Some(current_unix_timestamp());
+        })?;
         RuntimeStateStore::new(env.clone()).save(&RuntimeState {
             active_generation: Some(target),
             health_state: RuntimeHealthState::Healthy,
@@ -1536,6 +1559,38 @@ impl RollbackExecutor {
         metrics_registry().record_rollback();
         Ok(target)
     }
+}
+
+fn update_generation_history<F>(
+    env: &EnvironmentPaths,
+    generation: u64,
+    mut apply: F,
+) -> Result<(), DeploymentError>
+where
+    F: FnMut(&mut GenerationHistoryRecord),
+{
+    let store = RetentionStore::new(env.clone());
+    let mut metadata = store.read()?;
+    let mut updated = false;
+    for record in &mut metadata.generations {
+        if record.generation == generation {
+            apply(record);
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        let mut record = GenerationHistoryRecord {
+            generation,
+            ..GenerationHistoryRecord::default()
+        };
+        apply(&mut record);
+        metadata.generations.push(record);
+        metadata.generations.sort_by_key(|record| record.generation);
+    }
+    metadata.updated_at_unix = Some(current_unix_timestamp());
+    store.write(&metadata)?;
+    Ok(())
 }
 
 fn append_event(
