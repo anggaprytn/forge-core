@@ -562,9 +562,24 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     err.to_string(),
                 ))
             })?;
-        writer.write_artifact(
-            "runtime_env_snapshot.json",
-            &format!("{runtime_env_snapshot}\n"),
+        let runtime_env_snapshot_path = writer.generation_dir().join("runtime_env_snapshot.json");
+        writer
+            .write_artifact(
+                "runtime_env_snapshot.json",
+                &format!("{runtime_env_snapshot}\n"),
+            )
+            .map_err(|err| {
+                StorageError::Io(std::io::Error::other(format!(
+                    "failed to write {}: {err}",
+                    runtime_env_snapshot_path.display()
+                )))
+            })?;
+        diagnostics.append_log_line(
+            &format!(
+                "runtime env snapshot written: {}",
+                runtime_env_snapshot_path.display()
+            ),
+            &secret_values,
         )?;
         let resolved_runtime =
             serde_json::to_string_pretty(&runtime_env.resolved).map_err(|err| {
@@ -3947,6 +3962,101 @@ pub mod runtime_environment_snapshots {
                 .iter()
                 .any(|entry| entry.key == "FORGE_DEPLOYMENT_ID" && entry.value == "dep-1")
         );
+    }
+
+    #[test]
+    fn successful_deploy_persists_env_snapshot_before_promotion() {
+        let root = test_root("successful-deploy-persists-env-snapshot-before-promotion");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+
+        execute_with_runtime_env(&root);
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let snapshot_path = env.generation_dir(1).join("runtime_env_snapshot.json");
+        assert!(snapshot_path.exists());
+        assert_eq!(
+            PointerStore::new(env.clone())
+                .read_pointer("current")
+                .unwrap(),
+            Some(1)
+        );
+
+        let diagnostics = DiagnosticsStore::new(env, 1);
+        let log_lines = diagnostics.read_log_lines().unwrap();
+        let snapshot_line = log_lines
+            .iter()
+            .position(|line| line.contains("runtime env snapshot written:"))
+            .unwrap();
+        let promotion_line = log_lines
+            .iter()
+            .position(|line| line == "generation promoted")
+            .unwrap();
+        assert!(snapshot_line < promotion_line);
+        assert!(log_lines[snapshot_line].contains(snapshot_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn deployment_fails_if_env_snapshot_write_fails() {
+        let root = test_root("deployment-fails-if-env-snapshot-write-fails");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        std::fs::create_dir_all(env.generation_dir(1).join("runtime_env_snapshot.json")).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.to_path_buf()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = StickyRoutingRuntime {
+            inspection: RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            },
+        };
+
+        let err = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap_err();
+
+        assert!(err.to_string().contains("runtime_env_snapshot.json"));
+        assert_eq!(
+            PointerStore::new(env.clone())
+                .read_pointer("current")
+                .unwrap(),
+            None
+        );
+        assert!(!env.generation_dir(1).join("snapshot.json").exists());
     }
 
     #[test]

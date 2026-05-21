@@ -18,8 +18,9 @@ use crate::runtime::{
 };
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::storage::{
-    DiagnosticsStore, EnvironmentPaths, PersistedActivationMode, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PointerStore, RuntimeState, RuntimeStateStore, StorageError,
+    DiagnosticsStore, EnvironmentPaths, PersistedActivationMode, PersistedBuildInfo,
+    PersistedRouteTargetSource, PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo,
+    PersistedSnapshotMetadata, PointerStore, RuntimeState, RuntimeStateStore, StorageError,
     load_generation_build_info, load_generation_runtime_env_snapshot, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
@@ -137,6 +138,26 @@ pub fn route_subtree_id(project_id: &str, environment: &str) -> String {
     format!("forge:{project_id}:{environment}")
 }
 
+#[derive(Debug, Clone)]
+struct EnvironmentRuntimeTruth {
+    current_generation: Option<u64>,
+    active_generation: Option<u64>,
+    latest_generation: Option<u64>,
+    promoted_snapshot: Option<PersistedSnapshotMetadata>,
+    promoted_runtime: Option<PersistedRuntimeInfo>,
+    promoted_build: Option<PersistedBuildInfo>,
+    latest_snapshot: Option<PersistedSnapshotMetadata>,
+    latest_build: Option<PersistedBuildInfo>,
+    promoted_runtime_env_snapshot: Option<PersistedRuntimeEnvSnapshot>,
+    container_running: bool,
+    container_status: Option<String>,
+    container_started_at: Option<String>,
+    network_name: Option<String>,
+    container_ip: Option<String>,
+    image_ref: Option<String>,
+    route_details: Option<RouteStatusDetails>,
+}
+
 pub fn project_status_error_response(
     err: ProjectStatusError,
 ) -> (axum::http::StatusCode, ErrorResponse) {
@@ -199,37 +220,8 @@ where
     let domain = derive_environment_domain(&project.base_domain, environment);
 
     let env = EnvironmentPaths::new(storage_root, project_id, environment);
-    env.ensure_exists()?;
-    let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
-    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    let active_generation = resolve_active_generation(current_generation, &runtime_state);
-    let latest_generation = latest_generation(&env)?;
-
-    let promoted_snapshot = active_generation
-        .map(|generation| load_generation_snapshot_metadata(&env, generation))
-        .transpose()?
-        .flatten();
-    let promoted_runtime = active_generation
-        .map(|generation| load_generation_runtime_info(&env, generation))
-        .transpose()?
-        .flatten();
-    let promoted_build = active_generation
-        .map(|generation| load_generation_build_info(&env, generation))
-        .transpose()?
-        .flatten();
-
-    let latest_snapshot = latest_generation
-        .map(|generation| load_generation_snapshot_metadata(&env, generation))
-        .transpose()?
-        .flatten();
-    let latest_build = latest_generation
-        .map(|generation| load_generation_build_info(&env, generation))
-        .transpose()?
-        .flatten();
-    let promoted_runtime_env_snapshot = active_generation
-        .map(|generation| load_generation_runtime_env_snapshot(&env, generation))
-        .transpose()?
-        .flatten();
+    let truth =
+        load_environment_runtime_truth(&env, docker, routing, project_id, environment, &domain)?;
 
     let deploying = queue
         .map(|queue| queue.load_state())
@@ -243,84 +235,48 @@ where
                 .any(|record| record.project_id == project_id && record.environment == environment)
         });
 
-    let container_name = promoted_runtime
+    let container_name = truth
+        .promoted_runtime
         .as_ref()
         .map(|runtime| runtime.container_name.clone());
-    let container_inspection = inspect_promoted_container(docker, promoted_runtime.as_ref());
-    let container_running = container_inspection
-        .as_ref()
-        .is_some_and(|inspection| inspection.running);
-    let container_status = container_inspection
-        .as_ref()
-        .map(|inspection| inspection.state_status.clone());
-    let container_started_at = container_inspection
-        .as_ref()
-        .and_then(|inspection| inspection.started_at.clone());
-    let network_name =
-        select_network_name(promoted_runtime.as_ref(), container_inspection.as_ref());
-    let container_ip = network_name
-        .as_deref()
-        .and_then(|network| {
-            container_inspection
-                .as_ref()
-                .and_then(|inspection| inspection.network_ips.get(network).cloned())
-        })
-        .or_else(|| {
-            container_inspection
-                .as_ref()
-                .and_then(|inspection| inspection.network_ips.values().next().cloned())
-        });
-    let image_ref = container_inspection
-        .as_ref()
-        .map(|inspection| inspection.image_ref.clone())
-        .or_else(|| promoted_build.as_ref().map(|build| build.image_ref.clone()));
-
-    let route_details = inspect_route_status(
-        routing,
-        project_id,
-        environment,
-        &domain,
-        promoted_runtime.as_ref(),
-        container_inspection.as_ref(),
-        network_name.as_deref(),
-    );
-
-    let route_active = route_details
+    let route_active = truth
+        .route_details
         .as_ref()
         .and_then(|details| details.inspection.as_ref())
         .is_some();
-    let route_matches = route_details
+    let route_matches = truth
+        .route_details
         .as_ref()
         .is_some_and(RouteStatusDetails::matches_truth);
-    let route_required = promoted_runtime
+    let route_required = truth
+        .route_details
         .as_ref()
-        .and_then(|runtime| runtime.activation.as_ref())
-        .is_some_and(|activation| matches!(activation, PersistedActivationMode::Http { .. }));
-    let runtime_matches_promoted = current_generation == active_generation;
-    let promoted_snapshot_healthy = promoted_snapshot
+        .is_some_and(RouteStatusDetails::route_required);
+    let promoted_snapshot_healthy = truth
+        .promoted_snapshot
         .as_ref()
         .is_some_and(|snapshot| snapshot.state == "healthy");
 
     let status = if deploying {
         "deploying"
-    } else if current_generation.is_some()
+    } else if truth.active_generation.is_some()
         && promoted_snapshot_healthy
-        && container_running
-        && runtime_matches_promoted
+        && truth.container_running
         && (!route_required || route_matches)
     {
         "healthy"
-    } else if current_generation.is_none()
-        && latest_snapshot
+    } else if truth.current_generation.is_none()
+        && truth
+            .latest_snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.state == "failed")
     {
         "failed"
-    } else if current_generation.is_none()
-        && active_generation.is_none()
-        && latest_snapshot.is_none()
-        && promoted_runtime.is_none()
-        && promoted_build.is_none()
+    } else if truth.current_generation.is_none()
+        && truth.active_generation.is_none()
+        && truth.latest_snapshot.is_none()
+        && truth.promoted_runtime.is_none()
+        && truth.promoted_build.is_none()
     {
         "missing"
     } else {
@@ -331,52 +287,62 @@ where
         project_id: project_id.to_string(),
         environment: environment.to_string(),
         status: status.into(),
-        active_generation,
+        active_generation: truth.active_generation,
         domain,
-        commit_sha: promoted_build
+        commit_sha: truth
+            .promoted_build
             .as_ref()
             .and_then(|build| build.commit_sha.clone())
             .or_else(|| {
-                promoted_runtime
+                truth
+                    .promoted_runtime
                     .as_ref()
                     .and_then(|runtime| runtime.commit_sha.clone())
             }),
-        source_ref: promoted_build
+        source_ref: truth
+            .promoted_build
             .as_ref()
             .and_then(|build| build.source_ref.clone())
             .or_else(|| {
-                promoted_runtime
+                truth
+                    .promoted_runtime
                     .as_ref()
                     .and_then(|runtime| runtime.source_ref.clone())
             }),
         container_name,
-        container_running,
-        container_status,
-        network_name,
-        container_ip,
+        container_running: truth.container_running,
+        container_status: truth.container_status,
+        network_name: truth.network_name,
+        container_ip: truth.container_ip,
         route_active,
-        probe_path: promoted_runtime
+        probe_path: truth
+            .promoted_runtime
             .as_ref()
             .and_then(|runtime| runtime.probe_path.clone()),
-        image_ref,
-        last_deployment_id: promoted_build
+        image_ref: truth.image_ref,
+        last_deployment_id: truth
+            .promoted_build
             .as_ref()
             .map(|build| build.deployment_id.clone())
             .or_else(|| {
-                latest_build
+                truth
+                    .latest_build
                     .as_ref()
                     .map(|build| build.deployment_id.clone())
             }),
-        deployed_at_unix: promoted_snapshot
+        deployed_at_unix: truth
+            .promoted_snapshot
             .as_ref()
             .map(|snapshot| snapshot.finalized_at_unix)
             .or_else(|| {
-                latest_snapshot
+                truth
+                    .latest_snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.finalized_at_unix)
             }),
-        container_started_at,
-        runtime_env_snapshot: promoted_runtime_env_snapshot
+        container_started_at: truth.container_started_at,
+        runtime_env_snapshot: truth
+            .promoted_runtime_env_snapshot
             .as_ref()
             .map(runtime_env_snapshot_metadata),
     })
@@ -394,38 +360,24 @@ where
     D: DockerRuntime,
     R: RoutingRuntime,
 {
-    let status = load_project_environment_status(
-        storage_root,
-        queue,
-        docker,
-        routing,
-        project_id,
-        environment,
-    )?;
+    if !matches!(environment, "development" | "staging" | "production") {
+        return Err(ProjectStatusError::InvalidEnvironment);
+    }
+
+    let project = ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ProjectStatusError::ProjectLookup(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?
+        .ok_or(ProjectStatusError::ProjectNotFound)?;
+    let domain = derive_environment_domain(&project.base_domain, environment);
     let env = EnvironmentPaths::new(storage_root, project_id, environment);
-    let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
-    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    let active_generation = resolve_active_generation(current_generation, &runtime_state);
-    let promoted_runtime = active_generation
-        .map(|generation| load_generation_runtime_info(&env, generation))
-        .transpose()?
-        .flatten();
-    let promoted_runtime_env_snapshot = active_generation
-        .map(|generation| load_generation_runtime_env_snapshot(&env, generation))
-        .transpose()?
-        .flatten();
-    let container_inspection = inspect_promoted_container(docker, promoted_runtime.as_ref());
-    let network_name =
-        select_network_name(promoted_runtime.as_ref(), container_inspection.as_ref());
-    let route_details = inspect_route_status(
-        routing,
-        project_id,
-        environment,
-        &status.domain,
-        promoted_runtime.as_ref(),
-        container_inspection.as_ref(),
-        network_name.as_deref(),
-    );
+    let truth =
+        load_environment_runtime_truth(&env, docker, routing, project_id, environment, &domain)?;
+    let status =
+        build_environment_status_from_truth(queue, project_id, environment, &domain, &truth)?;
 
     let recent_failure_generations = list_recent_failure_generations(&env)?;
     let latest_failed_generation = recent_failure_generations.first().copied();
@@ -439,12 +391,14 @@ where
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
-        .map(|failure| mark_failure_historical(failure, active_generation, status.status.as_str()))
+        .map(|failure| {
+            mark_failure_historical(failure, truth.active_generation, status.status.as_str())
+        })
         .collect::<Vec<_>>();
 
     let latest_failure_is_current = latest_failed_generation.is_some_and(|generation| {
-        active_generation == Some(generation)
-            || (active_generation.is_none() && status.status != "healthy")
+        truth.active_generation == Some(generation)
+            || (truth.active_generation.is_none() && status.status != "healthy")
     });
 
     let probe_target = latest_failure
@@ -452,7 +406,8 @@ where
         .filter(|_| latest_failure_is_current)
         .and_then(|failure| failure.probe_target.clone())
         .or_else(|| {
-            promoted_runtime
+            truth
+                .promoted_runtime
                 .as_ref()
                 .map(|runtime| ProbeTargetDiagnostics {
                     host: status.container_ip.clone(),
@@ -461,7 +416,7 @@ where
                 })
         });
 
-    let route = if let Some(details) = route_details.as_ref() {
+    let route = if let Some(details) = truth.route_details.as_ref() {
         RouteDiagnostics {
             route_required: details.route_required(),
             route_active: details.inspection.is_some(),
@@ -491,14 +446,14 @@ where
         project_id: project_id.to_string(),
         environment: environment.to_string(),
         status: status.status,
-        active_generation,
+        active_generation: truth.active_generation,
         last_deployment_id: status.last_deployment_id,
         container: ContainerRuntimeDiagnostics {
             container_name: status.container_name,
             running: status.container_running,
             state_status: status.container_status,
             image_ref: status.image_ref,
-            network_name,
+            network_name: truth.network_name,
             container_ip: status.container_ip,
             started_at: status.container_started_at,
         },
@@ -527,7 +482,8 @@ where
         diagnostics_source: latest_failure
             .filter(|_| latest_failure_is_current && status_value != "healthy")
             .map(|failure| failure.diagnostics_source),
-        runtime_env_snapshot: promoted_runtime_env_snapshot
+        runtime_env_snapshot: truth
+            .promoted_runtime_env_snapshot
             .as_ref()
             .map(runtime_env_snapshot_metadata),
     })
@@ -553,14 +509,9 @@ pub fn load_project_environment_env_report(
 
     let env = EnvironmentPaths::new(storage_root, project_id, environment);
     env.ensure_exists()?;
-    let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
-    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    let generation =
-        resolve_active_generation(current_generation, &runtime_state).ok_or_else(|| {
-            ProjectStatusError::RuntimeEnvSnapshotUnavailable(
-                "runtime env snapshot unavailable".into(),
-            )
-        })?;
+    let generation = load_environment_active_generation(&env)?.ok_or_else(|| {
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable("runtime env snapshot unavailable".into())
+    })?;
     let snapshot = load_generation_runtime_env_snapshot(&env, generation)?.ok_or_else(|| {
         ProjectStatusError::RuntimeEnvSnapshotUnavailable(
             "runtime env snapshot unavailable for this generation; redeploy required".into(),
@@ -615,6 +566,251 @@ fn latest_generation(env: &EnvironmentPaths) -> Result<Option<u64>, ProjectStatu
         }
     }
     Ok(latest)
+}
+
+fn load_environment_active_generation(
+    env: &EnvironmentPaths,
+) -> Result<Option<u64>, ProjectStatusError> {
+    env.ensure_exists()?;
+    let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
+    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
+    Ok(resolve_active_generation(
+        current_generation,
+        &runtime_state,
+    ))
+}
+
+fn load_environment_runtime_truth<D, R>(
+    env: &EnvironmentPaths,
+    docker: &mut D,
+    routing: &mut R,
+    project_id: &str,
+    environment: &str,
+    domain: &str,
+) -> Result<EnvironmentRuntimeTruth, ProjectStatusError>
+where
+    D: DockerRuntime,
+    R: RoutingRuntime,
+{
+    env.ensure_exists()?;
+    let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
+    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
+    let active_generation = resolve_active_generation(current_generation, &runtime_state);
+    let latest_generation = latest_generation(env)?;
+
+    let promoted_snapshot = active_generation
+        .map(|generation| load_generation_snapshot_metadata(env, generation))
+        .transpose()?
+        .flatten();
+    let promoted_runtime = active_generation
+        .map(|generation| load_generation_runtime_info(env, generation))
+        .transpose()?
+        .flatten();
+    let promoted_build = active_generation
+        .map(|generation| load_generation_build_info(env, generation))
+        .transpose()?
+        .flatten();
+    let latest_snapshot = latest_generation
+        .map(|generation| load_generation_snapshot_metadata(env, generation))
+        .transpose()?
+        .flatten();
+    let latest_build = latest_generation
+        .map(|generation| load_generation_build_info(env, generation))
+        .transpose()?
+        .flatten();
+    let promoted_runtime_env_snapshot = active_generation
+        .map(|generation| load_generation_runtime_env_snapshot(env, generation))
+        .transpose()?
+        .flatten();
+
+    let container_inspection = inspect_promoted_container(docker, promoted_runtime.as_ref());
+    let container_running = container_inspection
+        .as_ref()
+        .is_some_and(|inspection| inspection.running);
+    let container_status = container_inspection
+        .as_ref()
+        .map(|inspection| inspection.state_status.clone());
+    let container_started_at = container_inspection
+        .as_ref()
+        .and_then(|inspection| inspection.started_at.clone());
+    let network_name =
+        select_network_name(promoted_runtime.as_ref(), container_inspection.as_ref());
+    let container_ip = network_name
+        .as_deref()
+        .and_then(|network| {
+            container_inspection
+                .as_ref()
+                .and_then(|inspection| inspection.network_ips.get(network).cloned())
+        })
+        .or_else(|| {
+            container_inspection
+                .as_ref()
+                .and_then(|inspection| inspection.network_ips.values().next().cloned())
+        });
+    let image_ref = container_inspection
+        .as_ref()
+        .map(|inspection| inspection.image_ref.clone())
+        .or_else(|| promoted_build.as_ref().map(|build| build.image_ref.clone()));
+    let route_details = inspect_route_status(
+        routing,
+        project_id,
+        environment,
+        domain,
+        promoted_runtime.as_ref(),
+        container_inspection.as_ref(),
+        network_name.as_deref(),
+    );
+
+    Ok(EnvironmentRuntimeTruth {
+        current_generation,
+        active_generation,
+        latest_generation,
+        promoted_snapshot,
+        promoted_runtime,
+        promoted_build,
+        latest_snapshot,
+        latest_build,
+        promoted_runtime_env_snapshot,
+        container_running,
+        container_status,
+        container_started_at,
+        network_name,
+        container_ip,
+        image_ref,
+        route_details,
+    })
+}
+
+fn build_environment_status_from_truth(
+    queue: Option<&PersistentQueue>,
+    project_id: &str,
+    environment: &str,
+    domain: &str,
+    truth: &EnvironmentRuntimeTruth,
+) -> Result<ProjectEnvironmentStatus, ProjectStatusError> {
+    let deploying = queue
+        .map(|queue| queue.load_state())
+        .transpose()?
+        .is_some_and(|state| {
+            state.active.as_ref().is_some_and(|record| {
+                record.project_id == project_id && record.environment == environment
+            }) || state
+                .queued
+                .iter()
+                .any(|record| record.project_id == project_id && record.environment == environment)
+        });
+
+    let container_name = truth
+        .promoted_runtime
+        .as_ref()
+        .map(|runtime| runtime.container_name.clone());
+    let route_active = truth
+        .route_details
+        .as_ref()
+        .and_then(|details| details.inspection.as_ref())
+        .is_some();
+    let route_matches = truth
+        .route_details
+        .as_ref()
+        .is_some_and(RouteStatusDetails::matches_truth);
+    let route_required = truth
+        .route_details
+        .as_ref()
+        .is_some_and(RouteStatusDetails::route_required);
+    let promoted_snapshot_healthy = truth
+        .promoted_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.state == "healthy");
+
+    let status = if deploying {
+        "deploying"
+    } else if truth.active_generation.is_some()
+        && promoted_snapshot_healthy
+        && truth.container_running
+        && (!route_required || route_matches)
+    {
+        "healthy"
+    } else if truth.current_generation.is_none()
+        && truth
+            .latest_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.state == "failed")
+    {
+        "failed"
+    } else if truth.current_generation.is_none()
+        && truth.active_generation.is_none()
+        && truth.latest_generation.is_none()
+        && truth.promoted_runtime.is_none()
+        && truth.promoted_build.is_none()
+    {
+        "missing"
+    } else {
+        "degraded"
+    };
+
+    Ok(ProjectEnvironmentStatus {
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        status: status.into(),
+        active_generation: truth.active_generation,
+        domain: domain.to_string(),
+        commit_sha: truth
+            .promoted_build
+            .as_ref()
+            .and_then(|build| build.commit_sha.clone())
+            .or_else(|| {
+                truth
+                    .promoted_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.commit_sha.clone())
+            }),
+        source_ref: truth
+            .promoted_build
+            .as_ref()
+            .and_then(|build| build.source_ref.clone())
+            .or_else(|| {
+                truth
+                    .promoted_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.source_ref.clone())
+            }),
+        container_name,
+        container_running: truth.container_running,
+        container_status: truth.container_status.clone(),
+        network_name: truth.network_name.clone(),
+        container_ip: truth.container_ip.clone(),
+        route_active,
+        probe_path: truth
+            .promoted_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.probe_path.clone()),
+        image_ref: truth.image_ref.clone(),
+        last_deployment_id: truth
+            .promoted_build
+            .as_ref()
+            .map(|build| build.deployment_id.clone())
+            .or_else(|| {
+                truth
+                    .latest_build
+                    .as_ref()
+                    .map(|build| build.deployment_id.clone())
+            }),
+        deployed_at_unix: truth
+            .promoted_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.finalized_at_unix)
+            .or_else(|| {
+                truth
+                    .latest_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.finalized_at_unix)
+            }),
+        container_started_at: truth.container_started_at.clone(),
+        runtime_env_snapshot: truth
+            .promoted_runtime_env_snapshot
+            .as_ref()
+            .map(runtime_env_snapshot_metadata),
+    })
 }
 
 fn list_generation_numbers(env: &EnvironmentPaths) -> Result<Vec<u64>, ProjectStatusError> {
@@ -1678,6 +1874,178 @@ mod tests {
         let report = load_project_environment_env_report(&root, "api", "staging").unwrap();
         assert_eq!(report.generation, 7);
         assert_eq!(report.deployment_id, "dep-7");
+    }
+
+    #[test]
+    fn env_reads_snapshot_for_promoted_generation() {
+        let root = test_root("env-reads-snapshot-for-promoted-generation");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 6);
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        PointerStore::new(env.clone()).swap_current(6).unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        let report = load_project_environment_env_report(&root, "api", "staging").unwrap();
+        assert_eq!(report.generation, 7);
+        assert_eq!(report.deployment_id, "dep-7");
+    }
+
+    #[test]
+    fn status_healthy_when_container_and_route_active() {
+        let root = test_root("status-healthy-when-container-and-route-active");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 6);
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        PointerStore::new(env.clone()).swap_current(6).unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(status.active_generation, Some(7));
+        assert!(status.container_running);
+        assert!(status.route_active);
+        assert_eq!(status.status, "healthy");
+    }
+
+    #[test]
+    fn diagnose_uses_same_runtime_truth_as_status() {
+        let root = test_root("diagnose-uses-same-runtime-truth-as-status");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 6);
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        PointerStore::new(env.clone()).swap_current(6).unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        let mut status_docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut status_routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut status_docker,
+            &mut status_routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        struct SingleInspectionRoutingRuntime {
+            inspection: Option<RouteInspection>,
+        }
+
+        impl RoutingRuntime for SingleInspectionRoutingRuntime {
+            fn update_route(
+                &mut self,
+                _request: RouteUpdateRequest,
+            ) -> Result<(), RoutingRuntimeError> {
+                Ok(())
+            }
+
+            fn inspect_route(
+                &mut self,
+                _subtree_id: &str,
+            ) -> Result<RouteInspection, RoutingRuntimeError> {
+                self.inspection
+                    .take()
+                    .ok_or_else(|| RoutingRuntimeError::InspectionFailed("missing route".into()))
+            }
+
+            fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
+                Ok(self.inspection.clone().into_iter().collect())
+            }
+
+            fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {
+                Ok(())
+            }
+        }
+
+        let mut diagnose_docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut diagnose_routing = SingleInspectionRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics = load_environment_diagnostics(
+            &root,
+            None,
+            &mut diagnose_docker,
+            &mut diagnose_routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(status.active_generation, diagnostics.active_generation);
+        assert_eq!(status.container_name, diagnostics.container.container_name);
+        assert_eq!(status.container_ip, diagnostics.container.container_ip);
+        assert_eq!(
+            diagnostics.route.current_target.as_deref(),
+            Some("172.29.0.2:3000")
+        );
+        assert_eq!(
+            diagnostics.route.expected_target.as_deref(),
+            Some("172.29.0.2:3000")
+        );
+        assert!(diagnostics.route.route_active);
+        assert!(diagnostics.route.matches_expected);
+        assert_eq!(diagnostics.status, "healthy");
     }
 
     #[test]
