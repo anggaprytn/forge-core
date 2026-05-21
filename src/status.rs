@@ -798,6 +798,11 @@ where
         .promoted_snapshot
         .as_ref()
         .is_some_and(|snapshot| snapshot.state == "healthy");
+    let latest_failed_without_promotion = truth.current_generation.is_none()
+        && truth
+            .latest_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.state == DeploymentLifecycleState::Failed);
     let status = if deploying {
         "deploying"
     } else if truth.active_generation.is_some()
@@ -808,10 +813,11 @@ where
     {
         "healthy"
     } else if truth.current_generation.is_none()
-        && truth
+        && (truth
             .latest_snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.state == "failed")
+            || latest_failed_without_promotion)
     {
         "failed"
     } else if truth.current_generation.is_none()
@@ -1482,6 +1488,11 @@ fn build_environment_status_from_truth(
         .active_lifecycle
         .as_ref()
         .or(truth.latest_lifecycle.as_ref());
+    let latest_failed_without_promotion = truth.current_generation.is_none()
+        && truth
+            .latest_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.state == DeploymentLifecycleState::Failed);
 
     let status = if deploying {
         "deploying"
@@ -1493,10 +1504,11 @@ fn build_environment_status_from_truth(
     {
         "healthy"
     } else if truth.current_generation.is_none()
-        && truth
+        && (truth
             .latest_snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.state == "failed")
+            || latest_failed_without_promotion)
     {
         "failed"
     } else if truth.current_generation.is_none()
@@ -2492,6 +2504,38 @@ mod tests {
             .unwrap();
     }
 
+    fn write_failed_first_generation(root: &Path, generation: u64) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                &format!(
+                    "{{\n  \"deployment_id\": \"dep-{generation}\",\n  \"image_ref\": \"forge/api:staging-gen-{generation}\"\n}}\n"
+                ),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", SnapshotState::Failed)
+            .unwrap();
+        write_lifecycle_state(root, generation, DeploymentLifecycleState::Failed);
+        DiagnosticsStore::new(env, generation)
+            .write_summary(&crate::storage::DiagnosticSummary {
+                deployment_id: Some(format!("dep-{generation}")),
+                failure_stage: "topology".into(),
+                failure_reason: "service dependency graph contains a cycle".into(),
+                container_name: "staging-api-api-gen-1".into(),
+                failed_service_name: Some("api".into()),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: Some("api<-worker; worker<-api".into()),
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+    }
+
     fn write_generation_with_runtime(
         root: &Path,
         generation: u64,
@@ -3348,10 +3392,12 @@ mod tests {
                 failure_stage: "validating_runtime".into(),
                 failure_reason: "http health probe failed".into(),
                 container_name: "staging-api-gen-8".into(),
+                failed_service_name: None,
                 probe_target_host: Some("172.29.0.3".into()),
                 probe_target_port: Some(3000),
                 probe_target_path: Some("/health".into()),
                 cleanup_recorded: true,
+                dependency_graph_summary: None,
                 runtime_env_preview: Vec::new(),
             })
             .unwrap();
@@ -3387,6 +3433,74 @@ mod tests {
             diagnostics.likely_failure_stage.as_deref(),
             Some("validating_runtime")
         );
+    }
+
+    #[test]
+    fn status_failed_when_first_deploy_fails_before_promotion() {
+        let root = test_root("status-failed-when-first-deploy-fails-before-promotion");
+        register_project(&root, "api", "api.example.com");
+        write_failed_first_generation(&root, 1);
+
+        let mut docker = StubDockerRuntime::default();
+        let mut routing = StubRoutingRuntime::default();
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.last_deployment_id.as_deref(), Some("dep-1"));
+        assert_eq!(
+            status.lifecycle_state,
+            Some(DeploymentLifecycleState::Failed)
+        );
+    }
+
+    #[test]
+    fn diagnose_reports_failed_first_deploy_without_promoted_generation() {
+        let root = test_root("diagnose-reports-failed-first-deploy-without-promoted-generation");
+        register_project(&root, "api", "api.example.com");
+        write_failed_first_generation(&root, 1);
+
+        let mut docker = StubDockerRuntime::default();
+        let mut routing = StubRoutingRuntime::default();
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.status, "failed");
+        assert_eq!(diagnostics.recent_failures.len(), 1);
+        assert_eq!(diagnostics.recent_failures[0].generation, 1);
+        assert_eq!(
+            diagnostics.recent_failures[0].deployment_id.as_deref(),
+            Some("dep-1")
+        );
+    }
+
+    #[test]
+    fn history_shows_failed_first_generation() {
+        let root = test_root("history-shows-failed-first-generation");
+        register_project(&root, "api", "api.example.com");
+        write_failed_first_generation(&root, 1);
+
+        let mut docker = StubDockerRuntime::default();
+        let mut routing = StubRoutingRuntime::default();
+        let history =
+            load_environment_history(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].generation, 1);
+        assert_eq!(
+            history.entries[0].lifecycle_state,
+            Some(DeploymentLifecycleState::Failed)
+        );
+        assert_eq!(history.entries[0].deployment_id.as_deref(), Some("dep-1"));
     }
 
     #[test]
@@ -3934,10 +4048,12 @@ mod tests {
                 failure_stage: "startup_recovery".into(),
                 failure_reason: "retention cleanup removed diagnostics".into(),
                 container_name: "staging-api-gen-8".into(),
+                failed_service_name: None,
                 probe_target_host: None,
                 probe_target_port: None,
                 probe_target_path: None,
                 cleanup_recorded: true,
+                dependency_graph_summary: None,
                 runtime_env_preview: Vec::new(),
             })
             .unwrap();
@@ -4192,10 +4308,12 @@ mod tests {
                 failure_stage: "startup_recovery".into(),
                 failure_reason: "retention cleanup removed diagnostics".into(),
                 container_name: "staging-api-gen-8".into(),
+                failed_service_name: None,
                 probe_target_host: None,
                 probe_target_port: None,
                 probe_target_path: None,
                 cleanup_recorded: true,
+                dependency_graph_summary: None,
                 runtime_env_preview: Vec::new(),
             })
             .unwrap();
@@ -4244,10 +4362,12 @@ mod tests {
                 failure_stage: "validation".into(),
                 failure_reason: "http health probe failed".into(),
                 container_name: "staging-api-gen-5".into(),
+                failed_service_name: None,
                 probe_target_host: None,
                 probe_target_port: None,
                 probe_target_path: None,
                 cleanup_recorded: false,
+                dependency_graph_summary: None,
                 runtime_env_preview: Vec::new(),
             })
             .unwrap();

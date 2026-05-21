@@ -17,6 +17,7 @@ pub struct CreateContainerRequest {
     pub labels: BTreeMap<String, String>,
     pub environment: BTreeMap<String, String>,
     pub network_name: Option<String>,
+    pub network_aliases: Vec<String>,
     pub command: Option<Vec<String>>,
 }
 

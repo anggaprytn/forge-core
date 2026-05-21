@@ -2054,10 +2054,12 @@ fn persist_cleanup_state(
         failure_stage: "startup_recovery".into(),
         failure_reason: merged.failure_reason.clone(),
         container_name: merged.container_name.clone().unwrap_or_default(),
+        failed_service_name: None,
         probe_target_host: None,
         probe_target_port: None,
         probe_target_path: None,
         cleanup_recorded: true,
+        dependency_graph_summary: None,
         runtime_env_preview: Vec::new(),
     })?;
     Ok(())
@@ -3093,6 +3095,7 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
         labels,
         environment,
         network_name: runtime.network_name.clone(),
+        network_aliases: Vec::new(),
         command: runtime.command.clone(),
     })?;
     docker.start_container(&runtime.container_name)?;

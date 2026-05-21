@@ -699,6 +699,14 @@ fn read_generation_deployment_id(path: &std::path::Path) -> Result<Option<String
         }
     }
 
+    let summary = path.join("diagnostics").join("summary.json");
+    if summary.exists() {
+        let raw = std::fs::read_to_string(summary)?;
+        if let Some(deployment_id) = extract_json_string(&raw, "deployment_id") {
+            return Ok(Some(deployment_id));
+        }
+    }
+
     let events = path.join("events.jsonl");
     if !events.exists() {
         return Ok(None);
@@ -1421,5 +1429,86 @@ pub mod deployment_status_reflects_runtime_state {
                 .contains("forge diagnose <project> <environment>")
         );
         assert!(err.message.contains("removed by retention"));
+    }
+
+    #[test]
+    fn logs_work_for_early_deploy_failure() {
+        let root = test_root("logs-work-for-early-deploy-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: Dockerfile\n",
+                "  context: .\n",
+                "services:\n",
+                "  api:\n",
+                "    runtime:\n",
+                "      port: 3000\n",
+                "      depends_on:\n",
+                "        - worker\n",
+                "  worker:\n",
+                "    runtime:\n",
+                "      depends_on:\n",
+                "        - api\n",
+            ),
+        )
+        .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.clone()),
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        let mut docker = NoopDockerRuntime;
+        let mut probes = StaticProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = NoopRoutingRuntime;
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: None,
+        })
+        .execute_next();
+
+        let daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        let logs = daemon.get_deployment_logs("dep-1").unwrap();
+        assert_eq!(logs.deployment_id, "dep-1");
+        assert!(
+            logs.lines
+                .iter()
+                .any(|line| line.contains("deployment started"))
+        );
+        assert!(
+            logs.validation_failure_summary
+                .as_deref()
+                .unwrap()
+                .contains("topology")
+        );
     }
 }

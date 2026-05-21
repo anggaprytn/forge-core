@@ -447,12 +447,16 @@ pub struct DiagnosticSummary {
     pub failure_reason: String,
     pub container_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target_path: Option<String>,
     pub cleanup_recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_graph_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_env_preview: Vec<String>,
 }

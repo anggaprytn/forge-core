@@ -3874,10 +3874,12 @@ pub mod deployment_diagnostics_endpoints {
                 failure_stage: "validating_runtime".into(),
                 failure_reason: "http health probe failed".into(),
                 container_name: "staging-api-gen-1".into(),
+                failed_service_name: None,
                 probe_target_host: Some("172.18.0.2".into()),
                 probe_target_port: Some(3000),
                 probe_target_path: Some("/health".into()),
                 cleanup_recorded: true,
+                dependency_graph_summary: None,
                 runtime_env_preview: Vec::new(),
             })
             .unwrap();

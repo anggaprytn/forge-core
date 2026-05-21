@@ -239,6 +239,15 @@ pub struct DeploymentExecutor<'a, D, P, R> {
     execution: ExecutionConfig,
 }
 
+struct DeploymentArtifacts {
+    env: EnvironmentPaths,
+    generation: u64,
+    events: EventStore,
+    diagnostics: DiagnosticsStore,
+    lifecycle_store: LifecycleStore,
+    writer: SnapshotWriter,
+}
+
 impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecutor<'a, D, P, R> {
     pub fn new(
         storage_root: impl Into<PathBuf>,
@@ -262,6 +271,44 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
     pub fn with_execution_config(mut self, execution: ExecutionConfig) -> Self {
         self.execution = execution;
         self
+    }
+
+    fn initialize_deployment_artifacts(
+        &self,
+        record: &DeploymentRecord,
+    ) -> Result<DeploymentArtifacts, DeploymentError> {
+        let env =
+            EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
+        let generation = GenerationAllocator::new(env.clone()).allocate()?;
+        let events = EventStore::new(env.clone(), generation);
+        let diagnostics = DiagnosticsStore::new(env.clone(), generation);
+        let lifecycle_store = LifecycleStore::new(env.clone(), generation);
+        let writer = SnapshotWriter::new(env.clone(), generation)?;
+        update_generation_history(&env, generation, |history| {
+            history.deployment_id = Some(record.deployment_id.clone());
+            history.commit_sha = record.commit_sha.clone();
+            history.source_ref = record.source_ref.clone();
+            history.source_path = record.source_path.clone();
+            history.created_at_unix = history.created_at_unix.or(Some(current_unix_timestamp()));
+        })?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Queued,
+            "deployment dequeued for execution",
+            None,
+            None,
+        )?;
+        Ok(DeploymentArtifacts {
+            env,
+            generation,
+            events,
+            diagnostics,
+            lifecycle_store,
+            writer,
+        })
     }
 
     pub fn execute_next(&mut self) -> Result<Option<DeploymentExecution>, DeploymentError> {
@@ -295,10 +342,39 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .source_path
             .clone()
             .unwrap_or_else(|| self.execution.context_path.clone());
-        let forge_yaml = load_optional_forge_yaml(&source_root, &record.project_id)
-            .map_err(|err| DeploymentError::InvalidInspection(err.to_string()))?;
+        let artifacts = self.initialize_deployment_artifacts(record)?;
+        append_event(
+            &artifacts.events,
+            record,
+            artifacts.generation,
+            "DEPLOYMENT_STARTED",
+            None,
+        )?;
+        artifacts.diagnostics.append_log_line(
+            &format!("deployment started for {}", record.deployment_id),
+            &[],
+        )?;
+
+        let forge_yaml = match load_optional_forge_yaml(&source_root, &record.project_id) {
+            Ok(config) => config,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &artifacts,
+                    classify_forge_yaml_failure_stage(&message),
+                    &message,
+                    generation_container_name(record, artifacts.generation),
+                    None,
+                    None,
+                    &[],
+                    &[],
+                )?;
+                return Err(DeploymentError::InvalidInspection(message));
+            }
+        };
         if forge_yaml.as_ref().is_some_and(is_multi_service_config) {
-            return self.execute_multi_service_record(record, &source_root, forge_yaml.as_ref());
+            return self.execute_multi_service_record(record, &source_root, artifacts, forge_yaml);
         }
         let default_execution = ExecutionConfig {
             context_path: source_root.clone(),
@@ -321,62 +397,47 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .as_ref()
             .and_then(|config| config.validation_timeout_ms())
             .unwrap_or(DEFAULT_VALIDATION_TIMEOUT_MS);
-        let env =
-            EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
-        let generation = GenerationAllocator::new(env.clone()).allocate()?;
-        let events = EventStore::new(env.clone(), generation);
-        let diagnostics = DiagnosticsStore::new(env.clone(), generation);
-        let lifecycle_store = LifecycleStore::new(env.clone(), generation);
-        let labels = forge_labels(record, generation);
-        let container_name = generation_container_name(record, generation);
-        let image_tag = format!(
-            "forge/{}:{}-gen-{}",
-            record.project_id, record.environment, generation
-        );
-        let writer = SnapshotWriter::new(env.clone(), generation)?;
-        update_generation_history(&env, generation, |history| {
-            history.deployment_id = Some(record.deployment_id.clone());
-            history.commit_sha = record.commit_sha.clone();
-            history.source_ref = record.source_ref.clone();
-            history.source_path = record.source_path.clone();
-            history.created_at_unix = history.created_at_unix.or(Some(current_unix_timestamp()));
-        })?;
-        persist_lifecycle_transition(
-            &lifecycle_store,
+        let container_name = generation_container_name(record, artifacts.generation);
+        let domain = match load_environment_domain(
+            &self.storage_root,
             &record.project_id,
             &record.environment,
-            generation,
-            DeploymentLifecycleState::Queued,
-            "deployment dequeued for execution",
-            None,
-            None,
-        )?;
-        let domain =
-            load_environment_domain(&self.storage_root, &record.project_id, &record.environment)?;
+        ) {
+            Ok(domain) => domain,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &artifacts,
+                    "runtime_env",
+                    &message,
+                    container_name.clone(),
+                    None,
+                    None,
+                    &[],
+                    &[],
+                )?;
+                return Err(err);
+            }
+        };
         let runtime_secrets = match self.resolve_runtime_secrets(&execution.context_path, record) {
             Ok(secrets) => secrets,
             Err(DeploymentError::MissingSecret(message)) => {
-                diagnostics.write_failure_reason(&message, &[])?;
-                diagnostics.append_log_line(
-                    &format!("deployment started for {}", record.deployment_id),
+                self.record_preparation_failure(
+                    record,
+                    &artifacts,
+                    "runtime_env",
+                    &message,
+                    container_name.clone(),
+                    None,
+                    Some("required secret resolution failed".into()),
+                    &[],
                     &[],
                 )?;
-                diagnostics.append_log_line(&message, &[])?;
-                diagnostics.write_summary(&DiagnosticSummary {
-                    deployment_id: Some(record.deployment_id.clone()),
-                    failure_stage: "preparing".into(),
-                    failure_reason: message.clone(),
-                    container_name: container_name.clone(),
-                    probe_target_host: None,
-                    probe_target_port: None,
-                    probe_target_path: None,
-                    cleanup_recorded: false,
-                    runtime_env_preview: Vec::new(),
-                })?;
                 append_event(
-                    &events,
+                    &artifacts.events,
                     record,
-                    generation,
+                    artifacts.generation,
                     "REQUIRED_SECRET_MISSING",
                     Some(message.clone()),
                 )?;
@@ -384,11 +445,24 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             }
             Err(err) => return Err(err),
         };
+        let DeploymentArtifacts {
+            env,
+            generation,
+            events,
+            diagnostics,
+            lifecycle_store,
+            writer,
+        } = artifacts;
+        let labels = forge_labels(record, generation);
+        let image_tag = format!(
+            "forge/{}:{}-gen-{}",
+            record.project_id, record.environment, generation
+        );
         let forge_yaml_values = forge_yaml
             .as_ref()
             .map(|config| config.environment().clone())
             .unwrap_or_default();
-        let runtime_env = build_runtime_env_artifacts(
+        let runtime_env = match build_runtime_env_artifacts(
             &RuntimeEnvMetadata {
                 project_id: record.project_id.clone(),
                 environment: record.environment.clone(),
@@ -401,14 +475,33 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &forge_yaml_values,
             &runtime_secrets,
             &BTreeMap::new(),
-        )?;
+        ) {
+            Ok(runtime_env) => runtime_env,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env: env.clone(),
+                        generation,
+                        events: EventStore::new(env.clone(), generation),
+                        diagnostics: DiagnosticsStore::new(env.clone(), generation),
+                        lifecycle_store: LifecycleStore::new(env.clone(), generation),
+                        writer: SnapshotWriter::new(env.clone(), generation)?,
+                    },
+                    "runtime_env",
+                    &message,
+                    container_name.clone(),
+                    None,
+                    None,
+                    &[],
+                    &[],
+                )?;
+                return Err(err.into());
+            }
+        };
         let redacted_env_preview = runtime_env.redacted_preview.clone();
         let secret_values = runtime_env.redaction_values.clone();
-        append_event(&events, record, generation, "DEPLOYMENT_STARTED", None)?;
-        diagnostics.append_log_line(
-            &format!("deployment started for {}", record.deployment_id),
-            &secret_values,
-        )?;
         persist_lifecycle_transition(
             &lifecycle_store,
             &record.project_id,
@@ -503,6 +596,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             labels: labels.clone(),
             environment: runtime_env.container_env.clone(),
             network_name: execution.network_name.clone(),
+            network_aliases: Vec::new(),
             command: None,
         }) {
             Ok(_) => {}
@@ -1011,45 +1105,92 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         &mut self,
         record: &DeploymentRecord,
         source_root: &Path,
-        forge_yaml: Option<&ForgeYamlConfig>,
+        artifacts: DeploymentArtifacts,
+        forge_yaml: Option<ForgeYamlConfig>,
     ) -> Result<DeploymentExecution, DeploymentError> {
-        let config = forge_yaml.ok_or_else(|| {
+        let config = forge_yaml.as_ref().ok_or_else(|| {
             DeploymentError::InvalidInspection("multi-service deployment requires forge.yml".into())
         })?;
         let mut execution = config.execution().clone();
         execution.network_name = self.execution.network_name.clone();
-        let env =
-            EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
-        let generation = GenerationAllocator::new(env.clone()).allocate()?;
-        let events = EventStore::new(env.clone(), generation);
-        let diagnostics = DiagnosticsStore::new(env.clone(), generation);
-        let lifecycle_store = LifecycleStore::new(env.clone(), generation);
+        let DeploymentArtifacts {
+            env,
+            generation,
+            events,
+            diagnostics,
+            lifecycle_store,
+            writer,
+        } = artifacts;
         let labels = forge_labels(record, generation);
-        let writer = SnapshotWriter::new(env.clone(), generation)?;
         let validation_timeout_ms = config
             .validation_timeout_ms()
             .unwrap_or(DEFAULT_VALIDATION_TIMEOUT_MS);
-        update_generation_history(&env, generation, |history| {
-            history.deployment_id = Some(record.deployment_id.clone());
-            history.commit_sha = record.commit_sha.clone();
-            history.source_ref = record.source_ref.clone();
-            history.source_path = record.source_path.clone();
-            history.created_at_unix = history.created_at_unix.or(Some(current_unix_timestamp()));
-        })?;
-        persist_lifecycle_transition(
-            &lifecycle_store,
+        let dependency_graph_summary = format_dependency_graph_summary(config);
+        diagnostics.append_log_line(
+            &format!("dependency graph: {dependency_graph_summary}"),
+            &[],
+        )?;
+        diagnostics.append_log_line(
+            &format!("startup order: {}", config.startup_order().join(" -> ")),
+            &[],
+        )?;
+        let default_container_name =
+            generation_service_container_name(record, generation, "api", config.services().len());
+        let domain = match load_environment_domain(
+            &self.storage_root,
             &record.project_id,
             &record.environment,
-            generation,
-            DeploymentLifecycleState::Queued,
-            "deployment dequeued for multi-service execution",
-            None,
-            None,
-        )?;
-        let domain =
-            load_environment_domain(&self.storage_root, &record.project_id, &record.environment)?;
-        let runtime_secrets = self.resolve_runtime_secrets(source_root, record)?;
-        let runtime_env = build_runtime_env_artifacts(
+        ) {
+            Ok(domain) => domain,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env,
+                        generation,
+                        events,
+                        diagnostics,
+                        lifecycle_store,
+                        writer,
+                    },
+                    "runtime_env",
+                    &message,
+                    default_container_name,
+                    None,
+                    Some(dependency_graph_summary),
+                    &[],
+                    &[],
+                )?;
+                return Err(err);
+            }
+        };
+        let runtime_secrets = match self.resolve_runtime_secrets(source_root, record) {
+            Ok(secrets) => secrets,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env,
+                        generation,
+                        events,
+                        diagnostics,
+                        lifecycle_store,
+                        writer,
+                    },
+                    "runtime_env",
+                    &message,
+                    default_container_name,
+                    None,
+                    Some(dependency_graph_summary),
+                    &[],
+                    &[],
+                )?;
+                return Err(err);
+            }
+        };
+        let runtime_env = match build_runtime_env_artifacts(
             &RuntimeEnvMetadata {
                 project_id: record.project_id.clone(),
                 environment: record.environment.clone(),
@@ -1062,10 +1203,33 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             config.environment(),
             &runtime_secrets,
             &BTreeMap::new(),
-        )?;
+        ) {
+            Ok(runtime_env) => runtime_env,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env,
+                        generation,
+                        events,
+                        diagnostics,
+                        lifecycle_store,
+                        writer,
+                    },
+                    "runtime_env",
+                    &message,
+                    default_container_name,
+                    None,
+                    Some(dependency_graph_summary),
+                    &[],
+                    &[],
+                )?;
+                return Err(err.into());
+            }
+        };
         let redacted_env_preview = runtime_env.redacted_preview.clone();
         let secret_values = runtime_env.redaction_values.clone();
-        append_event(&events, record, generation, "DEPLOYMENT_STARTED", None)?;
         diagnostics.append_log_line(
             &format!(
                 "multi-service deployment started for {}",
@@ -1093,12 +1257,41 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "forge/{}:{}-gen-{}",
                 record.project_id, record.environment, generation
             );
-            let image_ref = self.docker.build_image(BuildImageRequest {
+            let image_ref = match self.docker.build_image(BuildImageRequest {
                 image_tag: image_tag.clone(),
                 context_path: execution.context_path.clone(),
                 dockerfile_path: execution.dockerfile_path.clone(),
                 labels: labels.clone(),
-            })?;
+            }) {
+                Ok(image_ref) => image_ref,
+                Err(err) => {
+                    let message = format!("shared image build failed: {err}");
+                    self.record_preparation_failure(
+                        record,
+                        &DeploymentArtifacts {
+                            env: env.clone(),
+                            generation,
+                            events: EventStore::new(env.clone(), generation),
+                            diagnostics: DiagnosticsStore::new(env.clone(), generation),
+                            lifecycle_store: LifecycleStore::new(env.clone(), generation),
+                            writer: SnapshotWriter::new(env.clone(), generation)?,
+                        },
+                        "building",
+                        &message,
+                        generation_service_container_name(
+                            record,
+                            generation,
+                            "api",
+                            config.services().len(),
+                        ),
+                        None,
+                        Some(dependency_graph_summary.clone()),
+                        &redacted_env_preview,
+                        &secret_values,
+                    )?;
+                    return Err(err.into());
+                }
+            };
             diagnostics
                 .append_log_line(&format!("shared image built: {image_ref}"), &secret_values)?;
             update_generation_history(&env, generation, |history| {
@@ -1110,7 +1303,33 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         };
 
         if let Some(network_name) = execution.network_name.as_deref() {
-            self.docker.ensure_network(network_name)?;
+            if let Err(err) = self.docker.ensure_network(network_name) {
+                let message = format!("docker network ensure failed for {network_name}: {err}");
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env: env.clone(),
+                        generation,
+                        events: EventStore::new(env.clone(), generation),
+                        diagnostics: DiagnosticsStore::new(env.clone(), generation),
+                        lifecycle_store: LifecycleStore::new(env.clone(), generation),
+                        writer: SnapshotWriter::new(env.clone(), generation)?,
+                    },
+                    "preparing",
+                    &message,
+                    generation_service_container_name(
+                        record,
+                        generation,
+                        "api",
+                        config.services().len(),
+                    ),
+                    None,
+                    Some(dependency_graph_summary.clone()),
+                    &redacted_env_preview,
+                    &secret_values,
+                )?;
+                return Err(err.into());
+            }
             diagnostics.append_log_line(
                 &format!("docker network ready: {network_name}"),
                 &secret_values,
@@ -1118,22 +1337,15 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         }
 
         let mut service_runtime = BTreeMap::new();
-        let mut warmed_services = Vec::new();
-        let mut route_ids = Vec::new();
         for service_id in config.startup_order() {
             let service = config
                 .services()
                 .get(service_id)
                 .expect("startup order references known service");
+            diagnostics
+                .append_log_line(&format!("== service `{service_id}` =="), &secret_values)?;
             diagnostics.append_log_line(
-                &format!(
-                    "service `{service_id}` starting after dependencies: {}",
-                    if service.depends_on.is_empty() {
-                        "none".into()
-                    } else {
-                        service.depends_on.join(", ")
-                    }
-                ),
+                &format!("depends_on: {}", service_dependency_list(service)),
                 &secret_values,
             )?;
             let container_name = generation_service_container_name(
@@ -1163,12 +1375,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 labels: service_labels,
                 environment: runtime_env.container_env.clone(),
                 network_name: execution.network_name.clone(),
+                network_aliases: vec![service_id.clone()],
                 command: service_command(service),
             })?;
             self.docker.start_container(&container_name)?;
             let inspection = self.docker.inspect_container(&container_name)?;
             validate_inspection(&inspection, &container_name)?;
-            let warmup = self.validate_service_candidate(
+            self.validate_service_candidate(
                 service_id,
                 service,
                 validation_timeout_ms,
@@ -1181,14 +1394,6 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 &redacted_env_preview,
                 &secret_values,
             )?;
-            warmed_services.push(warmup);
-            if service.externally_exposed {
-                route_ids.push(route_subtree_id_for_service(
-                    record,
-                    service_id,
-                    config.services().len(),
-                ));
-            }
             service_runtime.insert(
                 service_id.clone(),
                 PersistedServiceRuntimeInfo {
@@ -1293,6 +1498,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 validation_succeeded: true,
                 runtime_snapshot_persisted: true,
                 convergence_target_stable: true,
+                gate_reason: None,
                 ..PersistedPromotionSummary::default()
             }),
         )?;
@@ -1395,10 +1601,6 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 promoted_at_unix: Some(current_unix_timestamp()),
                 gate_reason: None,
             }),
-        )?;
-        diagnostics.append_log_line(
-            &format!("startup order: {}", config.startup_order().join(" -> ")),
-            &secret_values,
         )?;
         for runtime in service_runtime.values() {
             self.capture_container_logs_tail(
@@ -2182,12 +2384,87 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             failure_stage: failure_stage.into(),
             failure_reason: failure_reason.into(),
             container_name: String::new(),
+            failed_service_name: None,
             probe_target_host: probe_target.map(|target| target.host.clone()),
             probe_target_port: probe_target.map(|target| target.port),
             probe_target_path: probe_target.and_then(|target| target.path.clone()),
             cleanup_recorded: false,
+            dependency_graph_summary: None,
             runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
+        finalize_failed_generation(&self.storage_root, record, generation, diagnostics)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_preparation_failure(
+        &self,
+        record: &DeploymentRecord,
+        artifacts: &DeploymentArtifacts,
+        failure_stage: &str,
+        failure_reason: &str,
+        container_name: String,
+        failed_service_name: Option<String>,
+        dependency_graph_summary: Option<String>,
+        redacted_env_preview: &[String],
+        secret_values: &[String],
+    ) -> Result<(), DeploymentError> {
+        persist_lifecycle_transition(
+            &artifacts.lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            artifacts.generation,
+            DeploymentLifecycleState::Failed,
+            failure_reason,
+            None,
+            Some(PersistedPromotionSummary {
+                gate_reason: Some(failure_reason.into()),
+                ..PersistedPromotionSummary::default()
+            }),
+        )?;
+        artifacts
+            .diagnostics
+            .write_failure_reason(failure_reason, secret_values)?;
+        artifacts
+            .diagnostics
+            .append_log_line(failure_reason, secret_values)?;
+        if let Some(service_id) = failed_service_name.as_deref() {
+            artifacts
+                .diagnostics
+                .append_log_line(&format!("failed service: {service_id}"), secret_values)?;
+        }
+        if let Some(summary) = dependency_graph_summary.as_deref() {
+            artifacts
+                .diagnostics
+                .append_log_line(&format!("dependency graph: {summary}"), secret_values)?;
+        }
+        append_redacted_event(
+            &artifacts.events,
+            record,
+            artifacts.generation,
+            "GENERATION_FAILED",
+            Some(failure_reason.into()),
+            secret_values,
+        )?;
+        artifacts.diagnostics.write_summary(&DiagnosticSummary {
+            deployment_id: Some(record.deployment_id.clone()),
+            failure_stage: failure_stage.into(),
+            failure_reason: failure_reason.into(),
+            container_name,
+            failed_service_name,
+            probe_target_host: None,
+            probe_target_port: None,
+            probe_target_path: None,
+            cleanup_recorded: false,
+            dependency_graph_summary,
+            runtime_env_preview: redacted_env_preview.to_vec(),
+        })?;
+        finalize_failed_generation(
+            &self.storage_root,
+            record,
+            artifacts.generation,
+            &artifacts.diagnostics,
+        )?;
         Ok(())
     }
 
@@ -2430,12 +2707,15 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             failure_stage: failure_stage.into(),
             failure_reason: failure_reason.into(),
             container_name: container_name.into(),
+            failed_service_name: None,
             probe_target_host: probe_target.map(|target| target.host.clone()),
             probe_target_port: probe_target.map(|target| target.port),
             probe_target_path: probe_target.and_then(|target| target.path.clone()),
             cleanup_recorded: true,
+            dependency_graph_summary: None,
             runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
+        finalize_failed_generation(&self.storage_root, record, generation, diagnostics)?;
         append_redacted_event(
             events,
             record,
@@ -3013,6 +3293,64 @@ fn route_subtree_id_for_service(
     )
 }
 
+fn classify_forge_yaml_failure_stage(message: &str) -> &'static str {
+    if message.contains("service `")
+        || message.contains("services")
+        || message.contains("depends on")
+        || message.contains("depends_on")
+        || message.contains("dependency graph")
+        || message.contains("cycle")
+    {
+        "topology"
+    } else {
+        "preparing"
+    }
+}
+
+fn finalize_failed_generation(
+    storage_root: &Path,
+    record: &DeploymentRecord,
+    generation: u64,
+    diagnostics: &DiagnosticsStore,
+) -> Result<(), DeploymentError> {
+    let env = EnvironmentPaths::new(storage_root, &record.project_id, &record.environment);
+    SnapshotWriter::new(env.clone(), generation)?.finalize(
+        &record.project_id,
+        &record.environment,
+        SnapshotState::Failed,
+    )?;
+    update_generation_history(&env, generation, |history| {
+        history.finalized_state = Some("failed".into());
+        history.finalized_at_unix = Some(current_unix_timestamp());
+    })?;
+    diagnostics.append_log_line("failed generation persisted", &[])?;
+    Ok(())
+}
+
+fn service_dependency_list(service: &ForgeServiceConfig) -> String {
+    if service.depends_on.is_empty() {
+        "none".into()
+    } else {
+        service.depends_on.join(", ")
+    }
+}
+
+fn format_dependency_graph_summary(config: &ForgeYamlConfig) -> String {
+    config
+        .startup_order()
+        .iter()
+        .map(|service_id| {
+            let depends_on = config
+                .services()
+                .get(service_id)
+                .map(service_dependency_list)
+                .unwrap_or_else(|| "unknown".into());
+            format!("{service_id}<-{depends_on}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn service_command(service: &ForgeServiceConfig) -> Option<Vec<String>> {
     service
         .command
@@ -3399,11 +3737,11 @@ pub mod deployment_fails_if_tcp_unreachable {
         .execute_next();
 
         assert!(result.is_err());
-        assert!(
-            !root
-                .join("projects/api/environments/production/generations/1/snapshot.json")
-                .exists()
-        );
+        let snapshot = std::fs::read_to_string(
+            root.join("projects/api/environments/production/generations/1/snapshot.json"),
+        )
+        .unwrap();
+        assert!(snapshot.contains("\"state\": \"failed\""));
     }
 }
 
@@ -3751,11 +4089,11 @@ pub mod deployment_fails_if_http_health_invalid {
                 "http health probe failed"
             ))
         ));
-        assert!(
-            !root
-                .join("projects/api/environments/production/generations/1/snapshot.json")
-                .exists()
-        );
+        let snapshot = std::fs::read_to_string(
+            root.join("projects/api/environments/production/generations/1/snapshot.json"),
+        )
+        .unwrap();
+        assert!(snapshot.contains("\"state\": \"failed\""));
     }
 }
 
@@ -4206,7 +4544,8 @@ pub mod snapshot_not_finalized_before_validation {
         let generation_dir = root.join("projects/api/environments/production/generations/1");
         assert!(generation_dir.join("build.json").exists());
         assert!(generation_dir.join("runtime.json").exists());
-        assert!(!generation_dir.join("snapshot.json").exists());
+        let snapshot = std::fs::read_to_string(generation_dir.join("snapshot.json")).unwrap();
+        assert!(snapshot.contains("\"state\": \"failed\""));
     }
 }
 
@@ -8049,6 +8388,7 @@ pub mod forge_owns_only_dedicated_route_subtree {
 #[cfg(test)]
 pub mod multi_service_orchestration {
     use super::*;
+    use crate::storage::{PersistedActivationMode, load_generation_runtime_info};
     use std::collections::BTreeMap;
     use std::fs;
 
@@ -8056,6 +8396,7 @@ pub mod multi_service_orchestration {
     struct MultiServiceDockerRuntime {
         containers: BTreeMap<String, bool>,
         created: Vec<String>,
+        create_requests: Vec<CreateContainerRequest>,
         started: Vec<String>,
     }
 
@@ -8075,6 +8416,7 @@ pub mod multi_service_orchestration {
             &mut self,
             request: CreateContainerRequest,
         ) -> Result<String, DockerRuntimeError> {
+            self.create_requests.push(request.clone());
             self.created.push(request.container_name.clone());
             self.containers
                 .insert(request.container_name.clone(), false);
@@ -8214,6 +8556,71 @@ pub mod multi_service_orchestration {
         .unwrap();
     }
 
+    fn write_invalid_multi_service_forge_yaml(root: &std::path::Path) {
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "version: 1\n",
+                "name: api\n",
+                "type: web\n",
+                "build:\n",
+                "  dockerfile: Dockerfile\n",
+                "  context: .\n",
+                "services:\n",
+                "  api:\n",
+                "    runtime:\n",
+                "      port: 3000\n",
+                "      depends_on:\n",
+                "        - worker\n",
+                "  worker:\n",
+                "    runtime:\n",
+                "      depends_on:\n",
+                "        - api\n",
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn early_deploy_failure_persists_generation_diagnostics() {
+        let root = test_root("early-deploy-failure-persists-generation-diagnostics");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_invalid_multi_service_forge_yaml(&root);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next();
+
+        assert!(matches!(result, Err(DeploymentError::InvalidInspection(_))));
+        let generation_dir = root.join("projects/api/environments/production/generations/1");
+        assert!(generation_dir.exists());
+        assert!(generation_dir.join("diagnostics/deployment.log").exists());
+        assert!(generation_dir.join("diagnostics/summary.json").exists());
+        assert!(
+            generation_dir
+                .join("diagnostics/failure_reason.log")
+                .exists()
+        );
+        let summary = fs::read_to_string(generation_dir.join("diagnostics/summary.json")).unwrap();
+        assert!(summary.contains("\"failure_stage\": \"topology\""));
+        assert!(summary.contains("\"deployment_id\": \"dep-1\""));
+        let snapshot = fs::read_to_string(generation_dir.join("snapshot.json")).unwrap();
+        assert!(snapshot.contains("\"state\": \"failed\""));
+    }
+
     #[test]
     fn multi_service_generation_promotes_only_when_all_required_services_healthy() {
         let root = test_root("multi-service-promote-gated");
@@ -8253,7 +8660,7 @@ pub mod multi_service_orchestration {
     }
 
     #[test]
-    fn startup_dependency_ordering_respected() {
+    fn multi_service_depends_on_topological_ordering() {
         let root = test_root("multi-service-startup-order");
         register_project(&root, "api", "example.com");
         fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
@@ -8300,6 +8707,55 @@ pub mod multi_service_orchestration {
     }
 
     #[test]
+    fn worker_service_without_healthcheck_allowed_as_internal_service() {
+        let root = test_root("worker-service-without-healthcheck-allowed-as-internal-service");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(routing.updates.len(), 1);
+        let runtime =
+            load_generation_runtime_info(&EnvironmentPaths::new(&root, "api", "production"), 1)
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            runtime.services["worker"].activation,
+            Some(PersistedActivationMode::Direct)
+        ));
+        assert!(!runtime.services["worker"].externally_exposed);
+    }
+
+    #[test]
     fn route_activation_skips_internal_services() {
         let root = test_root("multi-service-route-skip-internal");
         register_project(&root, "api", "example.com");
@@ -8338,6 +8794,113 @@ pub mod multi_service_orchestration {
 
         assert_eq!(routing.updates.len(), 1);
         assert_eq!(routing.updates[0].subtree_id, "forge:api:production:api");
+    }
+
+    #[test]
+    fn service_network_alias_allows_internal_dns() {
+        let root = test_root("service-network-alias-allows-internal-dns");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let api_request = docker
+            .create_requests
+            .iter()
+            .find(|request| request.container_name == "prod-api-api-gen-1")
+            .unwrap();
+        let worker_request = docker
+            .create_requests
+            .iter()
+            .find(|request| request.container_name == "prod-api-worker-gen-1")
+            .unwrap();
+        assert_eq!(api_request.network_aliases, vec!["api".to_string()]);
+        assert_eq!(worker_request.network_aliases, vec!["worker".to_string()]);
+    }
+
+    #[test]
+    fn runtime_command_overrides_dockerfile_cmd() {
+        let root = test_root("runtime-command-overrides-dockerfile-cmd");
+        register_project(&root, "api", "example.com");
+        fs::write(
+            root.join("Dockerfile"),
+            "FROM busybox\nCMD [\"sleep\",\"999\"]\n",
+        )
+        .unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let worker_request = docker
+            .create_requests
+            .iter()
+            .find(|request| request.container_name == "prod-api-worker-gen-1")
+            .unwrap();
+        assert_eq!(
+            worker_request.command,
+            Some(vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "node worker.js".to_string()
+            ])
+        );
     }
 
     #[test]

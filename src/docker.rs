@@ -106,6 +106,10 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
             args.push("--network".to_string());
             args.push(network_name.clone());
         }
+        for alias in &request.network_aliases {
+            args.push("--network-alias".to_string());
+            args.push(alias.clone());
+        }
         for (key, value) in &request.labels {
             args.push("--label".to_string());
             args.push(format!("{key}={value}"));
@@ -475,6 +479,7 @@ pub mod docker_adapter_starts_generation_named_container {
                 labels: labels("api", "production", 42),
                 environment: Default::default(),
                 network_name: None,
+                network_aliases: Vec::new(),
                 command: None,
             })
             .unwrap();
@@ -501,6 +506,7 @@ pub mod docker_adapter_disables_restart_policy {
                 labels: labels("api", "production", 42),
                 environment: Default::default(),
                 network_name: None,
+                network_aliases: Vec::new(),
                 command: None,
             })
             .unwrap();

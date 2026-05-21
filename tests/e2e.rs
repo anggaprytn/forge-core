@@ -334,7 +334,8 @@ fn dogfood_bad_app_failed_health_does_not_promote_current() {
             .inspect_route("forge:api:production")
             .is_err()
     );
-    assert!(!env.generation_dir(1).join("snapshot.json").exists());
+    let snapshot = std::fs::read_to_string(env.generation_dir(1).join("snapshot.json")).unwrap();
+    assert!(snapshot.contains("\"state\": \"failed\""));
 }
 
 #[test]
@@ -1005,6 +1006,7 @@ impl E2eHarness {
                 labels: forge_labels(&record, generation),
                 environment: Default::default(),
                 network_name: Some(self.network_name.clone()),
+                network_aliases: Vec::new(),
                 command: None,
             })
             .unwrap();
