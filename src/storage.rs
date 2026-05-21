@@ -211,6 +211,29 @@ pub struct PersistedValidationSummary {
     pub last_probe_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedProbeType {
+    Tcp,
+    Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedProbeHistoryEntry {
+    pub timestamp_unix: u64,
+    pub probe_type: PersistedProbeType,
+    pub success: bool,
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedProbeHistory {
+    #[serde(default)]
+    pub entries: Vec<PersistedProbeHistoryEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PersistedPromotionSummary {
     #[serde(default)]
@@ -642,6 +665,11 @@ pub struct LifecycleStore {
     generation: u64,
 }
 
+pub struct ProbeHistoryStore {
+    env: EnvironmentPaths,
+    generation: u64,
+}
+
 pub struct RetentionStore {
     env: EnvironmentPaths,
 }
@@ -701,6 +729,13 @@ pub fn load_generation_lifecycle(
     generation: u64,
 ) -> StorageResult<Option<PersistedDeploymentLifecycle>> {
     load_generation_json(env, generation, "lifecycle.json")
+}
+
+pub fn load_generation_probe_history(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> StorageResult<Option<PersistedProbeHistory>> {
+    load_generation_json(env, generation, "probe_history.json")
 }
 
 pub fn load_generation_snapshot_metadata(
@@ -973,6 +1008,47 @@ impl LifecycleStore {
             self.env
                 .generation_dir(self.generation)
                 .join("lifecycle.json"),
+            &bytes,
+        )
+    }
+}
+
+impl ProbeHistoryStore {
+    pub fn new(env: EnvironmentPaths, generation: u64) -> Self {
+        Self { env, generation }
+    }
+
+    pub fn read(&self) -> StorageResult<PersistedProbeHistory> {
+        self.env.ensure_exists()?;
+        Ok(load_generation_probe_history(&self.env, self.generation)?.unwrap_or_default())
+    }
+
+    pub fn append(
+        &self,
+        entry: PersistedProbeHistoryEntry,
+        max_entries: usize,
+    ) -> StorageResult<()> {
+        let mut history = self.read()?;
+        history.entries.push(entry);
+        if history.entries.len() > max_entries {
+            let drop_count = history.entries.len() - max_entries;
+            history.entries.drain(0..drop_count);
+        }
+        self.write(&history)
+    }
+
+    pub fn write(&self, history: &PersistedProbeHistory) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let bytes = serde_json::to_vec_pretty(history).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(
+            self.env
+                .generation_dir(self.generation)
+                .join("probe_history.json"),
             &bytes,
         )
     }

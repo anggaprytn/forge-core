@@ -10,8 +10,9 @@ use crate::api::{
     ContainerRuntimeDiagnostics, DeploymentHistoryEntry, DeploymentHistoryResponse,
     EnvironmentDiagnostics, EnvironmentDiffEntry, EnvironmentDiffResponse, EnvironmentDiffSummary,
     EnvironmentValueChange, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
-    ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction, RetentionRole,
-    RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic, SecretReferenceChange,
+    ProbeStabilityDiagnostics, ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction,
+    RetentionRole, RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic,
+    SecretReferenceChange,
 };
 use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::load_optional_manifest;
@@ -28,16 +29,158 @@ use crate::secrets::SecretStore;
 use crate::storage::{
     DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
-    PersistedPromotionSummary, PersistedResolvedRuntime, PersistedRuntimeEnvSnapshot,
-    PersistedRuntimeInfo, PersistedSnapshotMetadata, PersistedValidationSummary, PointerStore,
-    RetentionMetadata, RetentionStore, StorageError, load_generation_build_info,
-    load_generation_lifecycle, load_generation_resolved_runtime,
-    load_generation_runtime_env_snapshot, load_generation_runtime_info,
-    load_generation_snapshot_metadata,
+    PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary, PersistedResolvedRuntime,
+    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedSnapshotMetadata,
+    PersistedValidationSummary, PointerStore, RetentionMetadata, RetentionStore, StorageError,
+    load_generation_build_info, load_generation_lifecycle, load_generation_probe_history,
+    load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
 const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
+const PROBE_FLAPPING_WINDOW: usize = 8;
+const PROBE_CLEAR_STREAK_MIN: usize = 4;
+const PROBE_MIN_SAMPLES_FOR_RATE: usize = 4;
+const PROBE_MIN_FAILURES_FOR_FLAPPING: usize = 2;
+const PROBE_MIN_ALTERNATIONS_FOR_FLAPPING: usize = 3;
+const PROBE_SUCCESS_RATE_THRESHOLD: f64 = 0.75;
+
+#[derive(Debug, Clone)]
+struct ProbeFlappingAssessment {
+    flapping: bool,
+    diagnostics: ProbeStabilityDiagnostics,
+}
+
+fn load_recent_probe_history(
+    env: &EnvironmentPaths,
+    generation: Option<u64>,
+) -> Result<PersistedProbeHistory, ProjectStatusError> {
+    let Some(generation) = generation else {
+        return Ok(PersistedProbeHistory::default());
+    };
+    Ok(load_generation_probe_history(env, generation)?.unwrap_or_default())
+}
+
+fn probe_type_name(probe_type: &PersistedProbeType) -> &'static str {
+    match probe_type {
+        PersistedProbeType::Tcp => "tcp",
+        PersistedProbeType::Http => "http",
+    }
+}
+
+fn assess_probe_flapping(
+    history: &PersistedProbeHistory,
+    validation_summary: Option<&PersistedValidationSummary>,
+    promotion_summary: Option<&PersistedPromotionSummary>,
+) -> Option<ProbeFlappingAssessment> {
+    if history.entries.is_empty() {
+        return None;
+    }
+
+    let required_passes = validation_summary
+        .map(|summary| summary.required_consecutive_passes as usize)
+        .unwrap_or(0);
+    let clear_streak = required_passes.max(PROBE_CLEAR_STREAK_MIN).max(1);
+    let recent_entries = history
+        .entries
+        .iter()
+        .rev()
+        .take(PROBE_FLAPPING_WINDOW)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let sample_size = recent_entries.len();
+    let success_count = recent_entries.iter().filter(|entry| entry.success).count();
+    let recent_failure_count = sample_size.saturating_sub(success_count);
+    let success_rate = if sample_size == 0 {
+        1.0
+    } else {
+        success_count as f64 / sample_size as f64
+    };
+    let consecutive_success_streak = recent_entries
+        .iter()
+        .rev()
+        .take_while(|entry| entry.success)
+        .count();
+    let alternations = recent_entries
+        .windows(2)
+        .filter(|window| window[0].success != window[1].success)
+        .count();
+    let unstable_after_warmup = promotion_summary.is_some_and(|summary| summary.warmup_succeeded)
+        && sample_size >= clear_streak + PROBE_MIN_FAILURES_FOR_FLAPPING
+        && recent_failure_count >= PROBE_MIN_FAILURES_FOR_FLAPPING + 1
+        && consecutive_success_streak < clear_streak;
+    let oscillating = sample_size >= PROBE_MIN_SAMPLES_FOR_RATE + 1
+        && recent_failure_count >= PROBE_MIN_FAILURES_FOR_FLAPPING
+        && success_count >= PROBE_MIN_FAILURES_FOR_FLAPPING
+        && alternations >= PROBE_MIN_ALTERNATIONS_FOR_FLAPPING;
+    let low_success_rate = sample_size >= PROBE_MIN_SAMPLES_FOR_RATE
+        && recent_failure_count >= PROBE_MIN_FAILURES_FOR_FLAPPING
+        && success_rate < PROBE_SUCCESS_RATE_THRESHOLD;
+    let flapping = if consecutive_success_streak >= clear_streak {
+        false
+    } else {
+        oscillating || low_success_rate || unstable_after_warmup
+    };
+
+    let by_type = [PersistedProbeType::Tcp, PersistedProbeType::Http]
+        .into_iter()
+        .filter_map(|probe_type| {
+            let matching = recent_entries
+                .iter()
+                .filter(|entry| entry.probe_type == probe_type)
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                return None;
+            }
+            let successes = matching.iter().filter(|entry| entry.success).count();
+            let failures = matching.len().saturating_sub(successes);
+            let alternations = matching
+                .windows(2)
+                .filter(|window| window[0].success != window[1].success)
+                .count();
+            Some(format!(
+                "{}={}/{} ok, failures={}, alternations={}",
+                probe_type_name(&probe_type),
+                successes,
+                matching.len(),
+                failures,
+                alternations
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let latest_failure = recent_entries
+        .iter()
+        .rev()
+        .find(|entry| !entry.success)
+        .and_then(|entry| entry.failure_reason.as_deref())
+        .unwrap_or("none");
+    let flapping_window_summary = format!(
+        "window={} success_rate={:.0}% failures={} alternations={} stable_streak={} latest_failure={} [{}]",
+        sample_size,
+        success_rate * 100.0,
+        recent_failure_count,
+        alternations,
+        consecutive_success_streak,
+        latest_failure,
+        by_type
+    );
+
+    Some(ProbeFlappingAssessment {
+        flapping,
+        diagnostics: ProbeStabilityDiagnostics {
+            sample_size,
+            success_rate,
+            consecutive_success_streak,
+            recent_failure_count,
+            flapping_window_summary,
+        },
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectEnvironmentStatus {
@@ -917,6 +1060,14 @@ where
         .and_then(|summary| summary.gate_reason.clone());
     let validation_summary =
         visible_lifecycle.and_then(|lifecycle| lifecycle.validation_summary.clone());
+    let promotion_summary =
+        visible_lifecycle.and_then(|lifecycle| lifecycle.promotion_summary.clone());
+    let probe_history = load_recent_probe_history(&env, truth.active_generation)?;
+    let probe_flapping_assessment = assess_probe_flapping(
+        &probe_history,
+        validation_summary.as_ref(),
+        promotion_summary.as_ref(),
+    );
     let warmup_failure_summary = validation_summary.as_ref().and_then(|summary| {
         (!summary.validation_succeeded).then(|| {
             format!(
@@ -994,8 +1145,7 @@ where
         active_lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
         retention_role: truth.active_generation.map(|_| RetentionRole::Current),
         validation_summary,
-        promotion_summary: visible_lifecycle
-            .and_then(|lifecycle| lifecycle.promotion_summary.clone()),
+        promotion_summary,
         last_failed_transition: visible_lifecycle.and_then(|lifecycle| {
             lifecycle
                 .transitions
@@ -1009,13 +1159,10 @@ where
         restart_instability: visible_lifecycle
             .and_then(|lifecycle| lifecycle.validation_summary.as_ref())
             .is_some_and(|summary| !summary.restart_count_stable),
-        probe_flapping: visible_lifecycle
-            .and_then(|lifecycle| lifecycle.validation_summary.as_ref())
-            .is_some_and(|summary| {
-                summary.validation_succeeded
-                    && (summary.tcp_consecutive_passes > summary.required_consecutive_passes
-                        || summary.http_consecutive_passes > summary.required_consecutive_passes)
-            }),
+        probe_flapping: probe_flapping_assessment
+            .as_ref()
+            .is_some_and(|assessment| assessment.flapping),
+        probe_stability: probe_flapping_assessment.map(|assessment| assessment.diagnostics),
     })
 }
 
@@ -2018,7 +2165,8 @@ mod tests {
         BuildImageRequest, CreateContainerRequest, ManagedImage, RouteUpdateRequest,
     };
     use crate::storage::{
-        LifecycleStore, PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore,
+        LifecycleStore, PersistedProbeHistory, PersistedProbeHistoryEntry, PersistedProbeType,
+        PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore, ProbeHistoryStore,
         RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
         atomic_write,
     };
@@ -2281,6 +2429,62 @@ mod tests {
                     transition_reason: format!("gen-{generation}"),
                     validation_summary: None,
                     promotion_summary: None,
+                }],
+            })
+            .unwrap();
+    }
+
+    fn write_probe_history(
+        root: &Path,
+        generation: u64,
+        entries: Vec<(u64, PersistedProbeType, bool, u64, Option<&str>)>,
+    ) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        ProbeHistoryStore::new(env, generation)
+            .write(&PersistedProbeHistory {
+                entries: entries
+                    .into_iter()
+                    .map(
+                        |(timestamp_unix, probe_type, success, latency_ms, failure_reason)| {
+                            PersistedProbeHistoryEntry {
+                                timestamp_unix,
+                                probe_type,
+                                success,
+                                latency_ms,
+                                failure_reason: failure_reason.map(str::to_string),
+                            }
+                        },
+                    )
+                    .collect(),
+            })
+            .unwrap();
+    }
+
+    fn write_validation_lifecycle(
+        root: &Path,
+        generation: u64,
+        state: DeploymentLifecycleState,
+        validation_summary: PersistedValidationSummary,
+        promotion_summary: PersistedPromotionSummary,
+    ) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        LifecycleStore::new(env, generation)
+            .write(&PersistedDeploymentLifecycle {
+                lifecycle_version: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation,
+                state: state.clone(),
+                entered_at_unix: generation,
+                transition_reason: format!("gen-{generation}-{state:?}").to_lowercase(),
+                validation_summary: Some(validation_summary.clone()),
+                promotion_summary: Some(promotion_summary.clone()),
+                transitions: vec![crate::storage::DeploymentLifecycleTransition {
+                    state,
+                    entered_at_unix: generation,
+                    transition_reason: format!("gen-{generation}"),
+                    validation_summary: Some(validation_summary),
+                    promotion_summary: Some(promotion_summary),
                 }],
             })
             .unwrap();
@@ -2752,6 +2956,370 @@ mod tests {
                 .and_then(|target| target.path.as_deref()),
             Some("/health")
         );
+    }
+
+    #[test]
+    fn stable_promoted_generation_not_flapping() {
+        let root = test_root("stable-promoted-generation-not-flapping");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        write_validation_lifecycle(
+            &root,
+            7,
+            DeploymentLifecycleState::Promoted,
+            PersistedValidationSummary {
+                tcp_consecutive_passes: 5,
+                http_consecutive_passes: 5,
+                required_consecutive_passes: 3,
+                minimum_uptime_seconds: 10,
+                observed_uptime_seconds: 60,
+                restart_count_initial: 0,
+                restart_count_current: 0,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                validation_succeeded: true,
+                last_probe_error: None,
+            },
+            PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(7),
+                gate_reason: None,
+            },
+        );
+        write_probe_history(
+            &root,
+            7,
+            vec![
+                (1, PersistedProbeType::Tcp, true, 12, None),
+                (2, PersistedProbeType::Http, true, 14, None),
+                (3, PersistedProbeType::Tcp, true, 11, None),
+                (4, PersistedProbeType::Http, true, 13, None),
+                (5, PersistedProbeType::Tcp, true, 10, None),
+                (6, PersistedProbeType::Http, true, 12, None),
+            ],
+        );
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(!diagnostics.probe_flapping);
+        let stability = diagnostics.probe_stability.unwrap();
+        assert_eq!(stability.recent_failure_count, 0);
+        assert_eq!(stability.consecutive_success_streak, 6);
+    }
+
+    #[test]
+    fn alternating_probe_failures_detect_flapping() {
+        let root = test_root("alternating-probe-failures-detect-flapping");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        write_validation_lifecycle(
+            &root,
+            7,
+            DeploymentLifecycleState::Promoted,
+            PersistedValidationSummary {
+                tcp_consecutive_passes: 1,
+                http_consecutive_passes: 1,
+                required_consecutive_passes: 3,
+                minimum_uptime_seconds: 10,
+                observed_uptime_seconds: 60,
+                restart_count_initial: 0,
+                restart_count_current: 0,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                validation_succeeded: true,
+                last_probe_error: Some("http health probe returned unhealthy for /health".into()),
+            },
+            PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(7),
+                gate_reason: None,
+            },
+        );
+        write_probe_history(
+            &root,
+            7,
+            vec![
+                (1, PersistedProbeType::Tcp, true, 12, None),
+                (
+                    2,
+                    PersistedProbeType::Tcp,
+                    false,
+                    12,
+                    Some("tcp probe returned unhealthy"),
+                ),
+                (3, PersistedProbeType::Tcp, true, 11, None),
+                (
+                    4,
+                    PersistedProbeType::Tcp,
+                    false,
+                    11,
+                    Some("tcp probe returned unhealthy"),
+                ),
+                (5, PersistedProbeType::Tcp, true, 10, None),
+                (
+                    6,
+                    PersistedProbeType::Tcp,
+                    false,
+                    10,
+                    Some("tcp probe returned unhealthy"),
+                ),
+            ],
+        );
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(diagnostics.probe_flapping);
+        assert!(
+            diagnostics
+                .probe_stability
+                .unwrap()
+                .flapping_window_summary
+                .contains("alternations=")
+        );
+    }
+
+    #[test]
+    fn transient_single_failure_does_not_trigger_flapping() {
+        let root = test_root("transient-single-failure-does-not-trigger-flapping");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        write_validation_lifecycle(
+            &root,
+            7,
+            DeploymentLifecycleState::Promoted,
+            PersistedValidationSummary {
+                tcp_consecutive_passes: 4,
+                http_consecutive_passes: 4,
+                required_consecutive_passes: 3,
+                minimum_uptime_seconds: 10,
+                observed_uptime_seconds: 60,
+                restart_count_initial: 0,
+                restart_count_current: 0,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                validation_succeeded: true,
+                last_probe_error: None,
+            },
+            PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(7),
+                gate_reason: None,
+            },
+        );
+        write_probe_history(
+            &root,
+            7,
+            vec![
+                (1, PersistedProbeType::Tcp, true, 12, None),
+                (2, PersistedProbeType::Tcp, true, 12, None),
+                (
+                    3,
+                    PersistedProbeType::Tcp,
+                    false,
+                    12,
+                    Some("tcp probe returned unhealthy"),
+                ),
+                (4, PersistedProbeType::Tcp, true, 11, None),
+                (5, PersistedProbeType::Tcp, true, 10, None),
+                (6, PersistedProbeType::Tcp, true, 10, None),
+            ],
+        );
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(!diagnostics.probe_flapping);
+        assert_eq!(diagnostics.probe_stability.unwrap().recent_failure_count, 1);
+    }
+
+    #[test]
+    fn flapping_clears_after_stable_success_window() {
+        let root = test_root("flapping-clears-after-stable-success-window");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        write_validation_lifecycle(
+            &root,
+            7,
+            DeploymentLifecycleState::Promoted,
+            PersistedValidationSummary {
+                tcp_consecutive_passes: 4,
+                http_consecutive_passes: 4,
+                required_consecutive_passes: 3,
+                minimum_uptime_seconds: 10,
+                observed_uptime_seconds: 60,
+                restart_count_initial: 0,
+                restart_count_current: 0,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                validation_succeeded: true,
+                last_probe_error: None,
+            },
+            PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(7),
+                gate_reason: None,
+            },
+        );
+        write_probe_history(
+            &root,
+            7,
+            vec![
+                (1, PersistedProbeType::Tcp, true, 12, None),
+                (
+                    2,
+                    PersistedProbeType::Tcp,
+                    false,
+                    12,
+                    Some("tcp probe returned unhealthy"),
+                ),
+                (3, PersistedProbeType::Tcp, true, 12, None),
+                (
+                    4,
+                    PersistedProbeType::Tcp,
+                    false,
+                    12,
+                    Some("tcp probe returned unhealthy"),
+                ),
+                (5, PersistedProbeType::Tcp, true, 11, None),
+                (6, PersistedProbeType::Tcp, true, 11, None),
+                (7, PersistedProbeType::Tcp, true, 10, None),
+                (8, PersistedProbeType::Tcp, true, 10, None),
+            ],
+        );
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(!diagnostics.probe_flapping);
+        assert_eq!(
+            diagnostics
+                .probe_stability
+                .unwrap()
+                .consecutive_success_streak,
+            4
+        );
+    }
+
+    #[test]
+    fn diagnose_reports_probe_statistics() {
+        let root = test_root("diagnose-reports-probe-statistics");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        write_validation_lifecycle(
+            &root,
+            7,
+            DeploymentLifecycleState::Promoted,
+            PersistedValidationSummary {
+                tcp_consecutive_passes: 2,
+                http_consecutive_passes: 2,
+                required_consecutive_passes: 3,
+                minimum_uptime_seconds: 10,
+                observed_uptime_seconds: 60,
+                restart_count_initial: 0,
+                restart_count_current: 0,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                validation_succeeded: true,
+                last_probe_error: Some("http health probe returned unhealthy for /health".into()),
+            },
+            PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(7),
+                gate_reason: None,
+            },
+        );
+        write_probe_history(
+            &root,
+            7,
+            vec![
+                (1, PersistedProbeType::Tcp, true, 9, None),
+                (2, PersistedProbeType::Http, true, 15, None),
+                (
+                    3,
+                    PersistedProbeType::Tcp,
+                    false,
+                    9,
+                    Some("tcp probe returned unhealthy"),
+                ),
+                (
+                    4,
+                    PersistedProbeType::Http,
+                    false,
+                    16,
+                    Some("http health probe returned unhealthy for /health"),
+                ),
+                (5, PersistedProbeType::Tcp, true, 8, None),
+                (6, PersistedProbeType::Http, true, 14, None),
+            ],
+        );
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let stability = diagnostics.probe_stability.unwrap();
+        assert_eq!(stability.sample_size, 6);
+        assert_eq!(stability.consecutive_success_streak, 2);
+        assert_eq!(stability.recent_failure_count, 2);
+        assert!(stability.success_rate > 0.6 && stability.success_rate < 0.7);
+        assert!(stability.flapping_window_summary.contains("tcp="));
+        assert!(stability.flapping_window_summary.contains("http="));
     }
 
     #[test]

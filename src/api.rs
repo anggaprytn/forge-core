@@ -117,6 +117,15 @@ pub struct RouteDiagnostics {
     pub mismatch_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeStabilityDiagnostics {
+    pub sample_size: usize,
+    pub success_rate: f64,
+    pub consecutive_success_streak: usize,
+    pub recent_failure_count: usize,
+    pub flapping_window_summary: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentDeploymentFailure {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,7 +222,7 @@ pub struct SecretMutationDiagnostic {
     pub active_generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvironmentDiagnostics {
     pub project_id: String,
     pub environment: String,
@@ -268,6 +277,8 @@ pub struct EnvironmentDiagnostics {
     pub restart_instability: bool,
     #[serde(default)]
     pub probe_flapping: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_stability: Option<ProbeStabilityDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

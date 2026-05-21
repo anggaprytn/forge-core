@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::events::EventRecord;
 use crate::projects::ProjectRegistryStore;
@@ -19,7 +20,8 @@ use crate::storage::SnapshotState;
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     GcActionRecord, GcStore, PersistedActivationMode, PersistedBuildInfo,
-    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedSecretReference, PointerStore,
+    PersistedProbeHistoryEntry, PersistedProbeType, PersistedRouteTargetSource,
+    PersistedRuntimeInfo, PersistedSecretReference, PointerStore, ProbeHistoryStore,
     RuntimeHealthState, RuntimeStateStore, atomic_write, current_unix_timestamp,
     load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
     load_generation_snapshot_metadata,
@@ -29,6 +31,28 @@ use serde::{Deserialize, Serialize};
 // Beyond current/previous, retain only a small recent diagnostic tail of failed generations.
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
 const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
+const MAX_PROBE_HISTORY_ENTRIES: usize = 64;
+
+fn append_probe_history_entry(
+    env: &EnvironmentPaths,
+    generation: u64,
+    probe_type: PersistedProbeType,
+    success: bool,
+    latency_ms: u64,
+    failure_reason: Option<String>,
+) -> Result<(), ConvergenceError> {
+    ProbeHistoryStore::new(env.clone(), generation).append(
+        PersistedProbeHistoryEntry {
+            timestamp_unix: current_unix_timestamp(),
+            probe_type,
+            success,
+            latency_ms,
+            failure_reason,
+        },
+        MAX_PROBE_HISTORY_ENTRIES,
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
@@ -510,12 +534,64 @@ where
 
         let container_name =
             generation_container_name(&input.environment, &input.project_id, active_generation);
-        let tcp_ok = self
+        let tcp_started = Instant::now();
+        let tcp_ok = match self
             .probes
-            .probe_tcp(&container_name, input.internal_port())?;
+            .probe_tcp(&container_name, input.internal_port())
+        {
+            Ok(tcp_ok) => {
+                append_probe_history_entry(
+                    &env,
+                    active_generation,
+                    PersistedProbeType::Tcp,
+                    tcp_ok,
+                    tcp_started.elapsed().as_millis() as u64,
+                    (!tcp_ok).then(|| "tcp probe returned unhealthy".to_string()),
+                )?;
+                tcp_ok
+            }
+            Err(err) => {
+                append_probe_history_entry(
+                    &env,
+                    active_generation,
+                    PersistedProbeType::Tcp,
+                    false,
+                    tcp_started.elapsed().as_millis() as u64,
+                    Some(err.to_string()),
+                )?;
+                return Err(err.into());
+            }
+        };
         let http_ok = if let Some(path) = &input.http_health_path {
-            self.probes
-                .probe_http(&container_name, input.internal_port(), path)?
+            let http_started = Instant::now();
+            match self
+                .probes
+                .probe_http(&container_name, input.internal_port(), path)
+            {
+                Ok(http_ok) => {
+                    append_probe_history_entry(
+                        &env,
+                        active_generation,
+                        PersistedProbeType::Http,
+                        http_ok,
+                        http_started.elapsed().as_millis() as u64,
+                        (!http_ok)
+                            .then(|| format!("http health probe returned unhealthy for {path}")),
+                    )?;
+                    http_ok
+                }
+                Err(err) => {
+                    append_probe_history_entry(
+                        &env,
+                        active_generation,
+                        PersistedProbeType::Http,
+                        false,
+                        http_started.elapsed().as_millis() as u64,
+                        Some(err.to_string()),
+                    )?;
+                    return Err(err.into());
+                }
+            }
         } else {
             true
         };

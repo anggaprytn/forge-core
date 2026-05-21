@@ -26,9 +26,10 @@ use crate::storage::{
     CleanupRecord, CleanupStore, DeploymentLifecycleState, DiagnosticSummary, DiagnosticsStore,
     EnvironmentPaths, EventStore, GenerationAllocator, GenerationHistoryRecord, LifecycleStore,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
-    PersistedPromotionSummary, PersistedRouteTargetSource, PersistedRuntimeInfo,
-    PersistedValidationSummary, PointerStore, RetentionStore, RuntimeHealthState, RuntimeState,
-    RuntimeStateStore, SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
+    PersistedProbeHistoryEntry, PersistedProbeType, PersistedPromotionSummary,
+    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedValidationSummary, PointerStore,
+    ProbeHistoryStore, RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
+    SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
     load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
@@ -64,6 +65,29 @@ impl Display for DeploymentError {
 }
 
 impl std::error::Error for DeploymentError {}
+
+const MAX_PROBE_HISTORY_ENTRIES: usize = 64;
+
+fn append_probe_history_entry(
+    env: &EnvironmentPaths,
+    generation: u64,
+    probe_type: PersistedProbeType,
+    success: bool,
+    latency_ms: u64,
+    failure_reason: Option<String>,
+) -> Result<(), DeploymentError> {
+    ProbeHistoryStore::new(env.clone(), generation).append(
+        PersistedProbeHistoryEntry {
+            timestamp_unix: current_unix_timestamp(),
+            probe_type,
+            success,
+            latency_ms,
+            failure_reason,
+        },
+        MAX_PROBE_HISTORY_ENTRIES,
+    )?;
+    Ok(())
+}
 
 impl From<QueueError> for DeploymentError {
     fn from(value: QueueError) -> Self {
@@ -1291,19 +1315,46 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             }
 
             let tcp_ok = if validation.tcp_required {
+                let tcp_started = Instant::now();
                 match self.probes.probe_tcp(&probe_host, internal_port) {
                     Ok(true) => {
+                        append_probe_history_entry(
+                            env,
+                            generation,
+                            PersistedProbeType::Tcp,
+                            true,
+                            tcp_started.elapsed().as_millis() as u64,
+                            None,
+                        )?;
                         tcp_consecutive_passes += 1;
                         true
                     }
                     Ok(false) => {
+                        let failure_reason = "tcp probe returned unhealthy".to_string();
+                        append_probe_history_entry(
+                            env,
+                            generation,
+                            PersistedProbeType::Tcp,
+                            false,
+                            tcp_started.elapsed().as_millis() as u64,
+                            Some(failure_reason.clone()),
+                        )?;
                         tcp_consecutive_passes = 0;
-                        last_probe_error = Some("tcp probe returned unhealthy".into());
+                        last_probe_error = Some(failure_reason);
                         false
                     }
                     Err(err) => {
+                        let failure_reason = err.to_string();
+                        append_probe_history_entry(
+                            env,
+                            generation,
+                            PersistedProbeType::Tcp,
+                            false,
+                            tcp_started.elapsed().as_millis() as u64,
+                            Some(failure_reason.clone()),
+                        )?;
                         tcp_consecutive_passes = 0;
-                        last_probe_error = Some(err.to_string());
+                        last_probe_error = Some(failure_reason);
                         false
                     }
                 }
@@ -1328,18 +1379,45 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     0
                 };
             } else if let Some(path) = probe_path {
+                let http_started = Instant::now();
                 match self.probes.probe_http(&probe_host, internal_port, path) {
                     Ok(true) => {
+                        append_probe_history_entry(
+                            env,
+                            generation,
+                            PersistedProbeType::Http,
+                            true,
+                            http_started.elapsed().as_millis() as u64,
+                            None,
+                        )?;
                         http_consecutive_passes += 1;
                     }
                     Ok(false) => {
+                        let failure_reason =
+                            format!("http health probe returned unhealthy for {path}");
+                        append_probe_history_entry(
+                            env,
+                            generation,
+                            PersistedProbeType::Http,
+                            false,
+                            http_started.elapsed().as_millis() as u64,
+                            Some(failure_reason.clone()),
+                        )?;
                         http_consecutive_passes = 0;
-                        last_probe_error =
-                            Some(format!("http health probe returned unhealthy for {path}"));
+                        last_probe_error = Some(failure_reason);
                     }
                     Err(err) => {
+                        let failure_reason = err.to_string();
+                        append_probe_history_entry(
+                            env,
+                            generation,
+                            PersistedProbeType::Http,
+                            false,
+                            http_started.elapsed().as_millis() as u64,
+                            Some(failure_reason.clone()),
+                        )?;
                         http_consecutive_passes = 0;
-                        last_probe_error = Some(err.to_string());
+                        last_probe_error = Some(failure_reason);
                     }
                 }
             }

@@ -1549,6 +1549,26 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
             diagnostics.restart_instability, diagnostics.probe_flapping
         ));
     }
+    if let Some(probe_stability) = diagnostics.probe_stability.as_ref() {
+        output.push('\n');
+        output.push_str("Probe Stability:\n");
+        output.push_str(&format!(
+            "  Probe Success Rate: {:.0}%\n",
+            probe_stability.success_rate * 100.0
+        ));
+        output.push_str(&format!(
+            "  Consecutive Success Streak: {}\n",
+            probe_stability.consecutive_success_streak
+        ));
+        output.push_str(&format!(
+            "  Recent Failure Count: {}\n",
+            probe_stability.recent_failure_count
+        ));
+        output.push_str(&format!(
+            "  Flapping Window Summary: {}\n",
+            probe_stability.flapping_window_summary
+        ));
+    }
     if let Some(reason) = diagnostics.route.mismatch_reason.as_deref() {
         output.push('\n');
         output.push_str("Route Mismatch:\n");
