@@ -365,6 +365,7 @@ pub struct RecordedCommand {
 pub struct RecordingCommandRunner {
     pub commands: Vec<RecordedCommand>,
     pub outputs: Vec<String>,
+    pub envs: Vec<BTreeMap<String, String>>,
 }
 
 impl RecordingCommandRunner {
@@ -372,6 +373,7 @@ impl RecordingCommandRunner {
         Self {
             commands: Vec::new(),
             outputs,
+            envs: Vec::new(),
         }
     }
 }
@@ -385,12 +387,13 @@ impl CommandRunner for RecordingCommandRunner {
         &mut self,
         program: &str,
         args: &[String],
-        _env: &BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
     ) -> Result<String, DockerRuntimeError> {
         self.commands.push(RecordedCommand {
             program: program.to_string(),
             args: args.to_vec(),
         });
+        self.envs.push(env.clone());
         Ok(if self.outputs.is_empty() {
             String::new()
         } else {

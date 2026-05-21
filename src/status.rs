@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{
-    ContainerRuntimeDiagnostics, EnvironmentDiagnostics, ErrorResponse, ProbeTargetDiagnostics,
-    RecentDeploymentFailure, RouteDiagnostics,
+    ContainerRuntimeDiagnostics, EnvironmentDiagnostics, EnvironmentVariableReport,
+    EnvironmentVariableValue, ErrorResponse, ProbeTargetDiagnostics, RecentDeploymentFailure,
+    RouteDiagnostics, RuntimeEnvSnapshotMetadata,
 };
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{PersistentQueue, QueueError};
@@ -15,10 +16,12 @@ use crate::runtime::{
     ContainerInspection, DockerRuntime, DockerRuntimeError, RouteInspection, RoutingRuntime,
     RoutingRuntimeError,
 };
+use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, PersistedActivationMode, PersistedRouteTargetSource,
     PersistedRuntimeInfo, PointerStore, RuntimeStateStore, StorageError,
-    load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
+    load_generation_build_info, load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    load_generation_snapshot_metadata,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +56,8 @@ pub struct ProjectEnvironmentStatus {
     pub deployed_at_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_env_snapshot: Option<RuntimeEnvSnapshotMetadata>,
 }
 
 #[derive(Debug)]
@@ -64,6 +69,7 @@ pub enum ProjectStatusError {
     ProjectLookup(String),
     ProjectNotFound,
     InvalidEnvironment,
+    RuntimeEnvSnapshotUnavailable,
 }
 
 impl Display for ProjectStatusError {
@@ -81,6 +87,7 @@ impl Display for ProjectStatusError {
                     "environment must be one of development, staging, production"
                 )
             }
+            Self::RuntimeEnvSnapshotUnavailable => write!(f, "runtime env snapshot unavailable"),
         }
     }
 }
@@ -148,6 +155,13 @@ pub fn project_status_error_response(
                 message: "environment must be one of development, staging, production".into(),
             },
         ),
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable => (
+            axum::http::StatusCode::NOT_FOUND,
+            ErrorResponse {
+                code: "runtime_env_snapshot_unavailable".into(),
+                message: "runtime env snapshot unavailable".into(),
+            },
+        ),
         other => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ErrorResponse {
@@ -210,6 +224,10 @@ where
         .flatten();
     let latest_build = latest_generation
         .map(|generation| load_generation_build_info(&env, generation))
+        .transpose()?
+        .flatten();
+    let promoted_runtime_env_snapshot = active_generation
+        .map(|generation| load_generation_runtime_env_snapshot(&env, generation))
         .transpose()?
         .flatten();
 
@@ -358,6 +376,9 @@ where
                     .map(|snapshot| snapshot.finalized_at_unix)
             }),
         container_started_at,
+        runtime_env_snapshot: promoted_runtime_env_snapshot
+            .as_ref()
+            .map(runtime_env_snapshot_metadata),
     })
 }
 
@@ -387,6 +408,10 @@ where
     let active_generation = current_generation.or(runtime_state.active_generation);
     let promoted_runtime = active_generation
         .map(|generation| load_generation_runtime_info(&env, generation))
+        .transpose()?
+        .flatten();
+    let promoted_runtime_env_snapshot = active_generation
+        .map(|generation| load_generation_runtime_env_snapshot(&env, generation))
         .transpose()?
         .flatten();
     let container_inspection = inspect_promoted_container(docker, promoted_runtime.as_ref());
@@ -490,6 +515,61 @@ where
                 }
             }),
         diagnostics_source: latest_failure.map(|failure| failure.diagnostics_source),
+        runtime_env_snapshot: promoted_runtime_env_snapshot
+            .as_ref()
+            .map(runtime_env_snapshot_metadata),
+    })
+}
+
+pub fn load_project_environment_env_report(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+) -> Result<EnvironmentVariableReport, ProjectStatusError> {
+    if !matches!(environment, "development" | "staging" | "production") {
+        return Err(ProjectStatusError::InvalidEnvironment);
+    }
+
+    ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ProjectStatusError::ProjectLookup(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?
+        .ok_or(ProjectStatusError::ProjectNotFound)?;
+
+    let env = EnvironmentPaths::new(storage_root, project_id, environment);
+    env.ensure_exists()?;
+    let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
+    let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
+    let generation = current_generation
+        .or(runtime_state.active_generation)
+        .ok_or(ProjectStatusError::RuntimeEnvSnapshotUnavailable)?;
+    let snapshot = load_generation_runtime_env_snapshot(&env, generation)?
+        .ok_or(ProjectStatusError::RuntimeEnvSnapshotUnavailable)?;
+    let values = snapshot
+        .entries
+        .iter()
+        .map(|(key, entry)| EnvironmentVariableValue {
+            key: key.clone(),
+            value: render_snapshot_value(entry),
+            source: runtime_env_source_name(&entry.source).to_string(),
+            generated: GENERATED_FORGE_ENV_KEYS.contains(&key.as_str()),
+            redacted: entry.redacted,
+        })
+        .collect();
+
+    Ok(EnvironmentVariableReport {
+        project_id: snapshot.project_id,
+        environment: snapshot.environment,
+        generation: snapshot.generation,
+        deployment_id: snapshot.deployment_id,
+        source_environment: snapshot.source_environment,
+        source_ref: snapshot.source_ref,
+        commit_sha: snapshot.commit_sha,
+        domain: snapshot.domain,
+        values,
     })
 }
 
@@ -626,6 +706,49 @@ fn diagnostics_dir_source(env: &EnvironmentPaths, generation: u64) -> String {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
     )
+}
+
+fn runtime_env_snapshot_metadata(
+    snapshot: &crate::storage::PersistedRuntimeEnvSnapshot,
+) -> RuntimeEnvSnapshotMetadata {
+    RuntimeEnvSnapshotMetadata {
+        generation: snapshot.generation,
+        deployment_id: snapshot.deployment_id.clone(),
+        source_environment: snapshot.source_environment.clone(),
+        source_ref: snapshot.source_ref.clone(),
+        commit_sha: snapshot.commit_sha.clone(),
+        domain: snapshot.domain.clone(),
+        total_keys: snapshot.entries.len(),
+        secret_backed_keys: snapshot
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.redacted)
+            .map(|(key, _)| key.clone())
+            .collect(),
+        generated_forge_vars: snapshot
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                GENERATED_FORGE_ENV_KEYS
+                    .contains(&key.as_str())
+                    .then(|| (key.clone(), render_snapshot_value(entry)))
+            })
+            .collect(),
+    }
+}
+
+fn runtime_env_source_name(source: &crate::storage::PersistedRuntimeEnvSource) -> &'static str {
+    match source {
+        crate::storage::PersistedRuntimeEnvSource::ForgeYaml => "forge_yml",
+        crate::storage::PersistedRuntimeEnvSource::ProjectEnvironmentSecret => {
+            "project_environment_secret"
+        }
+        crate::storage::PersistedRuntimeEnvSource::DeployTimeOverride => "deploy_time_override",
+        crate::storage::PersistedRuntimeEnvSource::ForgeGenerated => "forge_generated",
+        crate::storage::PersistedRuntimeEnvSource::SystemRuntimeReserved => {
+            "system_runtime_reserved"
+        }
+    }
 }
 
 fn validation_failure_summary(value: &Value) -> Option<String> {
@@ -953,6 +1076,33 @@ mod tests {
         .unwrap();
         writer
             .write_artifact("runtime.json", &format!("{runtime}\n"))
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime_env_snapshot.json",
+                &format!(
+                    concat!(
+                        "{{\n",
+                        "  \"snapshot_version\": 1,\n",
+                        "  \"project_id\": \"api\",\n",
+                        "  \"environment\": \"staging\",\n",
+                        "  \"generation\": {generation},\n",
+                        "  \"deployment_id\": \"dep-{generation}\",\n",
+                        "  \"source_environment\": \"staging\",\n",
+                        "  \"source_ref\": \"main\",\n",
+                        "  \"commit_sha\": \"340ac8108006d84dbf951d8c0bb04ecfaf0eccac\",\n",
+                        "  \"domain\": \"staging-api.example.com\",\n",
+                        "  \"entries\": {{\n",
+                        "    \"FORGE_PROJECT_ID\": {{ \"source\": \"forge_generated\", \"value\": \"api\", \"sensitive\": false, \"redacted\": false }},\n",
+                        "    \"FORGE_ENVIRONMENT\": {{ \"source\": \"forge_generated\", \"value\": \"staging\", \"sensitive\": false, \"redacted\": false }},\n",
+                        "    \"API_BASE_URL\": {{ \"source\": \"forge_yaml\", \"value\": \"https://api.example.com\", \"sensitive\": false, \"redacted\": false }},\n",
+                        "    \"DATABASE_URL\": {{ \"source\": \"project_environment_secret\", \"secret_reference\": {{ \"scope\": \"environment\", \"key\": \"DATABASE_URL\", \"secret_id\": \"api:staging:DATABASE_URL\", \"sensitive\": true }}, \"sensitive\": true, \"redacted\": true }}\n",
+                        "  }}\n",
+                        "}}\n"
+                    ),
+                    generation = generation,
+                ),
+            )
             .unwrap();
         writer
             .finalize("api", "staging", SnapshotState::Healthy)
@@ -1413,5 +1563,45 @@ mod tests {
         assert!(diagnostics.latest_validation_failure.is_none());
         assert!(diagnostics.route.mismatch_reason.is_some());
         assert!(diagnostics.diagnostics_source.is_none());
+    }
+
+    #[test]
+    fn runtime_env_snapshot_metadata_is_exposed() {
+        let root = test_root("runtime-env-snapshot-metadata-is-exposed");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let report = load_project_environment_env_report(&root, "api", "staging").unwrap();
+        assert_eq!(report.generation, 7);
+        assert!(
+            report
+                .values
+                .iter()
+                .any(|entry| entry.key == "DATABASE_URL" && entry.value == "<secret>")
+        );
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+        assert_eq!(
+            status
+                .runtime_env_snapshot
+                .as_ref()
+                .unwrap()
+                .generated_forge_vars["FORGE_PROJECT_ID"],
+            "api"
+        );
     }
 }

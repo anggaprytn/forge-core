@@ -10,6 +10,7 @@ use crate::runtime::{
     ContainerInspection, CreateContainerRequest, DockerRuntime, ManagedImage, ProbeRuntime,
     RouteInspection, RouteUpdateRequest, RoutingRuntime,
 };
+use crate::runtime_env::restore_runtime_env;
 use crate::secrets::SecretStore;
 use crate::status::derive_environment_domain;
 #[cfg(test)]
@@ -18,7 +19,7 @@ use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     PersistedActivationMode, PersistedRouteTargetSource, PersistedRuntimeInfo,
     PersistedSecretReference, PointerStore, RuntimeHealthState, RuntimeStateStore,
-    load_generation_build_info, load_generation_runtime_info,
+    load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
 };
 
 // Beyond current/previous, retain only a small recent diagnostic tail of failed generations.
@@ -1965,8 +1966,13 @@ fn ensure_generation_container_running<RtD: DockerRuntime>(
         ("forge.generation".into(), generation.to_string()),
         ("forge.deployment_id".into(), deployment_id.to_string()),
     ]);
-    let environment =
-        resolve_recovery_environment(storage_root, project_id, environment, environment_variables)?;
+    let environment = resolve_recovery_environment(
+        storage_root,
+        project_id,
+        environment,
+        generation,
+        environment_variables,
+    )?;
     docker.create_container(CreateContainerRequest {
         container_name: container_name.to_string(),
         image_ref: image_ref.to_string(),
@@ -1982,8 +1988,14 @@ fn resolve_recovery_environment(
     storage_root: &std::path::Path,
     project_id: &str,
     environment: &str,
+    generation: u64,
     environment_variables: &BTreeMap<String, PersistedSecretReference>,
 ) -> Result<BTreeMap<String, String>, ConvergenceError> {
+    let env_paths = EnvironmentPaths::new(storage_root, project_id, environment);
+    if let Some(resolved) = load_generation_resolved_runtime(&env_paths, generation)? {
+        return restore_runtime_env(&resolved).map_err(ConvergenceError::Secret);
+    }
+
     let store = SecretStore::new(storage_root.join("secrets"))?;
     let mut resolved = BTreeMap::new();
     for (env_name, reference) in environment_variables {

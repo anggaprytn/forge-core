@@ -34,10 +34,10 @@ pub struct SecretResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct EncryptedSecretRecord {
-    version: u8,
-    nonce_b64: String,
-    ciphertext_b64: String,
+pub struct SealedValueRecord {
+    pub version: u8,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
 }
 
 #[derive(Debug)]
@@ -89,16 +89,7 @@ impl SecretStore {
     ) -> Result<SecretWriteResult, SecretError> {
         validate_secret_request(request)?;
         let cipher = cipher_from_env()?;
-        let mut nonce = [0u8; 12];
-        rand::rng().fill_bytes(&mut nonce);
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), request.value.as_bytes())
-            .map_err(|err| SecretError::Crypto(err.to_string()))?;
-        let record = EncryptedSecretRecord {
-            version: 1,
-            nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce),
-            ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
-        };
+        let record = seal_with_cipher(&cipher, &request.value)?;
         let bytes = serde_json::to_vec_pretty(&record)
             .map_err(|err| SecretError::Crypto(err.to_string()))?;
         atomic_write(
@@ -124,20 +115,10 @@ impl SecretStore {
         if !path.exists() {
             return Err(SecretError::MissingSecret(key.to_string()));
         }
-        let cipher = cipher_from_env()?;
         let raw = fs::read_to_string(path)?;
-        let record: EncryptedSecretRecord =
+        let record: SealedValueRecord =
             serde_json::from_str(&raw).map_err(|err| SecretError::Crypto(err.to_string()))?;
-        let nonce = base64::engine::general_purpose::STANDARD
-            .decode(record.nonce_b64)
-            .map_err(|err| SecretError::Crypto(err.to_string()))?;
-        let ciphertext = base64::engine::general_purpose::STANDARD
-            .decode(record.ciphertext_b64)
-            .map_err(|err| SecretError::Crypto(err.to_string()))?;
-        let plaintext = cipher
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-            .map_err(|err| SecretError::Crypto(err.to_string()))?;
-        String::from_utf8(plaintext).map_err(|err| SecretError::Crypto(err.to_string()))
+        unseal_value(&record)
     }
 
     fn path_for(&self, project_id: &str, environment: &str, key: &str) -> PathBuf {
@@ -172,6 +153,38 @@ fn cipher_from_env() -> Result<Aes256Gcm, SecretError> {
         return Err(SecretError::InvalidMasterKey);
     }
     Aes256Gcm::new_from_slice(&bytes).map_err(|_| SecretError::InvalidMasterKey)
+}
+
+pub fn seal_value(value: &str) -> Result<SealedValueRecord, SecretError> {
+    let cipher = cipher_from_env()?;
+    seal_with_cipher(&cipher, value)
+}
+
+pub fn unseal_value(record: &SealedValueRecord) -> Result<String, SecretError> {
+    let cipher = cipher_from_env()?;
+    let nonce = base64::engine::general_purpose::STANDARD
+        .decode(&record.nonce_b64)
+        .map_err(|err| SecretError::Crypto(err.to_string()))?;
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(&record.ciphertext_b64)
+        .map_err(|err| SecretError::Crypto(err.to_string()))?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|err| SecretError::Crypto(err.to_string()))?;
+    String::from_utf8(plaintext).map_err(|err| SecretError::Crypto(err.to_string()))
+}
+
+fn seal_with_cipher(cipher: &Aes256Gcm, value: &str) -> Result<SealedValueRecord, SecretError> {
+    let mut nonce = [0u8; 12];
+    rand::rng().fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), value.as_bytes())
+        .map_err(|err| SecretError::Crypto(err.to_string()))?;
+    Ok(SealedValueRecord {
+        version: 1,
+        nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce),
+        ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+    })
 }
 
 #[cfg(test)]

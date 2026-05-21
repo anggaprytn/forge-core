@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,7 @@ pub struct ForgeYamlConfig {
     execution: ExecutionConfig,
     validation: ValidationPolicy,
     validation_timeout_ms: Option<u64>,
+    environment: BTreeMap<String, String>,
 }
 
 impl ForgeYamlConfig {
@@ -48,6 +50,10 @@ impl ForgeYamlConfig {
     pub fn validation_timeout_ms(&self) -> Option<u64> {
         self.validation_timeout_ms
     }
+
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +63,8 @@ struct RawForgeYaml {
     name: String,
     #[serde(rename = "type")]
     app_type: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
     build: RawBuildConfig,
     runtime: RawRuntimeConfig,
     invariants: Vec<RawInvariant>,
@@ -200,6 +208,7 @@ impl RawForgeYaml {
                 },
             },
             validation_timeout_ms: invariant.timeout_ms,
+            environment: self.env,
         })
     }
 }

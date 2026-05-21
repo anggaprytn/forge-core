@@ -1,6 +1,7 @@
 use crate::events::EventRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +129,52 @@ pub struct EnvironmentDiagnostics {
     pub likely_failure_stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_env_snapshot: Option<RuntimeEnvSnapshotMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEnvSnapshotMetadata {
+    pub generation: u64,
+    pub deployment_id: String,
+    pub source_environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    pub total_keys: usize,
+    #[serde(default)]
+    pub secret_backed_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub generated_forge_vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentVariableValue {
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub generated: bool,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentVariableReport {
+    pub project_id: String,
+    pub environment: String,
+    pub generation: u64,
+    pub deployment_id: String,
+    pub source_environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub values: Vec<EnvironmentVariableValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

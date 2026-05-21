@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use forge_core::api::{
     CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics, ErrorResponse,
-    EventList, ProjectList, ProjectRecord, ProjectUpsertRequest,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
+    EnvironmentVariableReport, ErrorResponse, EventList, ProjectList, ProjectRecord,
+    ProjectUpsertRequest,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -156,6 +157,20 @@ where
                 print!("{}", render_environment_diagnostics(&diagnostics));
             }
         }
+        Command::Env {
+            project_id,
+            environment,
+            json,
+        } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let report = client.get_project_environment_env(&project_id, &environment)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                print!("{}", render_environment_variables(&report));
+            }
+        }
         Command::Events => {
             let (base_url, token) = api_credentials.clone().unwrap();
             let client = ForgeClient::new(base_url, token);
@@ -292,6 +307,17 @@ impl ForgeClient {
     ) -> Result<EnvironmentDiagnostics, CliError> {
         self.send_json(self.http.get(format!(
             "{}/api/projects/{project_id}/environments/{environment}/diagnostics",
+            self.base_url
+        )))
+    }
+
+    fn get_project_environment_env(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<EnvironmentVariableReport, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/env",
             self.base_url
         )))
     }
@@ -459,6 +485,11 @@ enum Command {
         json: bool,
     },
     Diagnose {
+        project_id: String,
+        environment: String,
+        json: bool,
+    },
+    Env {
         project_id: String,
         environment: String,
         json: bool,
@@ -649,6 +680,7 @@ fn parse_command(
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
         [cmd, rest @ ..] if cmd == "logs" => parse_logs_command(rest),
         [cmd, rest @ ..] if cmd == "diagnose" => parse_diagnose_command(rest),
+        [cmd, rest @ ..] if cmd == "env" => parse_env_command(rest),
         [cmd] if cmd == "events" => Ok(Command::Events),
         [cmd, project_id, environment] if cmd == "rollback" => Ok(Command::Rollback {
             project_id: project_id.clone(),
@@ -691,6 +723,7 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] logs [--json] <deployment_id>",
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] diagnose [--json] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] env [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
@@ -763,6 +796,28 @@ fn parse_status_command(args: &[String]) -> Result<Command, CliError> {
             deployment_id: deployment_id.clone(),
         }),
         [project_id, environment] => Ok(Command::ProjectStatus {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_env_command(args: &[String]) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut positionals = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+    }
+
+    match positionals.as_slice() {
+        [project_id, environment] => Ok(Command::Env {
             project_id: project_id.clone(),
             environment: environment.clone(),
             json,
@@ -991,6 +1046,17 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
         "  Probe Path: {}\n",
         status.probe_path.as_deref().unwrap_or("unknown")
     ));
+    if let Some(snapshot) = status.runtime_env_snapshot.as_ref() {
+        output.push('\n');
+        output.push_str("Runtime Env Snapshot:\n");
+        output.push_str(&format!("  Generation: {}\n", snapshot.generation));
+        output.push_str(&format!("  Deployment: {}\n", snapshot.deployment_id));
+        output.push_str(&format!(
+            "  Source Environment: {}\n",
+            snapshot.source_environment
+        ));
+        output.push_str(&format!("  Keys: {}\n", snapshot.total_keys));
+    }
     output
 }
 
@@ -1112,6 +1178,23 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         output.push('\n');
         output.push_str("Diagnostics Source:\n");
         output.push_str(&format!("  {source}\n"));
+    }
+    if let Some(snapshot) = diagnostics.runtime_env_snapshot.as_ref() {
+        output.push('\n');
+        output.push_str("Runtime Env Snapshot:\n");
+        output.push_str(&format!("  Generation: {}\n", snapshot.generation));
+        output.push_str(&format!("  Deployment: {}\n", snapshot.deployment_id));
+        for (key, value) in &snapshot.generated_forge_vars {
+            output.push_str(&format!("  {key}={value}\n"));
+        }
+    }
+    output
+}
+
+fn render_environment_variables(report: &EnvironmentVariableReport) -> String {
+    let mut output = String::new();
+    for value in &report.values {
+        output.push_str(&format!("{}={}\n", value.key, value.value));
     }
     output
 }

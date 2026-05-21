@@ -151,6 +151,26 @@ fn cli_diagnose_reads_environment_diagnostics() {
 }
 
 #[test]
+fn cli_env_reports_redacted_secret_keys() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"staging","generation":7,"deployment_id":"dep-7","source_environment":"staging","values":[{"key":"FORGE_PROJECT_ID","value":"api","source":"forge_generated","generated":true,"redacted":false},{"key":"API_BASE_URL","value":"https://api.example.com","source":"forge_yml","generated":false,"redacted":false},{"key":"DATABASE_URL","value":"<secret>","source":"project_environment_secret","generated":false,"redacted":true}]}}"#,
+    );
+
+    let output = run_cli(&url, &["env", "api", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("FORGE_PROJECT_ID=api"));
+    assert!(body.contains("API_BASE_URL=https://api.example.com"));
+    assert!(body.contains("DATABASE_URL=<secret>"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/projects/api/environments/staging/env");
+}
+
+#[test]
 fn cli_events_reads_event_stream() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(

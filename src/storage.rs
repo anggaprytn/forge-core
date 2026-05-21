@@ -1,4 +1,5 @@
 use crate::events::{EventRecord, redact_text};
+use crate::secrets::SealedValueRecord;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -127,6 +128,8 @@ pub enum PersistedActivationMode {
 pub struct PersistedSecretReference {
     pub scope: String,
     pub key: String,
+    #[serde(default)]
+    pub secret_id: Option<String>,
     pub sensitive: bool,
 }
 
@@ -150,6 +153,78 @@ pub struct PersistedRuntimeInfo {
     pub commit_sha: Option<String>,
     #[serde(default)]
     pub source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedRuntimeEnvSource {
+    ForgeYaml,
+    ProjectEnvironmentSecret,
+    DeployTimeOverride,
+    ForgeGenerated,
+    SystemRuntimeReserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRuntimeEnvEntry {
+    pub source: PersistedRuntimeEnvSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_reference: Option<PersistedSecretReference>,
+    #[serde(default)]
+    pub sensitive: bool,
+    #[serde(default)]
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRuntimeEnvSnapshot {
+    pub snapshot_version: u64,
+    pub project_id: String,
+    pub environment: String,
+    pub generation: u64,
+    pub deployment_id: String,
+    pub source_environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_order: Vec<String>,
+    pub entries: BTreeMap<String, PersistedRuntimeEnvEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedResolvedRuntimeEntry {
+    pub source: PersistedRuntimeEnvSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_reference: Option<PersistedSecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_value: Option<SealedValueRecord>,
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedResolvedRuntime {
+    pub snapshot_version: u64,
+    pub project_id: String,
+    pub environment: String,
+    pub generation: u64,
+    pub deployment_id: String,
+    pub source_environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    pub entries: BTreeMap<String, PersistedResolvedRuntimeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +474,20 @@ pub fn load_generation_snapshot_metadata(
     generation: u64,
 ) -> StorageResult<Option<PersistedSnapshotMetadata>> {
     load_generation_json(env, generation, "snapshot.json")
+}
+
+pub fn load_generation_runtime_env_snapshot(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> StorageResult<Option<PersistedRuntimeEnvSnapshot>> {
+    load_generation_json(env, generation, "runtime_env_snapshot.json")
+}
+
+pub fn load_generation_resolved_runtime(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> StorageResult<Option<PersistedResolvedRuntime>> {
+    load_generation_json(env, generation, "resolved_runtime.json")
 }
 
 impl EventStore {

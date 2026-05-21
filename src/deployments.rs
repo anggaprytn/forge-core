@@ -18,13 +18,14 @@ use crate::runtime::{
     DockerRuntimeError, ProbeError, ProbeRuntime, RouteInspection, RouteUpdateRequest,
     RoutingRuntime, RoutingRuntimeError,
 };
+use crate::runtime_env::{RuntimeEnvMetadata, build_runtime_env_artifacts};
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::status::derive_environment_domain;
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     GenerationAllocator, PersistedActivationMode, PersistedBuildInfo, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PersistedSecretReference, PointerStore, RuntimeHealthState, RuntimeState,
-    RuntimeStateStore, SnapshotState, SnapshotWriter, StorageError, load_generation_build_info,
+    PersistedRuntimeInfo, PointerStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
+    SnapshotState, SnapshotWriter, StorageError, load_generation_build_info,
     load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
@@ -292,6 +293,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             record.project_id, record.environment, generation
         );
         let writer = SnapshotWriter::new(env.clone(), generation)?;
+        let domain =
+            load_environment_domain(&self.storage_root, &record.project_id, &record.environment)?;
         let runtime_secrets = match self.resolve_runtime_secrets(&execution.context_path, record) {
             Ok(secrets) => secrets,
             Err(DeploymentError::MissingSecret(message)) => {
@@ -323,11 +326,26 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             }
             Err(err) => return Err(err),
         };
-        let secret_values = runtime_secrets
-            .iter()
-            .map(|secret| secret.value.clone())
-            .collect::<Vec<_>>();
-        let redacted_env_preview = runtime_env_preview(&runtime_secrets);
+        let forge_yaml_values = forge_yaml
+            .as_ref()
+            .map(|config| config.environment().clone())
+            .unwrap_or_default();
+        let runtime_env = build_runtime_env_artifacts(
+            &RuntimeEnvMetadata {
+                project_id: record.project_id.clone(),
+                environment: record.environment.clone(),
+                generation,
+                deployment_id: record.deployment_id.clone(),
+                source_ref: record.source_ref.clone(),
+                commit_sha: record.commit_sha.clone(),
+                domain: domain.clone(),
+            },
+            &forge_yaml_values,
+            &runtime_secrets,
+            &BTreeMap::new(),
+        )?;
+        let redacted_env_preview = runtime_env.redacted_preview.clone();
+        let secret_values = runtime_env.redaction_values.clone();
         append_event(&events, record, generation, "DEPLOYMENT_STARTED", None)?;
         diagnostics.append_log_line(
             &format!("deployment started for {}", record.deployment_id),
@@ -386,7 +404,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             container_name: container_name.clone(),
             image_ref: image_ref.clone(),
             labels: labels.clone(),
-            environment: runtime_environment(&runtime_secrets),
+            environment: runtime_env.container_env.clone(),
             network_name: execution.network_name.clone(),
         }) {
             Ok(_) => {}
@@ -514,7 +532,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     target_source: PersistedRouteTargetSource::ContainerIp,
                 },
             }),
-            environment_variables: runtime_secret_references(&runtime_secrets),
+            environment_variables: runtime_env
+                .snapshot
+                .entries
+                .iter()
+                .filter_map(|(key, entry)| {
+                    entry
+                        .secret_reference
+                        .clone()
+                        .map(|reference| (key.clone(), reference))
+                })
+                .collect(),
             source_ref: record.source_ref.clone(),
             repo_url: record.repo_url.clone(),
             commit_sha: record.commit_sha.clone(),
@@ -527,6 +555,25 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ))
         })?;
         writer.write_artifact("runtime.json", &format!("{runtime_json}\n"))?;
+        let runtime_env_snapshot =
+            serde_json::to_string_pretty(&runtime_env.snapshot).map_err(|err| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                ))
+            })?;
+        writer.write_artifact(
+            "runtime_env_snapshot.json",
+            &format!("{runtime_env_snapshot}\n"),
+        )?;
+        let resolved_runtime =
+            serde_json::to_string_pretty(&runtime_env.resolved).map_err(|err| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                ))
+            })?;
+        writer.write_artifact("resolved_runtime.json", &format!("{resolved_runtime}\n"))?;
         diagnostics.append_log_line("runtime inspection passed", &secret_values)?;
         self.validate_candidate(
             &validation,
@@ -1545,45 +1592,6 @@ fn forge_labels(record: &DeploymentRecord, generation: u64) -> BTreeMap<String, 
     ])
 }
 
-fn runtime_environment(secrets: &[SecretResolution]) -> BTreeMap<String, String> {
-    secrets
-        .iter()
-        .map(|secret| (secret.key.clone(), secret.value.clone()))
-        .collect()
-}
-
-fn runtime_secret_references(
-    secrets: &[SecretResolution],
-) -> BTreeMap<String, PersistedSecretReference> {
-    secrets
-        .iter()
-        .map(|secret| {
-            (
-                secret.key.clone(),
-                PersistedSecretReference {
-                    scope: "environment".into(),
-                    key: secret.source_key.clone(),
-                    sensitive: secret.sensitive,
-                },
-            )
-        })
-        .collect()
-}
-
-fn runtime_env_preview(secrets: &[SecretResolution]) -> Vec<String> {
-    secrets
-        .iter()
-        .map(|secret| {
-            let value = if secret.sensitive || secret.value.len() >= 8 {
-                "[REDACTED]".to_string()
-            } else {
-                secret.value.clone()
-            };
-            format!("{}={value}", secret.key)
-        })
-        .collect()
-}
-
 fn resolve_secret_reference(
     store: &SecretStore,
     record: &DeploymentRecord,
@@ -2411,7 +2419,21 @@ pub mod events_are_appended_for_state_transitions {
             tcp_ok: true,
             http_ok: true,
         };
-        let mut routing = TestRoutingRuntime::default();
+        let inspection = RouteInspection {
+            subtree_id: "forge:api:production".into(),
+            active_target: "172.18.0.2:3000".into(),
+            domain: Some("api.example.com".into()),
+            activation_verified: true,
+            verification_url: None,
+            verification_host: None,
+            verification_status_code: None,
+            verification_response_body: None,
+            health_checks_enabled: false,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![inspection; 8],
+        };
 
         DeploymentExecutor::new(
             &root,
@@ -2631,7 +2653,7 @@ pub mod rollback_restores_previous_generation {
 pub mod git_backed_rollback_status_correctness {
     use super::*;
     use crate::runtime::ManagedImage;
-    use crate::status::load_project_environment_status;
+    use crate::status::{load_project_environment_env_report, load_project_environment_status};
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -2765,6 +2787,106 @@ pub mod git_backed_rollback_status_correctness {
         .unwrap();
         writer
             .write_artifact("runtime.json", &format!("{runtime}\n"))
+            .unwrap();
+        let runtime_env_snapshot = serde_json::json!({
+            "snapshot_version": 1,
+            "project_id": project_id,
+            "environment": environment,
+            "generation": generation,
+            "deployment_id": format!("dep-{generation}"),
+            "source_environment": environment,
+            "source_ref": source_ref,
+            "commit_sha": commit_sha,
+            "domain": derive_environment_domain("api.example.com", environment),
+            "resolution_order": [
+                "forge_yml",
+                "project_environment_secret",
+                "deploy_time_override",
+                "forge_generated",
+                "system_runtime_reserved"
+            ],
+            "entries": {
+                "FORGE_PROJECT_ID": {
+                    "source": "forge_generated",
+                    "value": project_id,
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "FORGE_ENVIRONMENT": {
+                    "source": "forge_generated",
+                    "value": environment,
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "FORGE_GENERATION": {
+                    "source": "forge_generated",
+                    "value": generation.to_string(),
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "FORGE_DEPLOYMENT_ID": {
+                    "source": "forge_generated",
+                    "value": format!("dep-{generation}"),
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "FORGE_COMMIT_SHA": {
+                    "source": "forge_generated",
+                    "value": commit_sha,
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "FORGE_SOURCE_REF": {
+                    "source": "forge_generated",
+                    "value": source_ref,
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "FORGE_DOMAIN": {
+                    "source": "forge_generated",
+                    "value": derive_environment_domain("api.example.com", environment),
+                    "sensitive": false,
+                    "redacted": false
+                }
+            }
+        });
+        writer
+            .write_artifact(
+                "runtime_env_snapshot.json",
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&runtime_env_snapshot).unwrap()
+                ),
+            )
+            .unwrap();
+        let resolved_runtime = serde_json::json!({
+            "snapshot_version": 1,
+            "project_id": project_id,
+            "environment": environment,
+            "generation": generation,
+            "deployment_id": format!("dep-{generation}"),
+            "source_environment": environment,
+            "source_ref": source_ref,
+            "commit_sha": commit_sha,
+            "domain": derive_environment_domain("api.example.com", environment),
+            "entries": {
+                "FORGE_PROJECT_ID": { "source": "forge_generated", "value": project_id, "sensitive": false },
+                "FORGE_ENVIRONMENT": { "source": "forge_generated", "value": environment, "sensitive": false },
+                "FORGE_GENERATION": { "source": "forge_generated", "value": generation.to_string(), "sensitive": false },
+                "FORGE_DEPLOYMENT_ID": { "source": "forge_generated", "value": format!("dep-{generation}"), "sensitive": false },
+                "FORGE_COMMIT_SHA": { "source": "forge_generated", "value": commit_sha, "sensitive": false },
+                "FORGE_SOURCE_REF": { "source": "forge_generated", "value": source_ref, "sensitive": false },
+                "FORGE_DOMAIN": { "source": "forge_generated", "value": derive_environment_domain("api.example.com", environment), "sensitive": false }
+            }
+        });
+        writer
+            .write_artifact(
+                "resolved_runtime.json",
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&resolved_runtime).unwrap()
+                ),
+            )
             .unwrap();
         writer.finalize(project_id, environment, state).unwrap();
     }
@@ -2956,6 +3078,74 @@ pub mod git_backed_rollback_status_correctness {
             Some("forge/api:production-gen-1")
         );
         assert_eq!(status.container_name.as_deref(), Some("prod-api-gen-1"));
+    }
+
+    #[test]
+    fn rollback_restores_generation_env_snapshot() {
+        let root = test_root("rollback-restores-generation-env-snapshot");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            2,
+            SnapshotState::Healthy,
+            "release",
+            "bbb222",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue.enqueue(rollback_record("api", "production")).unwrap();
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(
+                generation_container_name("production", "api", 1),
+                container_inspection("api", "production", 1, "172.29.0.11"),
+            )]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![route_inspection(
+                "api",
+                "production",
+                "172.29.0.11",
+                Some("api.example.com"),
+            )],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let report = load_project_environment_env_report(&root, "api", "production").unwrap();
+        assert_eq!(report.generation, 1);
+        assert_eq!(report.deployment_id, "dep-1");
+        assert!(
+            report
+                .values
+                .iter()
+                .any(|entry| entry.key == "FORGE_COMMIT_SHA" && entry.value == "aaa111")
+        );
     }
 
     #[test]
@@ -3553,6 +3743,314 @@ pub mod deploy_loads_forge_yml {
             probes.http_hosts,
             vec![("172.18.0.2".to_string(), 4010, "/ready".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+pub mod runtime_environment_snapshots {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::{load_generation_resolved_runtime, load_generation_runtime_env_snapshot};
+    use std::fs;
+
+    struct StickyRoutingRuntime {
+        inspection: RouteInspection,
+    }
+
+    impl RoutingRuntime for StickyRoutingRuntime {
+        fn update_route(
+            &mut self,
+            _request: RouteUpdateRequest,
+        ) -> Result<(), RoutingRuntimeError> {
+            Ok(())
+        }
+
+        fn inspect_route(
+            &mut self,
+            _subtree_id: &str,
+        ) -> Result<RouteInspection, RoutingRuntimeError> {
+            Ok(self.inspection.clone())
+        }
+
+        fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
+            Ok(vec![self.inspection.clone()])
+        }
+
+        fn remove_route(&mut self, _subtree_id: &str) -> Result<(), RoutingRuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn write_env_forge_yaml(root: &std::path::Path, extra: &str) {
+        fs::write(
+            root.join("forge.yml"),
+            format!(
+                concat!(
+                    "version: 1\n",
+                    "name: api\n",
+                    "type: web\n",
+                    "env:\n",
+                    "  API_BASE_URL: https://api.example.com\n",
+                    "  FORGE_PROJECT_ID: bad-override\n",
+                    "  APP_MODE: yaml-value\n",
+                    "{extra}",
+                    "build:\n",
+                    "  dockerfile: Dockerfile\n",
+                    "  context: .\n",
+                    "runtime:\n",
+                    "  port: 3000\n",
+                    "  healthcheck:\n",
+                    "    path: /health\n",
+                    "    expected_status: 200\n",
+                    "invariants:\n",
+                    "  - name: health\n",
+                    "    path: /health\n",
+                    "    expect_status: 200\n",
+                ),
+                extra = extra
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_secret_manifest(root: &std::path::Path, env_name: &str, secret_key: &str) {
+        fs::write(
+            root.join("forge.project.json"),
+            format!(
+                r#"{{
+  "project_id": "api",
+  "secrets": {{
+    "environment_variables": {{
+      "{env_name}": {{
+        "scope": "environment",
+        "key": "{secret_key}",
+        "sensitive": true
+      }}
+    }}
+  }}
+}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn execute_with_runtime_env(
+        root: &std::path::Path,
+    ) -> DockerCliRuntime<RecordingCommandRunner> {
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.to_path_buf()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = StickyRoutingRuntime {
+            inspection: RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            },
+        };
+
+        DeploymentExecutor::new(
+            root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+        docker
+    }
+
+    #[test]
+    fn runtime_snapshot_persisted_per_generation() {
+        let root = test_root("runtime-snapshot-persisted-per-generation");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        write_secret_manifest(&root, "DATABASE_URL", "DATABASE_URL");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        SecretStore::new(root.join("secrets"))
+            .unwrap()
+            .write_environment_secret(&crate::secrets::SecretWriteRequest {
+                project_id: "api".into(),
+                environment: "production".into(),
+                key: "DATABASE_URL".into(),
+                value: "postgres://snapshot-secret".into(),
+            })
+            .unwrap();
+
+        execute_with_runtime_env(&root);
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let snapshot = load_generation_runtime_env_snapshot(&env, 1)
+            .unwrap()
+            .unwrap();
+        let resolved = load_generation_resolved_runtime(&env, 1).unwrap().unwrap();
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.deployment_id, "dep-1");
+        assert!(
+            env.generation_dir(1)
+                .join("runtime_env_snapshot.json")
+                .exists()
+        );
+        assert!(env.generation_dir(1).join("resolved_runtime.json").exists());
+        assert_eq!(
+            snapshot.entries["API_BASE_URL"].value.as_deref(),
+            Some("https://api.example.com")
+        );
+        assert!(snapshot.entries["DATABASE_URL"].redacted);
+        assert!(resolved.entries["DATABASE_URL"].sealed_value.is_some());
+    }
+
+    #[test]
+    fn env_resolution_order_is_deterministic() {
+        let root = test_root("env-resolution-order-is-deterministic");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        write_secret_manifest(&root, "APP_MODE", "APP_MODE");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        SecretStore::new(root.join("secrets"))
+            .unwrap()
+            .write_environment_secret(&crate::secrets::SecretWriteRequest {
+                project_id: "api".into(),
+                environment: "production".into(),
+                key: "APP_MODE".into(),
+                value: "secret-mode".into(),
+            })
+            .unwrap();
+
+        let docker = execute_with_runtime_env(&root);
+        let create_env = docker.runner.envs[1].clone();
+        assert_eq!(create_env["APP_MODE"], "secret-mode");
+        assert_eq!(create_env["FORGE_PROJECT_ID"], "api");
+    }
+
+    #[test]
+    fn generated_forge_vars_injected() {
+        let root = test_root("generated-forge-vars-injected");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+
+        let docker = execute_with_runtime_env(&root);
+        let create_env = docker.runner.envs[1].clone();
+        assert_eq!(create_env["FORGE_PROJECT_ID"], "api");
+        assert_eq!(create_env["FORGE_ENVIRONMENT"], "production");
+        assert_eq!(create_env["FORGE_GENERATION"], "1");
+        assert_eq!(create_env["FORGE_DEPLOYMENT_ID"], "dep-1");
+        assert_eq!(create_env["FORGE_COMMIT_SHA"], "abc123");
+        assert_eq!(create_env["FORGE_SOURCE_REF"], "main");
+        assert_eq!(create_env["FORGE_DOMAIN"], "api.example.com");
+    }
+
+    #[test]
+    fn runtime_container_receives_generated_vars() {
+        let root = test_root("runtime-container-receives-generated-vars");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+
+        let docker = execute_with_runtime_env(&root);
+        let create_env = docker.runner.envs[1].clone();
+        assert!(create_env.contains_key("FORGE_PROJECT_ID"));
+        assert!(create_env.contains_key("FORGE_ENVIRONMENT"));
+        assert!(create_env.contains_key("FORGE_GENERATION"));
+        assert!(create_env.contains_key("FORGE_DEPLOYMENT_ID"));
+        assert!(create_env.contains_key("FORGE_COMMIT_SHA"));
+        assert!(create_env.contains_key("FORGE_SOURCE_REF"));
+        assert!(create_env.contains_key("FORGE_DOMAIN"));
+    }
+
+    #[test]
+    fn diagnostics_redacts_secret_values() {
+        let root = test_root("diagnostics-redacts-secret-values");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        write_secret_manifest(&root, "DATABASE_URL", "DATABASE_URL");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        SecretStore::new(root.join("secrets"))
+            .unwrap()
+            .write_environment_secret(&crate::secrets::SecretWriteRequest {
+                project_id: "api".into(),
+                environment: "production".into(),
+                key: "DATABASE_URL".into(),
+                value: "postgres://diagnostic-secret".into(),
+            })
+            .unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.clone()),
+                source_ref: Some("main".into()),
+                repo_url: None,
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next();
+
+        let diagnostics =
+            fs::read_to_string(root.join(
+                "projects/api/environments/production/generations/1/diagnostics/summary.json",
+            ))
+            .unwrap();
+        assert!(diagnostics.contains("DATABASE_URL=[REDACTED]"));
+        assert!(!diagnostics.contains("postgres://diagnostic-secret"));
     }
 }
 

@@ -83,6 +83,19 @@ forge init
 ```
 This generates a `forge.yml` file, defining build contexts, exposed ports, and required health invariants.
 
+`forge.yml` can also define source-controlled runtime env values:
+```yaml
+env:
+  API_BASE_URL: https://api.example.com
+```
+
+Forge resolves runtime env snapshots with deterministic precedence, from lowest to highest:
+`forge.yml` values, project/environment secrets, deploy-time overrides (reserved), Forge-generated vars, then system/runtime reserved vars.
+
+Every finalized generation persists immutable runtime env artifacts:
+- `runtime_env_snapshot.json`: safe snapshot metadata, generated Forge vars, non-secret values, and redacted secret-backed keys.
+- `resolved_runtime.json`: generation-scoped authoritative restore data used for restart and rollback recovery.
+
 ### Deploying
 Forge queues the deployment, builds the artifact, and executes the convergence pipeline.
 ```bash
