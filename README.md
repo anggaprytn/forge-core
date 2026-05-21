@@ -1,25 +1,22 @@
-MIT License
+![Forge Cover](https://testing-1355450658.cos.ap-jakarta.myqcloud.com/forge-cover.webp)
 
-Copyright (c) 2026 Forge Authors
+# Forge
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+**Deterministic runtime convergence for AI-generated applications.**
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Forge is a single-node orchestration and deployment system designed around one core invariant: **a running container does not equal a successful deployment.** 
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-on the very first incoming request.
+Built in Rust, Forge treats deployment not as a transient event, but as a continuous state convergence problem. It enforces strict operational correctness, ensuring that AI-generated software doesn't just "deploy," but actually *converges* to a healthy, routable state—or safely rolls back.
+
+---
+
+## The "Last Mile" Problem
+
+Large Language Models (LLMs) can generate functional application code in seconds, but operationalizing that code remains a fragile, error-prone task. AI agents frequently hallucinate infrastructure requirements, leading to:
+* Binding to `127.0.0.1` inside containers instead of `0.0.0.0`.
+* Exposing incorrect internal ports to the host.
+* Failing to implement required health-check endpoints.
+* Silently crashing on the very first incoming request.
 
 Existing orchestration solutions are mismatched for this problem:
 * **Kubernetes** is architecturally misaligned for single-node, fast-iteration agentic workflows. It introduces massive overhead to solve problems AI agents don't have yet.
