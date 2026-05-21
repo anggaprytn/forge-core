@@ -31,28 +31,45 @@ Current stage:
 alpha
 ```
 
-**Alpha Loop Validated (May 2026)**:
-The first complete git-backed deployment loop has been validated on remote VPS:
-- [x] Mac CLI login to remote Forge server (`forge login`)
-- [x] Project registration from GitHub repo (`forge project add`)
-- [x] Git-backed deploy by ref (`forge deploy --ref`)
-- [x] Environment health & status monitoring (`forge status`)
-- [x] Git-backed rollback with status tracking
-- [x] Generated domain activation (production/staging/development)
-- [x] Immutable source checkout and tracking
+**Alpha Core Loop v1 Validated (May 2026)**:
 
-Validated capabilities:
+The Forge Alpha Core Loop v1 milestone formalizes the first validated end-to-end Forge platform baseline after successful live staging and production deployments on VPS infrastructure.
 
-- deterministic deployment ordering
-- restart-safe convergence recovery
-- immutable deployment snapshots
-- rollback semantics
-- Docker runtime orchestration
-- Caddy routing orchestration
-- persistent deployment queue
-- GitHub-triggered deploys
-- secret injection and redaction
-- AI-generated application deployment proofs
+### Validated Capabilities
+
+- **forge login**: Mac CLI login to remote Forge server.
+- **forge project add --repo**: Project registration from GitHub repository.
+- **git-backed deploy by ref**: Source-controlled deployment from branches or tags.
+- **Environment targets**: Staging and production deployment workflows.
+- **Generated environment domains**: Automatic derivation of staging/production domains.
+- **Immutable source checkout**: Server-side source resolution and cache management.
+- **Managed Docker runtime network**: Isolated container networks with Forge-managed lifecycles.
+- **Runtime validation and health probing**: TCP reachability and HTTP health check enforcement.
+- **Route activation and convergence**: Atomic Caddy route updates following successful validation.
+- **forge status**: Project and environment health and runtime monitoring.
+- **forge diagnose**: Deep inspection of runtime state and failure reasons.
+- **forge env**: Inspection of generation-scoped runtime environment variables.
+- **Runtime env snapshots**: Authoritative, redacted snapshots of the effective runtime environment.
+- **Rollback**: Atomic restoration of the previous healthy generation and its specific metadata.
+- **Authoritative pointers**: Deterministic current/previous pointer semantics.
+- **Runtime metadata injection**: Automatic injection of Forge-scoped context (Project ID, Generation, etc.).
+- **Route drift repair**: Continuous convergence of routing state toward the authoritative generation.
+- **Deterministic recovery**: Reliable reconstruction of runtime state after daemon or host restarts.
+
+### Milestone Summary
+
+Forge Alpha Core Loop v1 proves that git-backed immutable deployments can achieve deterministic runtime convergence with authoritative truth and automatic rollback correctness. It provides a stable foundation for AI-generated applications to converge operationally without manual infrastructure surgery.
+
+- [x] Deterministic deployment ordering
+- [x] Restart-safe convergence recovery
+- [x] Immutable deployment snapshots
+- [x] Rollback semantics
+- [x] Docker runtime orchestration
+- [x] Caddy routing orchestration
+- [x] Persistent deployment queue
+- [x] GitHub-triggered deploys
+- [x] Secret injection and redaction
+- [x] AI-generated application deployment proofs
 - **VPS Alpha Milestone (Manual Validation)**:
   - conservative and idempotent `install.sh`
   - systemd-managed daemon lifecycle

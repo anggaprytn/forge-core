@@ -378,30 +378,56 @@ forge logout
 
 ---
 
-# Validated Alpha Workflow
+# Alpha Core Loop v1 Validated (May 2026)
 
-The following complete git-backed loop has been validated for the alpha milestone:
+The Forge Alpha Core Loop v1 milestone formalizes the first validated end-to-end Forge platform baseline after successful live staging and production deployments on VPS infrastructure.
 
-1. **Login to remote server**:
-   ```bash
-   forge login https://forge.example.com
-   ```
-2. **Register project from GitHub**:
-   ```bash
-   forge project add --repo https://github.com/example/api.git
-   ```
-3. **Deploy by git ref**:
-   ```bash
-   forge deploy api staging --ref main
-   ```
-4. **Check environment status**:
-   ```bash
-   forge status api staging
-   ```
-5. **Rollback if needed**:
-   ```bash
-   forge rollback api staging
-   ```
+### Validated Capabilities
+
+- **forge login**: Mac CLI login to remote Forge server.
+- **forge project add --repo**: Project registration from GitHub repository.
+- **git-backed deploy by ref**: Source-controlled deployment from branches or tags.
+- **Environment targets**: Staging and production deployment workflows.
+- **Generated environment domains**: Automatic derivation of staging/production domains.
+- **Immutable source checkout**: Server-side source resolution and cache management.
+- **Managed Docker runtime network**: Isolated container networks with Forge-managed lifecycles.
+- **Runtime validation and health probing**: TCP reachability and HTTP health check enforcement.
+- **Route activation and convergence**: Atomic Caddy route updates following successful validation.
+- **forge status**: Project and environment health and runtime monitoring.
+- **forge diagnose**: Deep inspection of runtime state and failure reasons.
+- **forge env**: Inspection of generation-scoped runtime environment variables.
+- **Runtime env snapshots**: Authoritative, redacted snapshots of the effective runtime environment.
+- **Rollback**: Atomic restoration of the previous healthy generation and its specific metadata.
+- **Authoritative pointers**: Deterministic current/previous pointer semantics.
+- **Runtime metadata injection**: Automatic injection of Forge-scoped context (Project ID, Generation, etc.).
+- **Route drift repair**: Continuous convergence of routing state toward the authoritative generation.
+- **Deterministic recovery**: Reliable reconstruction of runtime state after daemon or host restarts.
+
+### Validated Deployment Example
+
+```bash
+# 1. Login to your Forge server
+forge login https://forge.example.com
+
+# 2. Register a project from a GitHub repository
+forge project add \
+  --repo https://github.com/example/repo.git
+
+# 3. Deploy to staging from the main branch
+forge deploy my-app staging --ref main
+
+# 4. Inspect status and domains
+forge status my-app staging
+# Staging domain: staging-my-app.example.com
+# Production domain: my-app.example.com
+
+# 5. Inspect runtime environment and diagnostics
+forge env my-app staging
+forge diagnose my-app staging
+
+# 6. Rollback if needed
+forge rollback my-app staging
+```
 
 ### Validated Features
 - Mac CLI login to remote Forge server.

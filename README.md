@@ -124,15 +124,80 @@ To maintain its strict guarantees, Forge explicitly accepts the following tradeo
 
 Forge is currently in **Alpha**. The core convergence engine and invariant enforcement are highly stable and production-minded, but the CLI and API surfaces are subject to change.
 
-### Alpha Loop Validated
-The first complete git-backed deployment loop has been validated on remote VPS:
-- [x] **forge login**: Mac CLI login to remote Forge server.
-- [x] **forge project add --repo**: Project registration from GitHub repository.
-- [x] **forge deploy <project> staging --ref main**: Git-backed deploy by ref.
-- [x] **forge status <project> staging**: Project/environment health & status.
-- [x] **rollback**: Git-backed rollback with restored generation status.
-- [x] **Generated domain live**: Derived staging domain route activation.
-- [x] **Source commit tracked**: Immutable source checkout and metadata tracking.
+### Alpha Core Loop v1 Validated
+
+The Forge Alpha Core Loop v1 milestone formalizes the first validated end-to-end Forge platform baseline after successful live staging and production deployments on VPS infrastructure.
+
+#### Validated Capabilities
+- **forge login**: Mac CLI login to remote Forge server.
+- **forge project add --repo**: Project registration from GitHub repository.
+- **git-backed deploy by ref**: Source-controlled deployment from branches or tags.
+- **Environment targets**: Staging and production deployment workflows.
+- **Generated environment domains**: Automatic derivation of staging/production domains.
+- **Immutable source checkout**: Server-side source resolution and cache management.
+- **Managed Docker runtime network**: Isolated container networks with Forge-managed lifecycles.
+- **Runtime validation and health probing**: TCP reachability and HTTP health check enforcement.
+- **Route activation and convergence**: Atomic Caddy route updates following successful validation.
+- **forge status**: Project and environment health and runtime monitoring.
+- **forge diagnose**: Deep inspection of runtime state and failure reasons.
+- **forge env**: Inspection of generation-scoped runtime environment variables.
+- **Runtime env snapshots**: Authoritative, redacted snapshots of the effective runtime environment.
+- **Rollback**: Atomic restoration of the previous healthy generation and its specific metadata.
+- **Authoritative pointers**: Deterministic current/previous pointer semantics.
+- **Runtime metadata injection**: Automatic injection of Forge-scoped context (Project ID, Generation, etc.).
+- **Route drift repair**: Continuous convergence of routing state toward the authoritative generation.
+- **Deterministic recovery**: Reliable reconstruction of runtime state after daemon or host restarts.
+
+#### Validated Deployment Example
+```bash
+# 1. Login to your Forge server
+forge login https://forge.example.com
+
+# 2. Register a project from a GitHub repository
+forge project add \
+  --repo https://github.com/example/repo.git
+
+# 3. Deploy to staging from the main branch
+forge deploy my-app staging --ref main
+
+# 4. Inspect status and domains
+forge status my-app staging
+# Staging domain: staging-my-app.example.com
+# Production domain: my-app.example.com
+
+# 5. Inspect runtime environment and diagnostics
+forge env my-app staging
+forge diagnose my-app staging
+
+# 6. Rollback if needed
+forge rollback my-app staging
+```
+
+#### Runtime Metadata Injection
+Forge automatically injects the following generation-scoped variables into every deployment:
+- `FORGE_PROJECT_ID`
+- `FORGE_ENVIRONMENT`
+- `FORGE_GENERATION`
+- `FORGE_DEPLOYMENT_ID`
+- `FORGE_COMMIT_SHA`
+- `FORGE_SOURCE_REF`
+- `FORGE_DOMAIN`
+
+These variables are generation-scoped, persist across diagnostics, and are correctly restored during rollback.
+
+#### Alpha Constraints
+- **Single-node only**: Designed for vertical scaling on single VPS/bare-metal instances.
+- **Single-service web apps**: One service per project (no complex microservice graphs).
+- **No autoscaling**: Fixed single-container runtimes.
+- **No preview environments**: Fixed environment set (dev/staging/production).
+- **No RBAC/teams**: Single-tenant operator model.
+- **No DNS automation**: Requires wildcard DNS pointing to the VPS.
+- **No web deploy UI**: Deployments are triggered via CLI, API, or Webhooks.
+- **No multi-region support**: Single-region, single-node focus.
+- **No distributed scheduler**: Local Docker-based execution only.
+
+#### Milestone Summary
+Forge Alpha Core Loop v1 proves that git-backed immutable deployments can achieve deterministic runtime convergence with authoritative truth and automatic rollback correctness. It provides a stable foundation for AI-generated applications to converge operationally without manual infrastructure surgery.
 
 - [x] Deterministic FSM deployment pipeline
 - [x] AI-native diagnostic generation & secret redaction
