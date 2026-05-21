@@ -124,37 +124,76 @@ impl CaddyApiRuntime {
         route
     }
 
-    fn order_updated_routes(
-        mut routes: Vec<serde_json::Value>,
-        updated_subtree_id: &str,
-    ) -> Vec<serde_json::Value> {
-        if updated_subtree_id == Self::ready_subtree_id() {
-            return routes;
+    fn route_order_bucket(route: &serde_json::Value) -> u8 {
+        if route.get("@id").and_then(|id| id.as_str()) == Some(Self::ready_subtree_id()) {
+            return 2;
         }
+        if route_has_explicit_host_matcher(route) {
+            return 0;
+        }
+        1
+    }
 
-        let mut ready_routes = Vec::new();
-        routes.retain(|route| {
-            if route.get("@id").and_then(|id| id.as_str()) == Some(Self::ready_subtree_id()) {
-                ready_routes.push(route.clone());
-                false
-            } else {
-                true
-            }
-        });
-        routes.extend(ready_routes);
+    fn order_updated_routes(mut routes: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        routes.sort_by_key(Self::route_order_bucket);
         routes
     }
 
     fn activation_probe_domain(&self, route: &serde_json::Value) -> Option<String> {
-        route
-            .get("match")
-            .and_then(|value| value.as_array())
-            .and_then(|matchers| matchers.first())
-            .and_then(|matcher| matcher.get("host"))
-            .and_then(|hosts| hosts.as_array())
-            .and_then(|hosts| hosts.first())
-            .and_then(|host| host.as_str())
+        route_matchers(route)
+            .iter()
+            .find_map(|matcher| {
+                matcher
+                    .get("host")
+                    .and_then(|hosts| hosts.as_array())
+                    .and_then(|hosts| hosts.first())
+                    .and_then(|host| host.as_str())
+            })
             .map(ToOwned::to_owned)
+    }
+
+    fn build_route_inspection(
+        &self,
+        routes: &[serde_json::Value],
+        route_index: usize,
+        subtree_id: &str,
+    ) -> Result<RouteInspection, RoutingRuntimeError> {
+        let route = &routes[route_index];
+        let active_target = route_active_target(route)
+            .ok_or_else(|| RoutingRuntimeError::InspectionFailed("missing active target".into()))?;
+        let domain = self.activation_probe_domain(route);
+        let probe_path = self
+            .probe_paths
+            .get(subtree_id)
+            .map(String::as_str)
+            .unwrap_or("/");
+        let shadowed = routes[..route_index]
+            .iter()
+            .filter(|candidate| {
+                candidate.get("terminal").and_then(|value| value.as_bool()) == Some(true)
+            })
+            .any(|candidate| route_matches_request(candidate, domain.as_deref(), probe_path));
+        let mut verification = self.activation_verification(subtree_id, domain.as_deref());
+        if shadowed {
+            verification.verified = false;
+            let note = "route shadowed by an earlier terminal matcher";
+            verification.response_body = Some(match verification.response_body.take() {
+                Some(body) if !body.is_empty() => format!("{body}; {note}"),
+                _ => note.to_string(),
+            });
+        }
+
+        Ok(RouteInspection {
+            subtree_id: subtree_id.into(),
+            active_target,
+            domain,
+            activation_verified: verification.verified,
+            verification_url: verification.url,
+            verification_host: verification.host,
+            verification_status_code: verification.status_code,
+            verification_response_body: verification.response_body,
+            health_checks_enabled: false,
+        })
     }
 
     fn activation_verification(
@@ -290,7 +329,7 @@ impl RoutingRuntime for CaddyApiRuntime {
             route.get("@id").and_then(|id| id.as_str()) != Some(request.subtree_id.as_str())
         });
         routes.push(Self::route_json(&request));
-        routes = Self::order_updated_routes(routes, &request.subtree_id);
+        routes = Self::order_updated_routes(routes);
         self.write_routes(&routes)?;
         self.probe_paths.insert(
             request.subtree_id,
@@ -301,72 +340,27 @@ impl RoutingRuntime for CaddyApiRuntime {
 
     fn inspect_route(&mut self, subtree_id: &str) -> Result<RouteInspection, RoutingRuntimeError> {
         let routes = self.read_routes()?;
-        let route = routes
-            .into_iter()
-            .find(|route| route.get("@id").and_then(|id| id.as_str()) == Some(subtree_id))
+        let route_index = routes
+            .iter()
+            .position(|route| route.get("@id").and_then(|id| id.as_str()) == Some(subtree_id))
             .ok_or_else(|| RoutingRuntimeError::InspectionFailed("missing route".into()))?;
-
-        let active_target = route
-            .get("handle")
-            .and_then(|handle| handle.as_array())
-            .and_then(|handle| handle.first())
-            .and_then(|handler| handler.get("upstreams"))
-            .and_then(|upstreams| upstreams.as_array())
-            .and_then(|upstreams| upstreams.first())
-            .and_then(|upstream| upstream.get("dial"))
-            .and_then(|dial| dial.as_str())
-            .ok_or_else(|| RoutingRuntimeError::InspectionFailed("missing active target".into()))?
-            .to_string();
-        let domain = self.activation_probe_domain(&route);
-        let verification = self.activation_verification(subtree_id, domain.as_deref());
-
-        Ok(RouteInspection {
-            subtree_id: subtree_id.into(),
-            active_target,
-            domain,
-            activation_verified: verification.verified,
-            verification_url: verification.url,
-            verification_host: verification.host,
-            verification_status_code: verification.status_code,
-            verification_response_body: verification.response_body,
-            health_checks_enabled: false,
-        })
+        self.build_route_inspection(&routes, route_index, subtree_id)
     }
 
     fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError> {
         let routes = self.read_routes()?;
         let mut managed = Vec::new();
-        for route in routes {
+        for (index, route) in routes.iter().enumerate() {
             let Some(subtree_id) = route.get("@id").and_then(|id| id.as_str()) else {
                 continue;
             };
             if !subtree_id.starts_with("forge:") {
                 continue;
             }
-            let active_target = route
-                .get("handle")
-                .and_then(|handle| handle.as_array())
-                .and_then(|handle| handle.first())
-                .and_then(|handler| handler.get("upstreams"))
-                .and_then(|upstreams| upstreams.as_array())
-                .and_then(|upstreams| upstreams.first())
-                .and_then(|upstream| upstream.get("dial"))
-                .and_then(|dial| dial.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let domain = self.activation_probe_domain(&route);
-            let verification = self.activation_verification(subtree_id, domain.as_deref());
-            managed.push(RouteInspection {
-                subtree_id: subtree_id.into(),
-                active_target,
-                domain,
-                activation_verified: verification.verified,
-                verification_url: verification.url,
-                verification_host: verification.host,
-                verification_status_code: verification.status_code,
-                verification_response_body: verification.response_body,
-                health_checks_enabled: false,
-            });
+            if route_active_target(route).is_none() {
+                continue;
+            }
+            managed.push(self.build_route_inspection(&routes, index, subtree_id)?);
         }
         Ok(managed)
     }
@@ -378,5 +372,158 @@ impl RoutingRuntime for CaddyApiRuntime {
         self.write_routes(&routes)?;
         self.probe_paths.remove(subtree_id);
         Ok(())
+    }
+}
+
+fn route_matchers(route: &serde_json::Value) -> &[serde_json::Value] {
+    route
+        .get("match")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn route_has_explicit_host_matcher(route: &serde_json::Value) -> bool {
+    route_matchers(route).iter().any(|matcher| {
+        matcher
+            .get("host")
+            .and_then(|hosts| hosts.as_array())
+            .is_some()
+    })
+}
+
+fn route_active_target(route: &serde_json::Value) -> Option<String> {
+    route
+        .get("handle")
+        .and_then(|handle| handle.as_array())
+        .and_then(|handle| handle.first())
+        .and_then(|handler| handler.get("upstreams"))
+        .and_then(|upstreams| upstreams.as_array())
+        .and_then(|upstreams| upstreams.first())
+        .and_then(|upstream| upstream.get("dial"))
+        .and_then(|dial| dial.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn route_matches_request(route: &serde_json::Value, host: Option<&str>, path: &str) -> bool {
+    let matchers = route_matchers(route);
+    if matchers.is_empty() {
+        return true;
+    }
+    matchers
+        .iter()
+        .any(|matcher| matcher_matches_request(matcher, host, path))
+}
+
+fn matcher_matches_request(matcher: &serde_json::Value, host: Option<&str>, path: &str) -> bool {
+    let host_matches = match matcher.get("host").and_then(|value| value.as_array()) {
+        Some(hosts) => host.is_some_and(|expected| {
+            hosts
+                .iter()
+                .filter_map(|value| value.as_str())
+                .any(|candidate| candidate == expected)
+        }),
+        None => true,
+    };
+    let path_matches = match matcher.get("path").and_then(|value| value.as_array()) {
+        Some(paths) => paths
+            .iter()
+            .filter_map(|value| value.as_str())
+            .any(|pattern| path_pattern_matches(pattern, path)),
+        None => true,
+    };
+    host_matches && path_matches
+}
+
+fn path_pattern_matches(pattern: &str, path: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        path.starts_with(prefix)
+    } else {
+        path == pattern
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy_route(id: &str, host: Option<&str>) -> serde_json::Value {
+        let request = RouteUpdateRequest {
+            subtree_id: id.into(),
+            target: "target:3000".into(),
+            domain: host.map(ToOwned::to_owned),
+            health_checks_enabled: false,
+            probe_path: Some("/health".into()),
+        };
+        CaddyApiRuntime::route_json(&request)
+    }
+
+    #[test]
+    fn app_routes_include_host_matcher_when_domain_available() {
+        let route = proxy_route("forge:api:production", Some("api.example.com"));
+        assert_eq!(
+            route["match"][0]["host"][0].as_str(),
+            Some("api.example.com")
+        );
+        assert_eq!(route["terminal"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn caddy_routes_order_host_specific_before_fallback() {
+        let ordered = CaddyApiRuntime::order_updated_routes(vec![
+            proxy_route("forge:api:production", None),
+            proxy_route("forge:staging:staging", Some("staging.example.com")),
+            serde_json::json!({
+                "@id": "forge:ready",
+                "terminal": true,
+                "handle": [{"handler": "static_response", "status_code": 200}]
+            }),
+        ]);
+
+        let ids: Vec<_> = ordered
+            .iter()
+            .filter_map(|route| route.get("@id").and_then(|id| id.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "forge:staging:staging",
+                "forge:api:production",
+                "forge:ready"
+            ]
+        );
+    }
+
+    #[test]
+    fn route_activation_verification_detects_shadowing() {
+        let legacy = proxy_route("forge:api:production", None);
+        let staged = proxy_route("forge:api:staging", Some("staging.example.com"));
+        assert!(route_matches_request(
+            &legacy,
+            Some("staging.example.com"),
+            "/health"
+        ));
+        assert!(!route_matches_request(
+            &serde_json::json!({
+                "@id": "external:preserve",
+                "terminal": true,
+                "match": [{"path": ["/preserve"]}],
+                "handle": [{"handler": "static_response", "status_code": 204}]
+            }),
+            Some("staging.example.com"),
+            "/health"
+        ));
+
+        let runtime = CaddyApiRuntime::new("http://127.0.0.1:2019", "http://127.0.0.1");
+        let inspection = runtime
+            .build_route_inspection(&[legacy, staged], 1, "forge:api:staging")
+            .unwrap();
+        assert!(!inspection.activation_verified);
+        assert!(
+            inspection
+                .verification_response_body
+                .as_deref()
+                .is_some_and(|body| body.contains("shadowed"))
+        );
     }
 }

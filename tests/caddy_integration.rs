@@ -212,6 +212,50 @@ fn caddy_integration_active_route_overrides_ready_placeholder() {
 }
 
 #[test]
+fn host_matched_route_not_shadowed_by_legacy_unmatched_route() {
+    let _guard = integration_lock();
+    let Some(mut harness) = CaddyHarness::start("host-shadowing-order") else {
+        return;
+    };
+    harness.start_sample_app("prod-api-gen-45");
+    harness.start_sample_app("staging-api-gen-45");
+    let mut routing = harness.routing();
+
+    routing
+        .update_route(RouteUpdateRequest {
+            subtree_id: "forge:api:production".into(),
+            target: "prod-api-gen-45:3000".into(),
+            domain: None,
+            health_checks_enabled: false,
+            probe_path: Some("/health".into()),
+        })
+        .unwrap();
+    routing
+        .update_route(RouteUpdateRequest {
+            subtree_id: "forge:api:staging".into(),
+            target: "staging-api-gen-45:3000".into(),
+            domain: Some("staging.example.com".into()),
+            health_checks_enabled: false,
+            probe_path: Some("/health".into()),
+        })
+        .unwrap();
+
+    let inspection = routing.inspect_route("forge:api:staging").unwrap();
+    assert!(inspection.activation_verified);
+    assert_eq!(inspection.domain.as_deref(), Some("staging.example.com"));
+
+    let route_order = harness.route_order();
+    assert_eq!(
+        route_order,
+        vec![
+            "external:preserve",
+            "forge:api:staging",
+            "forge:api:production"
+        ]
+    );
+}
+
+#[test]
 fn caddy_integration_failed_route_activation_does_not_advance_current() {
     let _guard = integration_lock();
     let Some(mut harness) = CaddyHarness::start("activation-failure") else {

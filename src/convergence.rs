@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::events::EventRecord;
+use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue};
 use crate::runtime::{
     ContainerInspection, CreateContainerRequest, DockerRuntime, ManagedImage, ProbeRuntime,
@@ -355,15 +356,19 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
                 docker,
             )?;
 
-            if let Some(route_recovery) =
-                persisted_http_route_recovery(&runtime_info, &project_id, &environment)
-            {
+            if let Some(route_recovery) = persisted_http_route_recovery(
+                &self.storage_root,
+                &runtime_info,
+                &project_id,
+                &environment,
+            )? {
                 ensure_http_route_matches_generation(
                     routing,
                     &route_recovery.subtree_id,
                     &inspection,
                     route_recovery.internal_port,
                     runtime_info.network_name.as_deref(),
+                    route_recovery.domain,
                     &route_recovery.target_source,
                     route_recovery.probe_path,
                 )?;
@@ -642,12 +647,13 @@ where
                     {
                         let runtime_info = load_generation_runtime_info(env, current_generation)?;
                         let route_recovery = http_route_recovery_input(
+                            &self.storage_root,
                             runtime_info.as_ref(),
                             &input.project_id,
                             &input.environment,
                             internal_port,
                             input.http_health_path.clone(),
-                        );
+                        )?;
                         let preferred_network = runtime_info
                             .as_ref()
                             .and_then(|info| info.network_name.as_deref());
@@ -663,6 +669,7 @@ where
                             &inspection,
                             route_recovery.internal_port,
                             preferred_network,
+                            route_recovery.domain,
                             &route_recovery.target_source,
                             route_recovery.probe_path,
                         )?;
@@ -673,12 +680,13 @@ where
                     {
                         let runtime_info = load_generation_runtime_info(env, current_generation)?;
                         let route_recovery = http_route_recovery_input(
+                            &self.storage_root,
                             runtime_info.as_ref(),
                             &input.project_id,
                             &input.environment,
                             internal_port,
                             input.http_health_path.clone(),
-                        );
+                        )?;
                         let preferred_network = runtime_info
                             .as_ref()
                             .and_then(|info| info.network_name.as_deref());
@@ -694,6 +702,7 @@ where
                             &inspection,
                             route_recovery.internal_port,
                             preferred_network,
+                            route_recovery.domain,
                             &route_recovery.target_source,
                             route_recovery.probe_path,
                         )?;
@@ -736,6 +745,9 @@ where
             }
             Err(err) => return Err(err.into()),
         };
+        if !inspection.activation_verified || inspection.health_checks_enabled {
+            return Ok(None);
+        }
         let containers = self.docker.list_managed_containers()?;
         Ok(resolve_generation_from_target(
             &inspection.active_target,
@@ -761,12 +773,13 @@ where
                     return Ok(false);
                 };
                 let route_recovery = http_route_recovery_input(
+                    &self.storage_root,
                     Some(&runtime_info),
                     &input.project_id,
                     &input.environment,
                     internal_port,
                     input.http_health_path.clone(),
-                );
+                )?;
                 let inspection = ensure_generation_container_running(
                     &self.storage_root,
                     &input.project_id,
@@ -785,6 +798,7 @@ where
                     &inspection,
                     route_recovery.internal_port,
                     runtime_info.network_name.as_deref(),
+                    route_recovery.domain,
                     &route_recovery.target_source,
                     route_recovery.probe_path,
                 )?;
@@ -841,63 +855,69 @@ fn route_subtree_id(project_id: &str, environment: &str) -> String {
 struct HttpRouteRecoveryInput {
     subtree_id: String,
     internal_port: u16,
+    domain: Option<String>,
     probe_path: Option<String>,
     target_source: PersistedRouteTargetSource,
 }
 
 fn persisted_http_route_recovery(
+    storage_root: &std::path::Path,
     runtime_info: &PersistedRuntimeInfo,
     project_id: &str,
     environment: &str,
-) -> Option<HttpRouteRecoveryInput> {
+) -> Result<Option<HttpRouteRecoveryInput>, ConvergenceError> {
     match &runtime_info.activation {
         Some(PersistedActivationMode::Http {
             internal_port,
             route_subtree_id: persisted_subtree_id,
             target_source,
-        }) => Some(HttpRouteRecoveryInput {
+        }) => Ok(Some(HttpRouteRecoveryInput {
             subtree_id: persisted_subtree_id
                 .clone()
                 .unwrap_or_else(|| route_subtree_id(project_id, environment)),
             internal_port: *internal_port,
+            domain: load_environment_domain(storage_root, project_id, environment)?,
             probe_path: runtime_info.probe_path.clone(),
             target_source: target_source.clone(),
-        }),
-        _ => None,
+        })),
+        _ => Ok(None),
     }
 }
 
 fn http_route_recovery_input(
+    storage_root: &std::path::Path,
     runtime_info: Option<&PersistedRuntimeInfo>,
     project_id: &str,
     environment: &str,
     internal_port: u16,
     probe_path: Option<String>,
-) -> HttpRouteRecoveryInput {
+) -> Result<HttpRouteRecoveryInput, ConvergenceError> {
     if let Some(runtime_info) = runtime_info {
         if let Some(mut persisted) =
-            persisted_http_route_recovery(runtime_info, project_id, environment)
+            persisted_http_route_recovery(storage_root, runtime_info, project_id, environment)?
         {
             if persisted.probe_path.is_none() {
                 persisted.probe_path = probe_path;
             }
-            return persisted;
+            return Ok(persisted);
         }
 
-        return HttpRouteRecoveryInput {
+        return Ok(HttpRouteRecoveryInput {
             subtree_id: route_subtree_id(project_id, environment),
             internal_port,
+            domain: load_environment_domain(storage_root, project_id, environment)?,
             probe_path: runtime_info.probe_path.clone().or(probe_path),
             target_source: PersistedRouteTargetSource::ContainerIp,
-        };
+        });
     }
 
-    HttpRouteRecoveryInput {
+    Ok(HttpRouteRecoveryInput {
         subtree_id: route_subtree_id(project_id, environment),
         internal_port,
+        domain: load_environment_domain(storage_root, project_id, environment)?,
         probe_path,
         target_source: PersistedRouteTargetSource::ContainerIp,
-    }
+    })
 }
 
 fn parse_generation_from_target(target: &str) -> Option<u64> {
@@ -1985,12 +2005,38 @@ fn resolve_recovery_environment(
     Ok(resolved)
 }
 
+fn load_environment_domain(
+    storage_root: &std::path::Path,
+    project_id: &str,
+    environment: &str,
+) -> Result<Option<String>, ConvergenceError> {
+    let project = ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("project lookup failed for {project_id}: {err}"),
+            )))
+        })?;
+    Ok(project.map(|project| derive_environment_domain(&project.base_domain, environment)))
+}
+
+fn derive_environment_domain(base_domain: &str, environment: &str) -> String {
+    match environment {
+        "production" => base_domain.to_string(),
+        "staging" => format!("staging-{base_domain}"),
+        "development" => format!("development-{base_domain}"),
+        other => format!("{other}-{base_domain}"),
+    }
+}
+
 fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
     routing: &mut RtR,
     subtree_id: &str,
     inspection: &ContainerInspection,
     internal_port: u16,
     preferred_network: Option<&str>,
+    domain: Option<String>,
     target_source: &PersistedRouteTargetSource,
     probe_path: Option<String>,
 ) -> Result<(), ConvergenceError> {
@@ -2006,6 +2052,7 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
         .inspect_route(subtree_id)
         .map(|route| {
             route.active_target == target
+                && route.domain == domain
                 && route.activation_verified
                 && !route.health_checks_enabled
         })
@@ -2017,12 +2064,16 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
     routing.update_route(RouteUpdateRequest {
         subtree_id: subtree_id.to_string(),
         target: target.clone(),
-        domain: None,
+        domain: domain.clone(),
         health_checks_enabled: false,
         probe_path,
     })?;
     let route = routing.inspect_route(subtree_id)?;
-    if route.active_target != target || !route.activation_verified || route.health_checks_enabled {
+    if route.active_target != target
+        || route.domain != domain
+        || !route.activation_verified
+        || route.health_checks_enabled
+    {
         return Err(ConvergenceError::Routing(
             crate::runtime::RoutingRuntimeError::UpdateFailed(
                 "route activation verification failed".into(),
@@ -2422,6 +2473,21 @@ fn setup_recoverable_http_generation(root: &std::path::Path, generation: u64) {
         .as_bytes(),
     )
     .unwrap();
+}
+
+#[cfg(test)]
+fn register_project(root: &std::path::Path, project_id: &str, base_domain: &str) {
+    ProjectRegistryStore::new(root)
+        .upsert(
+            crate::api::ProjectUpsertRequest {
+                project_id: Some(project_id.into()),
+                repo_url: format!("https://example.com/{project_id}.git"),
+                default_branch: "main".into(),
+                base_domain: Some(base_domain.into()),
+            },
+            None,
+        )
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -3569,6 +3635,50 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
                 .as_ref()
                 .map(|route| route.active_target.clone()),
             Some("172.19.0.11:3000".into())
+        );
+    }
+
+    #[test]
+    fn convergence_rewrites_legacy_unmatched_route_when_project_domain_known() {
+        let root = test_root("startup-recover-rewrites-legacy-route");
+        setup_recoverable_http_generation(&root, 1);
+        register_project(&root, "api", "api.example.com");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            route: Some(RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.19.0.11:3000".into(),
+                domain: None,
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }),
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        };
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        assert_eq!(routing.updates.len(), 1);
+        assert_eq!(
+            routing.updates[0].domain.as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            routing
+                .route
+                .as_ref()
+                .and_then(|route| route.domain.as_deref()),
+            Some("api.example.com")
         );
     }
 
