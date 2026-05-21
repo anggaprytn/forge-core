@@ -10,7 +10,17 @@ forge daemon
 
 It is intentionally aligned to the current implementation, not an aspirational installer.
 
-## 1. Prerequisites (Docker & Caddy)
+## 1. Alpha Loop Validated (May 2026)
+The first complete git-backed deployment loop has been validated on remote VPS:
+- [x] **Mac CLI login** to remote Forge server (`forge login`).
+- [x] **Project registration** from GitHub repo (`forge project add --repo`).
+- [x] **Git-backed deploy** by ref (`forge deploy api staging --ref main`).
+- [x] **Project/environment health** & status (`forge status`).
+- [x] **Git-backed rollback** with restored generation status.
+- [x] **Generated domain live** (derived staging domain route activation).
+- [x] **Source commit tracked** (immutable source checkout and metadata tracking).
+
+## 2. Prerequisites (Docker & Caddy)
 
 Forge does not install Docker or Caddy for you. Install them using your distribution's package manager.
 
@@ -50,7 +60,7 @@ Restart Caddy: `systemctl restart caddy`.
 
 ---
 
-## 2. Conservative Installation
+## 3. Conservative Installation
 
 For Linux hosts with systemd, use the provided conservative installer:
 
@@ -66,7 +76,7 @@ The installer is **idempotent** and safe:
 
 ---
 
-## 3. Host Directory & Permissions
+## 4. Host Directory & Permissions
 
 While `install.sh` creates the storage root, you must ensure your application checkout is accessible:
 
@@ -82,7 +92,7 @@ chown -R forge:forge /var/lib/forge
 
 ---
 
-## 4. Initialize Your Project
+## 5. Initialize Your Project
 
 Go to your application directory and initialize `forge.yml`:
 
@@ -95,7 +105,7 @@ Forge strictly validates `forge.yml`. Unsupported fields are rejected.
 
 ---
 
-## 5. Configure Forge Environment
+## 6. Configure Forge Environment
 
 Update `/etc/forge/forge.env` with your master key:
 
@@ -141,7 +151,7 @@ CLI commands and bearer-token API auth remain available for automation and opera
 
 ---
 
-## 6. Run Diagnostics
+## 7. Run Diagnostics
 
 Before starting the service, verify your environment:
 
@@ -154,7 +164,7 @@ forge doctor
 
 ---
 
-## 7. Start the Forge Daemon
+## 8. Start the Forge Daemon
 
 ```bash
 systemctl daemon-reload
@@ -166,7 +176,7 @@ systemctl enable --now forge
 
 ---
 
-## 8. Verify Readiness
+## 9. Verify Readiness
 
 ```bash
 curl http://127.0.0.1:8080/healthz
@@ -176,7 +186,7 @@ curl http://127.0.0.1:8080/metrics
 
 ---
 
-## 9. Deploy the Sample App
+## 10. Deploy the Sample App
 
 Set the CLI client environment for bearer-token auth, or use browser approval:
 

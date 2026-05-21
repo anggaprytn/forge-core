@@ -378,6 +378,51 @@ forge logout
 
 ---
 
+# Validated Alpha Workflow
+
+The following complete git-backed loop has been validated for the alpha milestone:
+
+1. **Login to remote server**:
+   ```bash
+   forge login https://forge.example.com
+   ```
+2. **Register project from GitHub**:
+   ```bash
+   forge project add --repo https://github.com/example/api.git
+   ```
+3. **Deploy by git ref**:
+   ```bash
+   forge deploy api staging --ref main
+   ```
+4. **Check environment status**:
+   ```bash
+   forge status api staging
+   ```
+5. **Rollback if needed**:
+   ```bash
+   forge rollback api staging
+   ```
+
+### Validated Features
+- Mac CLI login to remote Forge server.
+- Project registration from GitHub repo.
+- Generated project domain with automatic staging/development derivation.
+- Git-backed deploy by ref (main, branch, or tag).
+- Immutable source checkout and metadata tracking.
+- Docker build and managed network validation.
+- Derived staging domain route activation.
+- Project/environment health monitoring.
+- Git-backed rollback with restored generation state.
+
+### Known Alpha Constraints
+- Single-node deployments only.
+- Single-service web apps (one service per project).
+- No preview environments or automated DNS.
+- No web-based deployment trigger (API/CLI only).
+- No RBAC or team management.
+
+---
+
 ## Deploy via API
 
 ```bash

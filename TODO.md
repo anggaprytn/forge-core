@@ -11,14 +11,14 @@ Current runtime note: many runtime pieces already exist. The next alpha step is 
 
 ## Phase 0: Lock product semantics
 
-- [ ] Document binary model: `forge` client/operator CLI, `forged` future server/runtime authority binary name
-- [ ] Document shared control-plane model across CLI, API, and web
-- [ ] Document git-first canonical source model and source revision identity chain
-- [ ] Document fixed alpha environments: `development`, `staging`, `production`
-- [ ] Document default branch mapping: `development -> development`, `staging -> staging`, `production -> main`
-- [ ] Document planned derived domain semantics
-- [ ] Document explicit non-goals for alpha scope
-- [ ] Document web as visibility/control, not primary deployment engine
+- [x] Document binary model: `forge` client/operator CLI, `forged` future server/runtime authority binary name
+- [x] Document shared control-plane model across CLI, API, and web
+- [x] Document git-first canonical source model and source revision identity chain
+- [x] Document fixed alpha environments: `development`, `staging`, `production`
+- [x] Document default branch mapping: `development -> development`, `staging -> staging`, `production -> main`
+- [x] Document planned derived domain semantics
+- [x] Document explicit non-goals for alpha scope
+- [x] Document web as visibility/control, not primary deployment engine
 
 ## Phase 1: `forged` server command taxonomy
 
@@ -27,32 +27,32 @@ Current runtime note: many runtime pieces already exist. The next alpha step is 
 
 ## Phase 2: `forge` client login/whoami/logout/doctor
 
-- [ ] Confirm `forge login`
+- [x] Confirm `forge login`
 - [ ] Confirm `forge whoami`
 - [ ] Confirm `forge logout`
-- [ ] Confirm `forge doctor`
+- [x] Confirm `forge doctor`
 
 ## Phase 3: `forge.yml` manifest contract
 
-- [ ] Lock `forge.yml` alpha manifest contract
-- [ ] Keep manifest narrow and deterministic
+- [x] Lock `forge.yml` alpha manifest contract
+- [x] Keep manifest narrow and deterministic
 
 ## Phase 4: git-backed source acquisition
 
-- [ ] Resolve deploy source from repository + ref
-- [ ] Materialize immutable local source checkout
-- [ ] Keep local `--from` as alpha/dev mode
+- [x] Resolve deploy source from repository + ref
+- [x] Materialize immutable local source checkout
+- [x] Keep local `--from` as alpha/dev mode
 
 ## Phase 5: deploy by git ref
 
-- [ ] Route CLI/API/webhook deploy intent through the same git-ref pipeline
-- [ ] Avoid creating a separate Git deployment FSM
+- [x] Route CLI/API/webhook deploy intent through the same git-ref pipeline
+- [x] Avoid creating a separate Git deployment FSM
 
 ## Phase 6: derived domain routing
 
-- [ ] `production -> <base_domain>`
-- [ ] `staging -> staging-<base_domain>`
-- [ ] `development -> development-<base_domain>`
+- [x] `production -> <base_domain>`
+- [x] `staging -> staging-<base_domain>`
+- [x] `development -> development-<base_domain>`
 
 ## Phase 7: status/events/diagnostics UX
 
@@ -74,6 +74,7 @@ Current runtime note: many runtime pieces already exist. The next alpha step is 
 
 # Current Completed Baseline
 
+- [x] **Alpha Loop Validated (May 2026)**
 - [x] Core architecture defined
 - [x] Implementation spec defined
 - [x] Storage primitives

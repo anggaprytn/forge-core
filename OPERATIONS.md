@@ -43,6 +43,16 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 Forge has been manually validated on a real VPS for the alpha milestone.
 
+## Alpha Loop Validated (May 2026)
+The first complete git-backed deployment loop has been validated on remote VPS:
+- [x] **Mac CLI login** to remote Forge server (`forge login`).
+- [x] **Project registration** from GitHub repo (`forge project add --repo`).
+- [x] **Git-backed deploy** by ref (`forge deploy api staging --ref main`).
+- [x] **Project/environment health** & status (`forge status`).
+- [x] **Git-backed rollback** with restored generation status.
+- [x] **Generated domain live** (derived staging domain route activation).
+- [x] **Source commit tracked** (immutable source checkout and metadata tracking).
+
 ## Alpha Readiness Checklist
 
 - [x] **Install**: `install.sh` is conservative and idempotent.

@@ -31,6 +31,16 @@ Current stage:
 alpha
 ```
 
+**Alpha Loop Validated (May 2026)**:
+The first complete git-backed deployment loop has been validated on remote VPS:
+- [x] Mac CLI login to remote Forge server (`forge login`)
+- [x] Project registration from GitHub repo (`forge project add`)
+- [x] Git-backed deploy by ref (`forge deploy --ref`)
+- [x] Environment health & status monitoring (`forge status`)
+- [x] Git-backed rollback with status tracking
+- [x] Generated domain activation (production/staging/development)
+- [x] Immutable source checkout and tracking
+
 Validated capabilities:
 
 - deterministic deployment ordering

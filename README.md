@@ -111,6 +111,16 @@ To maintain its strict guarantees, Forge explicitly accepts the following tradeo
 
 Forge is currently in **Alpha**. The core convergence engine and invariant enforcement are highly stable and production-minded, but the CLI and API surfaces are subject to change.
 
+### Alpha Loop Validated
+The first complete git-backed deployment loop has been validated on remote VPS:
+- [x] **forge login**: Mac CLI login to remote Forge server.
+- [x] **forge project add --repo**: Project registration from GitHub repository.
+- [x] **forge deploy <project> staging --ref main**: Git-backed deploy by ref.
+- [x] **forge status <project> staging**: Project/environment health & status.
+- [x] **rollback**: Git-backed rollback with restored generation status.
+- [x] **Generated domain live**: Derived staging domain route activation.
+- [x] **Source commit tracked**: Immutable source checkout and metadata tracking.
+
 - [x] Deterministic FSM deployment pipeline
 - [x] AI-native diagnostic generation & secret redaction
 - [x] Filesystem-backed atomic state reconstruction
