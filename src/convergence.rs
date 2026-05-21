@@ -142,6 +142,54 @@ impl From<std::io::Error> for ConvergenceError {
     }
 }
 
+fn gc_path_error(action: &str, path: &std::path::Path, err: std::io::Error) -> ConvergenceError {
+    std::io::Error::new(
+        err.kind(),
+        format!("failed to {action} {}: {err}", path.display()),
+    )
+    .into()
+}
+
+fn gc_read_dir_optional(
+    path: &std::path::Path,
+    action: &str,
+) -> Result<Option<std::fs::ReadDir>, ConvergenceError> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(gc_path_error(action, path, err)),
+    }
+}
+
+fn gc_read_to_string_optional(
+    path: &std::path::Path,
+    action: &str,
+) -> Result<Option<String>, ConvergenceError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(gc_path_error(action, path, err)),
+    }
+}
+
+fn gc_read_pointer_optional(
+    env: &EnvironmentPaths,
+    name: &str,
+) -> Result<Option<u64>, ConvergenceError> {
+    let path = env.root.join(name);
+    let Some(raw) = gc_read_to_string_optional(&path, "read GC pointer")? else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| ConvergenceError::Storage(crate::storage::StorageError::InvalidPointer(path)))
+}
+
 pub trait ActiveDeploymentDecider {
     fn should_resume(&self, deployment: &DeploymentRecord) -> bool;
 }
@@ -1149,7 +1197,6 @@ fn environment_runtime_references(
     managed_containers: &[ContainerInspection],
     managed_routes: &[RouteInspection],
 ) -> Result<RuntimeReferences, ConvergenceError> {
-    env.ensure_exists()?;
     let active_matches = active_record
         .is_some_and(|record| record.project_id == project_id && record.environment == environment);
     let route_generation = managed_routes
@@ -1161,8 +1208,8 @@ fn environment_runtime_references(
         })
         .filter(|generation| active_matches || snapshot_is_finalized(env, *generation));
     Ok(RuntimeReferences {
-        current: PointerStore::new(env.clone()).read_pointer("current")?,
-        previous: PointerStore::new(env.clone()).read_pointer("previous")?,
+        current: gc_read_pointer_optional(env, "current")?,
+        previous: gc_read_pointer_optional(env, "previous")?,
         route_generation,
         converging_generation: if active_matches {
             latest_nonfinalized_generation(env)?
@@ -1173,11 +1220,12 @@ fn environment_runtime_references(
 }
 
 fn latest_nonfinalized_generation(env: &EnvironmentPaths) -> Result<Option<u64>, ConvergenceError> {
-    if !env.generations_dir().exists() {
+    let Some(entries) = gc_read_dir_optional(&env.generations_dir(), "scan generation root")?
+    else {
         return Ok(None);
-    }
+    };
     let mut latest: Option<u64> = None;
-    for entry in fs::read_dir(env.generations_dir())? {
+    for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -1247,20 +1295,22 @@ fn project_environment_paths(
 ) -> Result<Vec<(String, String, EnvironmentPaths)>, ConvergenceError> {
     let mut environments = Vec::new();
     let projects_root = storage_root.join("projects");
-    if !projects_root.exists() {
+    let Some(projects) = gc_read_dir_optional(&projects_root, "scan projects root")? else {
         return Ok(environments);
-    }
-    for project in fs::read_dir(projects_root)? {
+    };
+    for project in projects {
         let project = project?;
         if !project.file_type()?.is_dir() {
             continue;
         }
         let project_id = project.file_name().to_string_lossy().to_string();
         let envs_root = project.path().join("environments");
-        if !envs_root.exists() {
+        let Some(environments_root) =
+            gc_read_dir_optional(&envs_root, "scan project environments root")?
+        else {
             continue;
-        }
-        for environment in fs::read_dir(envs_root)? {
+        };
+        for environment in environments_root {
             let environment = environment?;
             if !environment.file_type()?.is_dir() {
                 continue;
@@ -1356,6 +1406,28 @@ fn gc_missing_artifact_action(
     )
 }
 
+fn gc_missing_root_action(
+    project_id: &str,
+    environment: &str,
+    dry_run: bool,
+    root_kind: &str,
+    path: &std::path::Path,
+) -> GcActionRecord {
+    gc_action_record(
+        project_id,
+        environment,
+        None,
+        dry_run,
+        Some("root"),
+        Some(format!("root={}", path.display())),
+        "scan",
+        &format!("optional GC {root_kind} root is missing"),
+        "skipped_missing",
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
 fn gc_candidate_generations(env: &EnvironmentPaths) -> Result<Vec<u64>, ConvergenceError> {
     let mut generations = BTreeSet::new();
     if env.generations_dir().exists() {
@@ -1425,6 +1497,16 @@ where
     RtD: DockerRuntime,
     RtR: RoutingRuntime,
 {
+    let mut actions = Vec::new();
+    for (root_kind, path) in [
+        ("source-checkouts", storage_root.join("source-checkouts")),
+        ("repositories", storage_root.join("repositories")),
+    ] {
+        if !path.exists() {
+            actions.push(gc_missing_root_action("*", "*", dry_run, root_kind, &path));
+        }
+    }
+
     let mut managed_containers = docker.list_managed_containers()?;
     managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
     let mut managed_images = docker.list_managed_images()?;
@@ -1433,21 +1515,20 @@ where
     managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
     let queue_state = queue.load_state()?;
     if queue_state.active.is_some() {
-        return Ok(GarbageCollectionReport {
-            actions: vec![gc_action_record(
-                "*",
-                "*",
-                None,
-                dry_run,
-                None,
-                Some("Global GC".into()),
-                "skip",
-                "deployment in progress",
-                "protected",
-                Vec::new(),
-                vec!["active deployment".into()],
-            )],
-        });
+        actions.push(gc_action_record(
+            "*",
+            "*",
+            None,
+            dry_run,
+            None,
+            Some("Global GC".into()),
+            "skip",
+            "deployment in progress",
+            "protected",
+            Vec::new(),
+            vec!["active deployment".into()],
+        ));
+        return Ok(GarbageCollectionReport { actions });
     }
 
     let environments = cleanup_scan_environments(
@@ -1456,10 +1537,28 @@ where
         &managed_images,
         &managed_routes,
     )?;
-    let mut actions = Vec::new();
     let mut reported_images = BTreeSet::new();
 
     for (project_id, environment, env) in &environments {
+        if !env.root.exists() {
+            actions.push(gc_missing_root_action(
+                project_id,
+                environment,
+                dry_run,
+                "gc metadata",
+                &env.root,
+            ));
+        }
+        if !env.generations_dir().exists() {
+            actions.push(gc_missing_root_action(
+                project_id,
+                environment,
+                dry_run,
+                "project environment generations",
+                &env.generations_dir(),
+            ));
+        }
+
         let references = environment_runtime_references(
             env,
             project_id,
@@ -1671,8 +1770,14 @@ where
     if !dry_run {
         for action in &actions {
             if action.outcome == "protected" || action.outcome == "skipped_missing" {
+                if action.project_id == "*" || action.environment == "*" {
+                    continue;
+                }
                 let env =
                     EnvironmentPaths::new(storage_root, &action.project_id, &action.environment);
+                if !env.root.exists() {
+                    continue;
+                }
                 GcStore::new(env).append(action.clone())?;
             }
         }
@@ -2001,9 +2106,10 @@ where
     RtD: DockerRuntime,
     RtR: RoutingRuntime,
 {
-    if !env.generations_dir().exists() {
+    let Some(entries) = gc_read_dir_optional(&env.generations_dir(), "scan generation root")?
+    else {
         return Ok(());
-    }
+    };
     let references = environment_runtime_references(
         env,
         project_id,
@@ -2013,7 +2119,7 @@ where
         managed_routes,
     )?;
     let mut generations = Vec::new();
-    for entry in fs::read_dir(env.generations_dir())? {
+    for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -2367,12 +2473,7 @@ fn generation_has_failure_diagnostics(
 ) -> Result<bool, ConvergenceError> {
     let diagnostics = env.generation_dir(generation).join("diagnostics");
     let summary_path = diagnostics.join("summary.json");
-    if summary_path.exists() {
-        let raw = match fs::read_to_string(summary_path) {
-            Ok(raw) => raw,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(err.into()),
-        };
+    if let Some(raw) = gc_read_to_string_optional(&summary_path, "read diagnostics summary")? {
         let summary: DiagnosticSummary = serde_json::from_str(&raw).map_err(|err| {
             ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2389,7 +2490,11 @@ fn generation_has_failure_diagnostics(
 
 fn list_generation_numbers(env: &EnvironmentPaths) -> Result<Vec<u64>, ConvergenceError> {
     let mut generations = Vec::new();
-    for entry in fs::read_dir(env.generations_dir())? {
+    let Some(entries) = gc_read_dir_optional(&env.generations_dir(), "scan generation root")?
+    else {
+        return Ok(generations);
+    };
+    for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -2422,16 +2527,22 @@ fn checkout_is_still_referenced(
         .join("projects")
         .join(project_id)
         .join("environments");
-    if !environments_root.exists() {
+    let Some(environments) =
+        gc_read_dir_optional(&environments_root, "scan project environments root")?
+    else {
         return Ok(false);
-    }
-    for environment in fs::read_dir(environments_root)? {
+    };
+    for environment in environments {
         let environment = environment?;
         let generations_root = environment.path().join("generations");
-        if !generations_root.exists() {
+        let Some(generations) = gc_read_dir_optional(
+            &generations_root,
+            "scan project environment generations root",
+        )?
+        else {
             continue;
-        }
-        for generation in fs::read_dir(generations_root)? {
+        };
+        for generation in generations {
             let generation = generation?;
             if !generation.file_type()?.is_dir() {
                 continue;
@@ -2724,22 +2835,24 @@ fn list_environments(
     storage_root: &std::path::Path,
 ) -> Result<Vec<(String, String, EnvironmentPaths)>, ConvergenceError> {
     let projects_root = storage_root.join("projects");
-    if !projects_root.exists() {
+    let Some(project_entries) = gc_read_dir_optional(&projects_root, "scan projects root")? else {
         return Ok(Vec::new());
-    }
+    };
 
     let mut environments = Vec::new();
-    for project_entry in fs::read_dir(projects_root)? {
+    for project_entry in project_entries {
         let project_entry = project_entry?;
         if !project_entry.file_type()?.is_dir() {
             continue;
         }
         let project_id = project_entry.file_name().to_string_lossy().to_string();
         let environments_root = project_entry.path().join("environments");
-        if !environments_root.exists() {
+        let Some(environment_entries) =
+            gc_read_dir_optional(&environments_root, "scan project environments root")?
+        else {
             continue;
-        }
-        for environment_entry in fs::read_dir(environments_root)? {
+        };
+        for environment_entry in environment_entries {
             let environment_entry = environment_entry?;
             if !environment_entry.file_type()?.is_dir() {
                 continue;
@@ -5153,6 +5266,94 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
                         && action.outcome == "skipped_missing"
                 )
         );
+    }
+
+    #[test]
+    fn gc_dry_run_handles_missing_source_checkouts_root() {
+        let root = test_root("gc-dry-run-handles-missing-source-checkouts-root");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+        let source_checkouts_root = root.join("source-checkouts");
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
+        assert!(report.actions.iter().any(|action| {
+            action.subject_kind.as_deref() == Some("root")
+                && action.subject.as_deref()
+                    == Some(&format!("root={}", source_checkouts_root.display()))
+                && action.outcome == "skipped_missing"
+        }));
+    }
+
+    #[test]
+    fn gc_dry_run_handles_missing_repositories_root() {
+        let root = test_root("gc-dry-run-handles-missing-repositories-root");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+        let repositories_root = root.join("repositories");
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
+        assert!(report.actions.iter().any(|action| {
+            action.subject_kind.as_deref() == Some("root")
+                && action.subject.as_deref()
+                    == Some(&format!("root={}", repositories_root.display()))
+                && action.outcome == "skipped_missing"
+        }));
+    }
+
+    #[test]
+    fn gc_dry_run_error_includes_path_context() {
+        let root = test_root("gc-dry-run-error-includes-path-context");
+        atomic_write(root.join("projects"), b"not a directory\n").unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+
+        let err = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "failed to scan projects root {}: Not a directory (os error 20)",
+                root.join("projects").display()
+            )
+        );
+    }
+
+    #[test]
+    fn gc_dry_run_succeeds_on_partial_storage_root() {
+        let root = test_root("gc-dry-run-succeeds-on-partial-storage-root");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+        let env = EnvironmentPaths::new(&root, "api", "production");
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
+        assert!(report.actions.iter().any(|action| {
+            action.subject_kind.as_deref() == Some("root")
+                && action.subject.as_deref() == Some(&format!("root={}", env.root.display()))
+                && action.outcome == "skipped_missing"
+        }));
+        assert!(report.actions.iter().any(|action| {
+            action.subject_kind.as_deref() == Some("root")
+                && action.subject.as_deref()
+                    == Some(&format!("root={}", env.generations_dir().display()))
+                && action.outcome == "skipped_missing"
+        }));
+        assert!(!env.root.exists());
     }
 
     #[test]

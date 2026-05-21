@@ -1422,6 +1422,7 @@ fn render_gc_report(
             Some("image") => "Image".into(),
             Some("diagnostics") => "Diagnostics".into(),
             Some("runtime_snapshot") => "Runtime Snapshot".into(),
+            Some("root") => "Root".into(),
             _ => format!("{} {}", action.project_id, action.environment),
         };
         output.push_str(&format!("{heading}\n"));
@@ -1430,7 +1431,8 @@ fn render_gc_report(
                 Some("checkout")
                 | Some("image")
                 | Some("diagnostics")
-                | Some("runtime_snapshot") => {
+                | Some("runtime_snapshot")
+                | Some("root") => {
                     output.push_str(&format!("  {subject}\n"));
                 }
                 _ => {}
