@@ -1,390 +1,88 @@
 # Contributing to Forge
 
-Forge is deterministic runtime orchestration software.
-
-Correctness matters more than feature velocity.
-
-Before contributing, read:
-
-- `README.md`
-- `ARCHITECTURE.md`
-- `INVARIANTS.md`
-- `OPERATIONS.md`
-- `TODO.md`
-
-Most implementation mistakes come from violating orchestration invariants.
+Forge is deterministic runtime orchestration software where **correctness overrides velocity**. This guide ensures that all contributions—whether from humans or AI—preserve the system's operational integrity.
 
 ---
 
-# Core Philosophy
+## 🚀 1. Setup & Environment
 
-Forge is not:
+### Prerequisites
+- Rust (2024 Edition)
+- Docker (Running)
+- Caddy (Installed/Available in path)
 
-```txt
-container automation
-```
-
-Forge is:
-
-```txt
-runtime convergence software
-```
-
-A running container is not a successful deployment.
-
-Do not weaken this distinction.
-
----
-
-# Contribution Rules
-
-These rules apply to:
-
-- humans
-- AI agents
-- copilots
-- automated refactoring tools
-
----
-
-# 1. Run Tests Before Every Commit
-
-Minimum required:
-
+### Local Baseline
+Before making changes, ensure your environment is healthy:
 ```bash
 cargo test -q
 ```
 
-Integration baseline:
+---
 
-```bash
-FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
-```
+## 🌿 2. Branching & Workflow
 
-Do not submit patches without running tests.
+### Branch Naming
+Follow these prefixes for all branches:
+- `feat/` - New capabilities (e.g., `feat/metrics-endpoint`)
+- `fix/` - Bug fixes (e.g., `fix/rollback-pointer`)
+- `docs/` - Documentation updates
+- `ref/` - Narrow, approved refactors (use with caution)
+
+### Workflow
+1. Create a branch from `main`.
+2. Implement a **single concern** (narrow slice).
+3. Add tests that specifically target the new behavior or fix.
+4. Verify all test gates pass (see `CLAUDE.md`).
 
 ---
 
-# 2. Preserve Core Invariants
+## 💻 3. Coding Standards
 
-Never violate:
+### Core Invariants
+> [!IMPORTANT]
+> Most architectural failures in Forge stem from violating orchestration invariants. You **must** read `INVARIANTS.md` before touching the convergence engine, rollback logic, or pointer management.
 
-```txt
-candidate
-→ validated
-→ finalized
-→ activated
-→ promoted
-```
+### The "Narrow Slice" Rule
+We do not accept broad refactors or "cleanup" PRs.
+- **Good:** "Add Prometheus metrics for queue depth"
+- **Bad:** "Modernize the runtime architecture"
 
-Rules:
-
-- never promote before validation
-- never finalize invalid generations
-- never bypass route verification
-- never weaken rollback ordering
-
-Read `INVARIANTS.md` before touching:
-
-- convergence
-- rollback
-- deployment executor
-- pointers
-- routing
-- snapshots
+### Authority Boundaries
+Logic must remain in the **Orchestrator**.
+- Adapters (Docker/Caddy) translate and execute; they do not decide.
+- CLI/API handle transport; they do not orchestrate.
 
 ---
 
-# 3. No Broad Refactors
+## 📤 4. PR Submission Checklist
 
-Forbidden contribution style:
+Before opening a PR, ensure you can check off every item:
 
-```txt
-large cleanup
-architecture rewrite
-trait redesign
-async rewrite
-runtime abstraction overhaul
-```
-
-Forge intentionally evolves in narrow slices.
-
-Large refactors hide semantic regressions.
-
-Prefer:
-
-```txt
-small focused changes
-```
+- [ ] **Tests Added:** Every functional change includes a corresponding test.
+- [ ] **Test Gates Green:** `cargo test -q` and `FORGE_INTEGRATION=1 cargo test -- --nocapture` pass locally.
+- [ ] **No Invariant Violations:** Changes preserve the `candidate → validated → finalized` sequence.
+- [ ] **Secrets Protected:** No plaintext secrets in logs, diagnostics, or events.
+- [ ] **Commit Messages:** Follow [Conventional Commits](https://www.conventionalcommits.org/).
+- [ ] **Single Concern:** The PR addresses exactly one issue or feature.
 
 ---
 
-# 4. Small PRs Only
+## 🔍 5. The Review Cycle
 
-Target:
-
-```txt
-1 concern per PR
-```
-
-## Good
-
-- metrics endpoint only
-- doctor command only
-- bounded logs only
-- single rollback fix
-
-## Bad
-
-- "observability overhaul"
-- "runtime cleanup"
-- "deployment improvements"
+1. **Automated Check:** CI will run the test gates.
+2. **Invariant Audit:** Reviewers will specifically look for drift in convergence semantics or pointer authority.
+3. **Redaction Check:** Verification that new logs or events do not leak sensitive data.
+4. **Approval:** Once invariants are confirmed and tests pass, the PR will be merged.
 
 ---
 
-# 5. Runtime Changes Require Regression Tests
-
-Any change touching:
-
-- deployment ordering
-- rollback
-- convergence
-- routing
-- snapshots
-- restart recovery
-- cleanup
-- secrets
-
-must include tests.
-
-No exceptions.
+## 🤖 AI Agent Guidelines
+If you are an AI assistant contributing to this repo:
+1. **Be Surgical:** Minimize the number of modified files.
+2. **Be Explicit:** State which invariants you are preserving in your PR description.
+3. **Be Defensive:** Always include a reproduction test for bug fixes.
 
 ---
 
-# 6. Preserve Authority Boundaries
-
-Forge owns orchestration authority.
-
-```txt
-Docker = execution runtime
-Caddy  = routing layer
-Forge  = orchestration authority
-```
-
-Do not move orchestration logic into:
-
-- Docker
-- Caddy
-- CLI
-- HTTP handlers
-
----
-
-# 7. CLI Must Stay Thin
-
-The CLI is an HTTP wrapper only.
-
-Do not duplicate business logic in the CLI.
-
----
-
-# 8. API Must Stay Thin
-
-HTTP handlers should only:
-
-- validate request
-- delegate work
-- return response
-
-Do not place orchestration semantics in handlers.
-
----
-
-# 9. No Hidden Runtime State
-
-Avoid:
-
-- hidden globals
-- implicit retries
-- silent recovery
-- magic background tasks
-
-Runtime state must remain reconstructable from:
-
-- snapshots
-- pointers
-- runtime inspection
-- routes
-- events
-
----
-
-# 10. No Unbounded Streams
-
-Forbidden without explicit design review:
-
-- unbounded logs
-- infinite queues
-- uncontrolled buffering
-- unlimited retries
-
-Operational safety matters more than convenience.
-
----
-
-# 11. Secrets Must Never Leak
-
-Secret values must never appear in:
-
-- logs
-- diagnostics
-- events
-- manifests
-- CLI output
-- API responses
-
-Secret names may appear.
-
-Always redact before persistence or delivery.
-
----
-
-# 12. Snapshot Integrity Is Critical
-
-Snapshots are rollback authority.
-
-Never:
-
-- mutate finalized snapshots
-- partially finalize snapshots
-- bypass atomic writes
-
----
-
-# 13. Preserve Pointer Semantics
-
-`current` means:
-
-```txt
-intended active generation
-```
-
-Routes reconcile toward `current`.
-
-Do not reverse this relationship.
-
----
-
-# 14. Avoid Semantic Drift
-
-Most dangerous changes:
-
-- changing ordering
-- changing authority boundaries
-- changing recovery semantics
-- changing convergence behavior
-
-These often appear harmless but break operational guarantees.
-
----
-
-# 15. AI Agent Rules
-
-AI-generated patches must be:
-
-- narrow
-- test-backed
-- locally verified
-
-Before accepting AI-generated changes:
-
-```bash
-git diff --stat
-git diff
-cargo test -q
-FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
-```
-
-Reject patches that:
-
-- touch unrelated files
-- introduce broad abstractions
-- change trait boundaries unnecessarily
-- modify convergence semantics unexpectedly
-- introduce unbounded behavior
-
----
-
-# 16. Commit Discipline
-
-Recommended workflow:
-
-```bash
-git checkout -b small-feature-slice
-```
-
-After successful tests:
-
-```bash
-git commit -m "Add metrics endpoint"
-```
-
-Do not stack unrelated changes into one commit.
-
----
-
-# 17. Preferred Development Style
-
-## Good
-
-- narrow slices
-- explicit invariants
-- deterministic behavior
-- small commits
-- tests first
-
-## Bad
-
-- magic
-- implicit behavior
-- large rewrites
-- framework-driven architecture
-
----
-
-# 18. Runtime Correctness > Features
-
-Forge prioritizes:
-
-```txt
-operational correctness
-```
-
-over feature breadth.
-
-A smaller correct system is preferred over a larger fragile one.
-
----
-
-# 19. If Unsure, Preserve Existing Semantics
-
-When uncertain:
-
-- preserve ordering
-- preserve invariants
-- preserve authority boundaries
-- preserve rollback semantics
-
-Do not casually "simplify" orchestration behavior.
-
----
-
-# 20. Most Important Rule
-
-Never break:
-
-```txt
-running container != successful deployment
-```
-
-That distinction is the foundation of Forge.
+## ⚖️ Governance
+Forge prioritizes a **small, correct system** over a large, fragile platform. If a proposed feature adds significant complexity without advancing deterministic convergence, it may be rejected or deferred.

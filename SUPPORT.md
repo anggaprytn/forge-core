@@ -1,279 +1,67 @@
 # Forge Support Policy
 
-Forge is currently in:
-
-```txt
-alpha
-```
-
-The project is operationally functional but still evolving.
-
-Support is best-effort and focused on:
-
-- runtime correctness
-- convergence behavior
-- operational safety
+Forge is currently in **Alpha**. While the core runtime is stable and validated, the system is evolving rapidly. Support is provided on a best-effort basis with a focus on **Operational Invariants**.
 
 ---
 
-# Supported Scope
+## 🚦 Triage Tiers
 
-Current support focus:
+Issues are prioritized based on their impact on system correctness:
 
-- deployment failures
-- rollback behavior
-- convergence issues
-- restart recovery
-- Docker integration
-- Caddy integration
-- runtime contracts
-- secret injection and redaction
-- webhook deployment flow
-- diagnostics and events
-- dogfood/runtime validation
+| Tier | Type | Priority | Description |
+| :--- | :--- | :--- | :--- |
+| **Tier 1** | **Invariant Violation** | **Immediate** | Cases where `candidate → finalized` is bypassed, or pointers diverge from route truth. |
+| **Tier 2** | **Recovery Failure** | **High** | Daemon or host restarts that result in non-deterministic or manual recovery. |
+| **Tier 3** | **Security/Redaction** | **High** | Secret leakage in logs, events, or diagnostics. |
+| **Tier 4** | **Convergence Bug** | **Medium** | Routes not reconciling toward `current`, or unhealthy containers remaining active. |
+| **Tier 5** | **General/Feature** | **Low** | UX improvements, new adapters, or CLI enhancements. |
 
 ---
 
-# Not Yet Supported
+## 🛑 Out of Scope
 
-Forge intentionally does not support:
-
-- Kubernetes clusters
-- multi-node orchestration
-- Windows runtimes
-- service meshes
-- distributed queues
-- enterprise RBAC
-- multi-tenant isolation
-- plugin ecosystems
-- persistent distributed volumes
-
-These are not alpha priorities.
+We will instantly close issues requesting:
+- Support for non-Docker container runtimes.
+- Support for Windows or non-Unix host operating systems.
+- Multi-node / Cluster orchestration features.
+- Kubernetes integration or service meshes.
+- Enterprise features like RBAC, Teams, or SSO.
 
 ---
 
-# Before Reporting Issues
+## 📝 Reporting an Issue
 
-Always verify:
+To ensure a Tier 1–3 issue is addressed, you **must** provide:
+1. **Forge Version:** (e.g., `git rev-parse HEAD`)
+2. **Runtime Context:** Output of `forge diagnose` or `forge doctor`.
+3. **The Violation:** Which specific invariant from `INVARIANTS.md` was broken?
+4. **Reproduction:** A minimal set of steps to trigger the failure.
 
-```bash
-cargo test -q
-```
-
-If runtime-related:
-
-```bash
-FORGE_INTEGRATION=1 cargo test -- --nocapture
-```
-
-If convergence or runtime-sensitive:
-
-```bash
-FORGE_INTEGRATION=1 cargo test dogfood -- --nocapture
-```
+### Required Artifacts
+- `runtime_state.json` (redacted)
+- `events.jsonl`
+- Docker & Caddy versions
 
 ---
 
-# Required Debug Information
+## 🔒 Security Vulnerabilities
 
-When reporting an issue, include:
+> [!CAUTION]
+> **Do not open public issues for security vulnerabilities.**
 
-- Forge version or commit SHA
-- OS and Docker version
-- Caddy version
-- exact command executed
-- deployment ID, if relevant
-- relevant events
-- diagnostics output
-- reproduction steps
-
-Helpful files:
-
-```txt
-runtime_state.json
-events.jsonl
-diagnostics/
-cleanup.json
-```
+If you discover a way to bypass authentication, escalate privileges, or leak plaintext secrets, please report it via the private security channel (see GitHub Security tab).
 
 ---
 
-# Important Operational Rule
+## 🤖 AI-Generated Issues
 
-Do NOT manually mutate:
-
-- finalized snapshots
-- current pointer
-- previous pointer
-- Forge-owned Caddy subtree
-
-unless performing explicit disaster recovery.
-
-Manual runtime edits can invalidate convergence assumptions.
+We welcome reports from AI agents, provided they include:
+- A reproduction test case in Rust.
+- A clear explanation of which state transition failed.
+- A summary of the observed vs. expected convergence behavior.
 
 ---
 
-# Recovery Expectations
+## 💡 Support Philosophy
 
-Forge is designed to recover from:
-
-- partial deployments
-- daemon crashes
-- failed route activations
-- unhealthy generations
-- orphaned containers or routes
-
-If runtime state diverges unexpectedly, report:
-
-- expected behavior
-- observed behavior
-- runtime artifacts
-
----
-
-# Security Issues
-
-Do not open public issues for:
-
-- secret leakage
-- authentication bypass
-- unsafe runtime escalation
-- convergence corruption vulnerabilities
-
-Report privately instead.
-
----
-
-# Secret Handling
-
-Never include real secret values in:
-
-- GitHub issues
-- logs
-- screenshots
-- diagnostics uploads
-
-Forge should redact secrets automatically, but operators should still avoid posting sensitive values publicly.
-
----
-
-# AI Agent Contributions
-
-Forge supports AI-assisted development, but:
-
-- AI-generated patches are not automatically trusted
-- all runtime changes require tests
-- invariants must remain preserved
-
-Before submitting AI-generated changes:
-
-```bash
-git diff --stat
-cargo test -q
-```
-
----
-
-# Support Philosophy
-
-Forge prioritizes:
-
-```txt
-correctness
-recoverability
-determinism
-```
-
-over feature velocity.
-
-A smaller stable runtime is preferred over a broader fragile platform.
-
----
-
-# What Good Bug Reports Look Like
-
-Good reports include:
-
-```txt
-- exact reproduction
-- deployment lifecycle
-- expected invariant
-- actual invariant violation
-- minimal reproduction
-```
-
-Bad reports look like:
-
-```txt
-"deploy broken"
-"routing weird"
-"rollback failed"
-```
-
-without runtime context.
-
----
-
-# Operational Red Flags
-
-Report immediately if you observe:
-
-- current points to an invalid generation
-- a failed generation becomes active
-- secret values appear in logs or events
-- routes diverge permanently from current
-- generation reuse
-- rollback activates an unhealthy generation
-- orphaned routes accumulate
-- convergence oscillation loops
-
-These are invariant violations.
-
----
-
-# Alpha Expectations
-
-Forge is still alpha software.
-
-Expect:
-
-- rapid iteration
-- runtime hardening work
-- evolving APIs
-- evolving operational tooling
-
-Do not assume long-term API stability yet.
-
----
-
-# Contribution Expectations
-
-Preferred contributions:
-
-- invariant tests
-- runtime hardening
-- deterministic recovery improvements
-- observability
-- operational tooling
-- convergence correctness
-
-Avoid:
-
-- broad platformization
-- speculative abstractions
-- enterprise feature creep
-- unnecessary refactors
-
----
-
-# Long-Term Goal
-
-Forge exists to make:
-
-```txt
-AI-generated applications operationally convergent
-```
-
-without requiring constant manual infrastructure repair.
-
-Support decisions are guided by that goal.
+Forge prioritizes **Correctness > Recoverability > Determinism**. Support decisions are guided by these priorities. We would rather have a stable, narrow system that recovers perfectly than a broad platform that requires manual surgery.
