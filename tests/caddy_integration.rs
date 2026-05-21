@@ -303,6 +303,7 @@ fn caddy_integration_failed_route_activation_does_not_advance_current() {
             activation: ActivationMode::Http {
                 internal_port: 3000,
             },
+            ..ValidationPolicy::default()
         },
     )
     .execute_next();
@@ -753,6 +754,7 @@ impl DockerRuntime for FakeDockerRuntime {
             running: true,
             state_status: "running".into(),
             exit_code: Some(0),
+            restart_count: 0,
             started_at: None,
             image_ref: "forge:test".into(),
             labels: fake_container_labels(container_name),
@@ -778,6 +780,7 @@ impl DockerRuntime for FakeDockerRuntime {
                 running: true,
                 state_status: "running".into(),
                 exit_code: Some(0),
+                restart_count: 0,
                 started_at: None,
                 image_ref: "forge:test".into(),
                 labels: fake_container_labels(name),

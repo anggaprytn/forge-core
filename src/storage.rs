@@ -157,6 +157,133 @@ pub struct PersistedRuntimeInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DeploymentLifecycleState {
+    Queued,
+    Building,
+    Starting,
+    Warming,
+    Validating,
+    Promoted,
+    Rollback,
+    Failed,
+    GcEligible,
+}
+
+impl DeploymentLifecycleState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Building => "building",
+            Self::Starting => "starting",
+            Self::Warming => "warming",
+            Self::Validating => "validating",
+            Self::Promoted => "promoted",
+            Self::Rollback => "rollback",
+            Self::Failed => "failed",
+            Self::GcEligible => "gc_eligible",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedValidationSummary {
+    #[serde(default)]
+    pub tcp_consecutive_passes: u32,
+    #[serde(default)]
+    pub http_consecutive_passes: u32,
+    #[serde(default)]
+    pub required_consecutive_passes: u32,
+    #[serde(default)]
+    pub minimum_uptime_seconds: u64,
+    #[serde(default)]
+    pub observed_uptime_seconds: u64,
+    #[serde(default)]
+    pub restart_count_initial: u64,
+    #[serde(default)]
+    pub restart_count_current: u64,
+    #[serde(default)]
+    pub restart_count_stable: bool,
+    #[serde(default)]
+    pub route_verification_stable: bool,
+    #[serde(default)]
+    pub validation_succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedPromotionSummary {
+    #[serde(default)]
+    pub warmup_succeeded: bool,
+    #[serde(default)]
+    pub validation_succeeded: bool,
+    #[serde(default)]
+    pub route_verification_succeeded: bool,
+    #[serde(default)]
+    pub runtime_snapshot_persisted: bool,
+    #[serde(default)]
+    pub convergence_target_stable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentLifecycleTransition {
+    pub state: DeploymentLifecycleState,
+    pub entered_at_unix: u64,
+    pub transition_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_summary: Option<PersistedValidationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_summary: Option<PersistedPromotionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDeploymentLifecycle {
+    pub lifecycle_version: u64,
+    pub project_id: String,
+    pub environment: String,
+    pub generation: u64,
+    pub state: DeploymentLifecycleState,
+    pub entered_at_unix: u64,
+    pub transition_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_summary: Option<PersistedValidationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_summary: Option<PersistedPromotionSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<DeploymentLifecycleTransition>,
+}
+
+impl PersistedDeploymentLifecycle {
+    pub fn transition(
+        &mut self,
+        state: DeploymentLifecycleState,
+        entered_at_unix: u64,
+        transition_reason: impl Into<String>,
+        validation_summary: Option<PersistedValidationSummary>,
+        promotion_summary: Option<PersistedPromotionSummary>,
+    ) {
+        let transition_reason = transition_reason.into();
+        self.state = state.clone();
+        self.entered_at_unix = entered_at_unix;
+        self.transition_reason = transition_reason.clone();
+        self.validation_summary = validation_summary.clone();
+        self.promotion_summary = promotion_summary.clone();
+        self.transitions.push(DeploymentLifecycleTransition {
+            state,
+            entered_at_unix,
+            transition_reason,
+            validation_summary,
+            promotion_summary,
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PersistedRuntimeEnvSource {
     ForgeYaml,
     ProjectEnvironmentSecret,
@@ -510,6 +637,11 @@ pub struct DiagnosticsStore {
     generation: u64,
 }
 
+pub struct LifecycleStore {
+    env: EnvironmentPaths,
+    generation: u64,
+}
+
 pub struct RetentionStore {
     env: EnvironmentPaths,
 }
@@ -562,6 +694,13 @@ pub fn load_generation_runtime_info(
     generation: u64,
 ) -> StorageResult<Option<PersistedRuntimeInfo>> {
     load_generation_json(env, generation, "runtime.json")
+}
+
+pub fn load_generation_lifecycle(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> StorageResult<Option<PersistedDeploymentLifecycle>> {
+    load_generation_json(env, generation, "lifecycle.json")
 }
 
 pub fn load_generation_snapshot_metadata(
@@ -810,6 +949,32 @@ impl DiagnosticsStore {
                 err.to_string(),
             ))
         })
+    }
+}
+
+impl LifecycleStore {
+    pub fn new(env: EnvironmentPaths, generation: u64) -> Self {
+        Self { env, generation }
+    }
+
+    pub fn read(&self) -> StorageResult<Option<PersistedDeploymentLifecycle>> {
+        load_generation_lifecycle(&self.env, self.generation)
+    }
+
+    pub fn write(&self, lifecycle: &PersistedDeploymentLifecycle) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        let bytes = serde_json::to_vec_pretty(lifecycle).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(
+            self.env
+                .generation_dir(self.generation)
+                .join("lifecycle.json"),
+            &bytes,
+        )
     }
 }
 

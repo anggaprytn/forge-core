@@ -3178,6 +3178,7 @@ impl DockerRuntime for TestDockerRuntime {
                 "exited".into()
             },
             exit_code: if running { Some(0) } else { Some(1) },
+            restart_count: 0,
             started_at: None,
             image_ref: test_image_ref(container_name),
             labels: Default::default(),
@@ -3209,6 +3210,7 @@ impl DockerRuntime for TestDockerRuntime {
                     "exited".into()
                 },
                 exit_code: if *running { Some(0) } else { Some(1) },
+                restart_count: 0,
                 started_at: None,
                 image_ref: test_image_ref(container_name),
                 labels: std::collections::BTreeMap::from([

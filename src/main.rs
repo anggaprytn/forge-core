@@ -831,7 +831,7 @@ fn parse_command(
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
         [cmd, rest @ ..] if cmd == "logs" => parse_logs_command(rest),
         [cmd, rest @ ..] if cmd == "diagnose" => parse_diagnose_command(rest),
-        [cmd, rest @ ..] if cmd == "history" => parse_history_command(rest),
+        [cmd, rest @ ..] if cmd == "history" || cmd == "deployments" => parse_history_command(rest),
         [cmd, action, rest @ ..] if cmd == "env" && action == "diff" => {
             parse_env_diff_command(rest)
         }
@@ -901,6 +901,7 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] diagnose [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] history [--json] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] deployments [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] env [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] env diff [--json] <project_id> <environment> --generation <from> --generation <to>",
         "  forge [--url URL] [--token TOKEN] events",
@@ -1323,6 +1324,29 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
         "  Probe Path: {}\n",
         status.probe_path.as_deref().unwrap_or("unknown")
     ));
+    if let Some(state) = status.lifecycle_state.as_ref() {
+        output.push_str(&format!("  Lifecycle State: {}\n", state.as_str()));
+    }
+    if let Some(promotion_state) = status.promotion_state.as_deref() {
+        output.push_str(&format!("  Promotion State: {promotion_state}\n"));
+    }
+    if let Some(summary) = status.validation_summary.as_ref() {
+        output.push_str(&format!(
+            "  Validation Counters: tcp={}/{} http={}/{}\n",
+            summary.tcp_consecutive_passes,
+            summary.required_consecutive_passes,
+            summary.http_consecutive_passes,
+            summary.required_consecutive_passes
+        ));
+        output.push_str(&format!(
+            "  Uptime Stability: {}s/{} stable_restarts={}\n",
+            status
+                .uptime_seconds
+                .unwrap_or(summary.observed_uptime_seconds),
+            summary.minimum_uptime_seconds,
+            summary.restart_count_stable
+        ));
+    }
     if let Some(snapshot) = status.runtime_env_snapshot.as_ref() {
         output.push('\n');
         output.push_str("Runtime Env Snapshot:\n");
@@ -1433,10 +1457,54 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         "  Probe Target: {}\n",
         format_probe_target(diagnostics.probe_target.as_ref())
     ));
+    if let Some(state) = diagnostics.active_lifecycle_state.as_ref() {
+        output.push_str(&format!("  Lifecycle State: {}\n", state.as_str()));
+    }
+    if let Some(promotion_state) = diagnostics.promotion_state.as_deref() {
+        output.push_str(&format!("  Promotion State: {promotion_state}\n"));
+    }
+    if let Some(summary) = diagnostics.validation_summary.as_ref() {
+        output.push_str(&format!(
+            "  Validation Counters: tcp={}/{} http={}/{}\n",
+            summary.tcp_consecutive_passes,
+            summary.required_consecutive_passes,
+            summary.http_consecutive_passes,
+            summary.required_consecutive_passes
+        ));
+        output.push_str(&format!(
+            "  Uptime Stability: {}s/{} stable_restarts={}\n",
+            summary.observed_uptime_seconds,
+            summary.minimum_uptime_seconds,
+            summary.restart_count_stable
+        ));
+    }
     if let Some(stage) = diagnostics.likely_failure_stage.as_deref() {
         output.push('\n');
         output.push_str("Likely Failure Stage:\n");
         output.push_str(&format!("  {stage}\n"));
+    }
+    if let Some(reason) = diagnostics.last_failed_transition.as_deref() {
+        output.push('\n');
+        output.push_str("Last Failed Transition:\n");
+        output.push_str(&format!("  {reason}\n"));
+    }
+    if let Some(reason) = diagnostics.promotion_gate_reason.as_deref() {
+        output.push('\n');
+        output.push_str("Promotion Gate:\n");
+        output.push_str(&format!("  {reason}\n"));
+    }
+    if let Some(summary) = diagnostics.warmup_failure_summary.as_deref() {
+        output.push('\n');
+        output.push_str("Warmup Failure Summary:\n");
+        output.push_str(&format!("  {summary}\n"));
+    }
+    if diagnostics.restart_instability || diagnostics.probe_flapping {
+        output.push('\n');
+        output.push_str("Stability Signals:\n");
+        output.push_str(&format!(
+            "  restart_instability: {}\n  probe_flapping: {}\n",
+            diagnostics.restart_instability, diagnostics.probe_flapping
+        ));
     }
     if let Some(reason) = diagnostics.route.mismatch_reason.as_deref() {
         output.push('\n');
@@ -1592,19 +1660,29 @@ fn render_deployment_history(history: &DeploymentHistoryResponse) -> String {
     for entry in &history.entries {
         output.push_str(&format!("Generation {}\n", entry.generation));
         let status = if entry.rollback_target {
-            "rollback_target"
-        } else if entry.retained {
-            if entry.promoted_at_unix.is_some() {
-                "active"
-            } else {
-                "historical"
-            }
+            "rollback_target".to_string()
+        } else if let Some(state) = entry.lifecycle_state.as_ref() {
+            state.as_str().to_string()
         } else if entry.eligible_for_gc {
-            "gc-eligible"
+            "gc_eligible".to_string()
+        } else if entry.promoted_at_unix.is_some() {
+            "promoted".to_string()
         } else {
-            "historical"
+            "historical".to_string()
         };
         output.push_str(&format!("  status: {status}\n"));
+        if let Some(summary) = entry.validation_summary.as_ref() {
+            output.push_str(&format!("  uptime: {}s\n", summary.observed_uptime_seconds));
+            output.push_str(&format!(
+                "  probes: {}/{} passed\n",
+                summary.tcp_consecutive_passes.min(
+                    summary
+                        .http_consecutive_passes
+                        .max(summary.required_consecutive_passes)
+                ),
+                summary.required_consecutive_passes
+            ));
+        }
         if let Some(commit_sha) = entry.commit_sha.as_deref() {
             output.push_str(&format!("  commit: {commit_sha}\n"));
         }
@@ -1619,6 +1697,9 @@ fn render_deployment_history(history: &DeploymentHistoryResponse) -> String {
         }
         if let Some(promoted_at) = entry.promoted_at_unix {
             output.push_str(&format!("  promoted: {promoted_at}\n"));
+        }
+        if let Some(reason) = entry.transition_reason.as_deref() {
+            output.push_str(&format!("  reason: {reason}\n"));
         }
         output.push_str(&format!(
             "  retained: {}\n",
@@ -2028,6 +2109,7 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
             activation: ActivationMode::Http {
                 internal_port: 3000,
             },
+            ..ValidationPolicy::default()
         },
         execution: ExecutionConfig {
             context_path: PathBuf::from("."),

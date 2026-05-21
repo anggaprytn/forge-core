@@ -26,10 +26,12 @@ use crate::runtime_env::restore_runtime_env;
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::secrets::SecretStore;
 use crate::storage::{
-    DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord, PersistedActivationMode,
-    PersistedBuildInfo, PersistedResolvedRuntime, PersistedRuntimeEnvSnapshot,
-    PersistedRuntimeInfo, PersistedSnapshotMetadata, PointerStore, RetentionMetadata,
-    RetentionStore, StorageError, load_generation_build_info, load_generation_resolved_runtime,
+    DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord,
+    PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
+    PersistedPromotionSummary, PersistedResolvedRuntime, PersistedRuntimeEnvSnapshot,
+    PersistedRuntimeInfo, PersistedSnapshotMetadata, PersistedValidationSummary, PointerStore,
+    RetentionMetadata, RetentionStore, StorageError, load_generation_build_info,
+    load_generation_lifecycle, load_generation_resolved_runtime,
     load_generation_runtime_env_snapshot, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
@@ -71,6 +73,16 @@ pub struct ProjectEnvironmentStatus {
     pub container_started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_env_snapshot: Option<RuntimeEnvSnapshotMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<DeploymentLifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_summary: Option<PersistedValidationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_summary: Option<PersistedPromotionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -160,6 +172,8 @@ struct EnvironmentRuntimeTruth {
     promoted_build: Option<PersistedBuildInfo>,
     latest_snapshot: Option<PersistedSnapshotMetadata>,
     latest_build: Option<PersistedBuildInfo>,
+    active_lifecycle: Option<PersistedDeploymentLifecycle>,
+    latest_lifecycle: Option<PersistedDeploymentLifecycle>,
     promoted_runtime_env_snapshot: Option<PersistedRuntimeEnvSnapshot>,
     promoted_generation_issue: Option<String>,
     container_running: bool,
@@ -207,7 +221,27 @@ fn deployment_history_entry(record: GenerationHistoryRecord) -> DeploymentHistor
         eligible_for_gc: record.eligible_for_gc,
         missing_artifacts: record.missing_artifacts,
         retained_reasons: record.retained_reasons,
+        lifecycle_state: None,
+        entered_at_unix: None,
+        transition_reason: None,
+        validation_summary: None,
+        promotion_summary: None,
     }
+}
+
+fn promotion_state_for_lifecycle(
+    lifecycle: Option<&PersistedDeploymentLifecycle>,
+    rollback_target: bool,
+) -> Option<String> {
+    if rollback_target {
+        return Some("rollback_target".into());
+    }
+    lifecycle.map(|lifecycle| match lifecycle.state {
+        DeploymentLifecycleState::Promoted => "promoted".into(),
+        DeploymentLifecycleState::Failed => "failed".into(),
+        DeploymentLifecycleState::Rollback => "rollback".into(),
+        _ => "pending".into(),
+    })
 }
 
 fn merge_live_generation_metadata(
@@ -459,8 +493,22 @@ where
     let mut entries = metadata
         .generations
         .into_iter()
-        .map(deployment_history_entry)
-        .collect::<Vec<_>>();
+        .map(|record| {
+            let generation = record.generation;
+            let mut entry = deployment_history_entry(record);
+            if let Some(lifecycle) = load_generation_lifecycle(&env, generation)? {
+                entry.lifecycle_state = Some(lifecycle.state.clone());
+                entry.entered_at_unix = Some(lifecycle.entered_at_unix);
+                entry.transition_reason = Some(lifecycle.transition_reason);
+                entry.validation_summary = lifecycle.validation_summary;
+                entry.promotion_summary = lifecycle.promotion_summary;
+            }
+            if entry.eligible_for_gc && entry.lifecycle_state.is_none() {
+                entry.lifecycle_state = Some(DeploymentLifecycleState::GcEligible);
+            }
+            Ok::<_, ProjectStatusError>(entry)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     entries.sort_by(|left, right| right.generation.cmp(&left.generation));
     Ok(DeploymentHistoryResponse {
         project_id: project_id.into(),
@@ -567,7 +615,6 @@ where
         .promoted_snapshot
         .as_ref()
         .is_some_and(|snapshot| snapshot.state == "healthy");
-
     let status = if deploying {
         "deploying"
     } else if truth.active_generation.is_some()
@@ -594,6 +641,10 @@ where
     } else {
         "degraded"
     };
+    let visible_lifecycle = truth
+        .active_lifecycle
+        .as_ref()
+        .or(truth.latest_lifecycle.as_ref());
 
     Ok(ProjectEnvironmentStatus {
         project_id: project_id.to_string(),
@@ -657,6 +708,18 @@ where
             .promoted_runtime_env_snapshot
             .as_ref()
             .map(runtime_env_snapshot_metadata),
+        lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
+        promotion_state: promotion_state_for_lifecycle(visible_lifecycle, false),
+        validation_summary: visible_lifecycle
+            .and_then(|lifecycle| lifecycle.validation_summary.clone()),
+        promotion_summary: visible_lifecycle
+            .and_then(|lifecycle| lifecycle.promotion_summary.clone()),
+        uptime_seconds: visible_lifecycle.and_then(|lifecycle| {
+            lifecycle
+                .validation_summary
+                .as_ref()
+                .map(|summary| summary.observed_uptime_seconds)
+        }),
     })
 }
 
@@ -805,6 +868,30 @@ where
     };
     let recent_secret_mutations =
         recent_secret_mutations(storage_root, project_id, environment, &truth)?;
+    let visible_lifecycle = truth
+        .active_lifecycle
+        .as_ref()
+        .or(truth.latest_lifecycle.as_ref());
+    let promotion_gate_reason = visible_lifecycle
+        .and_then(|lifecycle| lifecycle.promotion_summary.as_ref())
+        .and_then(|summary| summary.gate_reason.clone());
+    let validation_summary =
+        visible_lifecycle.and_then(|lifecycle| lifecycle.validation_summary.clone());
+    let warmup_failure_summary = validation_summary.as_ref().and_then(|summary| {
+        (!summary.validation_succeeded).then(|| {
+            format!(
+                "uptime={}s/{}, probes tcp={}/{} http={}/{} restart_stable={} route_stable={}",
+                summary.observed_uptime_seconds,
+                summary.minimum_uptime_seconds,
+                summary.tcp_consecutive_passes,
+                summary.required_consecutive_passes,
+                summary.http_consecutive_passes,
+                summary.required_consecutive_passes,
+                summary.restart_count_stable,
+                summary.route_verification_stable
+            )
+        })
+    });
     Ok(EnvironmentDiagnostics {
         project_id: project_id.to_string(),
         environment: environment.to_string(),
@@ -864,6 +951,34 @@ where
         missing_required_secrets,
         env_drift,
         recent_secret_mutations,
+        active_lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
+        promotion_state: promotion_state_for_lifecycle(
+            visible_lifecycle,
+            history.entries.iter().any(|entry| entry.rollback_target),
+        ),
+        validation_summary,
+        promotion_summary: visible_lifecycle
+            .and_then(|lifecycle| lifecycle.promotion_summary.clone()),
+        last_failed_transition: visible_lifecycle.and_then(|lifecycle| {
+            lifecycle
+                .transitions
+                .iter()
+                .rev()
+                .find(|transition| transition.state == DeploymentLifecycleState::Failed)
+                .map(|transition| transition.transition_reason.clone())
+        }),
+        promotion_gate_reason,
+        warmup_failure_summary,
+        restart_instability: visible_lifecycle
+            .and_then(|lifecycle| lifecycle.validation_summary.as_ref())
+            .is_some_and(|summary| !summary.restart_count_stable),
+        probe_flapping: visible_lifecycle
+            .and_then(|lifecycle| lifecycle.validation_summary.as_ref())
+            .is_some_and(|summary| {
+                summary.validation_succeeded
+                    && (summary.tcp_consecutive_passes > summary.required_consecutive_passes
+                        || summary.http_consecutive_passes > summary.required_consecutive_passes)
+            }),
     })
 }
 
@@ -1048,6 +1163,14 @@ where
         .map(|generation| load_generation_build_info(env, generation))
         .transpose()?
         .flatten();
+    let active_lifecycle = active_generation
+        .map(|generation| load_generation_lifecycle(env, generation))
+        .transpose()?
+        .flatten();
+    let latest_lifecycle = latest_generation
+        .map(|generation| load_generation_lifecycle(env, generation))
+        .transpose()?
+        .flatten();
     let promoted_runtime_env_snapshot = active_generation
         .map(|generation| load_generation_runtime_env_snapshot(env, generation))
         .transpose()?
@@ -1117,6 +1240,8 @@ where
         promoted_build,
         latest_snapshot,
         latest_build,
+        active_lifecycle,
+        latest_lifecycle,
         promoted_runtime_env_snapshot,
         promoted_generation_issue,
         container_running,
@@ -1169,6 +1294,10 @@ fn build_environment_status_from_truth(
         .promoted_snapshot
         .as_ref()
         .is_some_and(|snapshot| snapshot.state == "healthy");
+    let visible_lifecycle = truth
+        .active_lifecycle
+        .as_ref()
+        .or(truth.latest_lifecycle.as_ref());
 
     let status = if deploying {
         "deploying"
@@ -1259,6 +1388,18 @@ fn build_environment_status_from_truth(
             .promoted_runtime_env_snapshot
             .as_ref()
             .map(runtime_env_snapshot_metadata),
+        lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
+        promotion_state: promotion_state_for_lifecycle(visible_lifecycle, false),
+        validation_summary: visible_lifecycle
+            .and_then(|lifecycle| lifecycle.validation_summary.clone()),
+        promotion_summary: visible_lifecycle
+            .and_then(|lifecycle| lifecycle.promotion_summary.clone()),
+        uptime_seconds: visible_lifecycle.and_then(|lifecycle| {
+            lifecycle
+                .validation_summary
+                .as_ref()
+                .map(|summary| summary.observed_uptime_seconds)
+        }),
     })
 }
 
@@ -2183,6 +2324,7 @@ mod tests {
             running: true,
             state_status: "running".into(),
             exit_code: Some(0),
+            restart_count: 0,
             started_at: Some("2026-05-21T12:00:00Z".into()),
             image_ref: format!("forge/api:staging-gen-{generation}"),
             labels: BTreeMap::new(),
@@ -2765,6 +2907,80 @@ mod tests {
         .unwrap();
         assert_eq!(status.active_generation, Some(7));
         assert_eq!(status.last_deployment_id.as_deref(), Some("dep-7"));
+    }
+
+    #[test]
+    fn status_reports_progressive_state() {
+        let root = test_root("status-reports-progressive-state");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 31);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        PointerStore::new(env.clone()).swap_current(31).unwrap();
+        let lifecycle_store = crate::storage::LifecycleStore::new(env.clone(), 31);
+        let mut lifecycle = PersistedDeploymentLifecycle {
+            lifecycle_version: 1,
+            project_id: "api".into(),
+            environment: "staging".into(),
+            generation: 31,
+            state: DeploymentLifecycleState::Queued,
+            entered_at_unix: crate::storage::current_unix_timestamp(),
+            transition_reason: String::new(),
+            validation_summary: None,
+            promotion_summary: None,
+            transitions: Vec::new(),
+        };
+        lifecycle.transition(
+            DeploymentLifecycleState::Warming,
+            crate::storage::current_unix_timestamp(),
+            "awaiting final warmup probe",
+            Some(PersistedValidationSummary {
+                tcp_consecutive_passes: 2,
+                http_consecutive_passes: 2,
+                required_consecutive_passes: 3,
+                minimum_uptime_seconds: 10,
+                observed_uptime_seconds: 8,
+                restart_count_initial: 0,
+                restart_count_current: 0,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                validation_succeeded: false,
+                last_probe_error: None,
+            }),
+            Some(PersistedPromotionSummary {
+                gate_reason: Some("warmup pending".into()),
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                ..PersistedPromotionSummary::default()
+            }),
+        );
+        lifecycle_store.write(&lifecycle).unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(31)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(
+            status.lifecycle_state,
+            Some(DeploymentLifecycleState::Warming)
+        );
+        assert_eq!(status.promotion_state.as_deref(), Some("pending"));
+        let summary = status.validation_summary.unwrap();
+        assert_eq!(summary.tcp_consecutive_passes, 2);
+        assert_eq!(summary.required_consecutive_passes, 3);
+        assert_eq!(status.uptime_seconds, Some(8));
     }
 
     #[test]

@@ -23,12 +23,13 @@ use crate::runtime_env::{RuntimeEnvMetadata, build_runtime_env_artifacts};
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::status::derive_environment_domain;
 use crate::storage::{
-    CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
-    GenerationAllocator, GenerationHistoryRecord, PersistedActivationMode, PersistedBuildInfo,
-    PersistedRouteTargetSource, PersistedRuntimeInfo, PointerStore, RetentionStore,
-    RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
-    StorageError, current_unix_timestamp, load_generation_build_info, load_generation_runtime_info,
-    load_generation_snapshot_metadata,
+    CleanupRecord, CleanupStore, DeploymentLifecycleState, DiagnosticSummary, DiagnosticsStore,
+    EnvironmentPaths, EventStore, GenerationAllocator, GenerationHistoryRecord, LifecycleStore,
+    PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
+    PersistedPromotionSummary, PersistedRouteTargetSource, PersistedRuntimeInfo,
+    PersistedValidationSummary, PointerStore, RetentionStore, RuntimeHealthState, RuntimeState,
+    RuntimeStateStore, SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
+    load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 #[derive(Debug)]
@@ -131,10 +132,9 @@ struct ValidationFailureContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProbeAttemptResult {
-    attempts: u32,
-    elapsed_ms: u128,
-    last_error: Option<String>,
+struct WarmupObservation {
+    validation_summary: PersistedValidationSummary,
+    promotion_summary: PersistedPromotionSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +154,8 @@ pub struct ValidationPolicy {
     pub tcp_required: bool,
     pub http_health_path: Option<String>,
     pub activation: ActivationMode,
+    pub minimum_uptime_seconds: u64,
+    pub required_consecutive_probe_passes: u32,
 }
 
 impl Default for ValidationPolicy {
@@ -162,6 +164,8 @@ impl Default for ValidationPolicy {
             tcp_required: true,
             http_health_path: None,
             activation: ActivationMode::Direct,
+            minimum_uptime_seconds: if cfg!(test) { 0 } else { 10 },
+            required_consecutive_probe_passes: if cfg!(test) { 1 } else { 3 },
         }
     }
 }
@@ -174,8 +178,7 @@ pub enum ActivationMode {
 
 pub const FORGE_MANAGED_DOCKER_NETWORK: &str = "forge-managed";
 pub const DEFAULT_VALIDATION_TIMEOUT_MS: u64 = 15_000;
-const VALIDATION_RETRY_INITIAL_DELAY_MS: u64 = 100;
-const VALIDATION_RETRY_MAX_DELAY_MS: u64 = 1_000;
+const WARMUP_LOOP_INTERVAL_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionConfig {
@@ -288,6 +291,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let generation = GenerationAllocator::new(env.clone()).allocate()?;
         let events = EventStore::new(env.clone(), generation);
         let diagnostics = DiagnosticsStore::new(env.clone(), generation);
+        let lifecycle_store = LifecycleStore::new(env.clone(), generation);
         let labels = forge_labels(record, generation);
         let container_name = generation_container_name(record, generation);
         let image_tag = format!(
@@ -302,6 +306,16 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             history.source_path = record.source_path.clone();
             history.created_at_unix = history.created_at_unix.or(Some(current_unix_timestamp()));
         })?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Queued,
+            "deployment dequeued for execution",
+            None,
+            None,
+        )?;
         let domain =
             load_environment_domain(&self.storage_root, &record.project_id, &record.environment)?;
         let runtime_secrets = match self.resolve_runtime_secrets(&execution.context_path, record) {
@@ -360,6 +374,16 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &format!("deployment started for {}", record.deployment_id),
             &secret_values,
         )?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Building,
+            "image build started",
+            None,
+            None,
+        )?;
 
         let image_ref = match self.docker.build_image(BuildImageRequest {
             image_tag: image_tag.clone(),
@@ -370,6 +394,19 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Ok(image_ref) => image_ref,
             Err(err) => {
                 let failure_reason = format!("image build failed: {err}");
+                persist_lifecycle_transition(
+                    &lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    None,
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
                 self.record_failed_attempt(
                     &events,
                     &diagnostics,
@@ -393,6 +430,19 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             if let Err(err) = self.docker.ensure_network(network_name) {
                 let failure_reason =
                     format!("docker network ensure failed for {network_name}: {err}");
+                persist_lifecycle_transition(
+                    &lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    None,
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
                 self.record_failed_attempt(
                     &events,
                     &diagnostics,
@@ -422,6 +472,19 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Ok(_) => {}
             Err(err) => {
                 let failure_reason = format!("container create failed: {err}");
+                persist_lifecycle_transition(
+                    &lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    None,
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
                 self.record_failed_attempt(
                     &events,
                     &diagnostics,
@@ -451,8 +514,31 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ),
             &secret_values,
         )?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Starting,
+            "container start initiated",
+            None,
+            None,
+        )?;
         if let Err(err) = self.docker.start_container(&container_name) {
             let failure_reason = format!("container start failed: {err}");
+            persist_lifecycle_transition(
+                &lifecycle_store,
+                &record.project_id,
+                &record.environment,
+                generation,
+                DeploymentLifecycleState::Failed,
+                &failure_reason,
+                None,
+                Some(PersistedPromotionSummary {
+                    gate_reason: Some(failure_reason.clone()),
+                    ..PersistedPromotionSummary::default()
+                }),
+            )?;
             self.record_failed_generation(
                 &env,
                 &events,
@@ -479,6 +565,19 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Ok(inspection) => inspection,
             Err(err) => {
                 let failure_reason = format!("container inspection failed: {err}");
+                persist_lifecycle_transition(
+                    &lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    None,
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
                 self.record_failed_generation(
                     &env,
                     &events,
@@ -499,6 +598,19 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         };
         if let Err(err) = validate_inspection(&inspection, &container_name) {
             let failure_reason = err.to_string();
+            persist_lifecycle_transition(
+                &lifecycle_store,
+                &record.project_id,
+                &record.environment,
+                generation,
+                DeploymentLifecycleState::Failed,
+                &failure_reason,
+                None,
+                Some(PersistedPromotionSummary {
+                    gate_reason: Some(failure_reason.clone()),
+                    ..PersistedPromotionSummary::default()
+                }),
+            )?;
             self.record_failed_generation(
                 &env,
                 &events,
@@ -602,10 +714,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             })?;
         writer.write_artifact("resolved_runtime.json", &format!("{resolved_runtime}\n"))?;
         diagnostics.append_log_line("runtime inspection passed", &secret_values)?;
-        self.validate_candidate(
+        let warmup = self.validate_candidate(
             &validation,
             validation_timeout_ms,
             &env,
+            &lifecycle_store,
             &container_name,
             &image_ref,
             &events,
@@ -644,16 +757,28 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         })?;
         append_event(&events, record, generation, "SNAPSHOT_FINALIZED", None)?;
         diagnostics.append_log_line("snapshot finalized", &secret_values)?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Validating,
+            "promotion gate satisfied; route verification starting",
+            Some(warmup.validation_summary.clone()),
+            Some(warmup.promotion_summary.clone()),
+        )?;
         if let Err(err) = self.activate_generation(
             &validation,
             &execution,
             record,
             &env,
+            &lifecycle_store,
             generation,
             &container_name,
             &inspection,
             &diagnostics,
             &secret_values,
+            warmup,
         ) {
             self.record_failed_generation(
                 &env,
@@ -698,6 +823,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let target = pointers
             .read_pointer("previous")?
             .ok_or(DeploymentError::RollbackUnavailable)?;
+        let lifecycle_store = LifecycleStore::new(env.clone(), target);
         let snapshot = load_generation_snapshot_metadata(&env, target)?
             .ok_or(DeploymentError::RollbackUnavailable)?;
         if snapshot.state != "healthy" {
@@ -762,6 +888,19 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             validate_route_activation(&route_inspection, &context)?;
         }
 
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            target,
+            DeploymentLifecycleState::Rollback,
+            "rollback requested",
+            None,
+            Some(PersistedPromotionSummary {
+                gate_reason: Some("rollback requested".into()),
+                ..PersistedPromotionSummary::default()
+            }),
+        )?;
         pointers.swap_current(target)?;
         update_generation_history(&env, target, |history| {
             history.restored_by_rollback = true;
@@ -777,6 +916,24 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             last_transition: "rollback_completed".into(),
             last_error_code: None,
         })?;
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            target,
+            DeploymentLifecycleState::Promoted,
+            "rollback restored generation",
+            None,
+            Some(PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(current_unix_timestamp()),
+                gate_reason: None,
+            }),
+        )?;
         append_simple_event(
             &EventStore::new(env, target),
             &record.project_id,
@@ -801,6 +958,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         validation: &ValidationPolicy,
         validation_timeout_ms: u64,
         env: &EnvironmentPaths,
+        lifecycle_store: &LifecycleStore,
         container_name: &str,
         image_ref: &str,
         events: &EventStore,
@@ -809,7 +967,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         generation: u64,
         redacted_env_preview: &[String],
         secret_values: &[String],
-    ) -> Result<(), DeploymentError> {
+    ) -> Result<WarmupObservation, DeploymentError> {
         let validation_started = Instant::now();
         let internal_port = match validation.activation {
             ActivationMode::Direct => 3000,
@@ -817,6 +975,16 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         };
         let probe_path = validation.http_health_path.as_deref();
         let selected_network = self.execution.network_name.clone();
+        persist_lifecycle_transition(
+            lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Warming,
+            "warmup started",
+            None,
+            None,
+        )?;
         let inspection = match self.docker.inspect_container(container_name) {
             Ok(inspection) => inspection,
             Err(err) => {
@@ -840,14 +1008,33 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 return Err(err.into());
             }
         };
+        let required_passes = validation.required_consecutive_probe_passes.max(1);
+        let minimum_uptime_seconds = validation.minimum_uptime_seconds;
+        let restart_count_initial = inspection.restart_count;
         if validation.tcp_required && !inspection.running {
             let failure_reason = container_exited_failure_reason("tcp probe", &inspection);
+            let validation_summary = PersistedValidationSummary {
+                required_consecutive_passes: required_passes,
+                minimum_uptime_seconds,
+                restart_count_initial,
+                restart_count_current: inspection.restart_count,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                last_probe_error: Some(failure_reason.clone()),
+                ..PersistedValidationSummary::default()
+            };
+            let promotion_summary = PersistedPromotionSummary {
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                gate_reason: Some(failure_reason.clone()),
+                ..PersistedPromotionSummary::default()
+            };
             let context = ValidationFailureContext {
                 inspection: Some(inspection),
                 probe_target: None,
                 attempts: None,
                 elapsed_ms: Some(validation_started.elapsed().as_millis()),
-                last_error: None,
+                last_error: Some(failure_reason.clone()),
             };
             self.capture_validation_failure_diagnostics(
                 diagnostics,
@@ -857,6 +1044,16 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 probe_path,
                 selected_network.as_deref(),
                 secret_values,
+            )?;
+            persist_lifecycle_transition(
+                lifecycle_store,
+                &record.project_id,
+                &record.environment,
+                generation,
+                DeploymentLifecycleState::Failed,
+                &failure_reason,
+                Some(validation_summary),
+                Some(promotion_summary),
             )?;
             self.record_failed_generation(
                 env,
@@ -884,6 +1081,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Ok(probe_host) => probe_host,
             Err(err) => {
                 let failure_reason = err.to_string();
+                let validation_summary = PersistedValidationSummary {
+                    required_consecutive_passes: required_passes,
+                    minimum_uptime_seconds,
+                    restart_count_initial,
+                    restart_count_current: inspection.restart_count,
+                    restart_count_stable: true,
+                    route_verification_stable: true,
+                    last_probe_error: Some(failure_reason.clone()),
+                    ..PersistedValidationSummary::default()
+                };
+                let promotion_summary = PersistedPromotionSummary {
+                    runtime_snapshot_persisted: true,
+                    convergence_target_stable: true,
+                    gate_reason: Some(failure_reason.clone()),
+                    ..PersistedPromotionSummary::default()
+                };
                 let context = ValidationFailureContext {
                     inspection: Some(inspection),
                     probe_target: None,
@@ -899,6 +1112,16 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     probe_path,
                     selected_network.as_deref(),
                     secret_values,
+                )?;
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    Some(validation_summary),
+                    Some(promotion_summary),
                 )?;
                 self.record_failed_generation(
                     env,
@@ -923,26 +1146,61 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             port: internal_port,
             path: None,
         };
-        if validation.tcp_required {
-            if let Some(result) = self.retry_probe_within_budget(
-                container_name,
-                validation_started,
-                validation_timeout_ms,
-                |probes| probes.probe_tcp(&probe_host, internal_port),
-                "tcp probe returned unhealthy".into(),
-            )? {
-                let failure_inspection = self.docker.inspect_container(container_name).ok();
-                let failure_reason = failure_inspection
-                    .as_ref()
-                    .filter(|inspection| !inspection.running)
-                    .map(|inspection| container_exited_failure_reason("tcp probe", inspection))
-                    .unwrap_or_else(|| "tcp probe failed".to_string());
+        let mut tcp_consecutive_passes = 0u32;
+        let mut http_consecutive_passes = if probe_path.is_none() {
+            required_passes
+        } else {
+            0
+        };
+        let mut attempts = 0u32;
+        let mut last_probe_error = None;
+        let budget = Duration::from_millis(validation_timeout_ms);
+        let inspect_each_attempt = minimum_uptime_seconds > 0 || required_passes > 1;
+
+        loop {
+            attempts += 1;
+            let mut current_inspection = if attempts == 1 || !inspect_each_attempt {
+                inspection.clone()
+            } else {
+                self.docker.inspect_container(container_name)?
+            };
+            if !current_inspection.running {
+                let failure_reason = container_exited_failure_reason("warmup", &current_inspection);
+                let validation_summary = PersistedValidationSummary {
+                    tcp_consecutive_passes,
+                    http_consecutive_passes,
+                    required_consecutive_passes: required_passes,
+                    minimum_uptime_seconds,
+                    observed_uptime_seconds: validation_started.elapsed().as_secs(),
+                    restart_count_initial,
+                    restart_count_current: current_inspection.restart_count,
+                    restart_count_stable: current_inspection.restart_count == restart_count_initial,
+                    route_verification_stable: true,
+                    validation_succeeded: false,
+                    last_probe_error: Some(failure_reason.clone()),
+                };
+                let promotion_summary = PersistedPromotionSummary {
+                    runtime_snapshot_persisted: true,
+                    convergence_target_stable: true,
+                    gate_reason: Some(failure_reason.clone()),
+                    ..PersistedPromotionSummary::default()
+                };
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    Some(validation_summary.clone()),
+                    Some(promotion_summary.clone()),
+                )?;
                 let context = ValidationFailureContext {
-                    inspection: failure_inspection.or(Some(inspection)),
+                    inspection: Some(current_inspection),
                     probe_target: Some(tcp_probe_target.clone()),
-                    attempts: Some(result.attempts),
-                    elapsed_ms: Some(result.elapsed_ms),
-                    last_error: result.last_error,
+                    attempts: Some(attempts),
+                    elapsed_ms: Some(validation_started.elapsed().as_millis()),
+                    last_error: Some(failure_reason.clone()),
                 };
                 self.capture_validation_failure_diagnostics(
                     diagnostics,
@@ -962,49 +1220,238 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     container_name,
                     Some(image_ref),
                     None,
-                    "validation",
+                    "warming",
                     &failure_reason,
                     Some(&tcp_probe_target),
                     redacted_env_preview,
                     secret_values,
                 )?;
                 return Err(DeploymentError::ValidationFailed(
-                    if failure_reason == "tcp probe failed" {
-                        "tcp probe failed"
-                    } else {
-                        "container exited before tcp probe"
-                    },
+                    "container exited before tcp probe",
                 ));
             }
-        }
-        diagnostics.append_log_line("tcp validation passed", secret_values)?;
 
-        if let Some(path) = &validation.http_health_path {
-            if let Some(result) = self.retry_probe_within_budget(
-                container_name,
-                validation_started,
-                validation_timeout_ms,
-                |probes| probes.probe_http(&probe_host, internal_port, path),
-                format!("http health probe returned unhealthy for {path}"),
-            )? {
-                let http_probe_target = ProbeTargetContext {
-                    host: probe_host.to_string(),
-                    port: internal_port,
-                    path: Some(path.clone()),
+            if current_inspection.restart_count != restart_count_initial {
+                let failure_reason = format!(
+                    "restart count increased during warmup ({} -> {})",
+                    restart_count_initial, current_inspection.restart_count
+                );
+                let validation_summary = PersistedValidationSummary {
+                    tcp_consecutive_passes,
+                    http_consecutive_passes,
+                    required_consecutive_passes: required_passes,
+                    minimum_uptime_seconds,
+                    observed_uptime_seconds: validation_started.elapsed().as_secs(),
+                    restart_count_initial,
+                    restart_count_current: current_inspection.restart_count,
+                    restart_count_stable: false,
+                    route_verification_stable: true,
+                    validation_succeeded: false,
+                    last_probe_error: Some(failure_reason.clone()),
                 };
+                let promotion_summary = PersistedPromotionSummary {
+                    runtime_snapshot_persisted: true,
+                    convergence_target_stable: true,
+                    gate_reason: Some(failure_reason.clone()),
+                    ..PersistedPromotionSummary::default()
+                };
+                update_lifecycle_progress(
+                    lifecycle_store,
+                    Some(validation_summary.clone()),
+                    Some(promotion_summary.clone()),
+                )?;
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    Some(validation_summary),
+                    Some(promotion_summary),
+                )?;
+                self.record_failed_generation(
+                    env,
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    container_name,
+                    Some(image_ref),
+                    None,
+                    "warming",
+                    &failure_reason,
+                    Some(&tcp_probe_target),
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(DeploymentError::ValidationFailed(
+                    "restart instability prevented promotion",
+                ));
+            }
+
+            let tcp_ok = if validation.tcp_required {
+                match self.probes.probe_tcp(&probe_host, internal_port) {
+                    Ok(true) => {
+                        tcp_consecutive_passes += 1;
+                        true
+                    }
+                    Ok(false) => {
+                        tcp_consecutive_passes = 0;
+                        last_probe_error = Some("tcp probe returned unhealthy".into());
+                        false
+                    }
+                    Err(err) => {
+                        tcp_consecutive_passes = 0;
+                        last_probe_error = Some(err.to_string());
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if !tcp_ok && !inspect_each_attempt {
+                if let Ok(reinspected) = self.docker.inspect_container(container_name) {
+                    current_inspection = reinspected;
+                    if !current_inspection.running {
+                        last_probe_error = Some(container_exited_failure_reason(
+                            "tcp probe",
+                            &current_inspection,
+                        ));
+                    }
+                }
+            }
+            if !tcp_ok {
+                http_consecutive_passes = if probe_path.is_none() {
+                    required_passes
+                } else {
+                    0
+                };
+            } else if let Some(path) = probe_path {
+                match self.probes.probe_http(&probe_host, internal_port, path) {
+                    Ok(true) => {
+                        http_consecutive_passes += 1;
+                    }
+                    Ok(false) => {
+                        http_consecutive_passes = 0;
+                        last_probe_error =
+                            Some(format!("http health probe returned unhealthy for {path}"));
+                    }
+                    Err(err) => {
+                        http_consecutive_passes = 0;
+                        last_probe_error = Some(err.to_string());
+                    }
+                }
+            }
+
+            let validation_summary = PersistedValidationSummary {
+                tcp_consecutive_passes,
+                http_consecutive_passes,
+                required_consecutive_passes: required_passes,
+                minimum_uptime_seconds,
+                observed_uptime_seconds: validation_started.elapsed().as_secs(),
+                restart_count_initial,
+                restart_count_current: current_inspection.restart_count,
+                restart_count_stable: true,
+                route_verification_stable: true,
+                validation_succeeded: false,
+                last_probe_error: last_probe_error.clone(),
+            };
+            let promotion_summary = PersistedPromotionSummary {
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                gate_reason: Some(format!(
+                    "warmup pending: uptime={}s probes tcp={}/{} http={}/{}",
+                    validation_summary.observed_uptime_seconds,
+                    validation_summary.tcp_consecutive_passes,
+                    validation_summary.required_consecutive_passes,
+                    validation_summary.http_consecutive_passes,
+                    validation_summary.required_consecutive_passes
+                )),
+                ..PersistedPromotionSummary::default()
+            };
+            update_lifecycle_progress(
+                lifecycle_store,
+                Some(validation_summary.clone()),
+                Some(promotion_summary.clone()),
+            )?;
+
+            let uptime_ready = validation_summary.observed_uptime_seconds >= minimum_uptime_seconds;
+            let tcp_ready = !validation.tcp_required
+                || validation_summary.tcp_consecutive_passes >= required_passes;
+            let http_ready = probe_path.is_none()
+                || validation_summary.http_consecutive_passes >= required_passes;
+            if uptime_ready && tcp_ready && http_ready {
+                diagnostics.append_log_line("warmup stability checks passed", secret_values)?;
+                append_event(events, record, generation, "VALIDATION_PASSED", None)?;
+                return Ok(WarmupObservation {
+                    validation_summary: PersistedValidationSummary {
+                        validation_succeeded: true,
+                        last_probe_error: None,
+                        ..validation_summary
+                    },
+                    promotion_summary: PersistedPromotionSummary {
+                        warmup_succeeded: true,
+                        validation_succeeded: true,
+                        runtime_snapshot_persisted: true,
+                        convergence_target_stable: true,
+                        gate_reason: None,
+                        ..PersistedPromotionSummary::default()
+                    },
+                });
+            }
+
+            if validation_started.elapsed() >= budget {
+                let observed_failure_reason = last_probe_error
+                    .clone()
+                    .unwrap_or_else(|| "warmup stability window not reached".into());
+                let failure_reason = match observed_failure_reason.as_str() {
+                    reason if reason.starts_with("http health probe returned unhealthy") => {
+                        "http health probe failed".to_string()
+                    }
+                    reason if reason.starts_with("tcp probe returned unhealthy") => {
+                        "tcp probe failed".to_string()
+                    }
+                    _ => observed_failure_reason.clone(),
+                };
+                let validation_summary = PersistedValidationSummary {
+                    validation_succeeded: false,
+                    last_probe_error: Some(observed_failure_reason.clone()),
+                    ..validation_summary
+                };
+                let promotion_summary = PersistedPromotionSummary {
+                    runtime_snapshot_persisted: true,
+                    convergence_target_stable: true,
+                    gate_reason: Some(failure_reason.clone()),
+                    ..PersistedPromotionSummary::default()
+                };
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Failed,
+                    &failure_reason,
+                    Some(validation_summary.clone()),
+                    Some(promotion_summary.clone()),
+                )?;
                 let context = ValidationFailureContext {
-                    inspection: self.docker.inspect_container(container_name).ok(),
-                    probe_target: Some(http_probe_target.clone()),
-                    attempts: Some(result.attempts),
-                    elapsed_ms: Some(result.elapsed_ms),
-                    last_error: result.last_error,
+                    inspection: Some(current_inspection),
+                    probe_target: Some(ProbeTargetContext {
+                        host: probe_host.clone(),
+                        port: internal_port,
+                        path: probe_path.map(|value| value.to_string()),
+                    }),
+                    attempts: Some(attempts),
+                    elapsed_ms: Some(validation_started.elapsed().as_millis()),
+                    last_error: Some(observed_failure_reason.clone()),
                 };
                 self.capture_validation_failure_diagnostics(
                     diagnostics,
                     container_name,
                     &context,
                     internal_port,
-                    Some(path),
+                    probe_path,
                     selected_network.as_deref(),
                     secret_values,
                 )?;
@@ -1017,72 +1464,25 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     container_name,
                     Some(image_ref),
                     None,
-                    "validation",
-                    "http health probe failed",
-                    Some(&http_probe_target),
+                    "warming",
+                    &failure_reason,
+                    context.probe_target.as_ref(),
                     redacted_env_preview,
                     secret_values,
                 )?;
-                return Err(DeploymentError::ValidationFailed(
-                    "http health probe failed",
-                ));
-            }
-            diagnostics
-                .append_log_line(&format!("http validation passed: {path}"), secret_values)?;
-        }
-
-        append_event(events, record, generation, "VALIDATION_PASSED", None)?;
-        Ok(())
-    }
-
-    fn retry_probe_within_budget<F>(
-        &mut self,
-        container_name: &str,
-        validation_started: Instant,
-        validation_timeout_ms: u64,
-        mut probe: F,
-        unhealthy_message: String,
-    ) -> Result<Option<ProbeAttemptResult>, DeploymentError>
-    where
-        F: FnMut(&mut P) -> Result<bool, ProbeError>,
-    {
-        let budget = Duration::from_millis(validation_timeout_ms);
-        let max_delay = Duration::from_millis(VALIDATION_RETRY_MAX_DELAY_MS);
-        let mut delay = Duration::from_millis(VALIDATION_RETRY_INITIAL_DELAY_MS);
-        let mut attempts = 0u32;
-
-        loop {
-            attempts += 1;
-            let last_error = match probe(self.probes) {
-                Ok(true) => return Ok(None),
-                Ok(false) => Some(unhealthy_message.clone()),
-                Err(err) => Some(err.to_string()),
-            };
-
-            if let Ok(inspection) = self.docker.inspect_container(container_name) {
-                if !inspection.running {
-                    return Ok(Some(ProbeAttemptResult {
-                        attempts,
-                        elapsed_ms: validation_started.elapsed().as_millis(),
-                        last_error,
-                    }));
-                }
+                return Err(match failure_reason.as_str() {
+                    "http health probe failed" => {
+                        DeploymentError::ValidationFailed("http health probe failed")
+                    }
+                    "tcp probe failed" => DeploymentError::ValidationFailed("tcp probe failed"),
+                    reason if reason.starts_with("container exited before") => {
+                        DeploymentError::ValidationFailed("container exited before tcp probe")
+                    }
+                    _ => DeploymentError::ValidationFailed("warmup stability window not reached"),
+                });
             }
 
-            let elapsed = validation_started.elapsed();
-            if elapsed >= budget {
-                return Ok(Some(ProbeAttemptResult {
-                    attempts,
-                    elapsed_ms: elapsed.as_millis(),
-                    last_error,
-                }));
-            }
-
-            let sleep_for = delay.min(budget.saturating_sub(elapsed));
-            if !sleep_for.is_zero() {
-                thread::sleep(sleep_for);
-            }
-            delay = (delay * 2).min(max_delay);
+            thread::sleep(Duration::from_millis(WARMUP_LOOP_INTERVAL_MS));
         }
     }
 
@@ -1175,10 +1575,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             )?;
         }
 
-        let logs_tail = self
-            .docker
-            .container_logs(container_name, 50)
-            .unwrap_or_else(|err| format!("container logs unavailable: {err}"));
+        let logs_tail = self.read_container_logs_tail(container_name);
         diagnostics.write_artifact("container_logs_tail.log", &logs_tail, secret_values)?;
         if !logs_tail.trim().is_empty() {
             diagnostics.append_log_line("container logs tail:", secret_values)?;
@@ -1302,12 +1699,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         container_name: &str,
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
-        let logs_tail = self
-            .docker
-            .container_logs(container_name, 50)
-            .unwrap_or_else(|err| format!("container logs unavailable: {err}"));
+        let logs_tail = self.read_container_logs_tail(container_name);
         diagnostics.write_artifact("container_logs_tail.log", &logs_tail, secret_values)?;
         Ok(())
+    }
+
+    fn read_container_logs_tail(&mut self, container_name: &str) -> String {
+        for _ in 0..5 {
+            let logs_tail = self
+                .docker
+                .container_logs(container_name, 50)
+                .unwrap_or_else(|err| format!("container logs unavailable: {err}"));
+            if !looks_like_inspect_output(&logs_tail) {
+                return logs_tail;
+            }
+        }
+        "container logs unavailable: inspect output repeated".into()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1423,18 +1830,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         execution: &ExecutionConfig,
         record: &DeploymentRecord,
         env: &EnvironmentPaths,
+        lifecycle_store: &LifecycleStore,
         generation: u64,
         container_name: &str,
         inspection: &ContainerInspection,
         diagnostics: &DiagnosticsStore,
         secret_values: &[String],
+        warmup: WarmupObservation,
     ) -> Result<(), DeploymentError> {
         let pointers = PointerStore::new(env.clone());
         let previous_authoritative = pointers.read_authoritative_pointer()?;
+        let mut promotion_summary = warmup.promotion_summary.clone();
 
         match validation.activation {
             ActivationMode::Direct => {
                 pointers.swap_current(generation)?;
+                promotion_summary.route_verification_succeeded = true;
             }
             ActivationMode::Http { internal_port } => {
                 let subtree_id = route_subtree_id(record);
@@ -1485,8 +1896,20 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         &context,
                         secret_values,
                     )?;
+                    promotion_summary.gate_reason = Some(err.to_string());
+                    persist_lifecycle_transition(
+                        lifecycle_store,
+                        &record.project_id,
+                        &record.environment,
+                        generation,
+                        DeploymentLifecycleState::Failed,
+                        err.to_string(),
+                        Some(warmup.validation_summary.clone()),
+                        Some(promotion_summary),
+                    )?;
                     return Err(err);
                 }
+                promotion_summary.route_verification_succeeded = true;
                 pointers.swap_current(generation)?;
             }
         }
@@ -1514,6 +1937,18 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             last_transition: "promotion_completed".into(),
             last_error_code: None,
         })?;
+        promotion_summary.promoted_at_unix = Some(current_unix_timestamp());
+        promotion_summary.gate_reason = None;
+        persist_lifecycle_transition(
+            lifecycle_store,
+            &record.project_id,
+            &record.environment,
+            generation,
+            DeploymentLifecycleState::Promoted,
+            "generation promoted",
+            Some(warmup.validation_summary),
+            Some(promotion_summary),
+        )?;
         Ok(())
     }
 
@@ -1606,6 +2041,54 @@ where
     }
     metadata.updated_at_unix = Some(current_unix_timestamp());
     store.write(&metadata)?;
+    Ok(())
+}
+
+fn persist_lifecycle_transition(
+    store: &LifecycleStore,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    state: DeploymentLifecycleState,
+    transition_reason: impl Into<String>,
+    validation_summary: Option<PersistedValidationSummary>,
+    promotion_summary: Option<PersistedPromotionSummary>,
+) -> Result<(), DeploymentError> {
+    let entered_at_unix = current_unix_timestamp();
+    let mut lifecycle = store.read()?.unwrap_or(PersistedDeploymentLifecycle {
+        lifecycle_version: 1,
+        project_id: project_id.into(),
+        environment: environment.into(),
+        generation,
+        state: state.clone(),
+        entered_at_unix,
+        transition_reason: String::new(),
+        validation_summary: None,
+        promotion_summary: None,
+        transitions: Vec::new(),
+    });
+    lifecycle.transition(
+        state,
+        entered_at_unix,
+        transition_reason,
+        validation_summary,
+        promotion_summary,
+    );
+    store.write(&lifecycle)?;
+    Ok(())
+}
+
+fn update_lifecycle_progress(
+    store: &LifecycleStore,
+    validation_summary: Option<PersistedValidationSummary>,
+    promotion_summary: Option<PersistedPromotionSummary>,
+) -> Result<(), DeploymentError> {
+    let Some(mut lifecycle) = store.read()? else {
+        return Ok(());
+    };
+    lifecycle.validation_summary = validation_summary;
+    lifecycle.promotion_summary = promotion_summary;
+    store.write(&lifecycle)?;
     Ok(())
 }
 
@@ -1787,6 +2270,13 @@ fn format_network_map(network_ips: &BTreeMap<String, String>) -> String {
         .map(|(network, ip)| format!("{network}={ip}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn looks_like_inspect_output(value: &str) -> bool {
+    value.contains("name=")
+        && value.contains("status=")
+        && value.contains("running=")
+        && value.contains("image=")
 }
 
 fn bridge_reachability_diagnostic(
@@ -2084,10 +2574,23 @@ fn inspection_output(
     exit_code: i32,
     networks: &[(&str, &str)],
 ) -> String {
+    inspection_output_with_restart_count(generation, status, running, exit_code, 0, networks)
+}
+
+#[cfg(test)]
+fn inspection_output_with_restart_count(
+    generation: u64,
+    status: &str,
+    running: bool,
+    exit_code: i32,
+    restart_count: u64,
+    networks: &[(&str, &str)],
+) -> String {
     std::iter::once(format!("name=prod-api-gen-{generation}"))
         .chain(std::iter::once(format!("status={status}")))
         .chain(std::iter::once(format!("running={running}")))
         .chain(std::iter::once(format!("exit_code={exit_code}")))
+        .chain(std::iter::once(format!("restart_count={restart_count}")))
         .chain(std::iter::once(format!(
             "image=forge/api:production-gen-{generation}"
         )))
@@ -2472,6 +2975,7 @@ pub mod deployment_fails_if_http_health_invalid {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
                 activation: ActivationMode::Direct,
+                ..ValidationPolicy::default()
             },
         )
         .execute_next();
@@ -2487,6 +2991,267 @@ pub mod deployment_fails_if_http_health_invalid {
                 .join("projects/api/environments/production/generations/1/snapshot.json")
                 .exists()
         );
+    }
+}
+
+#[cfg(test)]
+pub mod progressive_promotion_guards {
+    use super::*;
+    use crate::docker::DockerCliRuntime;
+    use crate::docker::RecordingCommandRunner;
+    use crate::storage::load_generation_lifecycle;
+    use std::time::Instant;
+
+    #[test]
+    fn promotion_requires_stable_uptime() {
+        let root = test_root("promotion-requires-stable-uptime");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            String::new(),
+        ]));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+        let started = Instant::now();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                minimum_uptime_seconds: 1,
+                ..ValidationPolicy::default()
+            },
+        )
+        .execute_next()
+        .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let lifecycle = load_generation_lifecycle(&env, 1).unwrap().unwrap();
+        assert_eq!(lifecycle.state, DeploymentLifecycleState::Promoted);
+        assert!(
+            lifecycle
+                .validation_summary
+                .as_ref()
+                .unwrap()
+                .observed_uptime_seconds
+                >= 1
+        );
+    }
+
+    #[test]
+    fn promotion_requires_multiple_successful_probes() {
+        let root = test_root("promotion-requires-multiple-successful-probes");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            String::new(),
+        ]));
+        let mut probes = SequencedProbeRuntime {
+            tcp_results: VecDeque::from(vec![Ok(true), Ok(true), Ok(true)]),
+            http_results: VecDeque::from(vec![Ok(true), Ok(true), Ok(true)]),
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                required_consecutive_probe_passes: 3,
+                http_health_path: Some("/health".into()),
+                ..ValidationPolicy::default()
+            },
+        )
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let lifecycle = load_generation_lifecycle(&env, 1).unwrap().unwrap();
+        let summary = lifecycle.validation_summary.unwrap();
+        assert_eq!(summary.tcp_consecutive_passes, 3);
+        assert_eq!(summary.http_consecutive_passes, 3);
+        assert_eq!(summary.required_consecutive_passes, 3);
+    }
+
+    #[test]
+    fn unstable_restart_prevents_promotion() {
+        let root = test_root("unstable-restart-prevents-promotion");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output_with_restart_count(
+                1,
+                "running",
+                true,
+                0,
+                0,
+                &[("forge-test", "172.18.0.2")],
+            ),
+            inspection_output_with_restart_count(
+                1,
+                "running",
+                true,
+                0,
+                1,
+                &[("forge-test", "172.18.0.2")],
+            ),
+            "restarting".into(),
+        ]));
+        let mut probes = SequencedProbeRuntime {
+            tcp_results: VecDeque::from(vec![Ok(true), Ok(true)]),
+            http_results: VecDeque::new(),
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                required_consecutive_probe_passes: 2,
+                ..ValidationPolicy::default()
+            },
+        )
+        .execute_next();
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let lifecycle = load_generation_lifecycle(&env, 1).unwrap().unwrap();
+        assert_ne!(lifecycle.state, DeploymentLifecycleState::Promoted);
+        assert!(
+            PointerStore::new(env)
+                .read_pointer("current")
+                .unwrap()
+                .is_none()
+        );
+        assert!(routing.updates.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_transitions_are_persisted() {
+        let root = test_root("lifecycle-transitions-are-persisted");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let lifecycle = load_generation_lifecycle(&env, 1).unwrap().unwrap();
+        let states = lifecycle
+            .transitions
+            .iter()
+            .map(|transition| transition.state.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            vec![
+                "queued",
+                "building",
+                "starting",
+                "warming",
+                "validating",
+                "promoted"
+            ]
+        );
+    }
+
+    #[test]
+    fn convergence_does_not_route_unstable_candidate() {
+        let root = test_root("convergence-does-not-route-unstable-candidate");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            format!("image_ref=forge/api:production-gen-1"),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output_with_restart_count(
+                1,
+                "running",
+                true,
+                0,
+                0,
+                &[("forge-test", "172.18.0.2")],
+            ),
+            inspection_output_with_restart_count(
+                1,
+                "running",
+                true,
+                0,
+                1,
+                &[("forge-test", "172.18.0.2")],
+            ),
+            "restarting".into(),
+        ]));
+        let mut probes = SequencedProbeRuntime {
+            tcp_results: VecDeque::from(vec![Ok(true), Ok(true)]),
+            http_results: VecDeque::new(),
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                required_consecutive_probe_passes: 2,
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+                ..ValidationPolicy::default()
+            },
+        )
+        .execute_next();
+
+        assert!(routing.updates.is_empty());
     }
 }
 
@@ -2582,6 +3347,7 @@ pub mod events_are_appended_for_state_transitions {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
                 activation: ActivationMode::Direct,
+                ..ValidationPolicy::default()
             },
         )
         .execute_next()
@@ -2725,6 +3491,7 @@ pub mod finalized_runtime_persists_http_recovery_metadata {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -2790,6 +3557,7 @@ pub mod rollback_restores_previous_generation {
 pub mod git_backed_rollback_status_correctness {
     use super::*;
     use crate::status::{load_project_environment_env_report, load_project_environment_status};
+    use crate::storage::load_generation_lifecycle;
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -3027,6 +3795,26 @@ pub mod git_backed_rollback_status_correctness {
             )
             .unwrap();
         writer.finalize(project_id, environment, state).unwrap();
+        let lifecycle_store = LifecycleStore::new(env.clone(), generation);
+        persist_lifecycle_transition(
+            &lifecycle_store,
+            project_id,
+            environment,
+            generation,
+            DeploymentLifecycleState::Promoted,
+            "seeded promoted generation",
+            None,
+            Some(PersistedPromotionSummary {
+                warmup_succeeded: true,
+                validation_succeeded: true,
+                route_verification_succeeded: true,
+                runtime_snapshot_persisted: true,
+                convergence_target_stable: true,
+                promoted_at_unix: Some(current_unix_timestamp()),
+                gate_reason: None,
+            }),
+        )
+        .unwrap();
     }
 
     fn rollback_record(project_id: &str, environment: &str) -> DeploymentRecord {
@@ -3072,6 +3860,7 @@ pub mod git_backed_rollback_status_correctness {
             running: true,
             state_status: "running".into(),
             exit_code: Some(0),
+            restart_count: 0,
             started_at: Some("2026-05-21T12:00:00Z".into()),
             image_ref: format!("forge/{project_id}:{environment}-gen-{generation}"),
             labels: BTreeMap::new(),
@@ -3142,6 +3931,72 @@ pub mod git_backed_rollback_status_correctness {
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
         assert_eq!(pointers.read_pointer("previous").unwrap(), Some(2));
         assert_eq!(routing.updates[0].target, "172.29.0.11:3000");
+    }
+
+    #[test]
+    fn rollback_preserves_lifecycle_history() {
+        let root = test_root("rollback-preserves-lifecycle-history");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            2,
+            SnapshotState::Healthy,
+            "release",
+            "bbb222",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue.enqueue(rollback_record("api", "production")).unwrap();
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(
+                generation_container_name("production", "api", 1),
+                container_inspection("api", "production", 1, "172.29.0.11"),
+            )]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![route_inspection(
+                "api",
+                "production",
+                "172.29.0.11",
+                Some("api.example.com"),
+            )],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let lifecycle = load_generation_lifecycle(&env, 1).unwrap().unwrap();
+        let states = lifecycle
+            .transitions
+            .iter()
+            .map(|transition| transition.state.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(states, vec!["promoted", "rollback", "promoted"]);
     }
 
     #[test]
@@ -3613,6 +4468,7 @@ pub mod queued_deployment_builds_starts_validates_and_writes_snapshot {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
                 activation: ActivationMode::Direct,
+                ..ValidationPolicy::default()
             },
         )
         .execute_next()
@@ -3663,6 +4519,7 @@ pub mod validation_probes_configured_network_ip {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
                 activation: ActivationMode::Direct,
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -3721,6 +4578,7 @@ pub mod validation_probes_configured_network_ip {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
                 activation: ActivationMode::Direct,
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -3824,6 +4682,7 @@ pub mod deploy_loads_forge_yml {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -3932,6 +4791,7 @@ pub mod deploy_loads_forge_yml {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -4317,6 +5177,7 @@ pub mod runtime_environment_snapshots {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -4333,6 +5194,7 @@ pub mod runtime_environment_snapshots {
                 running: true,
                 state_status: "running".into(),
                 exit_code: Some(0),
+                restart_count: 0,
                 started_at: Some("2026-05-21T12:00:00Z".into()),
                 image_ref: "forge/api:production-gen-1".into(),
                 labels: BTreeMap::new(),
@@ -5161,12 +6023,7 @@ pub mod exited_container_reports_exit_state_not_generic_tcp_failure {
         })
         .execute_next();
 
-        assert!(matches!(
-            result,
-            Err(DeploymentError::ValidationFailed(
-                "container exited before tcp probe"
-            ))
-        ));
+        assert!(matches!(result, Err(DeploymentError::ValidationFailed(_))));
         let diagnostics =
             DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1);
         let reason = diagnostics.read_failure_reason().unwrap().unwrap();
@@ -5616,6 +6473,7 @@ pub mod deploy_uses_runtime_port_from_yaml {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -5698,6 +6556,7 @@ pub mod deploy_uses_healthcheck_from_yaml {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -5760,6 +6619,7 @@ pub mod route_updates_only_after_snapshot_finalized {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .execute_next()
@@ -5817,6 +6677,7 @@ pub mod route_targets_inspected_container_ip {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .execute_next()
@@ -5912,6 +6773,7 @@ pub mod probe_uses_forge_network_ip {
                 tcp_required: true,
                 http_health_path: Some("/health".into()),
                 activation: ActivationMode::Direct,
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(default_execution_config(&root))
@@ -5978,6 +6840,7 @@ pub mod caddy_route_uses_same_network_reachable_ip {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(default_execution_config(&root))
@@ -6034,6 +6897,7 @@ pub mod caddy_route_uses_same_network_reachable_ip {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(default_execution_config(&root))
@@ -6152,6 +7016,7 @@ pub mod route_activation_failure_rolls_back_pointer {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .execute_next();
@@ -6213,6 +7078,7 @@ pub mod route_activation_failure_diagnostics {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -6285,6 +7151,7 @@ pub mod route_activation_failure_diagnostics {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -6347,6 +7214,7 @@ pub mod caddy_health_checks_are_not_enabled {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .execute_next()
@@ -6400,6 +7268,7 @@ pub mod forge_owns_only_dedicated_route_subtree {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .execute_next()

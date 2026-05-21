@@ -139,6 +139,7 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
                 "status={{.State.Status}}",
                 "running={{.State.Running}}",
                 "exit_code={{.State.ExitCode}}",
+                "restart_count={{.RestartCount}}",
                 "started_at={{.State.StartedAt}}",
                 "image={{.Config.Image}}",
                 "restart_policy={{.HostConfig.RestartPolicy.Name}}",
@@ -260,6 +261,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
     let mut running = None;
     let mut state_status = None;
     let mut exit_code = None;
+    let mut restart_count = None;
     let mut started_at = None;
     let mut image_ref = None;
     let mut restart_policy = None;
@@ -275,6 +277,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             "status" => state_status = Some(value.to_string()),
             "running" => running = Some(value == "true"),
             "exit_code" => exit_code = value.parse::<i32>().ok(),
+            "restart_count" => restart_count = value.parse::<u64>().ok(),
             "started_at" => {
                 if !value.is_empty() && value != "0001-01-01T00:00:00Z" {
                     started_at = Some(value.to_string());
@@ -311,6 +314,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             }
         }),
         exit_code,
+        restart_count: restart_count.unwrap_or(0),
         started_at,
         image_ref: image_ref
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,

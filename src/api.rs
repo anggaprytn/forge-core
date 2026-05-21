@@ -1,4 +1,7 @@
 use crate::events::EventRecord;
+use crate::storage::{
+    DeploymentLifecycleState, PersistedPromotionSummary, PersistedValidationSummary,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -227,6 +230,24 @@ pub struct EnvironmentDiagnostics {
     pub env_drift: Option<EnvironmentDiffSummary>,
     #[serde(default)]
     pub recent_secret_mutations: Vec<SecretMutationDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_lifecycle_state: Option<DeploymentLifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_summary: Option<PersistedValidationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_summary: Option<PersistedPromotionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_transition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_gate_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_failure_summary: Option<String>,
+    #[serde(default)]
+    pub restart_instability: bool,
+    #[serde(default)]
+    pub probe_flapping: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +330,16 @@ pub struct DeploymentHistoryEntry {
     pub missing_artifacts: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retained_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<DeploymentLifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entered_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_summary: Option<PersistedValidationSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_summary: Option<PersistedPromotionSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

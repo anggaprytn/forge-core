@@ -157,6 +157,7 @@ fn docker_integration_executor_validates_candidate_over_container_ip() {
             tcp_required: true,
             http_health_path: Some("/health".into()),
             activation: ActivationMode::Direct,
+            ..ValidationPolicy::default()
         },
     )
     .with_execution_config(ExecutionConfig {

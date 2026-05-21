@@ -206,6 +206,7 @@ impl RawForgeYaml {
                 activation: ActivationMode::Http {
                     internal_port: self.runtime.port,
                 },
+                ..ValidationPolicy::default()
             },
             validation_timeout_ms: invariant.timeout_ms,
             environment: self.env,

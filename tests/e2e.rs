@@ -371,7 +371,10 @@ fn dogfood_bad_app_diagnostics_are_visible() {
 
     let summary = fs::read_to_string(diagnostics_dir.join("summary.json"))
         .expect("diagnostic summary should be persisted");
-    assert!(summary.contains("\"failure_stage\": \"validation\""));
+    assert!(
+        summary.contains("\"failure_stage\": \"validation\"")
+            || summary.contains("\"failure_stage\": \"warming\"")
+    );
     assert!(summary.contains("\"failure_reason\": \"http health probe failed\""));
 }
 
@@ -837,6 +840,7 @@ impl E2eHarness {
                 activation: ActivationMode::Http {
                     internal_port: 3000,
                 },
+                ..ValidationPolicy::default()
             },
         )
         .with_execution_config(ExecutionConfig {
@@ -1250,6 +1254,7 @@ impl DockerRuntime for NoopDockerRuntime {
             running: true,
             state_status: "running".into(),
             exit_code: Some(0),
+            restart_count: 0,
             started_at: None,
             image_ref: "noop".into(),
             labels: Default::default(),
