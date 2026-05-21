@@ -9,6 +9,8 @@ pub struct DeploymentRecord {
     pub deployment_id: String,
     pub project_id: String,
     pub environment: String,
+    #[serde(default = "default_deployment_intent")]
+    pub intent: String,
     #[serde(default)]
     pub source_path: Option<PathBuf>,
     #[serde(default)]
@@ -17,6 +19,10 @@ pub struct DeploymentRecord {
     pub repo_url: Option<String>,
     #[serde(default)]
     pub commit_sha: Option<String>,
+}
+
+fn default_deployment_intent() -> String {
+    "deploy".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +212,7 @@ fn parse_record(line: &str) -> Result<DeploymentRecord, QueueError> {
         deployment_id: parts[0].to_string(),
         project_id: parts[1].to_string(),
         environment: parts[2].to_string(),
+        intent: default_deployment_intent(),
         source_path: None,
         source_ref: None,
         repo_url: None,
@@ -240,6 +247,7 @@ pub mod only_one_active_deployment {
                 deployment_id: "d1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: None,
                 source_ref: None,
                 repo_url: None,
@@ -251,6 +259,7 @@ pub mod only_one_active_deployment {
                 deployment_id: "d2".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: None,
                 source_ref: None,
                 repo_url: None,
@@ -281,6 +290,7 @@ pub mod queued_deployments_survive_restart {
                 deployment_id: "d1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(PathBuf::from("/srv/apps/api")),
                 source_ref: None,
                 repo_url: None,

@@ -923,4 +923,53 @@ mod tests {
         assert_eq!(status.status, "failed");
         assert_eq!(status.last_deployment_id.as_deref(), Some("dep-3"));
     }
+
+    #[test]
+    fn status_after_rollback_reports_restored_generation() {
+        let root = test_root("status-after-rollback-reports-restored-generation");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 1);
+        write_generation(&root, 2);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "rollback_completed".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(1)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(status.status, "healthy");
+        assert_eq!(status.active_generation, Some(1));
+        assert_eq!(
+            status.commit_sha.as_deref(),
+            Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac")
+        );
+        assert_eq!(status.source_ref.as_deref(), Some("main"));
+        assert_eq!(status.image_ref.as_deref(), Some("forge/api:staging-gen-1"));
+        assert_eq!(status.last_deployment_id.as_deref(), Some("dep-1"));
+    }
 }

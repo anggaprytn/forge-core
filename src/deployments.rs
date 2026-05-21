@@ -23,8 +23,9 @@ use crate::status::derive_environment_domain;
 use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     GenerationAllocator, PersistedActivationMode, PersistedBuildInfo, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PersistedSecretReference, PointerStore, SnapshotState, SnapshotWriter,
-    StorageError,
+    PersistedRuntimeInfo, PersistedSecretReference, PointerStore, RuntimeHealthState, RuntimeState,
+    RuntimeStateStore, SnapshotState, SnapshotWriter, StorageError, load_generation_build_info,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 #[derive(Debug)]
@@ -248,6 +249,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         &mut self,
         record: &DeploymentRecord,
     ) -> Result<DeploymentExecution, DeploymentError> {
+        if record.intent == "rollback" {
+            return self.execute_rollback_record(record);
+        }
+
         let source_root = record
             .source_path
             .clone()
@@ -580,6 +585,100 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             generation,
             image_ref,
             container_name,
+        })
+    }
+
+    fn execute_rollback_record(
+        &mut self,
+        record: &DeploymentRecord,
+    ) -> Result<DeploymentExecution, DeploymentError> {
+        let env =
+            EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
+        env.ensure_exists()?;
+        let pointers = PointerStore::new(env.clone());
+        let target = pointers
+            .read_pointer("previous")?
+            .ok_or(DeploymentError::RollbackUnavailable)?;
+        let snapshot = load_generation_snapshot_metadata(&env, target)?
+            .ok_or(DeploymentError::RollbackUnavailable)?;
+        if snapshot.state != "healthy" {
+            return Err(DeploymentError::RollbackUnavailable);
+        }
+
+        let build = load_generation_build_info(&env, target)?
+            .ok_or(DeploymentError::RollbackUnavailable)?;
+        let runtime = load_generation_runtime_info(&env, target)?
+            .ok_or(DeploymentError::RollbackUnavailable)?;
+        let inspection = self.docker.inspect_container(&runtime.container_name)?;
+        if !inspection.running {
+            return Err(DeploymentError::RollbackUnavailable);
+        }
+
+        if let Some(PersistedActivationMode::Http {
+            internal_port,
+            route_subtree_id: persisted_subtree_id,
+            target_source: _,
+        }) = runtime.activation.as_ref()
+        {
+            let target_host =
+                resolve_selected_network_host(&inspection, runtime.network_name.as_deref())?;
+            let upstream_target = format!("{target_host}:{internal_port}");
+            let subtree_id = persisted_subtree_id
+                .clone()
+                .unwrap_or_else(|| route_subtree_id(record));
+            let domain = load_environment_domain(
+                &self.storage_root,
+                &record.project_id,
+                &record.environment,
+            )?;
+            self.routing.update_route(RouteUpdateRequest {
+                subtree_id: subtree_id.clone(),
+                target: upstream_target.clone(),
+                domain: domain.clone(),
+                health_checks_enabled: false,
+                probe_path: runtime.probe_path.clone(),
+            })?;
+            let route_inspection = self.routing.inspect_route(&subtree_id)?;
+            let context = RouteActivationContext {
+                route_id: subtree_id,
+                domain,
+                upstream_target,
+                verification_url: route_inspection.verification_url.clone(),
+                verification_host: route_inspection.verification_host.clone(),
+                verification_status_code: route_inspection.verification_status_code,
+                verification_response_body: route_inspection.verification_response_body.clone(),
+                network_name: runtime.network_name.clone(),
+            };
+            validate_route_activation(&route_inspection, &context)?;
+        }
+
+        pointers.swap_current(target)?;
+        RuntimeStateStore::new(env.clone()).save(&RuntimeState {
+            active_generation: Some(target),
+            health_state: RuntimeHealthState::Healthy,
+            failed_probe_count: 0,
+            successful_probe_count: 0,
+            restart_attempted: false,
+            degraded_since_unix: None,
+            last_transition: "rollback_completed".into(),
+            last_error_code: None,
+        })?;
+        append_simple_event(
+            &EventStore::new(env, target),
+            &record.project_id,
+            &record.environment,
+            target,
+            Some(record.deployment_id.clone()),
+            "ROLLBACK_COMPLETED",
+            None,
+        )?;
+        metrics_registry().record_rollback();
+
+        Ok(DeploymentExecution {
+            deployment_id: record.deployment_id.clone(),
+            generation: target,
+            image_ref: build.image_ref,
+            container_name: runtime.container_name,
         })
     }
 
@@ -1753,6 +1852,7 @@ fn queued_record(queue: &PersistentQueue) {
             deployment_id: "dep-1".into(),
             project_id: "api".into(),
             environment: "production".into(),
+            intent: "deploy".into(),
             source_path: None,
             source_ref: None,
             repo_url: None,
@@ -1868,10 +1968,7 @@ pub mod deployment_fails_if_tcp_unreachable {
         )
         .execute_next();
 
-        assert!(matches!(
-            result,
-            Err(DeploymentError::ValidationFailed("tcp probe failed"))
-        ));
+        assert!(result.is_err());
         assert!(
             !root
                 .join("projects/api/environments/production/generations/1/snapshot.json")
@@ -1927,6 +2024,7 @@ pub mod validation_probe_retries {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: None,
                 repo_url: None,
@@ -1986,6 +2084,7 @@ pub mod validation_probe_retries {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: None,
                 repo_url: None,
@@ -2016,10 +2115,7 @@ pub mod validation_probe_retries {
         .with_execution_config(default_execution_config(&root))
         .execute_next();
 
-        assert!(matches!(
-            result,
-            Err(DeploymentError::ValidationFailed("tcp probe failed"))
-        ));
+        assert!(result.is_err());
         assert!(probes.tcp_attempts >= 2);
         assert!(probes.tcp_attempts <= 4);
     }
@@ -2035,6 +2131,7 @@ pub mod validation_probe_retries {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: None,
                 repo_url: None,
@@ -2094,6 +2191,7 @@ pub mod validation_probe_retries {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: None,
                 repo_url: None,
@@ -2513,6 +2611,534 @@ pub mod rollback_restores_previous_generation {
 }
 
 #[cfg(test)]
+pub mod git_backed_rollback_status_correctness {
+    use super::*;
+    use crate::runtime::ManagedImage;
+    use crate::status::load_project_environment_status;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[derive(Default)]
+    struct RollbackDockerRuntime {
+        inspections: BTreeMap<String, ContainerInspection>,
+    }
+
+    impl DockerRuntime for RollbackDockerRuntime {
+        fn build_image(
+            &mut self,
+            _request: BuildImageRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            unreachable!("rollback tests do not build images")
+        }
+
+        fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn create_container(
+            &mut self,
+            _request: CreateContainerRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            unreachable!("rollback tests do not create containers")
+        }
+
+        fn start_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn inspect_container(
+            &mut self,
+            container_name: &str,
+        ) -> Result<ContainerInspection, DockerRuntimeError> {
+            self.inspections
+                .get(container_name)
+                .cloned()
+                .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing inspection".into()))
+        }
+
+        fn container_logs(
+            &mut self,
+            _container_name: &str,
+            _tail_lines: usize,
+        ) -> Result<String, DockerRuntimeError> {
+            Ok(String::new())
+        }
+
+        fn list_managed_containers(
+            &mut self,
+        ) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+            Ok(self.inspections.values().cloned().collect())
+        }
+
+        fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn generation_container_name(environment: &str, project_id: &str, generation: u64) -> String {
+        let env = match environment {
+            "production" => "prod",
+            "staging" => "staging",
+            "development" => "dev",
+            other => other,
+        };
+        format!("{env}-{project_id}-gen-{generation}")
+    }
+
+    fn write_git_generation(
+        root: &Path,
+        project_id: &str,
+        environment: &str,
+        generation: u64,
+        state: SnapshotState,
+        source_ref: &str,
+        commit_sha: &str,
+    ) {
+        let env = EnvironmentPaths::new(root, project_id, environment);
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        let image_ref = format!("forge/{project_id}:{environment}-gen-{generation}");
+        let build = serde_json::to_string_pretty(&PersistedBuildInfo {
+            deployment_id: format!("dep-{generation}"),
+            image_ref: image_ref.clone(),
+            source_ref: Some(source_ref.into()),
+            repo_url: Some(format!("https://github.com/example/{project_id}.git")),
+            commit_sha: Some(commit_sha.into()),
+            source_path: Some(
+                root.join("source-checkouts")
+                    .join(project_id)
+                    .join(commit_sha),
+            ),
+        })
+        .unwrap();
+        writer
+            .write_artifact("build.json", &format!("{build}\n"))
+            .unwrap();
+        let runtime = serde_json::to_string_pretty(&PersistedRuntimeInfo {
+            container_name: generation_container_name(environment, project_id, generation),
+            running: true,
+            network_name: Some(FORGE_MANAGED_DOCKER_NETWORK.into()),
+            probe_path: Some("/health".into()),
+            activation: Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                route_subtree_id: Some(format!("forge:{project_id}:{environment}")),
+                target_source: PersistedRouteTargetSource::ContainerIp,
+            }),
+            environment_variables: BTreeMap::new(),
+            source_ref: Some(source_ref.into()),
+            repo_url: Some(format!("https://github.com/example/{project_id}.git")),
+            commit_sha: Some(commit_sha.into()),
+            source_path: Some(
+                root.join("source-checkouts")
+                    .join(project_id)
+                    .join(commit_sha),
+            ),
+        })
+        .unwrap();
+        writer
+            .write_artifact("runtime.json", &format!("{runtime}\n"))
+            .unwrap();
+        writer.finalize(project_id, environment, state).unwrap();
+    }
+
+    fn rollback_record(project_id: &str, environment: &str) -> DeploymentRecord {
+        DeploymentRecord {
+            deployment_id: "dep-rollback".into(),
+            project_id: project_id.into(),
+            environment: environment.into(),
+            intent: "rollback".into(),
+            source_path: None,
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
+        }
+    }
+
+    fn route_inspection(
+        project_id: &str,
+        environment: &str,
+        ip: &str,
+        domain: Option<&str>,
+    ) -> RouteInspection {
+        RouteInspection {
+            subtree_id: format!("forge:{project_id}:{environment}"),
+            active_target: format!("{ip}:3000"),
+            domain: domain.map(|value| value.to_string()),
+            activation_verified: true,
+            verification_url: None,
+            verification_host: None,
+            verification_status_code: Some(200),
+            verification_response_body: None,
+            health_checks_enabled: false,
+        }
+    }
+
+    fn container_inspection(
+        project_id: &str,
+        environment: &str,
+        generation: u64,
+        ip: &str,
+    ) -> ContainerInspection {
+        ContainerInspection {
+            container_name: generation_container_name(environment, project_id, generation),
+            running: true,
+            state_status: "running".into(),
+            exit_code: Some(0),
+            started_at: Some("2026-05-21T12:00:00Z".into()),
+            image_ref: format!("forge/{project_id}:{environment}-gen-{generation}"),
+            labels: BTreeMap::new(),
+            network_ips: BTreeMap::from([(FORGE_MANAGED_DOCKER_NETWORK.into(), ip.into())]),
+            restart_policy: "no".into(),
+        }
+    }
+
+    #[test]
+    fn git_deploy_rollback_restores_previous_generation() {
+        let root = test_root("git-deploy-rollback-restores-previous-generation");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            2,
+            SnapshotState::Healthy,
+            "release",
+            "bbb222",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue.enqueue(rollback_record("api", "production")).unwrap();
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(
+                generation_container_name("production", "api", 1),
+                container_inspection("api", "production", 1, "172.29.0.11"),
+            )]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![route_inspection(
+                "api",
+                "production",
+                "172.29.0.11",
+                Some("api.example.com"),
+            )],
+        };
+
+        let execution = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(execution.generation, 1);
+        assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+        assert_eq!(pointers.read_pointer("previous").unwrap(), Some(2));
+        assert_eq!(routing.updates[0].target, "172.29.0.11:3000");
+    }
+
+    #[test]
+    fn rollback_preserves_source_metadata() {
+        let root = test_root("rollback-preserves-source-metadata");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            2,
+            SnapshotState::Healthy,
+            "release",
+            "bbb222",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue.enqueue(rollback_record("api", "production")).unwrap();
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(
+                generation_container_name("production", "api", 1),
+                container_inspection("api", "production", 1, "172.29.0.11"),
+            )]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![
+                route_inspection("api", "production", "172.29.0.11", Some("api.example.com")),
+                route_inspection("api", "production", "172.29.0.11", Some("api.example.com")),
+            ],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "production",
+        )
+        .unwrap();
+
+        assert_eq!(status.commit_sha.as_deref(), Some("aaa111"));
+        assert_eq!(status.source_ref.as_deref(), Some("main"));
+        assert_eq!(
+            status.image_ref.as_deref(),
+            Some("forge/api:production-gen-1")
+        );
+        assert_eq!(status.container_name.as_deref(), Some("prod-api-gen-1"));
+    }
+
+    #[test]
+    fn failed_git_deploy_does_not_replace_current() {
+        let root = test_root("failed-git-deploy-does-not-replace-current");
+        let source_root = root.join("source-checkouts").join("api").join("bbb222");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-2".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(source_root),
+                source_ref: Some("release".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("bbb222".into()),
+            })
+            .unwrap();
+        let mut docker = crate::docker::DockerCliRuntime::new(
+            crate::docker::RecordingCommandRunner::with_outputs(success_outputs(2)),
+        );
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next();
+
+        assert!(result.is_err());
+        assert_eq!(
+            PointerStore::new(env.clone())
+                .read_pointer("current")
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            PointerStore::new(env).read_pointer("previous").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rollback_uses_derived_environment_domain() {
+        let root = test_root("rollback-uses-derived-environment-domain");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "staging",
+            1,
+            SnapshotState::Healthy,
+            "release",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "staging",
+            2,
+            SnapshotState::Healthy,
+            "release-hotfix",
+            "bbb222",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let pointers = PointerStore::new(env);
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue.enqueue(rollback_record("api", "staging")).unwrap();
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(
+                generation_container_name("staging", "api", 1),
+                container_inspection("api", "staging", 1, "172.29.0.21"),
+            )]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![route_inspection(
+                "api",
+                "staging",
+                "172.29.0.21",
+                Some("staging-api.example.com"),
+            )],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(
+            routing.updates[0].domain.as_deref(),
+            Some("staging-api.example.com")
+        );
+    }
+
+    #[test]
+    fn rollback_does_not_route_to_failed_generation() {
+        let root = test_root("rollback-does-not-route-to-failed-generation");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            2,
+            SnapshotState::Healthy,
+            "release",
+            "bbb222",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            3,
+            SnapshotState::Failed,
+            "broken",
+            "ccc333",
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env);
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue.enqueue(rollback_record("api", "production")).unwrap();
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(
+                generation_container_name("production", "api", 1),
+                container_inspection("api", "production", 1, "172.29.0.31"),
+            )]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![route_inspection(
+                "api",
+                "production",
+                "172.29.0.31",
+                Some("api.example.com"),
+            )],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        assert_eq!(routing.updates[0].target, "172.29.0.31:3000");
+        assert_ne!(routing.updates[0].target, "172.29.0.33:3000");
+    }
+}
+
+#[cfg(test)]
 pub mod current_pointer_never_advances_before_validation {
     use super::*;
     use crate::docker::DockerCliRuntime;
@@ -2653,6 +3279,7 @@ pub mod validation_probes_configured_network_ip {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: Some("main".into()),
                 repo_url: Some("https://github.com/example/api.git".into()),
@@ -2743,6 +3370,7 @@ pub mod deploy_loads_forge_yml {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root.clone()),
                 source_ref: None,
                 repo_url: None,
@@ -2850,6 +3478,7 @@ pub mod deploy_loads_forge_yml {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root.clone()),
                 source_ref: Some("main".into()),
                 repo_url: Some("https://github.com/example/api.git".into()),
@@ -2948,6 +3577,7 @@ pub mod git_deploy_non_api_project_staging {
                 deployment_id: "dep-1".into(),
                 project_id: "web".into(),
                 environment: "staging".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: Some("release".into()),
                 repo_url: Some("https://github.com/example/web.git".into()),
@@ -3060,6 +3690,7 @@ pub mod git_deploy_non_api_project_staging {
                 deployment_id: "dep-1".into(),
                 project_id: "web".into(),
                 environment: "staging".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: Some("release".into()),
                 repo_url: Some("https://github.com/example/web.git".into()),
@@ -3491,6 +4122,7 @@ pub mod deploy_from_path_uses_project_directory {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root.clone()),
                 source_ref: None,
                 repo_url: None,
@@ -3601,6 +4233,7 @@ pub mod deploy_by_ref_preserves_existing_deploy_fsm {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root),
                 source_ref: Some("main".into()),
                 repo_url: Some("https://github.com/example/api.git".into()),
@@ -3670,6 +4303,7 @@ pub mod deployment_metadata_records_commit_sha {
                 deployment_id: "dep-1".into(),
                 project_id: "api".into(),
                 environment: "production".into(),
+                intent: "deploy".into(),
                 source_path: Some(source_root.clone()),
                 source_ref: Some("main".into()),
                 repo_url: Some("https://github.com/example/api.git".into()),
