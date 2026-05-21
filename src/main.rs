@@ -198,7 +198,14 @@ where
             caddy_admin_url,
             caddy_public_url,
             dry_run,
-        } => run_gc_command(config_path, caddy_admin_url, caddy_public_url, dry_run)?,
+            json,
+        } => run_gc_command(
+            config_path,
+            caddy_admin_url,
+            caddy_public_url,
+            dry_run,
+            json,
+        )?,
         Command::Rollback {
             project_id,
             environment,
@@ -538,6 +545,7 @@ enum Command {
         caddy_admin_url: String,
         caddy_public_url: String,
         dry_run: bool,
+        json: bool,
     },
     Rollback {
         project_id: String,
@@ -732,13 +740,11 @@ fn parse_command(
             caddy_admin_url,
             caddy_public_url,
             dry_run: false,
+            json: false,
         }),
-        [cmd, flag] if cmd == "gc" && flag == "--dry-run" => Ok(Command::Gc {
-            config_path,
-            caddy_admin_url,
-            caddy_public_url,
-            dry_run: true,
-        }),
+        [cmd, rest @ ..] if cmd == "gc" => {
+            parse_gc_command(rest, config_path, caddy_admin_url, caddy_public_url)
+        }
         [cmd, project_id, environment] if cmd == "rollback" => Ok(Command::Rollback {
             project_id: project_id.clone(),
             environment: environment.clone(),
@@ -783,7 +789,7 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] history [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] env [--json] <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] events",
-        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] gc [--dry-run]",
+        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] gc [--dry-run] [--json]",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
         "  forge [--url URL] [--token TOKEN] project list",
@@ -807,6 +813,30 @@ fn parse_history_command(args: &[String]) -> Result<Command, CliError> {
         }),
         _ => Err(CliError::Usage(usage())),
     }
+}
+
+fn parse_gc_command(
+    args: &[String],
+    config_path: PathBuf,
+    caddy_admin_url: String,
+    caddy_public_url: String,
+) -> Result<Command, CliError> {
+    let mut dry_run = false;
+    let mut json = false;
+    for value in args {
+        match value.as_str() {
+            "--dry-run" => dry_run = true,
+            "--json" => json = true,
+            _ => return Err(CliError::Usage(usage())),
+        }
+    }
+    Ok(Command::Gc {
+        config_path,
+        caddy_admin_url,
+        caddy_public_url,
+        dry_run,
+        json,
+    })
 }
 
 fn parse_deploy_command(args: &[String]) -> Result<Command, CliError> {
@@ -1383,15 +1413,29 @@ fn render_gc_report(
         return output;
     }
     for action in &report.actions {
-        output.push_str(&format!(
-            "{} {} {}\n",
-            action.project_id,
-            action.environment,
-            action
+        let heading = match action.subject_kind.as_deref() {
+            Some("generation") => action
                 .generation
-                .map(|value| format!("gen-{value}"))
-                .unwrap_or_else(|| "global".into())
-        ));
+                .map(|value| format!("Generation {value}"))
+                .unwrap_or_else(|| "Generation".into()),
+            Some("checkout") => "Checkout".into(),
+            Some("image") => "Image".into(),
+            Some("diagnostics") => "Diagnostics".into(),
+            Some("runtime_snapshot") => "Runtime Snapshot".into(),
+            _ => format!("{} {}", action.project_id, action.environment),
+        };
+        output.push_str(&format!("{heading}\n"));
+        if let Some(subject) = action.subject.as_deref() {
+            match action.subject_kind.as_deref() {
+                Some("checkout")
+                | Some("image")
+                | Some("diagnostics")
+                | Some("runtime_snapshot") => {
+                    output.push_str(&format!("  {subject}\n"));
+                }
+                _ => {}
+            }
+        }
         output.push_str(&format!("  action: {}\n", action.action));
         output.push_str(&format!("  reason: {}\n", action.reason));
         output.push_str(&format!("  outcome: {}\n", action.outcome));
@@ -1520,6 +1564,7 @@ fn run_gc_command(
     caddy_admin_url: String,
     caddy_public_url: String,
     dry_run: bool,
+    json: bool,
 ) -> Result<(), CliError> {
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
@@ -1535,7 +1580,11 @@ fn run_gc_command(
         dry_run,
     )
     .map_err(|err| CliError::Usage(err.to_string()))?;
-    print!("{}", render_gc_report(&report, dry_run));
+    if json {
+        print_json(&report)?;
+    } else {
+        print!("{}", render_gc_report(&report, dry_run));
+    }
     Ok(())
 }
 
@@ -1923,6 +1972,29 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "deploy accepts either --from <path> or --ref <ref>, not both"
+        );
+    }
+
+    #[test]
+    fn gc_command_accepts_dry_run_json() {
+        let parsed = ParsedArgs::parse(vec![
+            "--config".into(),
+            "/tmp/forge.conf".into(),
+            "gc".into(),
+            "--dry-run".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::Gc {
+                config_path: PathBuf::from("/tmp/forge.conf"),
+                caddy_admin_url: "http://127.0.0.1:2019".into(),
+                caddy_public_url: "http://127.0.0.1".into(),
+                dry_run: true,
+                json: true,
+            }
         );
     }
 }

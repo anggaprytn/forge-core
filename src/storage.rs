@@ -315,6 +315,10 @@ pub struct GcActionRecord {
     pub action: String,
     pub reason: String,
     pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1080,7 +1084,11 @@ fn load_generation_json<T: for<'de> Deserialize<'de>>(
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(path)?;
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
     serde_json::from_str(&raw).map(Some).map_err(|err| {
         StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

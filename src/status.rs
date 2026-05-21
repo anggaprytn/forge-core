@@ -250,7 +250,11 @@ fn generation_has_failure_diagnostics(
     let diagnostics = env.generation_dir(generation).join("diagnostics");
     let summary_path = diagnostics.join("summary.json");
     if summary_path.exists() {
-        let raw = fs::read_to_string(summary_path)?;
+        let raw = match fs::read_to_string(summary_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
         let summary: crate::storage::DiagnosticSummary =
             serde_json::from_str(&raw).map_err(|err| {
                 ProjectStatusError::Storage(StorageError::Io(std::io::Error::new(
@@ -768,6 +772,8 @@ where
             reason: action.reason,
             outcome: action.outcome,
             dry_run: action.dry_run,
+            subject_kind: action.subject_kind,
+            subject: action.subject,
             deleted: action.deleted,
             protected: action.protected,
         })

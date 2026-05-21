@@ -241,6 +241,10 @@ pub struct RecentGcAction {
     pub outcome: String,
     #[serde(default)]
     pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     #[serde(default)]
     pub deleted: Vec<String>,
     #[serde(default)]

@@ -24,6 +24,7 @@ use crate::storage::{
     load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
+use serde::{Deserialize, Serialize};
 
 // Beyond current/previous, retain only a small recent diagnostic tail of failed generations.
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
@@ -69,7 +70,7 @@ pub enum TickOutcome {
     NoActiveGeneration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GarbageCollectionReport {
     pub actions: Vec<GcActionRecord>,
 }
@@ -1302,6 +1303,117 @@ fn repair_missing_previous_generation(
     Ok(())
 }
 
+fn gc_action_record(
+    project_id: &str,
+    environment: &str,
+    generation: Option<u64>,
+    dry_run: bool,
+    subject_kind: Option<&str>,
+    subject: Option<String>,
+    action: &str,
+    reason: &str,
+    outcome: &str,
+    deleted: Vec<String>,
+    protected: Vec<String>,
+) -> GcActionRecord {
+    GcActionRecord {
+        timestamp_unix: current_unix_timestamp(),
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        generation,
+        dry_run,
+        action: action.to_string(),
+        reason: reason.to_string(),
+        outcome: outcome.to_string(),
+        subject_kind: subject_kind.map(|value| value.to_string()),
+        subject,
+        deleted,
+        protected,
+    }
+}
+
+fn gc_missing_artifact_action(
+    project_id: &str,
+    environment: &str,
+    generation: Option<u64>,
+    dry_run: bool,
+    subject_kind: &str,
+    subject: String,
+    reason: &str,
+) -> GcActionRecord {
+    gc_action_record(
+        project_id,
+        environment,
+        generation,
+        dry_run,
+        Some(subject_kind),
+        Some(subject),
+        "remove",
+        reason,
+        "skipped_missing",
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn gc_candidate_generations(env: &EnvironmentPaths) -> Result<Vec<u64>, ConvergenceError> {
+    let mut generations = BTreeSet::new();
+    if env.generations_dir().exists() {
+        generations.extend(list_generation_numbers(env)?);
+    }
+    for record in crate::storage::RetentionStore::new(env.clone())
+        .read()?
+        .generations
+    {
+        generations.insert(record.generation);
+    }
+    Ok(generations.into_iter().collect())
+}
+
+fn gc_retention_reasons(
+    references: &RuntimeReferences,
+    retained_healthy: &BTreeSet<u64>,
+    retained_failed: &BTreeSet<u64>,
+    generation: u64,
+) -> Vec<String> {
+    let mut protected = Vec::new();
+    if references.current == Some(generation) {
+        protected.push("current/promoted generation".into());
+    }
+    if references.previous == Some(generation) {
+        protected.push("rollback-safe generation".into());
+    }
+    if references.route_generation == Some(generation) {
+        protected.push("route reference".into());
+    }
+    if references.converging_generation == Some(generation) {
+        protected.push("deployment in progress".into());
+    }
+    if retained_healthy.contains(&generation) {
+        protected.push("recent healthy finalized generation".into());
+    }
+    if retained_failed.contains(&generation) {
+        protected.push("recent failed generation with diagnostics".into());
+    }
+    protected
+}
+
+fn gc_generation_reason(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> Result<String, ConvergenceError> {
+    if let Some(snapshot) = load_generation_snapshot_metadata(env, generation)? {
+        if snapshot.state == "healthy" {
+            return Ok("exceeded healthy retention window".into());
+        }
+        return Ok("outside failed diagnostic retention window".into());
+    }
+    if generation_has_failure_diagnostics(env, generation)? {
+        return Ok("outside failed diagnostic retention window".into());
+    }
+    Ok("historical generation is no longer protected".into())
+}
+
 pub fn garbage_collect<RtD, RtR>(
     storage_root: &std::path::Path,
     queue: &PersistentQueue,
@@ -1322,18 +1434,19 @@ where
     let queue_state = queue.load_state()?;
     if queue_state.active.is_some() {
         return Ok(GarbageCollectionReport {
-            actions: vec![GcActionRecord {
-                timestamp_unix: current_unix_timestamp(),
-                project_id: "*".into(),
-                environment: "*".into(),
-                generation: None,
+            actions: vec![gc_action_record(
+                "*",
+                "*",
+                None,
                 dry_run,
-                action: "GC_SKIPPED".into(),
-                reason: "deployment in progress".into(),
-                outcome: "protected".into(),
-                deleted: Vec::new(),
-                protected: vec!["active deployment".into()],
-            }],
+                None,
+                Some("Global GC".into()),
+                "skip",
+                "deployment in progress",
+                "protected",
+                Vec::new(),
+                vec!["active deployment".into()],
+            )],
         });
     }
 
@@ -1344,6 +1457,7 @@ where
         &managed_routes,
     )?;
     let mut actions = Vec::new();
+    let mut reported_images = BTreeSet::new();
 
     for (project_id, environment, env) in &environments {
         let references = environment_runtime_references(
@@ -1354,76 +1468,214 @@ where
             &managed_containers,
             &managed_routes,
         )?;
-        let generations = list_generation_numbers(env)?;
+        let generations = gc_candidate_generations(env)?;
         let retained_healthy = retained_healthy_generations(env, &references, &generations)?;
         let retained_failed = retained_failed_generations(env, &references, &generations)?;
 
         for generation in generations {
-            if references.contains(generation)
-                || retained_healthy.contains(&generation)
-                || retained_failed.contains(&generation)
-            {
-                let mut protected = Vec::new();
-                if references.current == Some(generation) {
-                    protected.push("current/promoted generation".into());
-                }
-                if references.previous == Some(generation) {
-                    protected.push("rollback-safe generation".into());
-                }
-                if retained_healthy.contains(&generation) {
-                    protected.push("recent healthy finalized generation".into());
-                }
-                if retained_failed.contains(&generation) {
-                    protected.push("recent failed generation with diagnostics".into());
-                }
-                if !protected.is_empty() {
-                    actions.push(GcActionRecord {
-                        timestamp_unix: current_unix_timestamp(),
-                        project_id: project_id.clone(),
-                        environment: environment.clone(),
-                        generation: Some(generation),
-                        dry_run,
-                        action: "GENERATION_PROTECTED".into(),
-                        reason: "retained by policy".into(),
-                        outcome: "protected".into(),
-                        deleted: Vec::new(),
-                        protected,
-                    });
-                }
+            let protected =
+                gc_retention_reasons(&references, &retained_healthy, &retained_failed, generation);
+            if !protected.is_empty() {
+                actions.push(gc_action_record(
+                    project_id,
+                    environment,
+                    Some(generation),
+                    dry_run,
+                    Some("generation"),
+                    Some(format!("Generation {generation}")),
+                    "retain",
+                    "retained by policy",
+                    "protected",
+                    Vec::new(),
+                    protected,
+                ));
                 continue;
             }
 
-            let mut deleted = vec![env.generation_dir(generation).display().to_string()];
-            if let Some(build) = load_generation_build_info(env, generation)? {
-                deleted.push(build.image_ref);
-                if let Some(source_path) = build.source_path {
-                    deleted.push(source_path.display().to_string());
+            let generation_dir = env.generation_dir(generation);
+            let reason = gc_generation_reason(env, generation)?;
+            if generation_dir.exists() {
+                actions.push(gc_action_record(
+                    project_id,
+                    environment,
+                    Some(generation),
+                    dry_run,
+                    Some("generation"),
+                    Some(format!("Generation {generation}")),
+                    "gc-eligible",
+                    &reason,
+                    if dry_run { "would_remove" } else { "planned" },
+                    vec![generation_dir.display().to_string()],
+                    Vec::new(),
+                ));
+            } else {
+                actions.push(gc_missing_artifact_action(
+                    project_id,
+                    environment,
+                    Some(generation),
+                    dry_run,
+                    "generation",
+                    format!("Generation {generation}"),
+                    "generation directory already removed",
+                ));
+            }
+
+            let build_info = load_generation_build_info(env, generation)?;
+            let image_ref = build_info
+                .as_ref()
+                .map(|build| build.image_ref.clone())
+                .or_else(|| {
+                    image_ref_for_generation(
+                        project_id,
+                        environment,
+                        generation,
+                        &managed_containers,
+                        &managed_images,
+                    )
+                });
+            if let Some(image_ref) = image_ref {
+                if reported_images.insert(image_ref.clone()) {
+                    let image_present = managed_images
+                        .iter()
+                        .any(|image| image.image_ref == image_ref);
+                    actions.push(if image_present {
+                        gc_action_record(
+                            project_id,
+                            environment,
+                            Some(generation),
+                            dry_run,
+                            Some("image"),
+                            Some(image_ref.clone()),
+                            "remove",
+                            "orphaned",
+                            if dry_run { "would_remove" } else { "planned" },
+                            vec![image_ref],
+                            Vec::new(),
+                        )
+                    } else {
+                        gc_missing_artifact_action(
+                            project_id,
+                            environment,
+                            Some(generation),
+                            dry_run,
+                            "image",
+                            image_ref,
+                            "orphaned image already removed",
+                        )
+                    });
                 }
             }
-            actions.push(GcActionRecord {
-                timestamp_unix: current_unix_timestamp(),
-                project_id: project_id.clone(),
-                environment: environment.clone(),
-                generation: Some(generation),
-                dry_run,
-                action: if dry_run {
-                    "GENERATION_GC_DRY_RUN".into()
+
+            if let Some(source_path) = build_info
+                .as_ref()
+                .and_then(|build| build.source_path.clone())
+            {
+                if checkout_is_still_referenced(storage_root, project_id, generation, &source_path)?
+                {
+                    actions.push(gc_action_record(
+                        project_id,
+                        environment,
+                        Some(generation),
+                        dry_run,
+                        Some("checkout"),
+                        Some(source_path.display().to_string()),
+                        "retain",
+                        "still referenced by another generation",
+                        "protected",
+                        Vec::new(),
+                        vec!["shared checkout".into()],
+                    ));
+                } else if source_path.exists() {
+                    actions.push(gc_action_record(
+                        project_id,
+                        environment,
+                        Some(generation),
+                        dry_run,
+                        Some("checkout"),
+                        Some(source_path.display().to_string()),
+                        "remove",
+                        "unreferenced",
+                        if dry_run { "would_remove" } else { "planned" },
+                        vec![source_path.display().to_string()],
+                        Vec::new(),
+                    ));
                 } else {
-                    "GENERATION_GC".into()
-                },
-                reason: "eligible by retention policy".into(),
-                outcome: if dry_run {
-                    "would_remove".into()
-                } else {
-                    "planned".into()
-                },
-                deleted,
-                protected: Vec::new(),
+                    actions.push(gc_missing_artifact_action(
+                        project_id,
+                        environment,
+                        Some(generation),
+                        dry_run,
+                        "checkout",
+                        source_path.display().to_string(),
+                        "unreferenced checkout already removed",
+                    ));
+                }
+            }
+
+            let diagnostics_dir = generation_dir.join("diagnostics");
+            actions.push(if diagnostics_dir.exists() {
+                gc_action_record(
+                    project_id,
+                    environment,
+                    Some(generation),
+                    dry_run,
+                    Some("diagnostics"),
+                    Some(diagnostics_dir.display().to_string()),
+                    "remove",
+                    "stale",
+                    if dry_run { "would_remove" } else { "planned" },
+                    vec![diagnostics_dir.display().to_string()],
+                    Vec::new(),
+                )
+            } else {
+                gc_missing_artifact_action(
+                    project_id,
+                    environment,
+                    Some(generation),
+                    dry_run,
+                    "diagnostics",
+                    diagnostics_dir.display().to_string(),
+                    "stale diagnostics already removed",
+                )
+            });
+
+            let runtime_snapshot = generation_dir.join("runtime_env_snapshot.json");
+            actions.push(if runtime_snapshot.exists() {
+                gc_action_record(
+                    project_id,
+                    environment,
+                    Some(generation),
+                    dry_run,
+                    Some("runtime_snapshot"),
+                    Some(runtime_snapshot.display().to_string()),
+                    "remove",
+                    "stale",
+                    if dry_run { "would_remove" } else { "planned" },
+                    vec![runtime_snapshot.display().to_string()],
+                    Vec::new(),
+                )
+            } else {
+                gc_missing_artifact_action(
+                    project_id,
+                    environment,
+                    Some(generation),
+                    dry_run,
+                    "runtime_snapshot",
+                    runtime_snapshot.display().to_string(),
+                    "stale runtime snapshot already removed",
+                )
             });
         }
     }
 
     if !dry_run {
+        for action in &actions {
+            if action.outcome == "protected" || action.outcome == "skipped_missing" {
+                let env =
+                    EnvironmentPaths::new(storage_root, &action.project_id, &action.environment);
+                GcStore::new(env).append(action.clone())?;
+            }
+        }
         let mut attempted_cleanup = BTreeSet::new();
         for (project_id, environment, env) in &environments {
             retry_tombstoned_cleanup(
@@ -1588,18 +1840,38 @@ fn append_gc_action(
     deleted: Vec<String>,
     protected: Vec<String>,
 ) -> Result<(), ConvergenceError> {
-    GcStore::new(env.clone()).append(GcActionRecord {
-        timestamp_unix: current_unix_timestamp(),
-        project_id: project_id.to_string(),
-        environment: environment.to_string(),
+    let subject_kind = match action {
+        "ORPHANED_IMAGE_REMOVED" | "ORPHANED_IMAGE_TOMBSTONED" => Some("image"),
+        "GENERATION_RETENTION_REMOVED" | "GENERATION_RETENTION_TOMBSTONED" => Some("generation"),
+        "RETENTION_RUNTIME_ARTIFACTS_REMOVED" | "RETENTION_RUNTIME_ARTIFACTS_TOMBSTONED" => {
+            Some("generation")
+        }
+        "ORPHANED_CONTAINER_REMOVED"
+        | "ORPHANED_CONTAINER_TOMBSTONED"
+        | "ORPHANED_ROUTE_REMOVED"
+        | "ORPHANED_ROUTE_TOMBSTONED"
+        | "CLEANUP_RETRY_SUCCEEDED"
+        | "CLEANUP_RETRY_TOMBSTONED" => Some("generation"),
+        _ => None,
+    };
+    let subject = match subject_kind {
+        Some("generation") => generation.map(|value| format!("Generation {value}")),
+        Some("image") => deleted.first().cloned(),
+        _ => None,
+    };
+    GcStore::new(env.clone()).append(gc_action_record(
+        project_id,
+        environment,
         generation,
-        dry_run: false,
-        action: action.to_string(),
-        reason: reason.to_string(),
-        outcome: outcome.to_string(),
+        false,
+        subject_kind,
+        subject,
+        action,
+        reason,
+        outcome,
         deleted,
         protected,
-    })?;
+    ))?;
     Ok(())
 }
 
@@ -2096,7 +2368,11 @@ fn generation_has_failure_diagnostics(
     let diagnostics = env.generation_dir(generation).join("diagnostics");
     let summary_path = diagnostics.join("summary.json");
     if summary_path.exists() {
-        let raw = fs::read_to_string(summary_path)?;
+        let raw = match fs::read_to_string(summary_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
         let summary: DiagnosticSummary = serde_json::from_str(&raw).map_err(|err| {
             ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2338,6 +2614,19 @@ where
                 std::iter::once(env.generation_dir(generation).display().to_string())
                     .chain(removed_checkout.into_iter())
                     .collect(),
+                Vec::new(),
+            )?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            append_gc_action(
+                env,
+                project_id,
+                environment,
+                Some(generation),
+                "GENERATION_RETENTION_REMOVED",
+                "generation directory already removed",
+                "skipped_missing",
+                vec![env.generation_dir(generation).display().to_string()],
                 Vec::new(),
             )?;
         }
@@ -4801,8 +5090,8 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
     }
 
     #[test]
-    fn gc_dry_run_reports_actions_without_mutation() {
-        let root = test_root("gc-dry-run-reports-actions-without-mutation");
+    fn gc_dry_run_is_non_mutating() {
+        let root = test_root("gc-dry-run-is-non-mutating");
         setup_active_generation(&root, 1);
         setup_active_generation(&root, 2);
         setup_active_generation(&root, 3);
@@ -4816,13 +5105,138 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
 
         let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
 
+        assert!(report.actions.iter().any(|action| {
+            action.generation == Some(1)
+                && action.subject_kind.as_deref() == Some("generation")
+                && action.outcome == "would_remove"
+        }));
+        assert!(env.generation_dir(1).exists());
+        assert!(docker.remove_calls.is_empty());
+        assert!(!env.gc_file().exists());
+    }
+
+    #[test]
+    fn gc_dry_run_handles_missing_artifacts() {
+        let root = test_root("gc-dry-run-handles-missing-artifacts");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(3).unwrap();
+        crate::storage::atomic_write(
+            env.generation_dir(1).join("build.json"),
+            b"{\n  \"deployment_id\": \"dep-1\",\n  \"image_ref\": \"forge/api:production-gen-1\",\n  \"source_path\": \"/tmp/forge-missing-checkout\"\n}\n",
+        )
+        .unwrap();
+        fs::remove_file(env.generation_dir(1).join("runtime_env_snapshot.json")).ok();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
         assert!(
             report
                 .actions
                 .iter()
-                .any(|action| { action.generation == Some(1) && action.outcome == "would_remove" })
+                .any(|action| action.subject_kind.as_deref() == Some("checkout")
+                    && action.outcome == "skipped_missing")
         );
-        assert!(env.generation_dir(1).exists());
-        assert!(docker.remove_calls.is_empty());
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(
+                    |action| action.subject_kind.as_deref() == Some("runtime_snapshot")
+                        && action.outcome == "skipped_missing"
+                )
+        );
+    }
+
+    #[test]
+    fn gc_json_output_reports_actions() {
+        let root = test_root("gc-json-output-reports-actions");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.seed_image("api", "production", 1, "forge/api:production-gen-1");
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        let actions = json["actions"].as_array().unwrap();
+
+        assert!(actions.iter().any(|action| {
+            action["subject_kind"] == "generation" && action["action"] == "gc-eligible"
+        }));
+        assert!(
+            actions.iter().any(|action| {
+                action["subject_kind"] == "image" && action["action"] == "remove"
+            })
+        );
+    }
+
+    #[test]
+    fn gc_skips_missing_generation_without_failure() {
+        let root = test_root("gc-skips-missing-generation-without-failure");
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(3).unwrap();
+        crate::storage::RetentionStore::new(env.clone())
+            .write(&crate::storage::RetentionMetadata {
+                updated_at_unix: Some(current_unix_timestamp()),
+                generations: vec![crate::storage::GenerationHistoryRecord {
+                    generation: 1,
+                    image_ref: Some("forge/api:production-gen-1".into()),
+                    source_path: Some(PathBuf::from("/tmp/missing-checkout")),
+                    ..crate::storage::GenerationHistoryRecord::default()
+                }],
+            })
+            .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
+        assert!(report.actions.iter().any(|action| {
+            action.generation == Some(1)
+                && action.subject_kind.as_deref() == Some("generation")
+                && action.outcome == "skipped_missing"
+        }));
+    }
+
+    #[test]
+    fn convergence_tolerates_partially_removed_generation() {
+        let root = test_root("convergence-tolerates-partially-removed-generation");
+        setup_active_generation(&root, 1);
+        setup_active_generation(&root, 2);
+        setup_active_generation(&root, 3);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        fs::remove_file(env.generation_dir(1).join("build.json")).unwrap();
+        fs::remove_file(env.generation_dir(1).join("runtime.json")).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-2".into(), true);
+        docker.containers.insert("prod-api-gen-3".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
     }
 }
