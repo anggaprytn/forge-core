@@ -1169,8 +1169,15 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
     } else {
         for failure in &diagnostics.recent_failures {
             output.push_str(&format!(
-                "  gen-{} {}: {}\n",
-                failure.generation, failure.failure_stage, failure.failure_reason
+                "  gen-{} {}{}: {}\n",
+                failure.generation,
+                failure.failure_stage,
+                if failure.historical {
+                    " [historical]"
+                } else {
+                    ""
+                },
+                failure.failure_reason
             ));
         }
     }

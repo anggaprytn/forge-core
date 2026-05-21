@@ -70,10 +70,7 @@ pub trait ControlPlane: Send {
         &self,
         deployment_id: &str,
     ) -> Result<Option<DeploymentStatus>, ErrorResponse>;
-    fn get_deployment_logs(
-        &self,
-        deployment_id: &str,
-    ) -> Result<Option<DeploymentLogs>, ErrorResponse>;
+    fn get_deployment_logs(&self, deployment_id: &str) -> Result<DeploymentLogs, ErrorResponse>;
     fn list_events(&self) -> Result<EventList, ErrorResponse>;
     fn queue_depth(&self) -> Result<usize, ErrorResponse>;
     fn get_project_environment_status(
@@ -117,10 +114,7 @@ where
         Daemon::get_deployment(self, deployment_id)
     }
 
-    fn get_deployment_logs(
-        &self,
-        deployment_id: &str,
-    ) -> Result<Option<DeploymentLogs>, ErrorResponse> {
+    fn get_deployment_logs(&self, deployment_id: &str) -> Result<DeploymentLogs, ErrorResponse> {
         Daemon::get_deployment_logs(self, deployment_id)
     }
 
@@ -1808,7 +1802,7 @@ async fn get_logs(
     };
 
     match daemon.get_deployment_logs(&id) {
-        Ok(Some(logs)) => json_response(
+        Ok(logs) => json_response(
             StatusCode::OK,
             &request_id,
             Json(SuccessEnvelope {
@@ -1817,15 +1811,13 @@ async fn get_logs(
                 data: logs,
             }),
         ),
-        Ok(None) => error_response(
-            StatusCode::NOT_FOUND,
-            &request_id,
-            ErrorResponse {
-                code: "deployment_not_found".into(),
-                message: "deployment not found".into(),
-            },
-        ),
-        Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+        Err(err) => {
+            let status = match err.code.as_str() {
+                "deployment_not_found" => StatusCode::NOT_FOUND,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            error_response(status, &request_id, err)
+        }
     }
 }
 

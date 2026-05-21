@@ -19,7 +19,7 @@ use crate::runtime::{
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, PersistedActivationMode, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PointerStore, RuntimeStateStore, StorageError,
+    PersistedRuntimeInfo, PointerStore, RuntimeState, RuntimeStateStore, StorageError,
     load_generation_build_info, load_generation_runtime_env_snapshot, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
@@ -69,7 +69,7 @@ pub enum ProjectStatusError {
     ProjectLookup(String),
     ProjectNotFound,
     InvalidEnvironment,
-    RuntimeEnvSnapshotUnavailable,
+    RuntimeEnvSnapshotUnavailable(String),
 }
 
 impl Display for ProjectStatusError {
@@ -87,7 +87,7 @@ impl Display for ProjectStatusError {
                     "environment must be one of development, staging, production"
                 )
             }
-            Self::RuntimeEnvSnapshotUnavailable => write!(f, "runtime env snapshot unavailable"),
+            Self::RuntimeEnvSnapshotUnavailable(message) => write!(f, "{message}"),
         }
     }
 }
@@ -155,11 +155,11 @@ pub fn project_status_error_response(
                 message: "environment must be one of development, staging, production".into(),
             },
         ),
-        ProjectStatusError::RuntimeEnvSnapshotUnavailable => (
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable(message) => (
             axum::http::StatusCode::NOT_FOUND,
             ErrorResponse {
                 code: "runtime_env_snapshot_unavailable".into(),
-                message: "runtime env snapshot unavailable".into(),
+                message,
             },
         ),
         other => (
@@ -202,10 +202,10 @@ where
     env.ensure_exists()?;
     let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
     let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    let active_generation = current_generation.or(runtime_state.active_generation);
+    let active_generation = resolve_active_generation(current_generation, &runtime_state);
     let latest_generation = latest_generation(&env)?;
 
-    let promoted_snapshot = current_generation
+    let promoted_snapshot = active_generation
         .map(|generation| load_generation_snapshot_metadata(&env, generation))
         .transpose()?
         .flatten();
@@ -405,7 +405,7 @@ where
     let env = EnvironmentPaths::new(storage_root, project_id, environment);
     let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
     let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    let active_generation = current_generation.or(runtime_state.active_generation);
+    let active_generation = resolve_active_generation(current_generation, &runtime_state);
     let promoted_runtime = active_generation
         .map(|generation| load_generation_runtime_info(&env, generation))
         .transpose()?
@@ -439,10 +439,17 @@ where
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
+        .map(|failure| mark_failure_historical(failure, active_generation, status.status.as_str()))
         .collect::<Vec<_>>();
+
+    let latest_failure_is_current = latest_failed_generation.is_some_and(|generation| {
+        active_generation == Some(generation)
+            || (active_generation.is_none() && status.status != "healthy")
+    });
 
     let probe_target = latest_failure
         .as_ref()
+        .filter(|_| latest_failure_is_current)
         .and_then(|failure| failure.probe_target.clone())
         .or_else(|| {
             promoted_runtime
@@ -500,12 +507,15 @@ where
         recent_failures,
         latest_validation_failure: latest_failure
             .as_ref()
+            .filter(|_| latest_failure_is_current)
             .and_then(|failure| failure.validation_failure.clone()),
         latest_route_activation_failure: latest_failure
             .as_ref()
+            .filter(|_| latest_failure_is_current)
             .and_then(|failure| failure.route_activation_failure.clone()),
         likely_failure_stage: latest_failure
             .as_ref()
+            .filter(|_| latest_failure_is_current && status_value != "healthy")
             .map(|failure| failure.failure_stage.clone())
             .or_else(|| {
                 if status_value == "degraded" {
@@ -514,7 +524,9 @@ where
                     None
                 }
             }),
-        diagnostics_source: latest_failure.map(|failure| failure.diagnostics_source),
+        diagnostics_source: latest_failure
+            .filter(|_| latest_failure_is_current && status_value != "healthy")
+            .map(|failure| failure.diagnostics_source),
         runtime_env_snapshot: promoted_runtime_env_snapshot
             .as_ref()
             .map(runtime_env_snapshot_metadata),
@@ -543,11 +555,17 @@ pub fn load_project_environment_env_report(
     env.ensure_exists()?;
     let current_generation = PointerStore::new(env.clone()).read_pointer("current")?;
     let runtime_state = RuntimeStateStore::new(env.clone()).load()?;
-    let generation = current_generation
-        .or(runtime_state.active_generation)
-        .ok_or(ProjectStatusError::RuntimeEnvSnapshotUnavailable)?;
-    let snapshot = load_generation_runtime_env_snapshot(&env, generation)?
-        .ok_or(ProjectStatusError::RuntimeEnvSnapshotUnavailable)?;
+    let generation =
+        resolve_active_generation(current_generation, &runtime_state).ok_or_else(|| {
+            ProjectStatusError::RuntimeEnvSnapshotUnavailable(
+                "runtime env snapshot unavailable".into(),
+            )
+        })?;
+    let snapshot = load_generation_runtime_env_snapshot(&env, generation)?.ok_or_else(|| {
+        ProjectStatusError::RuntimeEnvSnapshotUnavailable(
+            "runtime env snapshot unavailable for this generation; redeploy required".into(),
+        )
+    })?;
     let values = snapshot
         .entries
         .iter()
@@ -686,10 +704,28 @@ fn load_failure_details_internal(
             generation,
             failure_stage: summary.failure_stage,
             failure_reason: summary.failure_reason,
+            historical: false,
             validation_failure_summary,
             diagnostics_source,
         },
     }))
+}
+
+fn resolve_active_generation(
+    current_generation: Option<u64>,
+    runtime_state: &RuntimeState,
+) -> Option<u64> {
+    runtime_state.active_generation.or(current_generation)
+}
+
+fn mark_failure_historical(
+    mut failure: RecentDeploymentFailure,
+    active_generation: Option<u64>,
+    status: &str,
+) -> RecentDeploymentFailure {
+    failure.historical = failure.generation != active_generation.unwrap_or(failure.generation)
+        || status == "healthy";
+    failure
 }
 
 fn diagnostics_dir_source(env: &EnvironmentPaths, generation: u64) -> String {
@@ -1474,8 +1510,6 @@ mod tests {
     fn diagnose_reports_recent_failure_summary() {
         let root = test_root("diagnose-reports-recent-failure-summary");
         register_project(&root, "api", "api.example.com");
-        write_generation(&root, 7);
-
         let env = EnvironmentPaths::new(&root, "api", "staging");
         let failed = SnapshotWriter::new(env.clone(), 8).unwrap();
         failed
@@ -1509,12 +1543,8 @@ mod tests {
             )
             .unwrap();
 
-        let mut docker = StubDockerRuntime {
-            inspection: Some(healthy_container(7)),
-        };
-        let mut routing = StubRoutingRuntime {
-            inspection: Some(healthy_route()),
-        };
+        let mut docker = StubDockerRuntime::default();
+        let mut routing = StubRoutingRuntime::default();
 
         let diagnostics =
             load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
@@ -1602,6 +1632,149 @@ mod tests {
                 .unwrap()
                 .generated_forge_vars["FORGE_PROJECT_ID"],
             "api"
+        );
+    }
+
+    #[test]
+    fn env_reports_helpful_message_for_legacy_generation_without_snapshot() {
+        let root = test_root("env-reports-helpful-message-for-legacy-generation-without-snapshot");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        fs::remove_file(env.generation_dir(7).join("runtime_env_snapshot.json")).unwrap();
+
+        let err = load_project_environment_env_report(&root, "api", "staging").unwrap_err();
+        let (_, response) = project_status_error_response(err);
+        assert_eq!(response.code, "runtime_env_snapshot_unavailable");
+        assert_eq!(
+            response.message,
+            "runtime env snapshot unavailable for this generation; redeploy required"
+        );
+    }
+
+    #[test]
+    fn env_report_prefers_runtime_active_generation_snapshot() {
+        let root = test_root("env-report-prefers-runtime-active-generation-snapshot");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 6);
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        PointerStore::new(env.clone()).swap_current(6).unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        let report = load_project_environment_env_report(&root, "api", "staging").unwrap();
+        assert_eq!(report.generation, 7);
+        assert_eq!(report.deployment_id, "dep-7");
+    }
+
+    #[test]
+    fn diagnose_healthy_status_does_not_report_old_failure_stage() {
+        let root = test_root("diagnose-healthy-status-does-not-report-old-failure-stage");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let failed = SnapshotWriter::new(env.clone(), 8).unwrap();
+        failed
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-8\",\n  \"image_ref\": \"forge/api:staging-gen-8\"\n}\n",
+            )
+            .unwrap();
+        failed
+            .finalize("api", "staging", SnapshotState::Failed)
+            .unwrap();
+        DiagnosticsStore::new(env, 8)
+            .write_summary(&crate::storage::DiagnosticSummary {
+                deployment_id: Some("dep-8".into()),
+                failure_stage: "startup_recovery".into(),
+                failure_reason: "retention cleanup removed diagnostics".into(),
+                container_name: "staging-api-gen-8".into(),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                cleanup_recorded: true,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.status, "healthy");
+        assert!(diagnostics.likely_failure_stage.is_none());
+        assert!(diagnostics.diagnostics_source.is_none());
+        assert!(diagnostics.latest_validation_failure.is_none());
+    }
+
+    #[test]
+    fn diagnose_labels_old_cleanup_events_as_historical() {
+        let root = test_root("diagnose-labels-old-cleanup-events-as-historical");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let failed = SnapshotWriter::new(env.clone(), 8).unwrap();
+        failed
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-8\",\n  \"image_ref\": \"forge/api:staging-gen-8\"\n}\n",
+            )
+            .unwrap();
+        failed
+            .finalize("api", "staging", SnapshotState::Failed)
+            .unwrap();
+        DiagnosticsStore::new(env, 8)
+            .write_summary(&crate::storage::DiagnosticSummary {
+                deployment_id: Some("dep-8".into()),
+                failure_stage: "startup_recovery".into(),
+                failure_reason: "retention cleanup removed diagnostics".into(),
+                container_name: "staging-api-gen-8".into(),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                cleanup_recorded: true,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.recent_failures.len(), 1);
+        assert!(diagnostics.recent_failures[0].historical);
+        assert_eq!(
+            diagnostics.recent_failures[0].failure_stage,
+            "startup_recovery"
         );
     }
 }

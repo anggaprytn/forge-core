@@ -313,7 +313,7 @@ where
     pub fn get_deployment_logs(
         &self,
         deployment_id: &str,
-    ) -> Result<Option<DeploymentLogs>, ErrorResponse> {
+    ) -> Result<DeploymentLogs, ErrorResponse> {
         let Some(entry) = persisted_deployments(&self.config.storage_root)
             .map_err(|err| ErrorResponse {
                 code: "logs_unavailable".into(),
@@ -322,7 +322,10 @@ where
             .into_iter()
             .find(|entry| entry.deployment_id == deployment_id)
         else {
-            return Ok(None);
+            return Err(ErrorResponse {
+                code: "deployment_not_found".into(),
+                message: "deployment logs unavailable; run `forge diagnose <project> <environment>` or diagnostics may have been removed by retention".into(),
+            });
         };
 
         let lines = DiagnosticsStore::new(
@@ -370,7 +373,7 @@ where
             entry.project_id, entry.environment, entry.generation
         );
 
-        Ok(Some(DeploymentLogs {
+        Ok(DeploymentLogs {
             deployment_id: entry.deployment_id,
             project_id: entry.project_id,
             environment: entry.environment,
@@ -379,7 +382,7 @@ where
             container_logs,
             validation_failure_summary,
             diagnostics_source: Some(diagnostics_source),
-        }))
+        })
     }
 
     pub fn queue_depth(&self) -> Result<usize, ErrorResponse> {
@@ -1357,5 +1360,24 @@ pub mod deployment_status_reflects_runtime_state {
         let status = daemon.get_deployment("dep-persisted").unwrap().unwrap();
         assert_eq!(status.state, "degraded");
         assert_eq!(status.project_id, "api");
+    }
+
+    #[test]
+    fn logs_missing_deployment_returns_helpful_error() {
+        let root = test_root("logs-missing-deployment-returns-helpful-error");
+        let daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+
+        let err = daemon.get_deployment_logs("dep-missing").unwrap_err();
+        assert_eq!(err.code, "deployment_not_found");
+        assert!(
+            err.message
+                .contains("forge diagnose <project> <environment>")
+        );
+        assert!(err.message.contains("removed by retention"));
     }
 }

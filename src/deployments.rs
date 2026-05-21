@@ -3751,6 +3751,7 @@ pub mod runtime_environment_snapshots {
     use super::*;
     use crate::docker::DockerCliRuntime;
     use crate::docker::RecordingCommandRunner;
+    use crate::status::load_project_environment_env_report;
     use crate::storage::{load_generation_resolved_runtime, load_generation_runtime_env_snapshot};
     use std::fs;
 
@@ -3927,6 +3928,25 @@ pub mod runtime_environment_snapshots {
         );
         assert!(snapshot.entries["DATABASE_URL"].redacted);
         assert!(resolved.entries["DATABASE_URL"].sealed_value.is_some());
+    }
+
+    #[test]
+    fn env_snapshot_available_after_successful_deploy() {
+        let root = test_root("env-snapshot-available-after-successful-deploy");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+
+        execute_with_runtime_env(&root);
+
+        let report = load_project_environment_env_report(&root, "api", "production").unwrap();
+        assert_eq!(report.generation, 1);
+        assert_eq!(report.deployment_id, "dep-1");
+        assert!(
+            report
+                .values
+                .iter()
+                .any(|entry| entry.key == "FORGE_DEPLOYMENT_ID" && entry.value == "dep-1")
+        );
     }
 
     #[test]
