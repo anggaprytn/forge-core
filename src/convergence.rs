@@ -1249,6 +1249,7 @@ fn runtime_services(
                 Some(PersistedActivationMode::Http { .. })
             ),
             environment_variables: runtime_info.environment_variables.clone(),
+            state_config: None,
             volume_mounts: runtime_info.volume_mounts.clone(),
             source_ref: runtime_info.source_ref.clone(),
             repo_url: runtime_info.repo_url.clone(),
@@ -5949,6 +5950,7 @@ pub mod multi_service_convergence_and_gc {
                     required_for_promotion: true,
                     externally_exposed: true,
                     environment_variables: BTreeMap::new(),
+                    state_config: None,
                     volume_mounts: Vec::new(),
                     source_ref: None,
                     repo_url: None,
@@ -5972,6 +5974,7 @@ pub mod multi_service_convergence_and_gc {
                     required_for_promotion: true,
                     externally_exposed: false,
                     environment_variables: BTreeMap::new(),
+                    state_config: None,
                     volume_mounts: Vec::new(),
                     source_ref: None,
                     repo_url: None,
@@ -6060,6 +6063,7 @@ pub mod multi_service_convergence_and_gc {
                     required_for_promotion: true,
                     externally_exposed: false,
                     environment_variables: BTreeMap::new(),
+                    state_config: None,
                     volume_mounts: vec![crate::storage::PersistedVolumeMount {
                         volume_id: "postgres-data".into(),
                         docker_volume_name: volume_name.clone(),

@@ -30,11 +30,11 @@ use crate::storage::{
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedPromotionSummary,
     PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedServiceBuildInfo,
-    PersistedServiceRuntimeInfo, PersistedServiceState, PersistedValidationSummary,
-    PersistedVolumeMount, PersistedVolumeRetention, PointerStore, ProbeHistoryStore,
-    RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
-    SnapshotWriter, StorageError, current_unix_timestamp, load_generation_build_info,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    PersistedServiceRuntimeInfo, PersistedServiceState, PersistedStateConfig,
+    PersistedValidationSummary, PersistedVolumeMount, PersistedVolumeRetention, PointerStore,
+    ProbeHistoryStore, RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
+    SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
+    load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 #[derive(Debug)]
@@ -138,6 +138,14 @@ fn persisted_volume_mount(
         mount_path: state.mount_path.clone(),
         service_id: service_id.to_string(),
         generation,
+        retention: state.retention.clone(),
+    }
+}
+
+fn persisted_state_config(state: &ForgeStateConfig) -> PersistedStateConfig {
+    PersistedStateConfig {
+        volume: state.volume.clone(),
+        mount_path: state.mount_path.clone(),
         retention: state.retention.clone(),
     }
 }
@@ -1484,6 +1492,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     build_args: build_config
                         .map(|config| config.build_args.clone())
                         .unwrap_or_default(),
+                    state_config: service.state.as_ref().map(persisted_state_config),
                 },
             );
             let mut service_labels = labels.clone();
@@ -1577,6 +1586,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                                 .map(|reference| (key.clone(), reference))
                         })
                         .collect(),
+                    state_config: service.state.as_ref().map(persisted_state_config),
                     volume_mounts: volume_mounts.clone(),
                     source_ref: record.source_ref.clone(),
                     repo_url: record.repo_url.clone(),
@@ -3595,6 +3605,7 @@ fn runtime_services(
                 Some(PersistedActivationMode::Http { .. })
             ),
             environment_variables: runtime.environment_variables.clone(),
+            state_config: None,
             volume_mounts: runtime.volume_mounts.clone(),
             source_ref: runtime.source_ref.clone(),
             repo_url: runtime.repo_url.clone(),
@@ -9269,8 +9280,26 @@ pub mod multi_service_orchestration {
         deploy_once_with_stateful_yaml(&root, &mut docker, "dep-1");
 
         let env = EnvironmentPaths::new(&root, "api", "production");
+        let build = load_generation_build_info(&env, 1).unwrap().unwrap();
         let runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        let postgres_build = &build.services["postgres"];
         let postgres = &runtime.services["postgres"];
+        assert_eq!(
+            postgres_build.state_config.as_ref().unwrap(),
+            &PersistedStateConfig {
+                volume: "postgres-data".into(),
+                mount_path: "/var/lib/postgresql/data".into(),
+                retention: PersistedVolumeRetention::Ephemeral,
+            }
+        );
+        assert_eq!(
+            postgres.state_config.as_ref().unwrap(),
+            &PersistedStateConfig {
+                volume: "postgres-data".into(),
+                mount_path: "/var/lib/postgresql/data".into(),
+                retention: PersistedVolumeRetention::Ephemeral,
+            }
+        );
         assert_eq!(postgres.volume_mounts.len(), 1);
         assert_eq!(postgres.volume_mounts[0].volume_id, "postgres-data");
         assert_eq!(

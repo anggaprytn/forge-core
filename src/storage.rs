@@ -92,6 +92,8 @@ pub struct PersistedServiceBuildInfo {
     pub dockerfile_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_config: Option<PersistedStateConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +160,13 @@ pub enum PersistedVolumeRetention {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedStateConfig {
+    pub volume: String,
+    pub mount_path: String,
+    pub retention: PersistedVolumeRetention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedVolumeMount {
     pub volume_id: String,
     pub docker_volume_name: String,
@@ -197,6 +206,8 @@ pub struct PersistedServiceRuntimeInfo {
     pub externally_exposed: bool,
     #[serde(default)]
     pub environment_variables: BTreeMap<String, PersistedSecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_config: Option<PersistedStateConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volume_mounts: Vec<PersistedVolumeMount>,
     #[serde(default)]

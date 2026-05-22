@@ -1539,6 +1539,7 @@ fn collect_service_runtime_truth<D: DockerRuntime, R: RoutingRuntime>(
                     Some(PersistedActivationMode::Http { .. })
                 ),
                 environment_variables: runtime.environment_variables.clone(),
+                state_config: None,
                 volume_mounts: runtime.volume_mounts.clone(),
                 source_ref: runtime.source_ref.clone(),
                 repo_url: runtime.repo_url.clone(),
@@ -2934,6 +2935,7 @@ mod tests {
                         required_for_promotion: true,
                         externally_exposed: true,
                         environment_variables: BTreeMap::new(),
+                        state_config: None,
                         volume_mounts: Vec::new(),
                         source_ref: Some("main".into()),
                         repo_url: None,
@@ -2957,6 +2959,7 @@ mod tests {
                         required_for_promotion: false,
                         externally_exposed: false,
                         environment_variables: BTreeMap::new(),
+                        state_config: None,
                         volume_mounts: Vec::new(),
                         source_ref: Some("main".into()),
                         repo_url: None,
@@ -3042,6 +3045,7 @@ mod tests {
                     required_for_promotion: true,
                     externally_exposed: false,
                     environment_variables: BTreeMap::new(),
+                    state_config: None,
                     volume_mounts: vec![crate::storage::PersistedVolumeMount {
                         volume_id: "postgres-data".into(),
                         docker_volume_name: "forge-api-staging-vol-postgres-data".into(),

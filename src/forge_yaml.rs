@@ -179,16 +179,12 @@ struct RawServiceConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawStateConfig {
-    volume: String,
-    mount_path: String,
-    retention: RawStateRetention,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RawStateRetention {
-    Persistent,
-    Ephemeral,
+    #[serde(default)]
+    volume: Option<String>,
+    #[serde(default)]
+    mount_path: Option<String>,
+    #[serde(default)]
+    retention: Option<String>,
 }
 
 pub fn load_optional_forge_yaml(
@@ -373,7 +369,7 @@ impl RawForgeYaml {
             {
                 return Err(ForgeYamlError::Invalid(format!(
                     "state volume `{}` is declared by both service `{existing}` and service `{service_id}`",
-                    state.volume
+                    state.volume.as_deref().unwrap_or_default()
                 )));
             }
         }
@@ -399,12 +395,10 @@ impl RawForgeYaml {
                     image: raw.runtime.image.clone(),
                     command: raw.runtime.command.clone(),
                     state: raw.state.as_ref().map(|state| ForgeStateConfig {
-                        volume: state.volume.clone(),
-                        mount_path: state.mount_path.clone(),
-                        retention: match state.retention {
-                            RawStateRetention::Persistent => PersistedVolumeRetention::Persistent,
-                            RawStateRetention::Ephemeral => PersistedVolumeRetention::Ephemeral,
-                        },
+                        volume: state.volume.clone().expect("state validated"),
+                        mount_path: state.mount_path.clone().expect("state validated"),
+                        retention: parse_state_retention(service_id, state)
+                            .expect("state validated"),
                     }),
                     depends_on,
                     validation,
@@ -484,17 +478,46 @@ fn validate_healthcheck(healthcheck: &RawHealthcheckConfig) -> Result<(), ForgeY
 }
 
 fn validate_service_state(service_id: &str, state: &RawStateConfig) -> Result<(), ForgeYamlError> {
-    if state.volume.trim().is_empty() {
+    if state
+        .volume
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
         return Err(ForgeYamlError::Invalid(format!(
             "service `{service_id}` state.volume is required"
         )));
     }
-    if state.mount_path.trim().is_empty() || !state.mount_path.starts_with('/') {
+    let mount_path = state.mount_path.as_deref().unwrap_or_default();
+    if mount_path.trim().is_empty() {
+        return Err(ForgeYamlError::Invalid(format!(
+            "service `{service_id}` state.mount_path is required"
+        )));
+    }
+    if !mount_path.starts_with('/') {
         return Err(ForgeYamlError::Invalid(format!(
             "service `{service_id}` state.mount_path must start with `/`"
         )));
     }
+    parse_state_retention(service_id, state)?;
     Ok(())
+}
+
+fn parse_state_retention(
+    service_id: &str,
+    state: &RawStateConfig,
+) -> Result<PersistedVolumeRetention, ForgeYamlError> {
+    match state.retention.as_deref() {
+        Some("persistent") => Ok(PersistedVolumeRetention::Persistent),
+        Some("ephemeral") => Ok(PersistedVolumeRetention::Ephemeral),
+        None | Some("") => Err(ForgeYamlError::Invalid(format!(
+            "service `{service_id}` state.retention is required"
+        ))),
+        Some(_) => Err(ForgeYamlError::Invalid(format!(
+            "service `{service_id}` state.retention must be one of `persistent`, `ephemeral`"
+        ))),
+    }
 }
 
 fn validation_for_runtime(
@@ -702,6 +725,138 @@ mod tests {
         );
         assert!(config.services()["api"].externally_exposed);
         assert!(!config.services()["worker"].externally_exposed);
+    }
+
+    #[test]
+    fn service_state_schema_accepts_persistent_volume() {
+        let root = test_root("service-state-schema-accepts-persistent-volume");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "services:\n",
+                "  redis:\n",
+                "    runtime:\n",
+                "      image: redis:7\n",
+                "    state:\n",
+                "      volume: redis-data\n",
+                "      mount_path: /data\n",
+                "      retention: persistent\n",
+                "    expose: false\n",
+            ),
+        )
+        .unwrap();
+
+        let config = load_optional_forge_yaml(&root, "api").unwrap().unwrap();
+        let state = config.services()["redis"].state.as_ref().unwrap();
+        assert_eq!(state.volume, "redis-data");
+        assert_eq!(state.mount_path, "/data");
+        assert_eq!(state.retention, PersistedVolumeRetention::Persistent);
+    }
+
+    #[test]
+    fn service_state_schema_accepts_ephemeral_volume() {
+        let root = test_root("service-state-schema-accepts-ephemeral-volume");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "services:\n",
+                "  redis:\n",
+                "    runtime:\n",
+                "      image: redis:7\n",
+                "    state:\n",
+                "      volume: redis-data\n",
+                "      mount_path: /data\n",
+                "      retention: ephemeral\n",
+                "    expose: false\n",
+            ),
+        )
+        .unwrap();
+
+        let config = load_optional_forge_yaml(&root, "api").unwrap().unwrap();
+        assert_eq!(
+            config.services()["redis"].state.as_ref().unwrap().retention,
+            PersistedVolumeRetention::Ephemeral
+        );
+    }
+
+    #[test]
+    fn service_state_schema_rejects_missing_volume() {
+        let root = test_root("service-state-schema-rejects-missing-volume");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "services:\n",
+                "  redis:\n",
+                "    runtime:\n",
+                "      image: redis:7\n",
+                "    state:\n",
+                "      mount_path: /data\n",
+                "      retention: persistent\n",
+                "    expose: false\n",
+            ),
+        )
+        .unwrap();
+
+        let err = load_optional_forge_yaml(&root, "api").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("service `redis` state.volume is required")
+        );
+    }
+
+    #[test]
+    fn service_state_schema_rejects_invalid_retention() {
+        let root = test_root("service-state-schema-rejects-invalid-retention");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "services:\n",
+                "  redis:\n",
+                "    runtime:\n",
+                "      image: redis:7\n",
+                "    state:\n",
+                "      volume: redis-data\n",
+                "      mount_path: /data\n",
+                "      retention: durable\n",
+                "    expose: false\n",
+            ),
+        )
+        .unwrap();
+
+        let err = load_optional_forge_yaml(&root, "api").unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "service `redis` state.retention must be one of `persistent`, `ephemeral`"
+            )
+        );
+    }
+
+    #[test]
+    fn live_stateful_manifest_parses_successfully() {
+        let root = test_root("live-stateful-manifest-parses-successfully");
+        fs::write(
+            root.join("forge.yml"),
+            concat!(
+                "services:\n",
+                "  redis:\n",
+                "    runtime:\n",
+                "      image: redis:7\n",
+                "    state:\n",
+                "      volume: redis-data\n",
+                "      mount_path: /data\n",
+                "      retention: persistent\n",
+                "    expose: false\n",
+            ),
+        )
+        .unwrap();
+
+        let config = load_optional_forge_yaml(&root, "forge-stateful-test")
+            .unwrap()
+            .unwrap();
+        let redis = &config.services()["redis"];
+        assert_eq!(redis.image.as_deref(), Some("redis:7"));
+        assert!(!redis.externally_exposed);
+        assert!(redis.state.is_some());
     }
 
     fn test_root(name: &str) -> PathBuf {
