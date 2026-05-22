@@ -563,6 +563,13 @@ pub struct GenerationHistoryRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBackupArchiveFileRecord {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedBackupVolumeRecord {
     pub volume_id: String,
     pub docker_volume_name: String,
@@ -571,6 +578,8 @@ pub struct PersistedBackupVolumeRecord {
     pub archive_file: String,
     pub archive_size_bytes: u64,
     pub archive_sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_files: Vec<PersistedBackupArchiveFileRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,8 +594,17 @@ pub struct PersistedBackupRestoreRecord {
 pub struct PersistedBackupHookRecord {
     pub service_id: String,
     pub volume_id: String,
-    pub command: String,
-    pub executed_at_unix: u64,
+    pub container_name: String,
+    #[serde(alias = "command")]
+    pub pre_backup_command: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "executed_at_unix"
+    )]
+    pub started_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix: Option<u64>,
     pub timeout_seconds: u64,
     pub stdout: String,
     pub stderr: String,

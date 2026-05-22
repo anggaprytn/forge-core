@@ -2009,14 +2009,24 @@ fn render_restore_lineage(lineage: &RestoreLineage) -> String {
     if let Some(deployment_id) = lineage.source_deployment_id.as_deref() {
         output.push_str(&format!(" source_deployment={deployment_id}"));
     }
+    if let Some(hook_succeeded) = lineage.hook_succeeded {
+        output.push_str(&format!(" hook_succeeded={hook_succeeded}"));
+    }
     if !lineage.restored_volumes.is_empty() {
         let restored_volumes = lineage
             .restored_volumes
             .iter()
             .map(|volume| {
                 format!(
-                    "{}:{}->{}",
-                    volume.service_id, volume.volume_id, volume.mount_path
+                    "{}:{} {} checksum={} restored_volume={}",
+                    volume.service_id,
+                    volume.volume_id,
+                    volume.mount_path,
+                    volume.archive_sha256,
+                    volume
+                        .restored_docker_volume_name
+                        .as_deref()
+                        .unwrap_or("unknown")
                 )
             })
             .collect::<Vec<_>>()
@@ -2053,13 +2063,51 @@ fn render_backup_record(backup: &BackupRecord) -> String {
     } else {
         for volume in &backup.volumes {
             output.push_str(&format!(
-                "  {}:{} -> {} ({}, {} bytes)\n",
+                "  {}:{} -> {} ({}, {} bytes, sha256={})\n",
                 volume.service_id,
                 volume.volume_id,
                 volume.mount_path,
                 volume.archive_file,
-                volume.archive_size_bytes
+                volume.archive_size_bytes,
+                volume.archive_sha256
             ));
+            if volume.archive_files.is_empty() {
+                output.push_str("    archive files: none\n");
+            } else {
+                for file in &volume.archive_files {
+                    output.push_str(&format!(
+                        "    archive file: {} ({} bytes, sha256={})\n",
+                        file.path, file.size_bytes, file.sha256
+                    ));
+                }
+            }
+        }
+    }
+    output.push_str("Hooks:\n");
+    if backup.hooks.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for hook in &backup.hooks {
+            output.push_str(&format!(
+                "  {}:{} container={} command={} exit_code={} started_at={} completed_at={}\n",
+                hook.service_id,
+                hook.volume_id,
+                hook.container_name,
+                hook.pre_backup_command,
+                hook.exit_code,
+                hook.started_at_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                hook.completed_at_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
+            if !hook.stdout.is_empty() {
+                output.push_str(&format!("    stdout: {}\n", hook.stdout));
+            }
+            if !hook.stderr.is_empty() {
+                output.push_str(&format!("    stderr: {}\n", hook.stderr));
+            }
         }
     }
     output.push_str("Restores:\n");

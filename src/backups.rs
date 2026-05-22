@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 use crate::api::{
-    BackupListResponse, BackupRecord, BackupRestoreResponse, BackupVolumeRecord, RestoreRecord,
+    BackupArchiveFileRecord, BackupHookRecord, BackupListResponse, BackupRecord,
+    BackupRestoreResponse, BackupVolumeRecord, RestoreRecord,
 };
 use crate::events::EventRecord;
 use crate::projects::ProjectRegistryStore;
@@ -161,6 +163,7 @@ pub fn create_backup<D: DockerRuntime>(
                 archive_file,
                 archive_size_bytes: bytes.len() as u64,
                 archive_sha256: hex::encode(Sha256::digest(bytes)),
+                archive_files: inspect_archive_files(&archive_path)?,
             });
         }
         Ok((hooks, manifest))
@@ -345,10 +348,25 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
     metadata.runtime_info = runtime_with_primary_service(&metadata.runtime_info);
     let source_services = runtime_services(&metadata.runtime_info);
     let service_count = source_services.len();
+    let service_order = restore_service_order(&metadata.runtime_info, &source_services);
+    let service_container_names = source_services
+        .keys()
+        .map(|service_id| {
+            (
+                service_id.clone(),
+                generation_service_container_name(&record, generation, service_id, service_count),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut restored_services = BTreeMap::new();
-    for (service_id, service) in &source_services {
-        let container_name =
-            generation_service_container_name(&record, generation, service_id, service_count);
+    for service_id in &service_order {
+        let service = source_services
+            .get(service_id)
+            .expect("restore service order should reference known services");
+        let container_name = service_container_names
+            .get(service_id)
+            .cloned()
+            .expect("container name should be precomputed");
         let volume_mounts = restore_volume_mounts(
             storage_root,
             docker,
@@ -365,7 +383,7 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
             environment: runtime_env.clone(),
             network_name: service.network_name.clone(),
             network_aliases: if service_count > 1 {
-                vec![service_id.clone()]
+                vec![service_id.clone(), container_name.clone()]
             } else {
                 Vec::new()
             },
@@ -533,6 +551,12 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         let route = routing.inspect_route(&subtree_id)?;
         validate_route_activation(&route, &target)?;
     }
+    for service in source_services.values() {
+        if service.externally_exposed {
+            continue;
+        }
+        docker.stop_container(&service.container_name)?;
+    }
 
     PointerStore::new(env.clone()).swap_current(generation)?;
     RuntimeStateStore::new(env.clone()).save(&RuntimeState {
@@ -684,33 +708,128 @@ pub fn scan_backup_gc_actions(
 
 pub fn load_backup_restore_lineage(
     storage_root: &Path,
+    project_id: &str,
+    environment: &str,
     record: &GenerationHistoryRecord,
 ) -> Option<crate::api::RestoreLineage> {
     let backup_id = record.restored_from_backup_id.clone()?;
-    let restored_volumes = match find_backup_metadata(storage_root, &backup_id) {
-        Ok(metadata) => metadata
-            .volumes
-            .into_iter()
-            .map(|volume| BackupVolumeRecord {
-                volume_id: volume.volume_id,
-                docker_volume_name: volume.docker_volume_name,
-                service_id: volume.service_id,
-                mount_path: volume.mount_path,
-                archive_file: volume.archive_file,
-                archive_size_bytes: volume.archive_size_bytes,
-                archive_sha256: volume.archive_sha256,
-            })
-            .collect(),
-        Err(BackupError::NotFound(_)) => Vec::new(),
-        Err(_) => Vec::new(),
-    };
+    let metadata = find_backup_metadata(storage_root, &backup_id).ok()?;
+    let restored_runtime = load_generation_runtime_info(
+        &EnvironmentPaths::new(storage_root, project_id, environment),
+        record.generation,
+    )
+    .ok()
+    .flatten();
+    let restored_mounts = restored_runtime
+        .as_ref()
+        .map(runtime_services)
+        .unwrap_or_default()
+        .into_values()
+        .flat_map(|service| service.volume_mounts.into_iter())
+        .map(|mount| {
+            (
+                (mount.service_id.clone(), mount.volume_id.clone()),
+                mount.docker_volume_name,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let restored_volumes = metadata
+        .volumes
+        .iter()
+        .map(|volume| BackupVolumeRecord {
+            volume_id: volume.volume_id.clone(),
+            docker_volume_name: volume.docker_volume_name.clone(),
+            service_id: volume.service_id.clone(),
+            mount_path: volume.mount_path.clone(),
+            archive_file: volume.archive_file.clone(),
+            archive_size_bytes: volume.archive_size_bytes,
+            archive_sha256: volume.archive_sha256.clone(),
+            archive_files: volume
+                .archive_files
+                .iter()
+                .map(|file| BackupArchiveFileRecord {
+                    path: file.path.clone(),
+                    size_bytes: file.size_bytes,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+            restored_docker_volume_name: restored_mounts
+                .get(&(volume.service_id.clone(), volume.volume_id.clone()))
+                .cloned(),
+        })
+        .collect();
     Some(crate::api::RestoreLineage {
         backup_id,
         source_generation: record.restored_from_generation?,
         source_deployment_id: record.restored_from_deployment_id.clone(),
         restored_at_unix: record.restored_at_unix?,
+        hook_succeeded: (!metadata.hooks.is_empty())
+            .then(|| metadata.hooks.iter().all(|hook| hook.exit_code == 0)),
         restored_volumes,
     })
+}
+
+fn inspect_archive_files(
+    archive_path: &Path,
+) -> Result<Vec<crate::storage::PersistedBackupArchiveFileRecord>, BackupError> {
+    let bytes = fs::read(archive_path).map_err(|err| BackupError::Command(err.to_string()))?;
+    if let Ok(entries) = serde_json::from_slice::<Vec<(String, Vec<u8>)>>(&bytes) {
+        let mut files = entries
+            .into_iter()
+            .map(
+                |(path, contents)| crate::storage::PersistedBackupArchiveFileRecord {
+                    path,
+                    size_bytes: contents.len() as u64,
+                    sha256: hex::encode(Sha256::digest(&contents)),
+                },
+            )
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        return Ok(files);
+    }
+    let list_output = Command::new("tar")
+        .args(["-tzf", archive_path.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|err| BackupError::Command(format!("failed to list archive files: {err}")))?;
+    if !list_output.status.success() {
+        return Err(BackupError::Invalid(format!(
+            "failed to list archive files in {}: {}",
+            archive_path.display(),
+            String::from_utf8_lossy(&list_output.stderr).trim()
+        )));
+    }
+    let mut files = Vec::new();
+    for raw_path in String::from_utf8_lossy(&list_output.stdout).lines() {
+        let path = raw_path.trim().trim_start_matches("./");
+        if path.is_empty() || path.ends_with('/') {
+            continue;
+        }
+        let entry_output = Command::new("tar")
+            .arg("-xOzf")
+            .arg(archive_path)
+            .arg(raw_path)
+            .output()
+            .map_err(|err| {
+                BackupError::Command(format!(
+                    "failed to read archive entry {raw_path} from {}: {err}",
+                    archive_path.display()
+                ))
+            })?;
+        if !entry_output.status.success() {
+            return Err(BackupError::Invalid(format!(
+                "failed to read archive entry {raw_path} from {}: {}",
+                archive_path.display(),
+                String::from_utf8_lossy(&entry_output.stderr).trim()
+            )));
+        }
+        files.push(crate::storage::PersistedBackupArchiveFileRecord {
+            path: path.to_string(),
+            size_bytes: entry_output.stdout.len() as u64,
+            sha256: hex::encode(Sha256::digest(&entry_output.stdout)),
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
 }
 
 fn backups_environment_root(storage_root: &Path, project_id: &str, environment: &str) -> PathBuf {
@@ -834,6 +953,32 @@ fn api_backup_record(metadata: PersistedBackupMetadata) -> BackupRecord {
                 archive_file: volume.archive_file,
                 archive_size_bytes: volume.archive_size_bytes,
                 archive_sha256: volume.archive_sha256,
+                archive_files: volume
+                    .archive_files
+                    .into_iter()
+                    .map(|file| BackupArchiveFileRecord {
+                        path: file.path,
+                        size_bytes: file.size_bytes,
+                        sha256: file.sha256,
+                    })
+                    .collect(),
+                restored_docker_volume_name: None,
+            })
+            .collect(),
+        hooks: metadata
+            .hooks
+            .into_iter()
+            .map(|hook| BackupHookRecord {
+                service_id: hook.service_id,
+                volume_id: hook.volume_id,
+                container_name: hook.container_name,
+                pre_backup_command: hook.pre_backup_command,
+                started_at_unix: hook.started_at_unix,
+                completed_at_unix: hook.completed_at_unix,
+                timeout_seconds: hook.timeout_seconds,
+                stdout: hook.stdout,
+                stderr: hook.stderr,
+                exit_code: hook.exit_code,
             })
             .collect(),
         restores: metadata
@@ -884,6 +1029,24 @@ fn runtime_services(
     )])
 }
 
+fn restore_service_order(
+    runtime: &PersistedRuntimeInfo,
+    services: &BTreeMap<String, PersistedServiceRuntimeInfo>,
+) -> Vec<String> {
+    let mut ordered = runtime
+        .startup_order
+        .iter()
+        .filter(|service_id| services.contains_key(*service_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for service_id in services.keys() {
+        if !ordered.contains(service_id) {
+            ordered.push(service_id.clone());
+        }
+    }
+    ordered
+}
+
 fn run_pre_backup_hooks<D: DockerRuntime>(
     docker: &mut D,
     services: &BTreeMap<String, PersistedServiceRuntimeInfo>,
@@ -911,11 +1074,14 @@ fn run_pre_backup_hooks<D: DockerRuntime>(
                 command: vec!["sh".into(), "-lc".into(), command.clone()],
                 timeout: PRE_BACKUP_HOOK_TIMEOUT,
             })?;
+            let completed_at_unix = current_unix_timestamp();
             let record = PersistedBackupHookRecord {
                 service_id: service.service_id.clone(),
                 volume_id: mount.volume_id.clone(),
-                command: command.clone(),
-                executed_at_unix: current_unix_timestamp(),
+                container_name: service.container_name.clone(),
+                pre_backup_command: command.clone(),
+                started_at_unix: Some(completed_at_unix),
+                completed_at_unix: Some(completed_at_unix),
                 timeout_seconds: PRE_BACKUP_HOOK_TIMEOUT.as_secs(),
                 stdout: output.stdout,
                 stderr: output.stderr,
@@ -2107,8 +2273,8 @@ mod tests {
     }
 
     #[test]
-    fn backup_inspect_reports_volume_manifest() {
-        let root = test_root("backup-inspect-manifest");
+    fn backup_inspect_reports_archive_file_list() {
+        let root = test_root("backup-inspect-reports-archive-file-list");
         let mut docker = TestDockerRuntime::default();
         let seeded = seed_environment(&root, &mut docker);
         let created = create_backup(&root, &mut docker, "api", "production").unwrap();
@@ -2121,6 +2287,9 @@ mod tests {
             seeded.original_persistent_volume
         );
         assert_eq!(inspected.volumes[0].mount_path, "/data");
+        assert_eq!(inspected.volumes[0].archive_files.len(), 1);
+        assert_eq!(inspected.volumes[0].archive_files[0].path, "counter.txt");
+        assert_eq!(inspected.volumes[0].archive_files[0].size_bytes, 1);
     }
 
     #[test]
@@ -2248,8 +2417,8 @@ mod tests {
     }
 
     #[test]
-    fn restore_preserves_stateful_data() {
-        let root = test_root("restore-preserves-stateful-data");
+    fn restore_extracts_archive_into_fresh_volume() {
+        let root = test_root("restore-extracts-archive-into-fresh-volume");
         let mut docker = TestDockerRuntime::default();
         let seeded = seed_environment(&root, &mut docker);
         let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
@@ -2271,6 +2440,7 @@ mod tests {
             "7"
         );
         assert_ne!(restored_mountpoint, seeded.original_mountpoint);
+        assert!(restored_volume.contains("restore-gen-2-vol-redis"));
     }
 
     #[test]
@@ -2516,8 +2686,8 @@ mod tests {
     }
 
     #[test]
-    fn backup_hook_output_persisted() {
-        let root = test_root("backup-hook-output-persisted");
+    fn backup_inspect_reports_hook_execution() {
+        let root = test_root("backup-inspect-reports-hook-execution");
         let mut docker = TestDockerRuntime::default();
         seed_environment(&root, &mut docker);
         let env = EnvironmentPaths::new(&root, "api", "production");
@@ -2541,15 +2711,24 @@ mod tests {
         }));
 
         let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
-        let metadata = find_backup_metadata(&root, &backup.backup_id).unwrap();
+        let inspected = inspect_backup(&root, &backup.backup_id).unwrap();
 
-        assert_eq!(metadata.hooks[0].stdout, "ok");
-        assert_eq!(metadata.hooks[0].stderr, "warn");
+        assert_eq!(inspected.hooks.len(), 1);
+        assert_eq!(inspected.hooks[0].container_name, "prod-api-gen-1");
+        assert_eq!(
+            inspected.hooks[0].pre_backup_command,
+            "printf ok && printf warn >&2"
+        );
+        assert_eq!(inspected.hooks[0].stdout, "ok");
+        assert_eq!(inspected.hooks[0].stderr, "warn");
+        assert_eq!(inspected.hooks[0].exit_code, 0);
+        assert!(inspected.hooks[0].started_at_unix.is_some());
+        assert!(inspected.hooks[0].completed_at_unix.is_some());
     }
 
     #[test]
-    fn redis_backup_restore_with_save_preserves_counter() {
-        let root = test_root("redis-backup-restore-with-save-preserves-counter");
+    fn redis_backup_hook_persists_dump_rdb() {
+        let root = test_root("redis-backup-hook-persists-dump-rdb");
         let mut docker = TestDockerRuntime::default();
         seed_environment(&root, &mut docker);
         let env = EnvironmentPaths::new(&root, "api", "production");
@@ -2592,19 +2771,62 @@ mod tests {
         .unwrap();
 
         let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
-        let archive_bytes = fs::read(
-            backup_dir(&root, "api", "production", &backup.backup_id)
-                .join("volumes")
-                .join("api-redis.tar.gz"),
+        let inspected = inspect_backup(&root, &backup.backup_id).unwrap();
+        assert!(
+            inspected.volumes[0]
+                .archive_files
+                .iter()
+                .any(|file| file.path == "dump.rdb")
+        );
+        assert_eq!(inspected.hooks[0].pre_backup_command, "redis-cli SAVE");
+        assert_eq!(inspected.hooks[0].container_name, "prod-api-gen-1");
+    }
+
+    #[test]
+    fn redis_restore_recovers_counter_at_backup_time() {
+        let root = test_root("redis-restore-recovers-counter-at-backup-time");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let mut runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        runtime.services.get_mut("api").unwrap().state_config =
+            Some(crate::storage::PersistedStateConfig {
+                volume: "redis".into(),
+                mount_path: "/data".into(),
+                retention: PersistedVolumeRetention::Persistent,
+                pre_backup_command: Some("redis-cli SAVE".into()),
+            });
+        atomic_write(
+            env.generation_dir(1).join("runtime.json"),
+            format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()).as_bytes(),
         )
         .unwrap();
-        let archived_entries: Vec<(String, Vec<u8>)> =
-            serde_json::from_slice(&archive_bytes).unwrap();
-        assert!(
-            archived_entries
-                .iter()
-                .any(|(path, bytes)| { path == "dump.rdb" && bytes.as_slice() == b"1711" })
-        );
+        docker.exec_results.push_back(Ok(ExecInContainerOutput {
+            stdout: "OK".into(),
+            stderr: String::new(),
+            exit_code: 0,
+        }));
+        docker.exec_file_writes.push_back(vec![
+            (
+                root.join("volumes")
+                    .join("redis-source")
+                    .join("counter.txt"),
+                b"1711".to_vec(),
+            ),
+            (
+                root.join("volumes").join("redis-source").join("dump.rdb"),
+                b"1711".to_vec(),
+            ),
+        ]);
+        fs::write(
+            root.join("volumes")
+                .join("redis-source")
+                .join("counter.txt"),
+            "339",
+        )
+        .unwrap();
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
         fs::write(
             root.join("volumes")
                 .join("redis-source")
@@ -2627,6 +2849,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(restored_mountpoint.join("dump.rdb")).unwrap(),
             "1711"
+        );
+        assert_ne!(
+            fs::read_to_string(restored_mountpoint.join("counter.txt")).unwrap(),
+            "9999"
         );
     }
 
@@ -2656,8 +2882,49 @@ mod tests {
         assert_eq!(lineage.backup_id, backup.backup_id);
         assert_eq!(lineage.source_generation, 1);
         assert_eq!(lineage.source_deployment_id.as_deref(), Some("dep-1"));
+        assert_eq!(lineage.hook_succeeded, None);
         assert_eq!(lineage.restored_volumes.len(), 1);
         assert_eq!(lineage.restored_volumes[0].volume_id, "redis");
+        assert_eq!(
+            lineage.restored_volumes[0]
+                .restored_docker_volume_name
+                .as_deref(),
+            Some("forge-api-production-restore-gen-2-vol-redis")
+        );
+        assert!(!lineage.restored_volumes[0].archive_sha256.is_empty());
+    }
+
+    #[test]
+    fn restored_service_reads_restored_volume_state() {
+        let root = test_root("restored-service-reads-restored-volume-state");
+        let mut docker = TestDockerRuntime::default();
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        fs::write(
+            root.join("volumes")
+                .join("redis-source")
+                .join("counter.txt"),
+            "99",
+        )
+        .unwrap();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let runtime =
+            load_generation_runtime_info(&EnvironmentPaths::new(&root, "api", "production"), 2)
+                .unwrap()
+                .unwrap();
+        let redis_runtime = runtime.services.get("redis").unwrap();
+        let redis_mount = redis_runtime.volume_mounts.first().unwrap();
+        let restored_mountpoint = docker.volume_inspections[&redis_mount.docker_volume_name]
+            .mountpoint
+            .clone();
+        assert_eq!(
+            fs::read_to_string(restored_mountpoint.join("counter.txt")).unwrap(),
+            "44"
+        );
     }
 
     #[test]

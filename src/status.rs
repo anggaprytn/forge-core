@@ -1134,6 +1134,8 @@ where
             .and_then(|entry| {
                 load_backup_restore_lineage(
                     storage_root,
+                    project_id,
+                    environment,
                     &GenerationHistoryRecord {
                         generation: entry.generation,
                         deployment_id: entry.deployment_id.clone(),

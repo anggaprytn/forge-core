@@ -75,6 +75,14 @@ pub fn sample_http_app_fixture() -> PathBuf {
 }
 
 #[allow(dead_code)]
+pub fn redis_http_app_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("redis-http-app")
+}
+
+#[allow(dead_code)]
 pub fn bad_http_app_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

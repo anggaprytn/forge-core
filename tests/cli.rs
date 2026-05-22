@@ -470,7 +470,7 @@ fn cli_backup_inspect_reads_backup_manifest() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"data":{"backup_id":"backup-1","project_id":"api","environment":"production","created_at_unix":10,"source_generation":3,"services":["api"],"volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc"}],"restores":[{"restored_generation":4,"restored_deployment_id":"restore-backup-1-gen-4","restored_at_unix":20,"status":"completed"}]}}"#,
+        r#"{"data":{"backup_id":"backup-1","project_id":"api","environment":"production","created_at_unix":10,"source_generation":3,"services":["api"],"volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc","archive_files":[{"path":"dump.rdb","size_bytes":4,"sha256":"def"}]}],"hooks":[{"service_id":"api","volume_id":"redis","container_name":"prod-api-gen-3","pre_backup_command":"redis-cli SAVE","started_at_unix":11,"completed_at_unix":12,"timeout_seconds":30,"stdout":"OK","stderr":"","exit_code":0}],"restores":[{"restored_generation":4,"restored_deployment_id":"restore-backup-1-gen-4","restored_at_unix":20,"status":"completed"}]}}"#,
     );
 
     let output = run_cli(&url, &["backup", "inspect", "backup-1"]);
@@ -478,6 +478,9 @@ fn cli_backup_inspect_reads_backup_manifest() {
     let body = String::from_utf8_lossy(&output.stdout);
     assert!(body.contains("Restores:"));
     assert!(body.contains("gen-4 restore-backup-1-gen-4"));
+    assert!(body.contains("Hooks:"));
+    assert!(body.contains("redis-cli SAVE"));
+    assert!(body.contains("archive file: dump.rdb"));
 
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.method, "GET");
@@ -539,13 +542,15 @@ fn diagnose_reports_restore_lineage() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"data":{"project_id":"api","environment":"production","status":"healthy","active_generation":4,"container":{"running":true},"route":{"route_required":false,"route_active":false,"matches_expected":true},"retained_generations":[],"recent_gc_actions":[],"missing_required_secrets":[],"recent_secret_mutations":[],"startup_order":[],"services":[],"recent_failures":[],"active_restore":{"backup_id":"backup-1","source_generation":3,"source_deployment_id":"dep-3","restored_at_unix":20},"backup_restore_events":["restored backup backup-1 into gen-4"]}}"#,
+        r#"{"data":{"project_id":"api","environment":"production","status":"healthy","active_generation":4,"container":{"running":true},"route":{"route_required":false,"route_active":false,"matches_expected":true},"retained_generations":[],"recent_gc_actions":[],"missing_required_secrets":[],"recent_secret_mutations":[],"startup_order":[],"services":[],"recent_failures":[],"active_restore":{"backup_id":"backup-1","source_generation":3,"source_deployment_id":"dep-3","restored_at_unix":20,"hook_succeeded":true,"restored_volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc","archive_files":[{"path":"dump.rdb","size_bytes":4,"sha256":"def"}],"restored_docker_volume_name":"forge-api-production-restore-gen-4-vol-redis"}]},"backup_restore_events":["restored backup backup-1 into gen-4"]}}"#,
     );
 
     let output = run_cli(&url, &["diagnose", "api", "production"]);
     assert!(output.status.success());
     let body = String::from_utf8_lossy(&output.stdout);
     assert!(body.contains("Active Restore: backup=backup-1 source_generation=3"));
+    assert!(body.contains("hook_succeeded=true"));
+    assert!(body.contains("restored_volume=forge-api-production-restore-gen-4-vol-redis"));
     assert!(body.contains("Backup Restore Events:"));
 
     let request = requests.lock().unwrap().remove(0);

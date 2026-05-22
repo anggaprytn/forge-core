@@ -1775,22 +1775,14 @@ async fn get_project_environment_status(
         return response;
     }
 
-    let mut daemon = match state.daemon.lock() {
-        Ok(daemon) => daemon,
-        Err(_) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &request_id,
-                ErrorResponse {
-                    code: "daemon_lock_error".into(),
-                    message: "daemon lock poisoned".into(),
-                },
-            );
-        }
-    };
-
-    match daemon.get_project_environment_status(&project_id, &environment) {
-        Ok(status) => json_response(
+    let daemon = state.daemon.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut daemon = daemon.lock().unwrap();
+        daemon.get_project_environment_status(&project_id, &environment)
+    })
+    .await
+    {
+        Ok(Ok(status)) => json_response(
             StatusCode::OK,
             &request_id,
             Json(SuccessEnvelope {
@@ -1799,7 +1791,7 @@ async fn get_project_environment_status(
                 data: status,
             }),
         ),
-        Err(err) => {
+        Ok(Err(err)) => {
             let status = match err.code.as_str() {
                 "project_not_found" => StatusCode::NOT_FOUND,
                 "invalid_environment" => StatusCode::BAD_REQUEST,
@@ -1807,6 +1799,14 @@ async fn get_project_environment_status(
             };
             error_response(status, &request_id, err)
         }
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "status_request_failed".into(),
+                message: err.to_string(),
+            },
+        ),
     }
 }
 
@@ -1952,22 +1952,14 @@ async fn get_project_environment_diagnostics(
         return response;
     }
 
-    let mut daemon = match state.daemon.lock() {
-        Ok(daemon) => daemon,
-        Err(_) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &request_id,
-                ErrorResponse {
-                    code: "daemon_lock_error".into(),
-                    message: "daemon lock poisoned".into(),
-                },
-            );
-        }
-    };
-
-    match daemon.get_project_environment_diagnostics(&project_id, &environment) {
-        Ok(diagnostics) => json_response(
+    let daemon = state.daemon.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut daemon = daemon.lock().unwrap();
+        daemon.get_project_environment_diagnostics(&project_id, &environment)
+    })
+    .await
+    {
+        Ok(Ok(diagnostics)) => json_response(
             StatusCode::OK,
             &request_id,
             Json(SuccessEnvelope {
@@ -1976,7 +1968,15 @@ async fn get_project_environment_diagnostics(
                 data: diagnostics,
             }),
         ),
-        Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "diagnostics_request_failed".into(),
+                message: err.to_string(),
+            },
+        ),
     }
 }
 
@@ -2034,9 +2034,14 @@ async fn post_backup_create(
     if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
         return response;
     }
-    let mut daemon = state.daemon.lock().unwrap();
-    match daemon.create_backup(&project_id, &environment) {
-        Ok(backup) => json_response(
+    let daemon = state.daemon.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut daemon = daemon.lock().unwrap();
+        daemon.create_backup(&project_id, &environment)
+    })
+    .await
+    {
+        Ok(Ok(backup)) => json_response(
             StatusCode::CREATED,
             &request_id,
             Json(SuccessEnvelope {
@@ -2045,7 +2050,15 @@ async fn post_backup_create(
                 data: backup,
             }),
         ),
-        Err(error) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+        Ok(Err(error)) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "backup_create_failed".into(),
+                message: err.to_string(),
+            },
+        ),
     }
 }
 
@@ -2058,9 +2071,14 @@ async fn get_backup_list(
     if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
         return response;
     }
-    let daemon = state.daemon.lock().unwrap();
-    match daemon.list_backups(&project_id, &environment) {
-        Ok(backups) => json_response(
+    let daemon = state.daemon.clone();
+    match tokio::task::spawn_blocking(move || {
+        let daemon = daemon.lock().unwrap();
+        daemon.list_backups(&project_id, &environment)
+    })
+    .await
+    {
+        Ok(Ok(backups)) => json_response(
             StatusCode::OK,
             &request_id,
             Json(SuccessEnvelope {
@@ -2069,7 +2087,15 @@ async fn get_backup_list(
                 data: backups,
             }),
         ),
-        Err(error) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+        Ok(Err(error)) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "backup_list_failed".into(),
+                message: err.to_string(),
+            },
+        ),
     }
 }
 
@@ -2082,9 +2108,14 @@ async fn get_backup_inspect(
     if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
         return response;
     }
-    let daemon = state.daemon.lock().unwrap();
-    match daemon.inspect_backup(&backup_id) {
-        Ok(backup) => json_response(
+    let daemon = state.daemon.clone();
+    match tokio::task::spawn_blocking(move || {
+        let daemon = daemon.lock().unwrap();
+        daemon.inspect_backup(&backup_id)
+    })
+    .await
+    {
+        Ok(Ok(backup)) => json_response(
             StatusCode::OK,
             &request_id,
             Json(SuccessEnvelope {
@@ -2093,7 +2124,15 @@ async fn get_backup_inspect(
                 data: backup,
             }),
         ),
-        Err(error) => error_response(StatusCode::NOT_FOUND, &request_id, error),
+        Ok(Err(error)) => error_response(StatusCode::NOT_FOUND, &request_id, error),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "backup_inspect_failed".into(),
+                message: err.to_string(),
+            },
+        ),
     }
 }
 
@@ -2106,9 +2145,14 @@ async fn post_backup_restore(
     if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
         return response;
     }
-    let mut daemon = state.daemon.lock().unwrap();
-    match daemon.restore_backup(&backup_id) {
-        Ok(restore) => json_response(
+    let daemon = state.daemon.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut daemon = daemon.lock().unwrap();
+        daemon.restore_backup(&backup_id)
+    })
+    .await
+    {
+        Ok(Ok(restore)) => json_response(
             StatusCode::ACCEPTED,
             &request_id,
             Json(SuccessEnvelope {
@@ -2117,7 +2161,15 @@ async fn post_backup_restore(
                 data: restore,
             }),
         ),
-        Err(error) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+        Ok(Err(error)) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "backup_restore_failed".into(),
+                message: err.to_string(),
+            },
+        ),
     }
 }
 

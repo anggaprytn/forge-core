@@ -469,6 +469,13 @@ pub struct DeploymentHistoryResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupArchiveFileRecord {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupVolumeRecord {
     pub volume_id: String,
     pub docker_volume_name: String,
@@ -477,6 +484,26 @@ pub struct BackupVolumeRecord {
     pub archive_file: String,
     pub archive_size_bytes: u64,
     pub archive_sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_files: Vec<BackupArchiveFileRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_docker_volume_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupHookRecord {
+    pub service_id: String,
+    pub volume_id: String,
+    pub container_name: String,
+    pub pre_backup_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix: Option<u64>,
+    pub timeout_seconds: u64,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +527,8 @@ pub struct BackupRecord {
     pub services: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<BackupVolumeRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<BackupHookRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restores: Vec<RestoreRecord>,
 }
@@ -529,6 +558,8 @@ pub struct RestoreLineage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_deployment_id: Option<String>,
     pub restored_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_succeeded: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restored_volumes: Vec<BackupVolumeRecord>,
 }

@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::thread;
+use std::time::Duration;
 
 use reqwest::header::HOST;
 
@@ -17,9 +19,14 @@ pub struct CaddyApiRuntime {
     admin_base_url: String,
     public_base_url: String,
     probe_paths: BTreeMap<String, String>,
+    client: reqwest::blocking::Client,
+    insecure_client: reqwest::blocking::Client,
 }
 
 impl CaddyApiRuntime {
+    const REQUEST_RETRY_ATTEMPTS: usize = 40;
+    const REQUEST_RETRY_DELAY: Duration = Duration::from_millis(250);
+
     fn ready_subtree_id() -> &'static str {
         "forge:ready"
     }
@@ -29,6 +36,11 @@ impl CaddyApiRuntime {
             admin_base_url: admin_base_url.into().trim_end_matches('/').to_string(),
             public_base_url: public_base_url.into().trim_end_matches('/').to_string(),
             probe_paths: BTreeMap::new(),
+            client: reqwest::blocking::Client::new(),
+            insecure_client: reqwest::blocking::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .expect("reqwest blocking client should build"),
         }
     }
 
@@ -54,8 +66,14 @@ impl CaddyApiRuntime {
     }
 
     fn read_full_config(&self) -> Result<serde_json::Value, RoutingRuntimeError> {
-        let response = reqwest::blocking::get(format!("{}/config/", self.admin_base_url))
-            .map_err(|err| RoutingRuntimeError::InspectionFailed(err.to_string()))?;
+        let response = self.retry_client_request(
+            || {
+                self.client
+                    .get(format!("{}/config/", self.admin_base_url))
+                    .send()
+            },
+            false,
+        )?;
         if !response.status().is_success() {
             return Err(RoutingRuntimeError::InspectionFailed(format!(
                 "caddy config inspection failed with status {}",
@@ -68,8 +86,8 @@ impl CaddyApiRuntime {
     }
 
     fn read_routes(&self) -> Result<Vec<serde_json::Value>, RoutingRuntimeError> {
-        let response = reqwest::blocking::get(self.routes_url())
-            .map_err(|err| RoutingRuntimeError::InspectionFailed(err.to_string()))?;
+        let response =
+            self.retry_client_request(|| self.client.get(self.routes_url()).send(), false)?;
         if !response.status().is_success() {
             return Err(RoutingRuntimeError::InspectionFailed(format!(
                 "caddy route inspection failed with status {}",
@@ -87,12 +105,10 @@ impl CaddyApiRuntime {
             .map_err(|err| RoutingRuntimeError::UpdateFailed(err.to_string()))?;
         config["apps"]["http"]["servers"]["forge"]["routes"] = route_value;
 
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .post(self.load_url())
-            .json(&config)
-            .send()
-            .map_err(|err| RoutingRuntimeError::UpdateFailed(err.to_string()))?;
+        let response = self.retry_client_request(
+            || self.client.post(self.load_url()).json(&config).send(),
+            true,
+        )?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -221,26 +237,19 @@ impl CaddyApiRuntime {
         domain: Option<&str>,
         allow_invalid_certs: bool,
     ) -> ActivationVerification {
-        let client = reqwest::blocking::Client::builder()
-            .danger_accept_invalid_certs(allow_invalid_certs)
-            .build();
-        let client = match client {
-            Ok(client) => client,
-            Err(err) => {
-                return ActivationVerification {
-                    verified: false,
-                    url: Some(url.to_string()),
-                    host: domain.map(ToOwned::to_owned),
-                    status_code: None,
-                    response_body: Some(err.to_string()),
-                };
-            }
+        let client = if allow_invalid_certs {
+            &self.insecure_client
+        } else {
+            &self.client
         };
         let mut request = client.get(url);
         if let Some(domain) = domain {
             request = request.header(HOST, domain);
         }
-        match request.send() {
+        match self.retry_client_request(
+            || request.try_clone().expect("request should clone").send(),
+            false,
+        ) {
             Ok(response) => {
                 let status = response.status();
                 let body = response.text().ok();
@@ -260,6 +269,36 @@ impl CaddyApiRuntime {
                 response_body: Some(err.to_string()),
             },
         }
+    }
+
+    fn retry_client_request<F>(
+        &self,
+        mut send: F,
+        update_error: bool,
+    ) -> Result<reqwest::blocking::Response, RoutingRuntimeError>
+    where
+        F: FnMut() -> Result<reqwest::blocking::Response, reqwest::Error>,
+    {
+        let mut last_error = None;
+        for attempt in 0..Self::REQUEST_RETRY_ATTEMPTS {
+            match send() {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 < Self::REQUEST_RETRY_ATTEMPTS {
+                        thread::sleep(Self::REQUEST_RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        let message = last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "request failed".into());
+        Err(if update_error {
+            RoutingRuntimeError::UpdateFailed(message)
+        } else {
+            RoutingRuntimeError::InspectionFailed(message)
+        })
     }
 }
 

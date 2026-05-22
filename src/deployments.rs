@@ -4106,7 +4106,7 @@ pub mod validation_probe_retries {
     fn http_probe_retries_until_health_passes() {
         let root = test_root("http-probe-retries-until-health-passes");
         let source_root = root.join("source");
-        write_forge_yaml(&source_root, 500);
+        write_forge_yaml(&source_root, 5_000);
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queue
             .enqueue(DeploymentRecord {

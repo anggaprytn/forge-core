@@ -1,0 +1,29 @@
+version: 1
+name: api
+type: web
+env:
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  COUNTER_KEY: counter
+services:
+  redis:
+    runtime:
+      image: redis:7
+    state:
+      volume: redis
+      mount_path: /data
+      retention: persistent
+      pre_backup_command: redis-cli SAVE
+    expose: false
+  api:
+    build:
+      dockerfile: Dockerfile
+      context: .
+    runtime:
+      port: 3000
+      healthcheck:
+        path: /health
+        expected_status: 200
+    depends_on:
+      - redis
+    expose: true

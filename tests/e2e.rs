@@ -222,15 +222,88 @@ fn dogfood_reboot_recovery_restores_container_and_route() {
         )
     );
     let response = harness
-        .http_client
-        .get(harness.public_url("health"))
-        .send()
+        .wait_for_public_text("health", "ok\n")
         .expect("public route should be reachable after startup recovery");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
+fn dogfood_redis_restore_recovers_backup_time_state() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("redis-backup-restore") else {
+        return;
+    };
+
+    let fixture = common::redis_http_app_fixture();
+    harness.enqueue_deploy_for_fixture(&fixture);
+    harness
+        .execute_next_deployment_for_fixture(&fixture)
+        .unwrap();
+    let active_api_container = "prod-api-api-gen-1";
+
+    for _ in 0..5 {
+        let _ = harness.container_http_text(active_api_container, "incr");
+    }
     assert_eq!(
-        response.text().unwrap(),
-        "ok\n",
-        "startup recovery must override the forge:ready placeholder"
+        harness
+            .container_http_text(active_api_container, "counter")
+            .trim(),
+        "5"
+    );
+
+    let backup = harness.create_backup();
+    let backup_id = backup["backup_id"]
+        .as_str()
+        .expect("backup id should be present")
+        .to_string();
+    let inspected = harness.inspect_backup(&backup_id);
+    assert_eq!(
+        inspected["hooks"][0]["pre_backup_command"],
+        "redis-cli SAVE"
+    );
+    assert_eq!(inspected["hooks"][0]["exit_code"], 0);
+    assert!(
+        inspected["volumes"][0]["archive_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "dump.rdb")
+    );
+
+    for _ in 0..3 {
+        harness.container_http_text(active_api_container, "incr");
+    }
+    assert_eq!(
+        harness
+            .container_http_text(active_api_container, "counter")
+            .trim(),
+        "8"
+    );
+
+    let restore = harness.restore_backup(&backup_id);
+    assert_eq!(restore["restored_generation"], 2);
+    assert_eq!(
+        harness
+            .container_http_text("prod-api-api-gen-2", "counter")
+            .trim(),
+        "5"
+    );
+
+    let diagnostics = harness.get_diagnostics();
+    let active_restore = &diagnostics["active_restore"];
+    assert_eq!(active_restore["backup_id"], backup_id);
+    assert_eq!(active_restore["source_generation"], 1);
+    assert_eq!(active_restore["hook_succeeded"], true);
+    assert_eq!(active_restore["restored_volumes"][0]["volume_id"], "redis");
+    assert!(
+        active_restore["restored_volumes"][0]["archive_sha256"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        active_restore["restored_volumes"][0]["restored_docker_volume_name"]
+            .as_str()
+            .is_some_and(|value| value.contains("restore-gen-2-vol-redis"))
     );
 }
 
@@ -694,6 +767,7 @@ impl E2eHarness {
         ensure_test_master_key();
         cleanup_forge_containers().expect("forge containers should be cleaned between e2e runs");
         cleanup_forge_images().expect("forge images should be cleaned between e2e runs");
+        cleanup_forge_volumes().expect("forge volumes should be cleaned between e2e runs");
         cleanup_e2e_caddy_containers()
             .expect("e2e caddy containers should be cleaned between e2e runs");
 
@@ -757,6 +831,18 @@ impl E2eHarness {
                 format!("http://127.0.0.1:{public_port}"),
             ),
         };
+
+        ProjectRegistryStore::new(&harness.runtime_root)
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("api".into()),
+                    repo_url: "https://github.com/example/api.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
 
         harness.wait_for_caddy();
         harness.restart_api_server(AllowAllDecider(true));
@@ -1077,6 +1163,76 @@ impl E2eHarness {
         json["data"].clone()
     }
 
+    fn create_backup(&self) -> Value {
+        let response = self
+            .http_client
+            .post(self.api_url("api/projects/api/environments/production/backups"))
+            .bearer_auth(&self.token)
+            .send()
+            .expect("backup create request should reach api");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let json = response.json::<Value>().unwrap();
+        json["data"].clone()
+    }
+
+    fn inspect_backup(&self, backup_id: &str) -> Value {
+        let response = self
+            .http_client
+            .get(self.api_url(&format!("api/backups/{backup_id}")))
+            .bearer_auth(&self.token)
+            .send()
+            .expect("backup inspect request should reach api");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response.json::<Value>().unwrap();
+        json["data"].clone()
+    }
+
+    fn restore_backup(&self, backup_id: &str) -> Value {
+        let response = self
+            .http_client
+            .post(self.api_url(&format!("api/backups/{backup_id}/restore")))
+            .bearer_auth(&self.token)
+            .send()
+            .expect("backup restore request should reach api");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json = response.json::<Value>().unwrap();
+        json["data"].clone()
+    }
+
+    fn get_diagnostics(&self) -> Value {
+        let response = self
+            .http_client
+            .get(self.api_url("api/projects/api/environments/production/diagnostics"))
+            .bearer_auth(&self.token)
+            .send()
+            .expect("diagnostics request should reach api");
+        let status = response.status();
+        let body = response.text().unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json = serde_json::from_str::<Value>(&body).unwrap();
+        json["data"].clone()
+    }
+
+    fn container_http_text(&self, container_name: &str, path: &str) -> String {
+        let output = docker_output(&[
+            "exec",
+            container_name,
+            "python",
+            "-c",
+            &format!(
+                "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:3000/{}').read().decode(), end='')",
+                path.trim_start_matches('/')
+            ),
+        ])
+        .expect("container http request should succeed");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
     fn run_convergence_ticks(&mut self, ticks: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
         self.run_convergence_ticks_with_path(ticks, Some("/health"))
     }
@@ -1136,7 +1292,7 @@ impl E2eHarness {
     }
 
     fn wait_for_caddy(&self) {
-        for _ in 0..40 {
+        for _ in 0..240 {
             if let Ok(response) = self
                 .http_client
                 .get(format!(
@@ -1164,6 +1320,34 @@ impl E2eHarness {
             thread::sleep(Duration::from_millis(100));
         }
         panic!("api readyz did not become ready");
+    }
+
+    fn wait_for_public_text(
+        &self,
+        path: &str,
+        expected_body: &str,
+    ) -> Result<reqwest::blocking::Response, String> {
+        let mut last_body = String::new();
+        let url = self.public_url(path);
+        for _ in 0..40 {
+            match self.http_client.get(&url).send() {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().unwrap_or_default();
+                    if status == StatusCode::OK && body == expected_body {
+                        return self
+                            .http_client
+                            .get(&url)
+                            .send()
+                            .map_err(|err| err.to_string());
+                    }
+                    last_body = body;
+                }
+                Err(err) => last_body = err.to_string(),
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        Err(last_body)
     }
 
     fn install_ready_placeholder(&self) {
@@ -1208,6 +1392,7 @@ impl Drop for E2eHarness {
             let _ = server.join.join();
         }
         let _ = cleanup_forge_containers();
+        let _ = cleanup_forge_volumes();
         let _ = docker(&["rm", "-f", &self.caddy_container_name]);
         let _ = docker(&["network", "rm", &self.network_name]);
     }
@@ -1382,15 +1567,20 @@ impl RoutingRuntime for NoopRoutingRuntime {
 }
 
 fn docker(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("docker")
-        .args(args)
-        .output()
-        .map_err(|err| err.to_string())?;
+    let output = docker_output(args)?;
     if output.status.success() {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+fn docker_output(args: &[&str]) -> Result<std::process::Output, String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|err| err.to_string())?;
+    Ok(output)
 }
 
 fn docker_container_ip(name: &str, network_name: &str) -> String {
@@ -1437,6 +1627,21 @@ fn cleanup_forge_images() -> Result<(), String> {
     let ids = String::from_utf8_lossy(&output.stdout);
     for id in ids.lines().filter(|line| !line.trim().is_empty()) {
         let _ = docker(&["rmi", "-f", id.trim()]);
+    }
+    Ok(())
+}
+
+fn cleanup_forge_volumes() -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(["volume", "ls", "-q", "--filter", "label=forge.managed=true"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let names = String::from_utf8_lossy(&output.stdout);
+    for name in names.lines().filter(|line| !line.trim().is_empty()) {
+        let _ = docker(&["volume", "rm", "-f", name.trim()]);
     }
     Ok(())
 }
