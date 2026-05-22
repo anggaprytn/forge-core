@@ -556,7 +556,15 @@ Not supported in v1:
 - UDP
 - non-network workers
 - multi-port services
-- persistent-volume workloads
+- distributed storage
+- volume snapshotting
+
+Single-node Docker volume workloads are supported with two roles:
+
+- `persistent`: survives deploy, rollback, and convergence repair
+- `ephemeral`: scoped to a generation and removed by GC after the generation stops being rollback-safe
+
+Rollback restores runtime topology and volume attachment intent only. Forge does not snapshot database contents or rewind persistent data.
 
 ## 15. Routing Model
 

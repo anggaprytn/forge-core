@@ -727,6 +727,13 @@ impl DockerRuntime for FakeDockerRuntime {
         Ok(())
     }
 
+    fn ensure_volume(
+        &mut self,
+        _request: forge_core::runtime::CreateVolumeRequest,
+    ) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
+
     fn create_container(
         &mut self,
         request: CreateContainerRequest,
@@ -759,6 +766,7 @@ impl DockerRuntime for FakeDockerRuntime {
             image_ref: "forge:test".into(),
             labels: fake_container_labels(container_name),
             network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(container_name))]),
+            volume_mounts: Vec::new(),
             restart_policy: "no".into(),
         })
     }
@@ -785,6 +793,7 @@ impl DockerRuntime for FakeDockerRuntime {
                 image_ref: "forge:test".into(),
                 labels: fake_container_labels(name),
                 network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(name))]),
+                volume_mounts: Vec::new(),
                 restart_policy: "no".into(),
             })
             .collect())
@@ -793,6 +802,12 @@ impl DockerRuntime for FakeDockerRuntime {
     fn list_managed_images(
         &mut self,
     ) -> Result<Vec<forge_core::runtime::ManagedImage>, DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
+    fn list_managed_volumes(
+        &mut self,
+    ) -> Result<Vec<forge_core::runtime::ManagedVolume>, DockerRuntimeError> {
         Ok(Vec::new())
     }
 
@@ -807,6 +822,10 @@ impl DockerRuntime for FakeDockerRuntime {
     }
 
     fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
+
+    fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
         Ok(())
     }
 }

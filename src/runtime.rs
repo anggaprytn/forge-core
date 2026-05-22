@@ -19,7 +19,26 @@ pub struct CreateContainerRequest {
     pub environment: BTreeMap<String, String>,
     pub network_name: Option<String>,
     pub network_aliases: Vec<String>,
+    pub volume_mounts: Vec<VolumeMountRequest>,
     pub command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeMountRequest {
+    pub volume_name: String,
+    pub mount_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateVolumeRequest {
+    pub volume_name: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerVolumeMount {
+    pub volume_name: String,
+    pub mount_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,12 +52,19 @@ pub struct ContainerInspection {
     pub image_ref: String,
     pub labels: BTreeMap<String, String>,
     pub network_ips: BTreeMap<String, String>,
+    pub volume_mounts: Vec<ContainerVolumeMount>,
     pub restart_policy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedImage {
     pub image_ref: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedVolume {
+    pub volume_name: String,
     pub labels: BTreeMap<String, String>,
 }
 
@@ -77,6 +103,7 @@ impl std::error::Error for ProbeError {}
 pub trait DockerRuntime {
     fn build_image(&mut self, request: BuildImageRequest) -> Result<String, DockerRuntimeError>;
     fn ensure_network(&mut self, network_name: &str) -> Result<(), DockerRuntimeError>;
+    fn ensure_volume(&mut self, request: CreateVolumeRequest) -> Result<(), DockerRuntimeError>;
     fn create_container(
         &mut self,
         request: CreateContainerRequest,
@@ -93,9 +120,11 @@ pub trait DockerRuntime {
     ) -> Result<String, DockerRuntimeError>;
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError>;
     fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError>;
+    fn list_managed_volumes(&mut self) -> Result<Vec<ManagedVolume>, DockerRuntimeError>;
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_image(&mut self, image_ref: &str) -> Result<(), DockerRuntimeError>;
+    fn remove_volume(&mut self, volume_name: &str) -> Result<(), DockerRuntimeError>;
 }
 
 pub trait ProbeRuntime {

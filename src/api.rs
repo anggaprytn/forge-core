@@ -146,8 +146,21 @@ pub struct ServiceRuntimeStatus {
     pub health: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeRuntimeStatus>,
     #[serde(default)]
     pub logs_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeRuntimeStatus {
+    pub volume_id: String,
+    pub docker_volume_name: String,
+    pub mount_path: String,
+    pub retention: String,
+    pub attached: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +326,10 @@ pub struct EnvironmentDiagnostics {
     pub env_drift: Option<EnvironmentDiffSummary>,
     #[serde(default)]
     pub recent_secret_mutations: Vec<SecretMutationDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphaned_state_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_repair_events: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_lifecycle_state: Option<DeploymentLifecycleState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

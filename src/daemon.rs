@@ -940,6 +940,13 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(())
     }
 
+    fn ensure_volume(
+        &mut self,
+        _request: crate::runtime::CreateVolumeRequest,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
+
     fn create_container(
         &mut self,
         request: crate::runtime::CreateContainerRequest,
@@ -971,6 +978,7 @@ impl DockerRuntime for NoopDockerRuntime {
                 "forge-managed".into(),
                 "172.18.0.2".into(),
             )]),
+            volume_mounts: Vec::new(),
             restart_policy: "no".into(),
         })
     }
@@ -995,6 +1003,12 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(Vec::new())
     }
 
+    fn list_managed_volumes(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::ManagedVolume>, crate::runtime::DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(
         &mut self,
         _container_name: &str,
@@ -1010,6 +1024,13 @@ impl DockerRuntime for NoopDockerRuntime {
     }
 
     fn remove_image(&mut self, _image_ref: &str) -> Result<(), crate::runtime::DockerRuntimeError> {
+        Ok(())
+    }
+
+    fn remove_volume(
+        &mut self,
+        _volume_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
         Ok(())
     }
 }

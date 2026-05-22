@@ -67,6 +67,7 @@ fn docker_integration_real_adapter_honors_runtime_invariants() {
             environment: Default::default(),
             network_name: None,
             network_aliases: Vec::new(),
+            volume_mounts: Vec::new(),
             command: None,
         })
         .expect("generation-named container should be created");

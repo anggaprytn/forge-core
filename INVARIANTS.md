@@ -241,6 +241,14 @@ resolve rollback target
 
 `current` must not update before rollback route activation succeeds.
 
+Stateful rollback semantics:
+
+- rollback restores runtime topology, not database history
+- Forge does not snapshot databases or copy Docker volume contents
+- persistent volumes are operator-owned durability and must be reattached without rewrite
+- immutable generations do not imply immutable data
+- ephemeral generation-scoped volumes may disappear after GC once the generation is no longer rollback-safe
+
 ---
 
 ## 14. Restart Recovery Invariants

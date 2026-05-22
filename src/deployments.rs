@@ -8,16 +8,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::events::{EventRecord, redact_text};
-use crate::forge_yaml::{ForgeServiceConfig, ForgeYamlConfig, load_optional_forge_yaml};
+use crate::forge_yaml::{
+    ForgeServiceConfig, ForgeStateConfig, ForgeYamlConfig, load_optional_forge_yaml,
+};
 use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
-    BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
-    DockerRuntimeError, ProbeError, ProbeRuntime, RouteInspection, RouteUpdateRequest,
-    RoutingRuntime, RoutingRuntimeError,
+    BuildImageRequest, ContainerInspection, CreateContainerRequest, CreateVolumeRequest,
+    DockerRuntime, DockerRuntimeError, ProbeError, ProbeRuntime, RouteInspection,
+    RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError, VolumeMountRequest,
 };
 use crate::runtime_env::{RuntimeEnvMetadata, build_runtime_env_artifacts};
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
@@ -28,10 +30,11 @@ use crate::storage::{
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedPromotionSummary,
     PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedServiceBuildInfo,
-    PersistedServiceRuntimeInfo, PersistedServiceState, PersistedValidationSummary, PointerStore,
-    ProbeHistoryStore, RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
-    SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
-    load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
+    PersistedServiceRuntimeInfo, PersistedServiceState, PersistedValidationSummary,
+    PersistedVolumeMount, PersistedVolumeRetention, PointerStore, ProbeHistoryStore,
+    RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
+    SnapshotWriter, StorageError, current_unix_timestamp, load_generation_build_info,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 #[derive(Debug)]
@@ -68,6 +71,91 @@ impl Display for DeploymentError {
 impl std::error::Error for DeploymentError {}
 
 const MAX_PROBE_HISTORY_ENTRIES: usize = 64;
+
+fn sanitize_volume_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn stateful_volume_name(
+    record: &DeploymentRecord,
+    generation: u64,
+    state: &ForgeStateConfig,
+) -> String {
+    let project = sanitize_volume_component(&record.project_id);
+    let environment = sanitize_volume_component(&record.environment);
+    let volume = sanitize_volume_component(&state.volume);
+    match state.retention {
+        PersistedVolumeRetention::Persistent => {
+            format!("forge-{project}-{environment}-vol-{volume}")
+        }
+        PersistedVolumeRetention::Ephemeral => {
+            format!("forge-{project}-{environment}-gen-{generation}-vol-{volume}")
+        }
+    }
+}
+
+fn stateful_volume_labels(
+    record: &DeploymentRecord,
+    generation: u64,
+    service_id: &str,
+    state: &ForgeStateConfig,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("forge.managed".into(), "true".into()),
+        ("forge.project_id".into(), record.project_id.clone()),
+        ("forge.environment".into(), record.environment.clone()),
+        ("forge.generation".into(), generation.to_string()),
+        ("forge.service_id".into(), service_id.to_string()),
+        ("forge.volume_id".into(), state.volume.clone()),
+        (
+            "forge.volume_retention".into(),
+            match state.retention {
+                PersistedVolumeRetention::Persistent => "persistent".into(),
+                PersistedVolumeRetention::Ephemeral => "ephemeral".into(),
+            },
+        ),
+    ])
+}
+
+fn persisted_volume_mount(
+    record: &DeploymentRecord,
+    generation: u64,
+    service_id: &str,
+    state: &ForgeStateConfig,
+) -> PersistedVolumeMount {
+    PersistedVolumeMount {
+        volume_id: state.volume.clone(),
+        docker_volume_name: stateful_volume_name(record, generation, state),
+        mount_path: state.mount_path.clone(),
+        service_id: service_id.to_string(),
+        generation,
+        retention: state.retention.clone(),
+    }
+}
+
+fn ensure_stateful_volume<RtD: DockerRuntime>(
+    docker: &mut RtD,
+    record: &DeploymentRecord,
+    generation: u64,
+    service_id: &str,
+    state: &ForgeStateConfig,
+) -> Result<PersistedVolumeMount, DeploymentError> {
+    let mount = persisted_volume_mount(record, generation, service_id, state);
+    docker.ensure_volume(CreateVolumeRequest {
+        volume_name: mount.docker_volume_name.clone(),
+        labels: stateful_volume_labels(record, generation, service_id, state),
+    })?;
+    Ok(mount)
+}
 
 fn append_probe_history_entry(
     env: &EnvironmentPaths,
@@ -591,6 +679,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             )?;
         }
 
+        let volume_mounts: Vec<PersistedVolumeMount> = Vec::new();
+
         match self.docker.create_container(CreateContainerRequest {
             container_name: container_name.clone(),
             image_ref: image_ref.clone(),
@@ -598,6 +688,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             environment: runtime_env.container_env.clone(),
             network_name: execution.network_name.clone(),
             network_aliases: Vec::new(),
+            volume_mounts: volume_mounts
+                .iter()
+                .map(|mount| VolumeMountRequest {
+                    volume_name: mount.docker_volume_name.clone(),
+                    mount_path: mount.mount_path.clone(),
+                })
+                .collect(),
             command: None,
         }) {
             Ok(_) => {}
@@ -799,6 +896,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         .map(|reference| (key.clone(), reference))
                 })
                 .collect(),
+            volume_mounts: volume_mounts.clone(),
             source_ref: record.source_ref.clone(),
             repo_url: record.repo_url.clone(),
             commit_sha: record.commit_sha.clone(),
@@ -1394,6 +1492,16 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "forge.route_id".into(),
                 route_subtree_id_for_service(record, service_id, config.services().len()),
             );
+            let volume_mounts = match service.state.as_ref() {
+                Some(state) => vec![ensure_stateful_volume(
+                    self.docker,
+                    record,
+                    generation,
+                    service_id,
+                    state,
+                )?],
+                None => Vec::new(),
+            };
             diagnostics
                 .append_log_line(&format!("[service:{service_id}] starting"), &secret_values)?;
             self.docker.create_container(CreateContainerRequest {
@@ -1403,6 +1511,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 environment: runtime_env.container_env.clone(),
                 network_name: execution.network_name.clone(),
                 network_aliases: vec![service_id.clone()],
+                volume_mounts: volume_mounts
+                    .iter()
+                    .map(|mount| VolumeMountRequest {
+                        volume_name: mount.docker_volume_name.clone(),
+                        mount_path: mount.mount_path.clone(),
+                    })
+                    .collect(),
                 command: service_command(service),
             })?;
             self.docker.start_container(&container_name)?;
@@ -1462,6 +1577,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                                 .map(|reference| (key.clone(), reference))
                         })
                         .collect(),
+                    volume_mounts: volume_mounts.clone(),
                     source_ref: record.source_ref.clone(),
                     repo_url: record.repo_url.clone(),
                     commit_sha: record.commit_sha.clone(),
@@ -1495,6 +1611,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             probe_path: primary_runtime.probe_path.clone(),
             activation: primary_runtime.activation.clone(),
             environment_variables: primary_runtime.environment_variables.clone(),
+            volume_mounts: primary_runtime.volume_mounts.clone(),
             source_ref: record.source_ref.clone(),
             repo_url: record.repo_url.clone(),
             commit_sha: record.commit_sha.clone(),
@@ -3478,6 +3595,7 @@ fn runtime_services(
                 Some(PersistedActivationMode::Http { .. })
             ),
             environment_variables: runtime.environment_variables.clone(),
+            volume_mounts: runtime.volume_mounts.clone(),
             source_ref: runtime.source_ref.clone(),
             repo_url: runtime.repo_url.clone(),
             commit_sha: runtime.commit_sha.clone(),
@@ -4757,6 +4875,13 @@ pub mod git_backed_rollback_status_correctness {
             Ok(())
         }
 
+        fn ensure_volume(
+            &mut self,
+            _request: crate::runtime::CreateVolumeRequest,
+        ) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
         fn create_container(
             &mut self,
             _request: CreateContainerRequest,
@@ -4798,6 +4923,12 @@ pub mod git_backed_rollback_status_correctness {
             Ok(Vec::new())
         }
 
+        fn list_managed_volumes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedVolume>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
         fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
@@ -4807,6 +4938,10 @@ pub mod git_backed_rollback_status_correctness {
         }
 
         fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
     }
@@ -4861,6 +4996,7 @@ pub mod git_backed_rollback_status_correctness {
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
             environment_variables: BTreeMap::new(),
+            volume_mounts: Vec::new(),
             source_ref: Some(source_ref.into()),
             repo_url: Some(format!("https://github.com/example/{project_id}.git")),
             commit_sha: Some(commit_sha.into()),
@@ -5047,6 +5183,7 @@ pub mod git_backed_rollback_status_correctness {
             image_ref: format!("forge/{project_id}:{environment}-gen-{generation}"),
             labels: BTreeMap::new(),
             network_ips: BTreeMap::from([(FORGE_MANAGED_DOCKER_NETWORK.into(), ip.into())]),
+            volume_mounts: Vec::new(),
             restart_policy: "no".into(),
         }
     }
@@ -5079,7 +5216,18 @@ pub mod git_backed_rollback_status_correctness {
         pointers.swap_current(2).unwrap();
 
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
-        queue.enqueue(rollback_record("api", "production")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
         let mut docker = RollbackDockerRuntime {
             inspections: BTreeMap::from([(
                 generation_container_name("production", "api", 1),
@@ -5143,7 +5291,18 @@ pub mod git_backed_rollback_status_correctness {
         pointers.swap_current(2).unwrap();
 
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
-        queue.enqueue(rollback_record("api", "production")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
         let mut docker = RollbackDockerRuntime {
             inspections: BTreeMap::from([(
                 generation_container_name("production", "api", 1),
@@ -5209,7 +5368,18 @@ pub mod git_backed_rollback_status_correctness {
         pointers.swap_current(2).unwrap();
 
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
-        queue.enqueue(rollback_record("api", "production")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
         let mut docker = RollbackDockerRuntime {
             inspections: BTreeMap::from([(
                 generation_container_name("production", "api", 1),
@@ -5283,7 +5453,18 @@ pub mod git_backed_rollback_status_correctness {
         pointers.swap_current(2).unwrap();
 
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
-        queue.enqueue(rollback_record("api", "production")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
         let mut docker = RollbackDockerRuntime {
             inspections: BTreeMap::from([(
                 generation_container_name("production", "api", 1),
@@ -5351,7 +5532,18 @@ pub mod git_backed_rollback_status_correctness {
         pointers.swap_current(2).unwrap();
 
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
-        queue.enqueue(rollback_record("api", "production")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
         let mut docker = RollbackDockerRuntime {
             inspections: BTreeMap::from([(
                 generation_container_name("production", "api", 1),
@@ -5553,7 +5745,18 @@ pub mod git_backed_rollback_status_correctness {
         pointers.swap_current(2).unwrap();
 
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
-        queue.enqueue(rollback_record("api", "production")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
         let mut docker = RollbackDockerRuntime {
             inspections: BTreeMap::from([(
                 generation_container_name("production", "api", 1),
@@ -6046,6 +6249,13 @@ pub mod runtime_environment_snapshots {
             Ok(())
         }
 
+        fn ensure_volume(
+            &mut self,
+            _request: crate::runtime::CreateVolumeRequest,
+        ) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
         fn create_container(
             &mut self,
             _request: CreateContainerRequest,
@@ -6084,6 +6294,12 @@ pub mod runtime_environment_snapshots {
             Ok(Vec::new())
         }
 
+        fn list_managed_volumes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedVolume>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
         fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
@@ -6093,6 +6309,10 @@ pub mod runtime_environment_snapshots {
         }
 
         fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
     }
@@ -6381,6 +6601,7 @@ pub mod runtime_environment_snapshots {
                 image_ref: "forge/api:production-gen-1".into(),
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([("forge-net".into(), "172.19.0.5".into())]),
+                volume_mounts: Vec::new(),
                 restart_policy: "no".into(),
             },
         };
@@ -8476,10 +8697,13 @@ pub mod multi_service_orchestration {
         containers: BTreeMap<String, bool>,
         container_images: BTreeMap<String, String>,
         container_logs: BTreeMap<String, String>,
+        volumes: BTreeMap<String, BTreeMap<String, String>>,
         build_requests: Vec<BuildImageRequest>,
+        ensured_volumes: Vec<crate::runtime::CreateVolumeRequest>,
         created: Vec<String>,
         create_requests: Vec<CreateContainerRequest>,
         started: Vec<String>,
+        removed_volumes: Vec<String>,
     }
 
     impl DockerRuntime for MultiServiceDockerRuntime {
@@ -8492,6 +8716,17 @@ pub mod multi_service_orchestration {
         }
 
         fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn ensure_volume(
+            &mut self,
+            request: crate::runtime::CreateVolumeRequest,
+        ) -> Result<(), DockerRuntimeError> {
+            self.volumes
+                .entry(request.volume_name.clone())
+                .or_insert(request.labels.clone());
+            self.ensured_volumes.push(request);
             Ok(())
         }
 
@@ -8552,6 +8787,7 @@ pub mod multi_service_orchestration {
                 image_ref,
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([(FORGE_MANAGED_DOCKER_NETWORK.into(), ip.into())]),
+                volume_mounts: request_volume_mounts(&self.create_requests, container_name),
                 restart_policy: "no".into(),
             })
         }
@@ -8580,6 +8816,19 @@ pub mod multi_service_orchestration {
             Ok(Vec::new())
         }
 
+        fn list_managed_volumes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedVolume>, DockerRuntimeError> {
+            Ok(self
+                .volumes
+                .iter()
+                .map(|(volume_name, labels)| crate::runtime::ManagedVolume {
+                    volume_name: volume_name.clone(),
+                    labels: labels.clone(),
+                })
+                .collect())
+        }
+
         fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
@@ -8591,6 +8840,33 @@ pub mod multi_service_orchestration {
         fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
+
+        fn remove_volume(&mut self, volume_name: &str) -> Result<(), DockerRuntimeError> {
+            self.removed_volumes.push(volume_name.to_string());
+            self.volumes.remove(volume_name);
+            Ok(())
+        }
+    }
+
+    fn request_volume_mounts(
+        requests: &[CreateContainerRequest],
+        container_name: &str,
+    ) -> Vec<crate::runtime::ContainerVolumeMount> {
+        requests
+            .iter()
+            .rev()
+            .find(|request| request.container_name == container_name)
+            .map(|request| {
+                request
+                    .volume_mounts
+                    .iter()
+                    .map(|mount| crate::runtime::ContainerVolumeMount {
+                        volume_name: mount.volume_name.clone(),
+                        mount_path: mount.mount_path.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[derive(Default)]
@@ -8645,6 +8921,37 @@ pub mod multi_service_orchestration {
                     worker_runtime,
                     concat!("      depends_on:\n", "        - api\n",)
                 )
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_stateful_multi_service_forge_yaml(root: &std::path::Path, retention: &str) {
+        fs::write(
+            root.join("forge.yml"),
+            format!(
+                concat!(
+                    "version: 1\n",
+                    "name: api\n",
+                    "type: web\n",
+                    "build:\n",
+                    "  dockerfile: Dockerfile\n",
+                    "  context: .\n",
+                    "services:\n",
+                    "  postgres:\n",
+                    "    runtime:\n",
+                    "      image: postgres:16\n",
+                    "    state:\n",
+                    "      volume: postgres-data\n",
+                    "      mount_path: /var/lib/postgresql/data\n",
+                    "      retention: {retention}\n",
+                    "  api:\n",
+                    "    runtime:\n",
+                    "      port: 3000\n",
+                    "      depends_on:\n",
+                    "        - postgres\n",
+                ),
+                retention = retention
             ),
         )
         .unwrap();
@@ -8707,6 +9014,53 @@ pub mod multi_service_orchestration {
         .unwrap();
     }
 
+    fn deploy_once_with_stateful_yaml(
+        root: &std::path::Path,
+        docker: &mut MultiServiceDockerRuntime,
+        deployment_id: &str,
+    ) {
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: deployment_id.into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        DeploymentExecutor::new(
+            root,
+            &queue,
+            docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(root))
+        .execute_next()
+        .unwrap();
+    }
+
     #[test]
     fn early_deploy_failure_persists_generation_diagnostics() {
         let root = test_root("early-deploy-failure-persists-generation-diagnostics");
@@ -8745,6 +9099,188 @@ pub mod multi_service_orchestration {
         assert!(summary.contains("\"deployment_id\": \"dep-1\""));
         let snapshot = fs::read_to_string(generation_dir.join("snapshot.json")).unwrap();
         assert!(snapshot.contains("\"state\": \"failed\""));
+    }
+
+    #[test]
+    fn persistent_volume_survives_redeploy() {
+        let root = test_root("persistent-volume-survives-redeploy");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_stateful_multi_service_forge_yaml(&root, "persistent");
+        let mut docker = MultiServiceDockerRuntime::default();
+
+        deploy_once_with_stateful_yaml(&root, &mut docker, "dep-1");
+        deploy_once_with_stateful_yaml(&root, &mut docker, "dep-2");
+
+        let postgres_requests = docker
+            .create_requests
+            .iter()
+            .filter(|request| request.container_name.contains("postgres"))
+            .collect::<Vec<_>>();
+        assert_eq!(postgres_requests.len(), 2);
+        assert_eq!(
+            postgres_requests[0].volume_mounts[0].volume_name,
+            postgres_requests[1].volume_mounts[0].volume_name
+        );
+        assert!(
+            docker.removed_volumes.is_empty(),
+            "persistent volumes must not be removed during redeploy"
+        );
+    }
+
+    #[test]
+    fn rollback_reuses_persistent_volume() {
+        let root = test_root("rollback-reuses-persistent-volume");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_stateful_multi_service_forge_yaml(&root, "persistent");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                },
+            ],
+        };
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-2".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        for _ in 0..2 {
+            DeploymentExecutor::new(
+                &root,
+                &queue,
+                &mut docker,
+                &mut probes,
+                &mut routing,
+                ValidationPolicy::default(),
+            )
+            .with_execution_config(default_execution_config(&root))
+            .execute_next()
+            .unwrap();
+        }
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let gen1 = load_generation_runtime_info(&env, 1)
+            .unwrap()
+            .unwrap()
+            .services["postgres"]
+            .volume_mounts[0]
+            .docker_volume_name
+            .clone();
+        let gen2 = load_generation_runtime_info(&env, 2)
+            .unwrap()
+            .unwrap()
+            .services["postgres"]
+            .volume_mounts[0]
+            .docker_volume_name
+            .clone();
+        assert_eq!(gen1, gen2);
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn stateful_service_runtime_truth_persisted() {
+        let root = test_root("stateful-service-runtime-truth-persisted");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_stateful_multi_service_forge_yaml(&root, "ephemeral");
+        let mut docker = MultiServiceDockerRuntime::default();
+
+        deploy_once_with_stateful_yaml(&root, &mut docker, "dep-1");
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        let postgres = &runtime.services["postgres"];
+        assert_eq!(postgres.volume_mounts.len(), 1);
+        assert_eq!(postgres.volume_mounts[0].volume_id, "postgres-data");
+        assert_eq!(
+            postgres.volume_mounts[0].mount_path,
+            "/var/lib/postgresql/data"
+        );
+        assert!(matches!(
+            postgres.volume_mounts[0].retention,
+            PersistedVolumeRetention::Ephemeral
+        ));
     }
 
     #[test]

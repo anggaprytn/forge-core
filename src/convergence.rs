@@ -9,8 +9,9 @@ use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue};
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
-    ContainerInspection, CreateContainerRequest, DockerRuntime, ManagedImage, ProbeRuntime,
-    RouteInspection, RouteUpdateRequest, RoutingRuntime,
+    ContainerInspection, ContainerVolumeMount, CreateContainerRequest, CreateVolumeRequest,
+    DockerRuntime, ManagedImage, ManagedVolume, ProbeRuntime, RouteInspection, RouteUpdateRequest,
+    RoutingRuntime, VolumeMountRequest,
 };
 use crate::runtime_env::restore_runtime_env;
 use crate::secrets::SecretStore;
@@ -21,9 +22,10 @@ use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     GcActionRecord, GcStore, PersistedActivationMode, PersistedBuildInfo,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PersistedSecretReference, PersistedServiceRuntimeInfo, PointerStore,
-    ProbeHistoryStore, RuntimeHealthState, RuntimeStateStore, atomic_write, current_unix_timestamp,
-    load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
+    PersistedRuntimeInfo, PersistedSecretReference, PersistedServiceRuntimeInfo,
+    PersistedVolumeRetention, PointerStore, ProbeHistoryStore, RuntimeHealthState,
+    RuntimeStateStore, atomic_write, current_unix_timestamp, load_generation_build_info,
+    load_generation_resolved_runtime, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,58 @@ use serde::{Deserialize, Serialize};
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
 const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
 const MAX_PROBE_HISTORY_ENTRIES: usize = 64;
+
+fn expected_volume_mounts(runtime: &PersistedServiceRuntimeInfo) -> Vec<ContainerVolumeMount> {
+    runtime
+        .volume_mounts
+        .iter()
+        .map(|mount| ContainerVolumeMount {
+            volume_name: mount.docker_volume_name.clone(),
+            mount_path: mount.mount_path.clone(),
+        })
+        .collect()
+}
+
+fn volume_mounts_match(expected: &[ContainerVolumeMount], actual: &[ContainerVolumeMount]) -> bool {
+    let normalize = |mounts: &[ContainerVolumeMount]| {
+        let mut values = mounts
+            .iter()
+            .map(|mount| (mount.volume_name.clone(), mount.mount_path.clone()))
+            .collect::<Vec<_>>();
+        values.sort();
+        values
+    };
+    normalize(expected) == normalize(actual)
+}
+
+fn ensure_runtime_volumes<RtD: DockerRuntime>(
+    project_id: &str,
+    environment: &str,
+    runtime: &PersistedServiceRuntimeInfo,
+    docker: &mut RtD,
+) -> Result<(), ConvergenceError> {
+    for mount in &runtime.volume_mounts {
+        docker.ensure_volume(CreateVolumeRequest {
+            volume_name: mount.docker_volume_name.clone(),
+            labels: BTreeMap::from([
+                ("forge.managed".into(), "true".into()),
+                ("forge.project_id".into(), project_id.to_string()),
+                ("forge.environment".into(), environment.to_string()),
+                ("forge.generation".into(), mount.generation.to_string()),
+                ("forge.service_id".into(), mount.service_id.clone()),
+                ("forge.volume_id".into(), mount.volume_id.clone()),
+                (
+                    "forge.volume_retention".into(),
+                    match mount.retention {
+                        PersistedVolumeRetention::Persistent => "persistent".into(),
+                        PersistedVolumeRetention::Ephemeral => "ephemeral".into(),
+                    },
+                ),
+            ]),
+        })?;
+    }
+    Ok(())
+}
 
 fn append_probe_history_entry(
     env: &EnvironmentPaths,
@@ -284,6 +338,8 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
         managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
         let mut managed_images = docker.list_managed_images()?;
         managed_images.sort_by(|left, right| left.image_ref.cmp(&right.image_ref));
+        let mut managed_volumes = docker.list_managed_volumes()?;
+        managed_volumes.sort_by(|left, right| left.volume_name.cmp(&right.volume_name));
         let mut managed_routes = routing.list_managed_routes()?;
         managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
         let queue_state = self.queue.load_state()?;
@@ -342,6 +398,7 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
                 active_record,
                 &managed_containers,
                 &managed_images,
+                &managed_volumes,
                 &managed_routes,
                 &mut attempted_cleanup,
             )?;
@@ -691,6 +748,8 @@ where
         managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
         let mut managed_images = self.docker.list_managed_images()?;
         managed_images.sort_by(|left, right| left.image_ref.cmp(&right.image_ref));
+        let mut managed_volumes = self.docker.list_managed_volumes()?;
+        managed_volumes.sort_by(|left, right| left.volume_name.cmp(&right.volume_name));
         let mut managed_routes = self.routing.list_managed_routes()?;
         managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
         let queue_state = self.queue.load_state()?;
@@ -739,6 +798,7 @@ where
             queue_state.active.as_ref(),
             &managed_containers,
             &managed_images,
+            &managed_volumes,
             &managed_routes,
             &mut attempted_cleanup,
         )?;
@@ -1189,6 +1249,7 @@ fn runtime_services(
                 Some(PersistedActivationMode::Http { .. })
             ),
             environment_variables: runtime_info.environment_variables.clone(),
+            volume_mounts: runtime_info.volume_mounts.clone(),
             source_ref: runtime_info.source_ref.clone(),
             repo_url: runtime_info.repo_url.clone(),
             commit_sha: runtime_info.commit_sha.clone(),
@@ -1697,6 +1758,8 @@ where
     managed_containers.sort_by(|left, right| left.container_name.cmp(&right.container_name));
     let mut managed_images = docker.list_managed_images()?;
     managed_images.sort_by(|left, right| left.image_ref.cmp(&right.image_ref));
+    let mut managed_volumes = docker.list_managed_volumes()?;
+    managed_volumes.sort_by(|left, right| left.volume_name.cmp(&right.volume_name));
     let mut managed_routes = routing.list_managed_routes()?;
     managed_routes.sort_by(|left, right| left.subtree_id.cmp(&right.subtree_id));
     let queue_state = queue.load_state()?;
@@ -1806,6 +1869,7 @@ where
             }
 
             let build_info = load_generation_build_info(env, generation)?;
+            let runtime_info = load_generation_runtime_info(env, generation)?;
             let image_ref = build_info
                 .as_ref()
                 .map(|build| build.image_ref.clone())
@@ -1894,6 +1958,56 @@ where
                         source_path.display().to_string(),
                         "unreferenced checkout already removed",
                     ));
+                }
+            }
+
+            if let Some(runtime_info) = runtime_info.as_ref() {
+                for service in runtime_services(runtime_info, "").values() {
+                    for mount in &service.volume_mounts {
+                        let subject = mount.docker_volume_name.clone();
+                        if matches!(mount.retention, PersistedVolumeRetention::Persistent) {
+                            actions.push(gc_action_record(
+                                project_id,
+                                environment,
+                                Some(generation),
+                                dry_run,
+                                Some("volume"),
+                                Some(subject),
+                                "retain",
+                                "persistent state is operator-owned durability",
+                                "protected",
+                                Vec::new(),
+                                vec!["persistent volume".into()],
+                            ));
+                        } else if managed_volumes
+                            .iter()
+                            .any(|volume| volume.volume_name == mount.docker_volume_name)
+                        {
+                            actions.push(gc_action_record(
+                                project_id,
+                                environment,
+                                Some(generation),
+                                dry_run,
+                                Some("volume"),
+                                Some(subject.clone()),
+                                "remove",
+                                "ephemeral generation-scoped volume",
+                                if dry_run { "would_remove" } else { "planned" },
+                                vec![subject],
+                                Vec::new(),
+                            ));
+                        } else {
+                            actions.push(gc_missing_artifact_action(
+                                project_id,
+                                environment,
+                                Some(generation),
+                                dry_run,
+                                "volume",
+                                subject,
+                                "ephemeral volume already removed",
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -2008,6 +2122,7 @@ where
                 None,
                 &managed_containers,
                 &managed_images,
+                &managed_volumes,
                 &managed_routes,
                 &mut attempted_cleanup,
             )?;
@@ -2559,6 +2674,7 @@ fn enforce_generation_retention<RtD, RtR>(
     active_record: Option<&DeploymentRecord>,
     managed_containers: &[ContainerInspection],
     managed_images: &[ManagedImage],
+    managed_volumes: &[ManagedVolume],
     managed_routes: &[RouteInspection],
     attempted_cleanup: &mut BTreeSet<(String, String, u64)>,
 ) -> Result<(), ConvergenceError>
@@ -2599,6 +2715,7 @@ where
             generation,
             managed_containers,
             managed_images,
+            managed_volumes,
         )?;
         if cleanup.container_removed {
             attempted_cleanup.insert((project_id.to_string(), environment.to_string(), generation));
@@ -2788,6 +2905,36 @@ fn cleanup_source_checkout_if_unreferenced(
     }
 }
 
+fn cleanup_ephemeral_volumes<RtD: DockerRuntime>(
+    docker: &mut RtD,
+    runtime_info: Option<&PersistedRuntimeInfo>,
+    generation: u64,
+    managed_volumes: &[ManagedVolume],
+) -> Result<Vec<String>, ConvergenceError> {
+    let Some(runtime_info) = runtime_info else {
+        return Ok(Vec::new());
+    };
+    let mut removed = Vec::new();
+    for service in runtime_services(runtime_info, "").values() {
+        for mount in &service.volume_mounts {
+            if mount.generation != generation
+                || !matches!(mount.retention, PersistedVolumeRetention::Ephemeral)
+            {
+                continue;
+            }
+            if !managed_volumes
+                .iter()
+                .any(|volume| volume.volume_name == mount.docker_volume_name)
+            {
+                continue;
+            }
+            docker.remove_volume(&mount.docker_volume_name)?;
+            removed.push(mount.docker_volume_name.clone());
+        }
+    }
+    Ok(removed)
+}
+
 fn retention_cleanup_generation<RtD, RtR>(
     docker: &mut RtD,
     routing: &mut RtR,
@@ -2798,6 +2945,7 @@ fn retention_cleanup_generation<RtD, RtR>(
     generation: u64,
     managed_containers: &[ContainerInspection],
     managed_images: &[ManagedImage],
+    managed_volumes: &[ManagedVolume],
 ) -> Result<CleanupRecord, ConvergenceError>
 where
     RtD: DockerRuntime,
@@ -2891,6 +3039,8 @@ where
 
     let removed_checkout =
         cleanup_source_checkout_if_unreferenced(env, project_id, generation, build_info.as_ref())?;
+    let removed_volumes =
+        cleanup_ephemeral_volumes(docker, runtime_info.as_ref(), generation, managed_volumes)?;
     match fs::remove_dir_all(env.generation_dir(generation)) {
         Ok(()) => {
             append_retention_event(
@@ -2912,6 +3062,7 @@ where
                 "removed",
                 std::iter::once(env.generation_dir(generation).display().to_string())
                     .chain(removed_checkout.into_iter())
+                    .chain(removed_volumes.into_iter())
                     .collect(),
                 Vec::new(),
             )?;
@@ -3067,15 +3218,42 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
     runtime: &PersistedServiceRuntimeInfo,
     docker: &mut RtD,
 ) -> Result<ContainerInspection, ConvergenceError> {
+    let expected_mounts = expected_volume_mounts(runtime);
     match docker.inspect_container(&runtime.container_name) {
-        Ok(inspection) if inspection.running => return Ok(inspection),
+        Ok(inspection)
+            if inspection.running
+                && volume_mounts_match(&expected_mounts, &inspection.volume_mounts) =>
+        {
+            return Ok(inspection);
+        }
         Ok(_) => {
-            docker.start_container(&runtime.container_name)?;
-            return Ok(docker.inspect_container(&runtime.container_name)?);
+            if volume_mounts_match(
+                &expected_mounts,
+                &docker
+                    .inspect_container(&runtime.container_name)?
+                    .volume_mounts,
+            ) {
+                docker.start_container(&runtime.container_name)?;
+                return Ok(docker.inspect_container(&runtime.container_name)?);
+            }
+            docker.remove_container(&runtime.container_name)?;
+            append_cleanup_event(
+                &EnvironmentPaths::new(storage_root, project_id, environment),
+                project_id,
+                environment,
+                generation,
+                Some(deployment_id.to_string()),
+                "VOLUME_ATTACHMENT_REPAIRED",
+                Some(format!(
+                    "recreated container {} due to stale volume attachment state",
+                    runtime.container_name
+                )),
+            )?;
         }
         Err(_) => {}
     }
 
+    ensure_runtime_volumes(project_id, environment, runtime, docker)?;
     let labels = BTreeMap::from([
         ("forge.managed".into(), "true".into()),
         ("forge.project_id".into(), project_id.to_string()),
@@ -3083,7 +3261,7 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
         ("forge.generation".into(), generation.to_string()),
         ("forge.deployment_id".into(), deployment_id.to_string()),
     ]);
-    let environment = resolve_recovery_environment(
+    let container_environment = resolve_recovery_environment(
         storage_root,
         project_id,
         environment,
@@ -3094,13 +3272,45 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
         container_name: runtime.container_name.to_string(),
         image_ref: runtime.image_ref.to_string(),
         labels,
-        environment,
+        environment: container_environment,
         network_name: runtime.network_name.clone(),
         network_aliases: Vec::new(),
+        volume_mounts: runtime
+            .volume_mounts
+            .iter()
+            .map(|mount| VolumeMountRequest {
+                volume_name: mount.docker_volume_name.clone(),
+                mount_path: mount.mount_path.clone(),
+            })
+            .collect(),
         command: runtime.command.clone(),
     })?;
     docker.start_container(&runtime.container_name)?;
-    Ok(docker.inspect_container(&runtime.container_name)?)
+    let inspection = docker.inspect_container(&runtime.container_name)?;
+    if !volume_mounts_match(&expected_mounts, &inspection.volume_mounts) {
+        return Err(ConvergenceError::Storage(crate::storage::StorageError::Io(
+            std::io::Error::other(format!(
+                "recreated container {} without expected volume attachments",
+                runtime.container_name
+            )),
+        )));
+    }
+    if !expected_mounts.is_empty() {
+        append_cleanup_event(
+            &EnvironmentPaths::new(storage_root, project_id, environment),
+            project_id,
+            environment,
+            generation,
+            Some(deployment_id.to_string()),
+            "VOLUME_ATTACHMENT_REPAIRED",
+            Some(format!(
+                "restored {} volume attachment(s) for {}",
+                expected_mounts.len(),
+                runtime.container_name
+            )),
+        )?;
+    }
+    Ok(inspection)
 }
 
 fn resolve_recovery_environment(
@@ -3263,6 +3473,9 @@ impl ProbeRuntime for TestProbeRuntime {
 struct TestDockerRuntime {
     containers: std::collections::BTreeMap<String, bool>,
     images: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    volumes: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    container_volume_mounts:
+        std::collections::BTreeMap<String, Vec<crate::runtime::ContainerVolumeMount>>,
     network_ips: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     remove_failures: std::collections::BTreeMap<String, usize>,
     image_remove_failures: std::collections::BTreeMap<String, usize>,
@@ -3271,6 +3484,7 @@ struct TestDockerRuntime {
     start_calls: Vec<String>,
     stop_calls: Vec<String>,
     remove_calls: Vec<String>,
+    removed_volumes: Vec<String>,
     image_remove_calls: Vec<String>,
 }
 
@@ -3334,6 +3548,17 @@ impl DockerRuntime for TestDockerRuntime {
         request: crate::runtime::CreateContainerRequest,
     ) -> Result<String, crate::runtime::DockerRuntimeError> {
         self.create_calls.push(request.container_name.clone());
+        self.container_volume_mounts.insert(
+            request.container_name.clone(),
+            request
+                .volume_mounts
+                .iter()
+                .map(|mount| crate::runtime::ContainerVolumeMount {
+                    volume_name: mount.volume_name.clone(),
+                    mount_path: mount.mount_path.clone(),
+                })
+                .collect(),
+        );
         self.containers.insert(request.container_name.clone(), true);
         Ok(request.container_name)
     }
@@ -3370,6 +3595,11 @@ impl DockerRuntime for TestDockerRuntime {
             image_ref: test_image_ref(container_name),
             labels: Default::default(),
             network_ips: self.inspection_network_ips(container_name),
+            volume_mounts: self
+                .container_volume_mounts
+                .get(container_name)
+                .cloned()
+                .unwrap_or_default(),
             restart_policy: "no".into(),
         })
     }
@@ -3414,6 +3644,11 @@ impl DockerRuntime for TestDockerRuntime {
                     ),
                 ]),
                 network_ips: self.inspection_network_ips(container_name),
+                volume_mounts: self
+                    .container_volume_mounts
+                    .get(container_name)
+                    .cloned()
+                    .unwrap_or_default(),
                 restart_policy: "no".into(),
             })
             .collect())
@@ -3427,6 +3662,29 @@ impl DockerRuntime for TestDockerRuntime {
             .iter()
             .map(|(image_ref, labels)| ManagedImage {
                 image_ref: image_ref.clone(),
+                labels: labels.clone(),
+            })
+            .collect())
+    }
+
+    fn ensure_volume(
+        &mut self,
+        request: crate::runtime::CreateVolumeRequest,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        self.volumes
+            .entry(request.volume_name)
+            .or_insert(request.labels);
+        Ok(())
+    }
+
+    fn list_managed_volumes(
+        &mut self,
+    ) -> Result<Vec<ManagedVolume>, crate::runtime::DockerRuntimeError> {
+        Ok(self
+            .volumes
+            .iter()
+            .map(|(volume_name, labels)| ManagedVolume {
+                volume_name: volume_name.clone(),
                 labels: labels.clone(),
             })
             .collect())
@@ -3469,6 +3727,15 @@ impl DockerRuntime for TestDockerRuntime {
             }
         }
         self.images.remove(image_ref);
+        Ok(())
+    }
+
+    fn remove_volume(
+        &mut self,
+        volume_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        self.removed_volumes.push(volume_name.to_string());
+        self.volumes.remove(volume_name);
         Ok(())
     }
 }
@@ -5682,6 +5949,7 @@ pub mod multi_service_convergence_and_gc {
                     required_for_promotion: true,
                     externally_exposed: true,
                     environment_variables: BTreeMap::new(),
+                    volume_mounts: Vec::new(),
                     source_ref: None,
                     repo_url: None,
                     commit_sha: None,
@@ -5704,6 +5972,7 @@ pub mod multi_service_convergence_and_gc {
                     required_for_promotion: true,
                     externally_exposed: false,
                     environment_variables: BTreeMap::new(),
+                    volume_mounts: Vec::new(),
                     source_ref: None,
                     repo_url: None,
                     commit_sha: None,
@@ -5722,6 +5991,7 @@ pub mod multi_service_convergence_and_gc {
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
             environment_variables: BTreeMap::new(),
+            volume_mounts: Vec::new(),
             source_ref: None,
             repo_url: None,
             commit_sha: None,
@@ -5735,6 +6005,90 @@ pub mod multi_service_convergence_and_gc {
             format!("{runtime}\n").as_bytes(),
         )
         .unwrap();
+    }
+
+    fn setup_stateful_generation(
+        root: &std::path::Path,
+        generation: u64,
+        retention: PersistedVolumeRetention,
+    ) -> String {
+        let env = EnvironmentPaths::new(root, "api", "production");
+        SnapshotWriter::new(env.clone(), generation)
+            .unwrap()
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
+        let volume_name = match retention {
+            PersistedVolumeRetention::Persistent => {
+                "forge-api-production-vol-postgres-data".to_string()
+            }
+            PersistedVolumeRetention::Ephemeral => {
+                format!("forge-api-production-gen-{generation}-vol-postgres-data")
+            }
+        };
+        let runtime = serde_json::to_string_pretty(&PersistedRuntimeInfo {
+            container_name: format!("prod-api-postgres-gen-{generation}"),
+            running: true,
+            network_name: Some("forge-test".into()),
+            probe_path: None,
+            activation: Some(PersistedActivationMode::Direct),
+            environment_variables: BTreeMap::new(),
+            volume_mounts: vec![crate::storage::PersistedVolumeMount {
+                volume_id: "postgres-data".into(),
+                docker_volume_name: volume_name.clone(),
+                mount_path: "/var/lib/postgresql/data".into(),
+                service_id: "postgres".into(),
+                generation,
+                retention: retention.clone(),
+            }],
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
+            source_path: None,
+            services: BTreeMap::from([(
+                "postgres".into(),
+                PersistedServiceRuntimeInfo {
+                    service_id: "postgres".into(),
+                    container_name: format!("prod-api-postgres-gen-{generation}"),
+                    image_ref: "postgres:16".into(),
+                    running: true,
+                    state: crate::storage::PersistedServiceState::Healthy,
+                    network_name: Some("forge-test".into()),
+                    probe_path: None,
+                    activation: Some(PersistedActivationMode::Direct),
+                    command: None,
+                    depends_on: Vec::new(),
+                    required_for_promotion: true,
+                    externally_exposed: false,
+                    environment_variables: BTreeMap::new(),
+                    volume_mounts: vec![crate::storage::PersistedVolumeMount {
+                        volume_id: "postgres-data".into(),
+                        docker_volume_name: volume_name.clone(),
+                        mount_path: "/var/lib/postgresql/data".into(),
+                        service_id: "postgres".into(),
+                        generation,
+                        retention,
+                    }],
+                    source_ref: None,
+                    repo_url: None,
+                    commit_sha: None,
+                    source_path: None,
+                },
+            )]),
+            startup_order: vec!["postgres".into()],
+        })
+        .unwrap();
+        crate::storage::atomic_write(
+            env.generation_dir(generation).join("runtime.json"),
+            format!("{runtime}\n").as_bytes(),
+        )
+        .unwrap();
+        crate::storage::atomic_write(
+            env.generation_dir(generation).join("build.json"),
+            format!("{{\"deployment_id\":\"dep-{generation}\",\"image_ref\":\"postgres:16\"}}\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        volume_name
     }
 
     #[test]
@@ -5787,6 +6141,113 @@ pub mod multi_service_convergence_and_gc {
                     .protected
                     .iter()
                     .any(|reason| reason == "rollback-safe generation")
+        }));
+    }
+
+    #[test]
+    fn convergence_repairs_missing_volume_attachment() {
+        let root = test_root("convergence-repairs-missing-volume-attachment");
+        register_project(&root, "api", "example.com");
+        let volume_name = setup_stateful_generation(&root, 1, PersistedVolumeRetention::Persistent);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker
+            .containers
+            .insert("prod-api-postgres-gen-1".into(), true);
+        docker.network_ips.insert(
+            "prod-api-postgres-gen-1".into(),
+            BTreeMap::from([("forge-test".into(), "172.18.0.11".into())]),
+        );
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        assert!(
+            docker
+                .create_calls
+                .iter()
+                .any(|name| name == "prod-api-postgres-gen-1")
+        );
+        assert!(docker.volumes.contains_key(&volume_name));
+    }
+
+    #[test]
+    fn ephemeral_volume_removed_by_gc() {
+        let root = test_root("ephemeral-volume-removed-by-gc");
+        let volume_name = setup_stateful_generation(&root, 1, PersistedVolumeRetention::Ephemeral);
+        setup_stateful_generation(&root, 2, PersistedVolumeRetention::Ephemeral);
+        setup_stateful_generation(&root, 3, PersistedVolumeRetention::Ephemeral);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.volumes.insert(
+            volume_name.clone(),
+            BTreeMap::from([
+                ("forge.managed".into(), "true".into()),
+                ("forge.project_id".into(), "api".into()),
+                ("forge.environment".into(), "production".into()),
+                ("forge.generation".into(), "1".into()),
+                ("forge.volume_retention".into(), "ephemeral".into()),
+            ]),
+        );
+        let mut routing = TestRoutingRuntime::default();
+
+        garbage_collect(&root, &queue, &mut docker, &mut routing, false).unwrap();
+
+        assert!(docker.image_remove_calls.is_empty() || !docker.removed_volumes.is_empty());
+        assert!(
+            docker
+                .removed_volumes
+                .iter()
+                .any(|name| name == &volume_name)
+        );
+    }
+
+    #[test]
+    fn gc_preserves_persistent_volumes() {
+        let root = test_root("gc-preserves-persistent-volumes");
+        let volume_name = setup_stateful_generation(&root, 1, PersistedVolumeRetention::Persistent);
+        setup_stateful_generation(&root, 2, PersistedVolumeRetention::Persistent);
+        setup_stateful_generation(&root, 3, PersistedVolumeRetention::Persistent);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+        pointers.swap_current(3).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.volumes.insert(
+            volume_name.clone(),
+            BTreeMap::from([
+                ("forge.managed".into(), "true".into()),
+                ("forge.project_id".into(), "api".into()),
+                ("forge.environment".into(), "production".into()),
+                ("forge.generation".into(), "1".into()),
+                ("forge.volume_retention".into(), "persistent".into()),
+            ]),
+        );
+        let mut routing = TestRoutingRuntime::default();
+
+        let report = garbage_collect(&root, &queue, &mut docker, &mut routing, true).unwrap();
+
+        assert!(
+            !docker
+                .removed_volumes
+                .iter()
+                .any(|name| name == &volume_name)
+        );
+        assert!(report.actions.iter().any(|action| {
+            action.subject_kind.as_deref() == Some("volume")
+                && action.subject.as_deref() == Some(volume_name.as_str())
+                && action.outcome == "protected"
         }));
     }
 }

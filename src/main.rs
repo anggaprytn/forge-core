@@ -1355,6 +1355,18 @@ fn render_services_section(services: &[ServiceRuntimeStatus], include_logs: bool
         if let Some(reason) = service.failure_reason.as_deref() {
             output.push_str(&format!("    failure_reason: {reason}\n"));
         }
+        if !service.volumes.is_empty() {
+            output.push_str("    volumes:\n");
+            for volume in &service.volumes {
+                output.push_str(&format!(
+                    "      {} -> {} ({}, attached={})\n",
+                    volume.docker_volume_name, volume.mount_path, volume.retention, volume.attached
+                ));
+                for warning in &volume.warnings {
+                    output.push_str(&format!("      warning: {warning}\n"));
+                }
+            }
+        }
         if include_logs {
             output.push_str("    logs_tail:\n");
             if service.logs_tail.is_empty() {
@@ -1697,6 +1709,20 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
     if !diagnostics.services.is_empty() {
         output.push('\n');
         output.push_str(&render_services_section(&diagnostics.services, true));
+    }
+    if !diagnostics.orphaned_state_warnings.is_empty() {
+        output.push('\n');
+        output.push_str("State Warnings:\n");
+        for warning in &diagnostics.orphaned_state_warnings {
+            output.push_str(&format!("  {warning}\n"));
+        }
+    }
+    if !diagnostics.volume_repair_events.is_empty() {
+        output.push('\n');
+        output.push_str("Volume Repairs:\n");
+        for event in &diagnostics.volume_repair_events {
+            output.push_str(&format!("  {event}\n"));
+        }
     }
     output.push('\n');
     output.push_str("Recent Failures:\n");
@@ -2570,6 +2596,7 @@ mod tests {
                     route: "active".into(),
                     health: "healthy".into(),
                     failure_reason: None,
+                    volumes: Vec::new(),
                     logs_tail: Vec::new(),
                 },
                 ServiceRuntimeStatus {
@@ -2589,6 +2616,7 @@ mod tests {
                     route: "none".into(),
                     health: "running".into(),
                     failure_reason: None,
+                    volumes: Vec::new(),
                     logs_tail: Vec::new(),
                 },
             ],

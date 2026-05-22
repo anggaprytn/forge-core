@@ -12,8 +12,9 @@ use crate::api::{
     EnvironmentValueChange, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
     ProbeStabilityDiagnostics, ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction,
     RetentionRole, RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic,
-    SecretReferenceChange, ServiceRuntimeStatus,
+    SecretReferenceChange, ServiceRuntimeStatus, VolumeRuntimeStatus,
 };
+use crate::events::EventRecord;
 use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::load_optional_manifest;
 use crate::projects::ProjectRegistryStore;
@@ -31,11 +32,11 @@ use crate::storage::{
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary, PersistedResolvedRuntime,
     PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
-    PersistedServiceState, PersistedSnapshotMetadata, PersistedValidationSummary, PointerStore,
-    RetentionMetadata, RetentionStore, StorageError, load_generation_build_info,
-    load_generation_lifecycle, load_generation_probe_history, load_generation_resolved_runtime,
-    load_generation_runtime_env_snapshot, load_generation_runtime_info,
-    load_generation_snapshot_metadata,
+    PersistedServiceState, PersistedSnapshotMetadata, PersistedValidationSummary,
+    PersistedVolumeRetention, PointerStore, RetentionMetadata, RetentionStore, StorageError,
+    load_generation_build_info, load_generation_lifecycle, load_generation_probe_history,
+    load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
@@ -1075,6 +1076,18 @@ where
     };
     let recent_secret_mutations =
         recent_secret_mutations(storage_root, project_id, environment, &truth)?;
+    let orphaned_state_warnings = orphaned_state_warnings(&services);
+    let volume_repair_events = recent_volume_repair_events(
+        &env,
+        &[
+            truth.active_generation,
+            latest_failed_generation,
+            truth.latest_generation,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>(),
+    )?;
     let visible_lifecycle = truth
         .active_lifecycle
         .as_ref()
@@ -1168,6 +1181,8 @@ where
         missing_required_secrets,
         env_drift,
         recent_secret_mutations,
+        orphaned_state_warnings,
+        volume_repair_events,
         active_lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
         retention_role: truth.active_generation.map(|_| RetentionRole::Current),
         validation_summary,
@@ -1524,6 +1539,7 @@ fn collect_service_runtime_truth<D: DockerRuntime, R: RoutingRuntime>(
                     Some(PersistedActivationMode::Http { .. })
                 ),
                 environment_variables: runtime.environment_variables.clone(),
+                volume_mounts: runtime.volume_mounts.clone(),
                 source_ref: runtime.source_ref.clone(),
                 repo_url: runtime.repo_url.clone(),
                 commit_sha: runtime.commit_sha.clone(),
@@ -1598,8 +1614,45 @@ fn collect_service_runtime_truth<D: DockerRuntime, R: RoutingRuntime>(
                 },
                 health: service_health_status(service, running),
                 failure_reason: None,
+                volumes: service_volume_statuses(service, inspection.as_ref()),
                 logs_tail: Vec::new(),
             })
+        })
+        .collect()
+}
+
+fn service_volume_statuses(
+    service: &PersistedServiceRuntimeInfo,
+    inspection: Option<&ContainerInspection>,
+) -> Vec<VolumeRuntimeStatus> {
+    service
+        .volume_mounts
+        .iter()
+        .map(|mount| {
+            let attached = inspection.is_some_and(|value| {
+                value.volume_mounts.iter().any(|actual| {
+                    actual.volume_name == mount.docker_volume_name
+                        && actual.mount_path == mount.mount_path
+                })
+            });
+            let mut warnings = Vec::new();
+            if !attached {
+                warnings.push(format!(
+                    "expected {} at {} is not attached",
+                    mount.docker_volume_name, mount.mount_path
+                ));
+            }
+            VolumeRuntimeStatus {
+                volume_id: mount.volume_id.clone(),
+                docker_volume_name: mount.docker_volume_name.clone(),
+                mount_path: mount.mount_path.clone(),
+                retention: match mount.retention {
+                    PersistedVolumeRetention::Persistent => "persistent".into(),
+                    PersistedVolumeRetention::Ephemeral => "ephemeral".into(),
+                },
+                attached,
+                warnings,
+            }
         })
         .collect()
 }
@@ -1811,6 +1864,53 @@ fn build_environment_status_from_truth(
                 .map(|summary| summary.observed_uptime_seconds)
         }),
     })
+}
+
+fn orphaned_state_warnings(services: &[ServiceRuntimeStatus]) -> Vec<String> {
+    services
+        .iter()
+        .flat_map(|service| {
+            service.volumes.iter().flat_map(|volume| {
+                volume
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("service {}: {warning}", service.service_id))
+            })
+        })
+        .collect()
+}
+
+fn recent_volume_repair_events(
+    env: &EnvironmentPaths,
+    generations: &[u64],
+) -> Result<Vec<String>, ProjectStatusError> {
+    let mut events = Vec::new();
+    for generation in generations {
+        let path = env.generation_dir(*generation).join("events.jsonl");
+        if !path.exists() {
+            continue;
+        }
+        let raw = fs::read_to_string(path)?;
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<EventRecord>(line).map_err(|err| {
+                ProjectStatusError::Storage(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                )))
+            })?;
+            if event.event_type == "VOLUME_ATTACHMENT_REPAIRED" {
+                events.push(event.reason.unwrap_or_else(|| {
+                    format!("generation {} volume attachment repaired", generation)
+                }));
+            }
+        }
+    }
+    events.reverse();
+    events.truncate(5);
+    Ok(events)
 }
 
 fn list_generation_numbers(env: &EnvironmentPaths) -> Result<Vec<u64>, ProjectStatusError> {
@@ -2472,6 +2572,7 @@ fn inspect_service_route_status<R: RoutingRuntime>(
         probe_path: service.probe_path.clone(),
         activation: service.activation.clone(),
         environment_variables: service.environment_variables.clone(),
+        volume_mounts: service.volume_mounts.clone(),
         source_ref: service.source_ref.clone(),
         repo_url: service.repo_url.clone(),
         commit_sha: service.commit_sha.clone(),
@@ -2533,6 +2634,13 @@ mod tests {
             Ok(())
         }
 
+        fn ensure_volume(
+            &mut self,
+            _request: crate::runtime::CreateVolumeRequest,
+        ) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
         fn create_container(
             &mut self,
             request: CreateContainerRequest,
@@ -2571,6 +2679,12 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn list_managed_volumes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedVolume>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
         fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
@@ -2580,6 +2694,10 @@ mod tests {
         }
 
         fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
         }
     }
@@ -2672,6 +2790,7 @@ mod tests {
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
             environment_variables: BTreeMap::new(),
+            volume_mounts: Vec::new(),
             source_ref: Some("main".into()),
             repo_url: None,
             commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
@@ -2789,6 +2908,7 @@ mod tests {
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
             environment_variables: BTreeMap::new(),
+            volume_mounts: Vec::new(),
             source_ref: Some("main".into()),
             repo_url: None,
             commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
@@ -2814,6 +2934,7 @@ mod tests {
                         required_for_promotion: true,
                         externally_exposed: true,
                         environment_variables: BTreeMap::new(),
+                        volume_mounts: Vec::new(),
                         source_ref: Some("main".into()),
                         repo_url: None,
                         commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
@@ -2836,6 +2957,7 @@ mod tests {
                         required_for_promotion: false,
                         externally_exposed: false,
                         environment_variables: BTreeMap::new(),
+                        volume_mounts: Vec::new(),
                         source_ref: Some("main".into()),
                         repo_url: None,
                         commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
@@ -2879,6 +3001,102 @@ mod tests {
                 "worker polling\n",
                 &[],
             )
+            .unwrap();
+    }
+
+    fn write_stateful_generation(root: &Path, generation: u64) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        let runtime = PersistedRuntimeInfo {
+            container_name: format!("staging-api-db-gen-{generation}"),
+            running: true,
+            network_name: Some("forge-managed".into()),
+            probe_path: None,
+            activation: Some(PersistedActivationMode::Direct),
+            environment_variables: BTreeMap::new(),
+            volume_mounts: vec![crate::storage::PersistedVolumeMount {
+                volume_id: "postgres-data".into(),
+                docker_volume_name: "forge-api-staging-vol-postgres-data".into(),
+                mount_path: "/var/lib/postgresql/data".into(),
+                service_id: "db".into(),
+                generation,
+                retention: PersistedVolumeRetention::Persistent,
+            }],
+            source_ref: Some("main".into()),
+            repo_url: None,
+            commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
+            source_path: None,
+            services: BTreeMap::from([(
+                "db".into(),
+                PersistedServiceRuntimeInfo {
+                    service_id: "db".into(),
+                    container_name: format!("staging-api-db-gen-{generation}"),
+                    image_ref: "postgres:16".into(),
+                    running: true,
+                    state: PersistedServiceState::Healthy,
+                    network_name: Some("forge-managed".into()),
+                    probe_path: None,
+                    activation: Some(PersistedActivationMode::Direct),
+                    command: None,
+                    depends_on: Vec::new(),
+                    required_for_promotion: true,
+                    externally_exposed: false,
+                    environment_variables: BTreeMap::new(),
+                    volume_mounts: vec![crate::storage::PersistedVolumeMount {
+                        volume_id: "postgres-data".into(),
+                        docker_volume_name: "forge-api-staging-vol-postgres-data".into(),
+                        mount_path: "/var/lib/postgresql/data".into(),
+                        service_id: "db".into(),
+                        generation,
+                        retention: PersistedVolumeRetention::Persistent,
+                    }],
+                    source_ref: Some("main".into()),
+                    repo_url: None,
+                    commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
+                    source_path: None,
+                },
+            )]),
+            startup_order: vec!["db".into()],
+        };
+        writer
+            .write_artifact(
+                "runtime.json",
+                &format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                &format!(
+                    "{{\"deployment_id\":\"dep-{generation}\",\"image_ref\":\"postgres:16\"}}\n"
+                ),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime_env_snapshot.json",
+                &format!(
+                    "{{\"snapshot_version\":1,\"project_id\":\"api\",\"environment\":\"staging\",\"generation\":{generation},\"deployment_id\":\"dep-{generation}\",\"source_environment\":\"staging\",\"entries\":{{}}}}\n"
+                ),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", SnapshotState::Healthy)
+            .unwrap();
+        PointerStore::new(env.clone())
+            .swap_current(generation)
+            .unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(generation),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 1,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
             .unwrap();
     }
 
@@ -3030,6 +3248,7 @@ mod tests {
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
             environment_variables: BTreeMap::new(),
+            volume_mounts: Vec::new(),
             source_ref: Some("main".into()),
             repo_url: None,
             commit_sha: Some("340ac8108006d84dbf951d8c0bb04ecfaf0eccac".into()),
@@ -3128,6 +3347,7 @@ mod tests {
             image_ref: format!("forge/api:staging-gen-{generation}"),
             labels: BTreeMap::new(),
             network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
+            volume_mounts: Vec::new(),
             restart_policy: "no".into(),
         }
     }
@@ -5089,6 +5309,7 @@ mod tests {
                 image_ref: "forge/api:staging-gen-7".into(),
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
+                volume_mounts: Vec::new(),
                 restart_policy: "always".into(),
             }),
         };
@@ -5143,6 +5364,7 @@ mod tests {
                 image_ref: "forge/api:staging-gen-9".into(),
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
+                volume_mounts: Vec::new(),
                 restart_policy: "always".into(),
             }),
         };
@@ -5176,5 +5398,44 @@ mod tests {
             .unwrap();
         assert_eq!(worker.route, "none");
         assert_eq!(worker.health, "running");
+    }
+
+    #[test]
+    fn diagnose_reports_volume_state() {
+        let root = test_root("diagnose-reports-volume-state");
+        register_project(&root, "api", "api.example.com");
+        write_stateful_generation(&root, 4);
+        let mut docker = StubDockerRuntime {
+            inspection: Some(ContainerInspection {
+                container_name: "staging-api-db-gen-4".into(),
+                running: true,
+                state_status: "running".into(),
+                exit_code: None,
+                restart_count: 0,
+                started_at: None,
+                image_ref: "postgres:16".into(),
+                labels: BTreeMap::new(),
+                network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.9".into())]),
+                volume_mounts: vec![crate::runtime::ContainerVolumeMount {
+                    volume_name: "forge-api-staging-vol-postgres-data".into(),
+                    mount_path: "/var/lib/postgresql/data".into(),
+                }],
+                restart_policy: "always".into(),
+            }),
+        };
+        let mut routing = StubRoutingRuntime::default();
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+        let db = diagnostics
+            .services
+            .iter()
+            .find(|service| service.service_id == "db")
+            .unwrap();
+        assert_eq!(db.volumes.len(), 1);
+        assert_eq!(db.volumes[0].retention, "persistent");
+        assert!(db.volumes[0].attached);
+        assert!(diagnostics.orphaned_state_warnings.is_empty());
     }
 }

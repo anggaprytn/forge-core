@@ -3,8 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::process::Command;
 
 use crate::runtime::{
-    BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
-    DockerRuntimeError, ManagedImage,
+    BuildImageRequest, ContainerInspection, ContainerVolumeMount, CreateContainerRequest,
+    CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ManagedImage, ManagedVolume,
 };
 
 pub trait CommandRunner {
@@ -95,6 +95,28 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         self.runner.run("docker", &create_args).map(|_| ())
     }
 
+    fn ensure_volume(&mut self, request: CreateVolumeRequest) -> Result<(), DockerRuntimeError> {
+        let inspect_args = vec![
+            "volume".to_string(),
+            "inspect".to_string(),
+            request.volume_name.clone(),
+        ];
+        if self.runner.run("docker", &inspect_args).is_ok() {
+            return Ok(());
+        }
+
+        let mut create_args = vec![
+            "volume".to_string(),
+            "create".to_string(),
+            request.volume_name.clone(),
+        ];
+        for (key, value) in &request.labels {
+            create_args.push("--label".to_string());
+            create_args.push(format!("{key}={value}"));
+        }
+        self.runner.run("docker", &create_args).map(|_| ())
+    }
+
     fn create_container(
         &mut self,
         request: CreateContainerRequest,
@@ -113,6 +135,13 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         for alias in &request.network_aliases {
             args.push("--network-alias".to_string());
             args.push(alias.clone());
+        }
+        for mount in &request.volume_mounts {
+            args.push("--mount".to_string());
+            args.push(format!(
+                "type=volume,src={},dst={}",
+                mount.volume_name, mount.mount_path
+            ));
         }
         for (key, value) in &request.labels {
             args.push("--label".to_string());
@@ -159,6 +188,9 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
                 "{{end}}",
                 "{{range $name, $settings := .NetworkSettings.Networks}}",
                 "network:{{$name}}={{$settings.IPAddress}}",
+                "{{end}}",
+                "{{range .Mounts}}",
+                "mount:{{.Type}}:{{.Name}}={{.Destination}}",
                 "{{end}}",
             ]
             .join("\n"),
@@ -239,6 +271,41 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         Ok(images)
     }
 
+    fn list_managed_volumes(&mut self) -> Result<Vec<ManagedVolume>, DockerRuntimeError> {
+        let args = vec![
+            "volume".to_string(),
+            "ls".to_string(),
+            "--filter".to_string(),
+            "label=forge.managed=true".to_string(),
+            "--format".to_string(),
+            "{{.Name}}".to_string(),
+        ];
+        let output = self.runner.run("docker", &args)?;
+        let mut volumes = Vec::new();
+        for volume_name in output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let inspect_args = vec![
+                "volume".to_string(),
+                "inspect".to_string(),
+                "--format".to_string(),
+                [
+                    "name={{.Name}}",
+                    "{{range $key, $value := .Labels}}",
+                    "label:{{$key}}={{$value}}",
+                    "{{end}}",
+                ]
+                .join("\n"),
+                volume_name.to_string(),
+            ];
+            let inspection = self.runner.run("docker", &inspect_args)?;
+            volumes.push(parse_volume_inspection_output(&inspection)?);
+        }
+        Ok(volumes)
+    }
+
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
         let args = vec!["stop".to_string(), container_name.to_string()];
         self.runner.run("docker", &args).map(|_| ())
@@ -255,6 +322,15 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
 
     fn remove_image(&mut self, image_ref: &str) -> Result<(), DockerRuntimeError> {
         let args = vec!["rmi".to_string(), "-f".to_string(), image_ref.to_string()];
+        self.runner.run("docker", &args).map(|_| ())
+    }
+
+    fn remove_volume(&mut self, volume_name: &str) -> Result<(), DockerRuntimeError> {
+        let args = vec![
+            "volume".to_string(),
+            "rm".to_string(),
+            volume_name.to_string(),
+        ];
         self.runner.run("docker", &args).map(|_| ())
     }
 }
@@ -278,6 +354,7 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
     let mut restart_policy = None;
     let mut labels = BTreeMap::new();
     let mut network_ips = BTreeMap::new();
+    let mut volume_mounts = Vec::new();
 
     for line in output.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -308,6 +385,12 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
                     value.to_string(),
                 );
             }
+            _ if key.starts_with("mount:volume:") => {
+                volume_mounts.push(ContainerVolumeMount {
+                    volume_name: key.trim_start_matches("mount:volume:").to_string(),
+                    mount_path: value.to_string(),
+                });
+            }
             _ => {}
         }
     }
@@ -331,8 +414,36 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing image ref".into()))?,
         labels,
         network_ips,
+        volume_mounts,
         restart_policy: restart_policy
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing restart policy".into()))?,
+    })
+}
+
+fn parse_volume_inspection_output(output: &str) -> Result<ManagedVolume, DockerRuntimeError> {
+    let mut volume_name = None;
+    let mut labels = BTreeMap::new();
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "name" => volume_name = Some(value.to_string()),
+            _ if key.starts_with("label:") => {
+                labels.insert(
+                    key.trim_start_matches("label:").to_string(),
+                    value.to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ManagedVolume {
+        volume_name: volume_name
+            .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing volume name".into()))?,
+        labels,
     })
 }
 
@@ -485,6 +596,7 @@ pub mod docker_adapter_starts_generation_named_container {
                 environment: Default::default(),
                 network_name: None,
                 network_aliases: Vec::new(),
+                volume_mounts: Vec::new(),
                 command: None,
             })
             .unwrap();
@@ -512,6 +624,7 @@ pub mod docker_adapter_disables_restart_policy {
                 environment: Default::default(),
                 network_name: None,
                 network_aliases: Vec::new(),
+                volume_mounts: Vec::new(),
                 command: None,
             })
             .unwrap();

@@ -1008,6 +1008,7 @@ impl E2eHarness {
                 environment: Default::default(),
                 network_name: Some(self.network_name.clone()),
                 network_aliases: Vec::new(),
+                volume_mounts: Vec::new(),
                 command: None,
             })
             .unwrap();
@@ -1238,6 +1239,13 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(())
     }
 
+    fn ensure_volume(
+        &mut self,
+        _request: forge_core::runtime::CreateVolumeRequest,
+    ) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
+
     fn create_container(
         &mut self,
         request: forge_core::runtime::CreateContainerRequest,
@@ -1263,6 +1271,7 @@ impl DockerRuntime for NoopDockerRuntime {
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: Default::default(),
+            volume_mounts: Vec::new(),
             restart_policy: "no".into(),
         })
     }
@@ -1285,6 +1294,12 @@ impl DockerRuntime for NoopDockerRuntime {
         Ok(Vec::new())
     }
 
+    fn list_managed_volumes(
+        &mut self,
+    ) -> Result<Vec<forge_core::runtime::ManagedVolume>, DockerRuntimeError> {
+        Ok(Vec::new())
+    }
+
     fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
         Ok(())
     }
@@ -1294,6 +1309,10 @@ impl DockerRuntime for NoopDockerRuntime {
     }
 
     fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+        Ok(())
+    }
+
+    fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
         Ok(())
     }
 }

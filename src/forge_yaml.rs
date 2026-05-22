@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::deployments::{ActivationMode, ExecutionConfig, ValidationPolicy};
+use crate::storage::PersistedVolumeRetention;
 
 #[derive(Debug)]
 pub enum ForgeYamlError {
@@ -84,10 +85,18 @@ pub struct ForgeServiceConfig {
     pub build: Option<ForgeBuildConfig>,
     pub image: Option<String>,
     pub command: Option<String>,
+    pub state: Option<ForgeStateConfig>,
     pub depends_on: Vec<String>,
     pub validation: ValidationPolicy,
     pub required_for_promotion: bool,
     pub externally_exposed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeStateConfig {
+    pub volume: String,
+    pub mount_path: String,
+    pub retention: PersistedVolumeRetention,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,9 +169,26 @@ struct RawServiceConfig {
     build: Option<RawBuildConfig>,
     runtime: RawRuntimeConfig,
     #[serde(default)]
+    state: Option<RawStateConfig>,
+    #[serde(default)]
     depends_on: Vec<String>,
     #[serde(default)]
     expose: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStateConfig {
+    volume: String,
+    mount_path: String,
+    retention: RawStateRetention,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawStateRetention {
+    Persistent,
+    Ephemeral,
 }
 
 pub fn load_optional_forge_yaml(
@@ -266,6 +292,7 @@ impl RawForgeYaml {
             build: None,
             image: None,
             command: runtime.command.clone(),
+            state: None,
             depends_on: Vec::new(),
             validation: validation.clone(),
             required_for_promotion: true,
@@ -333,6 +360,22 @@ impl RawForgeYaml {
                     "service `{service_id}` requires either services.{service_id}.build, runtime.image, or root forge.yml build"
                 )));
             }
+            if let Some(state) = service.state.as_ref() {
+                validate_service_state(service_id, state)?;
+            }
+        }
+        let mut seen_volume_ids = BTreeMap::new();
+        for (service_id, service) in &self.services {
+            let Some(state) = service.state.as_ref() else {
+                continue;
+            };
+            if let Some(existing) = seen_volume_ids.insert(state.volume.clone(), service_id.clone())
+            {
+                return Err(ForgeYamlError::Invalid(format!(
+                    "state volume `{}` is declared by both service `{existing}` and service `{service_id}`",
+                    state.volume
+                )));
+            }
         }
 
         let startup_order = topological_service_order(&self.services)?;
@@ -355,6 +398,14 @@ impl RawForgeYaml {
                     }),
                     image: raw.runtime.image.clone(),
                     command: raw.runtime.command.clone(),
+                    state: raw.state.as_ref().map(|state| ForgeStateConfig {
+                        volume: state.volume.clone(),
+                        mount_path: state.mount_path.clone(),
+                        retention: match state.retention {
+                            RawStateRetention::Persistent => PersistedVolumeRetention::Persistent,
+                            RawStateRetention::Ephemeral => PersistedVolumeRetention::Ephemeral,
+                        },
+                    }),
                     depends_on,
                     validation,
                     required_for_promotion: true,
@@ -428,6 +479,20 @@ fn validate_healthcheck(healthcheck: &RawHealthcheckConfig) -> Result<(), ForgeY
         return Err(ForgeYamlError::Invalid(
             "forge.yml runtime.healthcheck.expected_status must equal 200".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_service_state(service_id: &str, state: &RawStateConfig) -> Result<(), ForgeYamlError> {
+    if state.volume.trim().is_empty() {
+        return Err(ForgeYamlError::Invalid(format!(
+            "service `{service_id}` state.volume is required"
+        )));
+    }
+    if state.mount_path.trim().is_empty() || !state.mount_path.starts_with('/') {
+        return Err(ForgeYamlError::Invalid(format!(
+            "service `{service_id}` state.mount_path must start with `/`"
+        )));
     }
     Ok(())
 }

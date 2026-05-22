@@ -150,6 +150,23 @@ pub enum PersistedServiceState {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedVolumeRetention {
+    Persistent,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedVolumeMount {
+    pub volume_id: String,
+    pub docker_volume_name: String,
+    pub mount_path: String,
+    pub service_id: String,
+    pub generation: u64,
+    pub retention: PersistedVolumeRetention,
+}
+
 impl Default for PersistedServiceState {
     fn default() -> Self {
         Self::Healthy
@@ -180,6 +197,8 @@ pub struct PersistedServiceRuntimeInfo {
     pub externally_exposed: bool,
     #[serde(default)]
     pub environment_variables: BTreeMap<String, PersistedSecretReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_mounts: Vec<PersistedVolumeMount>,
     #[serde(default)]
     pub source_ref: Option<String>,
     #[serde(default)]
@@ -211,6 +230,8 @@ pub struct PersistedRuntimeInfo {
     pub activation: Option<PersistedActivationMode>,
     #[serde(default)]
     pub environment_variables: BTreeMap<String, PersistedSecretReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_mounts: Vec<PersistedVolumeMount>,
     #[serde(default)]
     pub source_ref: Option<String>,
     #[serde(default)]
