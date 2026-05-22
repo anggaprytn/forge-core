@@ -107,8 +107,8 @@ pub fn create_backup<D: DockerRuntime>(
         .ok_or_else(|| BackupError::NotFound(format!("generation {generation} runtime missing")))?;
     let runtime_env_snapshot =
         load_generation_runtime_env_snapshot(&env, generation)?.ok_or_else(|| {
-            BackupError::NotFound(format!(
-                "generation {generation} runtime env snapshot missing"
+            BackupError::Invalid(format!(
+                "active generation lacks runtime env snapshot; redeploy before backup (project={project_id}, environment={environment}, generation={generation})"
             ))
         })?;
     let resolved = load_generation_resolved_runtime(&env, generation)?.ok_or_else(|| {
@@ -131,29 +131,40 @@ pub fn create_backup<D: DockerRuntime>(
     let backup_id = format!("backup-{}", current_unix_timestamp());
     let backup_dir = backup_dir(storage_root, project_id, environment, &backup_id);
     fs::create_dir_all(backup_dir.join("volumes"))?;
-    let mut manifest = Vec::new();
-    for mount in volume_mounts {
-        let archive_file = format!("{}-{}.tar.gz", mount.service_id, mount.volume_id);
-        let archive_dir = backup_dir.join("volumes");
-        docker.run_volume_archive_helper(VolumeArchiveHelperRequest {
-            volume_name: mount.docker_volume_name.clone(),
-            archive_dir: archive_dir.clone(),
-            archive_file: archive_file.clone(),
-            mode: VolumeArchiveMode::Backup,
-            timeout: VOLUME_HELPER_TIMEOUT,
-        })?;
-        let archive_path = archive_dir.join(&archive_file);
-        let bytes = fs::read(&archive_path).map_err(|err| BackupError::Command(err.to_string()))?;
-        manifest.push(PersistedBackupVolumeRecord {
-            volume_id: mount.volume_id,
-            docker_volume_name: mount.docker_volume_name,
-            service_id: mount.service_id,
-            mount_path: mount.mount_path,
-            archive_file,
-            archive_size_bytes: bytes.len() as u64,
-            archive_sha256: hex::encode(Sha256::digest(bytes)),
-        });
-    }
+    let backup_result = (|| -> Result<Vec<PersistedBackupVolumeRecord>, BackupError> {
+        let mut manifest = Vec::new();
+        for mount in volume_mounts {
+            let archive_file = format!("{}-{}.tar.gz", mount.service_id, mount.volume_id);
+            let archive_dir = backup_dir.join("volumes");
+            docker.run_volume_archive_helper(VolumeArchiveHelperRequest {
+                volume_name: mount.docker_volume_name.clone(),
+                archive_dir: archive_dir.clone(),
+                archive_file: archive_file.clone(),
+                mode: VolumeArchiveMode::Backup,
+                timeout: VOLUME_HELPER_TIMEOUT,
+            })?;
+            let archive_path = archive_dir.join(&archive_file);
+            let bytes =
+                fs::read(&archive_path).map_err(|err| BackupError::Command(err.to_string()))?;
+            manifest.push(PersistedBackupVolumeRecord {
+                volume_id: mount.volume_id,
+                docker_volume_name: mount.docker_volume_name,
+                service_id: mount.service_id,
+                mount_path: mount.mount_path,
+                archive_file,
+                archive_size_bytes: bytes.len() as u64,
+                archive_sha256: hex::encode(Sha256::digest(bytes)),
+            });
+        }
+        Ok(manifest)
+    })();
+    let manifest = match backup_result {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            cleanup_partial_backup_dir(&backup_dir)?;
+            return Err(err);
+        }
+    };
 
     let source_deployment_id = build.deployment_id.clone();
     let metadata = PersistedBackupMetadata {
@@ -198,11 +209,13 @@ pub fn list_backups(
 ) -> Result<BackupListResponse, BackupError> {
     let root = backups_environment_root(storage_root, project_id, environment);
     let mut backups = Vec::new();
+    let mut warnings = Vec::new();
     if !root.exists() {
         return Ok(BackupListResponse {
             project_id: project_id.into(),
             environment: environment.into(),
             backups,
+            warnings,
         });
     }
 
@@ -224,13 +237,38 @@ pub fn list_backups(
         {
             continue;
         }
-        backups.push(api_backup_record(read_backup_metadata(&entry.path())?));
+        match read_backup_metadata(&entry.path()) {
+            Ok(metadata) => backups.push(api_backup_record(metadata)),
+            Err(BackupError::Command(message))
+                if message.contains("metadata.json")
+                    && message.contains("No such file or directory") =>
+            {
+                let backup_name = entry.file_name().to_string_lossy().into_owned();
+                warnings.push(format!(
+                    "skipped corrupt backup {backup_name}: missing metadata.json"
+                ));
+                warnings.push(format!(
+                    "cleanup partial backup directory: {}",
+                    entry.path().display()
+                ));
+            }
+            Err(BackupError::Command(message)) | Err(BackupError::Invalid(message)) => {
+                let backup_name = entry.file_name().to_string_lossy().into_owned();
+                warnings.push(format!("skipped corrupt backup {backup_name}: {message}"));
+                warnings.push(format!(
+                    "cleanup partial backup directory: {}",
+                    entry.path().display()
+                ));
+            }
+            Err(err) => return Err(err),
+        }
     }
     backups.sort_by(|left, right| right.created_at_unix.cmp(&left.created_at_unix));
     Ok(BackupListResponse {
         project_id: project_id.into(),
         environment: environment.into(),
         backups,
+        warnings,
     })
 }
 
@@ -696,6 +734,18 @@ fn write_backup_metadata(
         format!("{}\n", serde_json::to_string_pretty(metadata).unwrap()).as_bytes(),
     )?;
     Ok(())
+}
+
+fn cleanup_partial_backup_dir(path: &Path) -> Result<(), BackupError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path).map_err(|err| {
+        BackupError::Command(format!(
+            "backup failed and cleanup of partial backup directory {} also failed: {err}",
+            path.display()
+        ))
+    })
 }
 
 fn read_backup_metadata(path: &Path) -> Result<PersistedBackupMetadata, BackupError> {
@@ -1850,6 +1900,7 @@ mod tests {
         let listed = list_backups(&root, "api", "production").unwrap();
 
         assert!(listed.backups.is_empty());
+        assert!(listed.warnings.is_empty());
     }
 
     #[test]
@@ -1863,6 +1914,7 @@ mod tests {
 
         assert_eq!(listed.backups.len(), 1);
         assert_eq!(listed.backups[0].backup_id, created.backup_id);
+        assert!(listed.warnings.is_empty());
     }
 
     #[test]
@@ -1873,6 +1925,51 @@ mod tests {
         let listed = list_backups(&root, "api", "production").unwrap();
 
         assert!(listed.backups.is_empty());
+        assert!(listed.warnings.is_empty());
+    }
+
+    #[test]
+    fn backup_list_skips_missing_metadata_backup_dir() {
+        let root = test_root("backup-list-skips-missing-metadata");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let created = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let corrupt_dir = backup_dir(&root, "api", "production", "backup-corrupt");
+        fs::create_dir_all(corrupt_dir.join("volumes")).unwrap();
+
+        let listed = list_backups(&root, "api", "production").unwrap();
+
+        assert_eq!(listed.backups.len(), 1);
+        assert_eq!(listed.backups[0].backup_id, created.backup_id);
+        assert!(listed.warnings.iter().any(
+            |warning| warning == "skipped corrupt backup backup-corrupt: missing metadata.json"
+        ));
+    }
+
+    #[test]
+    fn backup_list_reports_corrupt_backup_warning() {
+        let root = test_root("backup-list-reports-corrupt-warning");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let corrupt_dir = backup_dir(&root, "api", "production", "backup-corrupt");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+        fs::write(corrupt_dir.join("metadata.json"), "{not-json").unwrap();
+
+        let listed = list_backups(&root, "api", "production").unwrap();
+
+        assert!(listed.backups.is_empty());
+        assert!(
+            listed
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("skipped corrupt backup backup-corrupt:"))
+        );
+        assert!(
+            listed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cleanup partial backup directory:"))
+        );
     }
 
     #[test]
@@ -2085,6 +2182,58 @@ mod tests {
             BackupError::Docker(DockerRuntimeError::CommandFailed(_))
         ));
         assert!(err.to_string().contains("stderr: tar: permission denied"));
+    }
+
+    #[test]
+    fn backup_create_rejects_legacy_generation_before_creating_backup_dir() {
+        let root = test_root("backup-create-rejects-legacy-generation");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        fs::remove_file(env.generation_dir(1).join("runtime_env_snapshot.json")).unwrap();
+
+        let err = create_backup(&root, &mut docker, "api", "production").unwrap_err();
+
+        assert!(matches!(err, BackupError::Invalid(_)));
+        let backup_root = backups_environment_root(&root, "api", "production");
+        assert!(!backup_root.exists() || fs::read_dir(&backup_root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn failed_backup_create_does_not_leave_metadata_less_dir() {
+        let root = test_root("failed-backup-create-no-metadata-less-dir");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        docker
+            .helper_results
+            .push_back(Err(DockerRuntimeError::CommandFailed(
+                "helper container failed".into(),
+            )));
+
+        let _ = create_backup(&root, &mut docker, "api", "production").unwrap_err();
+
+        let backup_root = backups_environment_root(&root, "api", "production");
+        assert!(!backup_root.exists() || fs::read_dir(&backup_root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn backup_create_error_mentions_redeploy_required_for_missing_snapshot() {
+        let root = test_root("backup-create-redeploy-required");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        fs::remove_file(env.generation_dir(1).join("runtime_env_snapshot.json")).unwrap();
+
+        let err = create_backup(&root, &mut docker, "api", "production").unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message
+                .contains("active generation lacks runtime env snapshot; redeploy before backup")
+        );
+        assert!(message.contains("project=api"));
+        assert!(message.contains("environment=production"));
+        assert!(message.contains("generation=1"));
     }
 
     #[test]

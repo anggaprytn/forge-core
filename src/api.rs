@@ -510,6 +510,8 @@ pub struct BackupListResponse {
     pub environment: String,
     #[serde(default)]
     pub backups: Vec<BackupRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

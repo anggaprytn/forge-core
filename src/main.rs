@@ -2097,6 +2097,12 @@ fn render_backup_list(backups: &BackupListResponse) -> String {
             ));
         }
     }
+    if !backups.warnings.is_empty() {
+        output.push_str("Warnings:\n");
+        for warning in &backups.warnings {
+            output.push_str(&format!("  {warning}\n"));
+        }
+    }
     output
 }
 
