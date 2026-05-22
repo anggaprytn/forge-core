@@ -2,10 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
-use crate::process::run_command_with_timeout;
 use sha2::{Digest, Sha256};
 
 use crate::api::{
@@ -17,7 +15,8 @@ use crate::queue::DeploymentRecord;
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
     ContainerInspection, CreateContainerRequest, CreateVolumeRequest, DockerRuntime,
-    DockerRuntimeError, RouteInspection, RouteUpdateRequest, RoutingRuntime, VolumeMountRequest,
+    DockerRuntimeError, RouteInspection, RouteUpdateRequest, RoutingRuntime,
+    VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeMountRequest,
 };
 use crate::runtime_env::{RuntimeEnvMetadata, generated_forge_vars, restore_runtime_env};
 use crate::status::derive_environment_domain;
@@ -84,6 +83,8 @@ impl From<std::io::Error> for BackupError {
     }
 }
 
+const VOLUME_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub fn create_backup<D: DockerRuntime>(
     storage_root: &Path,
     docker: &mut D,
@@ -125,10 +126,16 @@ pub fn create_backup<D: DockerRuntime>(
     fs::create_dir_all(backup_dir.join("volumes"))?;
     let mut manifest = Vec::new();
     for mount in volume_mounts {
-        let inspection = docker.inspect_volume(&mount.docker_volume_name)?;
         let archive_file = format!("{}-{}.tar.gz", mount.service_id, mount.volume_id);
-        let archive_path = backup_dir.join("volumes").join(&archive_file);
-        archive_directory(&inspection.mountpoint, &archive_path)?;
+        let archive_dir = backup_dir.join("volumes");
+        docker.run_volume_archive_helper(VolumeArchiveHelperRequest {
+            volume_name: mount.docker_volume_name.clone(),
+            archive_dir: archive_dir.clone(),
+            archive_file: archive_file.clone(),
+            mode: VolumeArchiveMode::Backup,
+            timeout: VOLUME_HELPER_TIMEOUT,
+        })?;
+        let archive_path = archive_dir.join(&archive_file);
         let bytes = fs::read(&archive_path).map_err(|err| BackupError::Command(err.to_string()))?;
         manifest.push(PersistedBackupVolumeRecord {
             volume_id: mount.volume_id,
@@ -274,6 +281,7 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         let volume_mounts = restore_volume_mounts(
             storage_root,
             docker,
+            &diagnostics,
             generation,
             &record,
             service,
@@ -677,47 +685,6 @@ fn api_backup_record(metadata: PersistedBackupMetadata) -> BackupRecord {
     }
 }
 
-fn archive_directory(source: &Path, archive_path: &Path) -> Result<(), BackupError> {
-    if let Some(parent) = archive_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| BackupError::Command(err.to_string()))?;
-    }
-    let output = run_command_with_timeout(
-        Command::new("tar")
-            .arg("-czf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(source)
-            .arg("."),
-        Duration::from_secs(60),
-    )
-    .map_err(|err| BackupError::Command(err.to_string()))?;
-    if !output.status.success() {
-        return Err(BackupError::Command(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), BackupError> {
-    fs::create_dir_all(target).map_err(|err| BackupError::Command(err.to_string()))?;
-    let output = run_command_with_timeout(
-        Command::new("tar")
-            .arg("-xzf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(target),
-        Duration::from_secs(60),
-    )
-    .map_err(|err| BackupError::Command(err.to_string()))?;
-    if !output.status.success() {
-        return Err(BackupError::Command(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn runtime_services(
     runtime: &PersistedRuntimeInfo,
 ) -> BTreeMap<String, PersistedServiceRuntimeInfo> {
@@ -756,6 +723,7 @@ fn runtime_services(
 fn restore_volume_mounts<D: DockerRuntime>(
     storage_root: &Path,
     docker: &mut D,
+    diagnostics: &DiagnosticsStore,
     generation: u64,
     record: &DeploymentRecord,
     service: &PersistedServiceRuntimeInfo,
@@ -788,7 +756,6 @@ fn restore_volume_mounts<D: DockerRuntime>(
                 ("forge.volume_retention".into(), "persistent".into()),
             ]),
         })?;
-        let inspection = docker.inspect_volume(&volume_name)?;
         let backup = metadata
             .volumes
             .iter()
@@ -801,10 +768,44 @@ fn restore_volume_mounts<D: DockerRuntime>(
                     service.service_id, mount.volume_id
                 ))
             })?;
-        extract_archive(
-            &backup_root.join("volumes").join(&backup.archive_file),
-            &inspection.mountpoint,
-        )?;
+        let helper_result = docker.run_volume_archive_helper(VolumeArchiveHelperRequest {
+            volume_name: volume_name.clone(),
+            archive_dir: backup_root.join("volumes"),
+            archive_file: backup.archive_file.clone(),
+            mode: VolumeArchiveMode::Restore,
+            timeout: VOLUME_HELPER_TIMEOUT,
+        });
+        match helper_result {
+            Ok(output) => {
+                if !output.stdout.is_empty() {
+                    diagnostics.append_log_line(
+                        &format!(
+                            "restore helper stdout for {}:{}: {}",
+                            service.service_id, mount.volume_id, output.stdout
+                        ),
+                        &[],
+                    )?;
+                }
+                if !output.stderr.is_empty() {
+                    diagnostics.append_log_line(
+                        &format!(
+                            "restore helper stderr for {}:{}: {}",
+                            service.service_id, mount.volume_id, output.stderr
+                        ),
+                        &[],
+                    )?;
+                }
+            }
+            Err(err) => {
+                let reason = format!(
+                    "restore helper failed for service {} volume {}: {}",
+                    service.service_id, mount.volume_id, err
+                );
+                diagnostics.append_log_line(&reason, &[])?;
+                diagnostics.write_failure_reason(&reason, &[])?;
+                return Err(BackupError::Docker(err));
+            }
+        }
         restored.push(PersistedVolumeMount {
             volume_id: mount.volume_id.clone(),
             docker_volume_name: volume_name,
@@ -1084,7 +1085,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::api::ProjectUpsertRequest;
-    use crate::runtime::{ManagedImage, ManagedVolume, RouteUpdateRequest, VolumeInspection};
+    use crate::runtime::{
+        ManagedImage, ManagedVolume, RouteUpdateRequest, VolumeArchiveHelperOutput,
+        VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
+    };
     use crate::secrets::seal_value;
     use crate::storage::{
         PersistedResolvedRuntime, PersistedResolvedRuntimeEntry, PersistedRuntimeEnvSource,
@@ -1149,6 +1153,10 @@ mod tests {
         created_containers: Vec<CreateContainerRequest>,
         started_containers: Vec<String>,
         next_container_ip: VecDeque<String>,
+        helper_requests: Vec<VolumeArchiveHelperRequest>,
+        helper_results: VecDeque<Result<VolumeArchiveHelperOutput, DockerRuntimeError>>,
+        inspect_volume_calls: Vec<String>,
+        fail_inspect_volume: bool,
     }
 
     impl DockerRuntime for TestDockerRuntime {
@@ -1272,10 +1280,49 @@ mod tests {
             &mut self,
             volume_name: &str,
         ) -> Result<VolumeInspection, DockerRuntimeError> {
+            self.inspect_volume_calls.push(volume_name.into());
+            if self.fail_inspect_volume {
+                return Err(DockerRuntimeError::CommandFailed(format!(
+                    "host volume inspection denied for {volume_name}"
+                )));
+            }
             self.volume_inspections
                 .get(volume_name)
                 .cloned()
                 .ok_or_else(|| DockerRuntimeError::CommandFailed(volume_name.into()))
+        }
+
+        fn run_volume_archive_helper(
+            &mut self,
+            request: VolumeArchiveHelperRequest,
+        ) -> Result<VolumeArchiveHelperOutput, DockerRuntimeError> {
+            self.helper_requests.push(request.clone());
+            if let Some(result) = self.helper_results.pop_front() {
+                return result;
+            }
+
+            let inspection = self
+                .volume_inspections
+                .get(&request.volume_name)
+                .cloned()
+                .ok_or_else(|| DockerRuntimeError::CommandFailed(request.volume_name.clone()))?;
+            fs::create_dir_all(&request.archive_dir).unwrap();
+            match request.mode {
+                VolumeArchiveMode::Backup => {
+                    let snapshot = encode_directory_snapshot(&inspection.mountpoint);
+                    fs::write(request.archive_dir.join(&request.archive_file), snapshot).unwrap();
+                }
+                VolumeArchiveMode::Restore => {
+                    let snapshot =
+                        fs::read(request.archive_dir.join(&request.archive_file)).unwrap();
+                    restore_directory_snapshot(&inspection.mountpoint, &snapshot);
+                }
+            }
+
+            Ok(VolumeArchiveHelperOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         }
 
         fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
@@ -1292,6 +1339,44 @@ mod tests {
 
         fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
             Ok(())
+        }
+    }
+
+    fn encode_directory_snapshot(root: &Path) -> Vec<u8> {
+        fn walk(root: &Path, current: &Path, entries: &mut Vec<(String, Vec<u8>)>) {
+            let mut children = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for path in children {
+                if path.is_dir() {
+                    walk(root, &path, entries);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                entries.push((relative, fs::read(&path).unwrap()));
+            }
+        }
+
+        let mut entries = Vec::new();
+        walk(root, root, &mut entries);
+        serde_json::to_vec(&entries).unwrap()
+    }
+
+    fn restore_directory_snapshot(root: &Path, snapshot: &[u8]) {
+        let entries: Vec<(String, Vec<u8>)> = serde_json::from_slice(snapshot).unwrap();
+        fs::create_dir_all(root).unwrap();
+        for (relative, contents) in entries {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, contents).unwrap();
         }
     }
 
@@ -1506,6 +1591,28 @@ mod tests {
     }
 
     #[test]
+    fn backup_uses_helper_container_not_host_volume_path() {
+        let root = test_root("backup-uses-helper-container");
+        let mut docker = TestDockerRuntime {
+            fail_inspect_volume: true,
+            ..Default::default()
+        };
+        let seeded = seed_environment(&root, &mut docker);
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        assert!(docker.inspect_volume_calls.is_empty());
+        assert_eq!(docker.helper_requests.len(), 1);
+        let request = &docker.helper_requests[0];
+        assert_eq!(request.volume_name, seeded.original_persistent_volume);
+        assert_eq!(request.mode, VolumeArchiveMode::Backup);
+        assert_eq!(
+            request.archive_dir,
+            backup_dir(&root, "api", "production", &backup.backup_id).join("volumes")
+        );
+    }
+
+    #[test]
     fn backup_only_includes_persistent_volumes() {
         let root = test_root("backup-only-includes-persistent");
         let mut docker = TestDockerRuntime::default();
@@ -1551,6 +1658,15 @@ mod tests {
     }
 
     #[test]
+    fn backup_list_empty_when_backup_root_missing() {
+        let root = test_root("backup-list-empty-when-root-missing");
+
+        let listed = list_backups(&root, "api", "production").unwrap();
+
+        assert!(listed.backups.is_empty());
+    }
+
+    #[test]
     fn restore_creates_new_generation() {
         let root = test_root("restore-creates-new-generation");
         let mut docker = TestDockerRuntime::default();
@@ -1567,6 +1683,31 @@ mod tests {
                 .read_authoritative_pointer()
                 .unwrap(),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn restore_uses_helper_container_to_populate_new_volume() {
+        let root = test_root("restore-uses-helper-container");
+        let mut docker = TestDockerRuntime {
+            fail_inspect_volume: true,
+            ..Default::default()
+        };
+        seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+        docker.helper_requests.clear();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        assert!(docker.inspect_volume_calls.is_empty());
+        assert_eq!(docker.helper_requests.len(), 1);
+        let request = &docker.helper_requests[0];
+        assert!(request.volume_name.contains("restore-gen-2-vol-redis"));
+        assert_eq!(request.mode, VolumeArchiveMode::Restore);
+        assert_eq!(
+            request.archive_dir,
+            backup_dir(&root, "api", "production", &backup.backup_id).join("volumes")
         );
     }
 
@@ -1610,6 +1751,40 @@ mod tests {
             fs::read_to_string(seeded.original_mountpoint.join("counter.txt")).unwrap(),
             "7"
         );
+    }
+
+    #[test]
+    fn backup_helper_failure_records_stderr() {
+        let root = test_root("backup-helper-failure-records-stderr");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        docker.helper_results.push_back(Err(DockerRuntimeError::CommandFailed(
+            "helper container failed for volume forge-api-production-vol-redis; stderr: tar: permission denied".into(),
+        )));
+
+        let err = create_backup(&root, &mut docker, "api", "production").unwrap_err();
+
+        assert!(matches!(
+            err,
+            BackupError::Docker(DockerRuntimeError::CommandFailed(_))
+        ));
+        assert!(err.to_string().contains("stderr: tar: permission denied"));
+    }
+
+    #[test]
+    fn backup_create_does_not_require_host_volume_permissions() {
+        let root = test_root("backup-create-does-not-require-host-volume-permissions");
+        let mut docker = TestDockerRuntime {
+            fail_inspect_volume: true,
+            ..Default::default()
+        };
+        seed_environment(&root, &mut docker);
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        assert_eq!(backup.volumes.len(), 1);
+        assert!(docker.inspect_volume_calls.is_empty());
+        assert_eq!(docker.helper_requests.len(), 1);
     }
 
     #[test]

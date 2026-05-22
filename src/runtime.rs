@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildImageRequest {
@@ -76,6 +77,27 @@ pub struct VolumeInspection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeArchiveMode {
+    Backup,
+    Restore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeArchiveHelperRequest {
+    pub volume_name: String,
+    pub archive_dir: PathBuf,
+    pub archive_file: String,
+    pub mode: VolumeArchiveMode,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeArchiveHelperOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerRuntimeError {
     CommandFailed(String),
     InvalidResponse(String),
@@ -134,6 +156,20 @@ pub trait DockerRuntime {
     ) -> Result<VolumeInspection, DockerRuntimeError> {
         Err(DockerRuntimeError::CommandFailed(format!(
             "volume inspection not implemented for {volume_name}"
+        )))
+    }
+    fn run_volume_archive_helper(
+        &mut self,
+        request: VolumeArchiveHelperRequest,
+    ) -> Result<VolumeArchiveHelperOutput, DockerRuntimeError> {
+        let direction = match request.mode {
+            VolumeArchiveMode::Backup => "backup",
+            VolumeArchiveMode::Restore => "restore",
+        };
+        let archive_dir = Path::new(&request.archive_dir).display();
+        Err(DockerRuntimeError::CommandFailed(format!(
+            "volume archive helper not implemented for {} {} in {}",
+            direction, request.volume_name, archive_dir
         )))
     }
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;

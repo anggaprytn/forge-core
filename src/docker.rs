@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::process::Command;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use crate::process::run_command_with_timeout;
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, ContainerVolumeMount, CreateContainerRequest,
     CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ManagedImage, ManagedVolume,
-    VolumeInspection,
+    VolumeArchiveHelperOutput, VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
 };
 
 pub trait CommandRunner {
@@ -339,6 +340,100 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         parse_volume_full_inspection_output(&inspection)
     }
 
+    fn run_volume_archive_helper(
+        &mut self,
+        request: VolumeArchiveHelperRequest,
+    ) -> Result<VolumeArchiveHelperOutput, DockerRuntimeError> {
+        const HELPER_IMAGE: &str = "busybox:1.36";
+
+        fs::create_dir_all(&request.archive_dir)
+            .map_err(|err| DockerRuntimeError::CommandFailed(err.to_string()))?;
+
+        let helper_name = format!(
+            "forge-volume-helper-{}-{}",
+            sanitize_helper_name(&request.volume_name),
+            rand::random::<u64>()
+        );
+        let data_mount = match request.mode {
+            VolumeArchiveMode::Backup => format!("{}:/data:ro", request.volume_name),
+            VolumeArchiveMode::Restore => format!("{}:/data", request.volume_name),
+        };
+        let backup_mount = match request.mode {
+            VolumeArchiveMode::Backup => format!("{}:/backup", request.archive_dir.display()),
+            VolumeArchiveMode::Restore => format!("{}:/backup:ro", request.archive_dir.display()),
+        };
+        let mut create_args = vec![
+            "create".to_string(),
+            "--name".to_string(),
+            helper_name.clone(),
+            "-v".to_string(),
+            data_mount,
+            "-v".to_string(),
+            backup_mount,
+            HELPER_IMAGE.to_string(),
+        ];
+        match request.mode {
+            VolumeArchiveMode::Backup => {
+                create_args.extend([
+                    "tar".to_string(),
+                    "czf".to_string(),
+                    format!("/backup/{}", request.archive_file),
+                    "-C".to_string(),
+                    "/data".to_string(),
+                    ".".to_string(),
+                ]);
+            }
+            VolumeArchiveMode::Restore => {
+                create_args.extend([
+                    "tar".to_string(),
+                    "xzf".to_string(),
+                    format!("/backup/{}", request.archive_file),
+                    "-C".to_string(),
+                    "/data".to_string(),
+                ]);
+            }
+        }
+
+        self.runner.run("docker", &create_args)?;
+        let output = run_command_with_timeout(
+            Command::new("docker").args(["start", "-a", helper_name.as_str()]),
+            request.timeout,
+        );
+        let cleanup_args = vec!["rm".to_string(), "-f".to_string(), helper_name.clone()];
+        let cleanup_result = self.runner.run("docker", &cleanup_args);
+
+        let output = output.map_err(|err| DockerRuntimeError::CommandFailed(err.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let mut message = format!(
+                "helper container {} failed for volume {}",
+                helper_name, request.volume_name
+            );
+            if !stderr.is_empty() {
+                message.push_str(&format!("; stderr: {stderr}"));
+            }
+            if !stdout.is_empty() {
+                message.push_str(&format!("; stdout: {stdout}"));
+            }
+            if let Err(err) = cleanup_result {
+                message.push_str(&format!("; cleanup: {err}"));
+            }
+            return Err(DockerRuntimeError::CommandFailed(message));
+        }
+        if let Err(err) = cleanup_result {
+            return Err(DockerRuntimeError::CommandFailed(format!(
+                "helper container cleanup failed for volume {}: {err}",
+                request.volume_name
+            )));
+        }
+
+        Ok(VolumeArchiveHelperOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
         let args = vec!["stop".to_string(), container_name.to_string()];
         self.runner.run("docker", &args).map(|_| ())
@@ -374,6 +469,16 @@ fn parse_built_image_ref(output: &str) -> Option<String> {
         .rev()
         .find_map(|line| line.strip_prefix("image_ref="))
         .map(|value| value.to_string())
+}
+
+fn sanitize_helper_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect()
 }
 
 fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRuntimeError> {
