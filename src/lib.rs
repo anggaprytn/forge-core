@@ -16,6 +16,7 @@ pub mod invariants;
 pub mod manifest;
 pub mod metrics;
 pub mod probes;
+pub mod process;
 pub mod projects;
 pub mod queue;
 pub mod route_truth;

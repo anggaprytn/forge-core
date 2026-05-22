@@ -121,6 +121,125 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/environments/{environment}/backups:
+    post:
+      summary: Create a crash-consistent backup for the active generation
+      operationId: createBackup
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: environment
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Backup created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeBackupRecord'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Active generation or persistent volume not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    get:
+      summary: List backups for one project environment
+      operationId: listBackups
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: environment
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Backup inventory
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeBackupList'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/backups/{backup_id}:
+    get:
+      summary: Inspect one backup manifest
+      operationId: inspectBackup
+      parameters:
+        - in: path
+          name: backup_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Backup manifest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeBackupRecord'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Backup not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/backups/{backup_id}/restore:
+    post:
+      summary: Restore a backup into a new generation
+      operationId: restoreBackup
+      parameters:
+        - in: path
+          name: backup_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Backup restored into a new generation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeBackupRestore'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Backup not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /deployments:
     post:
       summary: Enqueue a deployment operation
@@ -422,6 +541,119 @@ components:
           type: array
           items:
             type: string
+    BackupVolumeRecord:
+      type: object
+      required:
+        - volume_id
+        - docker_volume_name
+        - service_id
+        - mount_path
+        - archive_file
+        - archive_size_bytes
+        - archive_sha256
+      properties:
+        volume_id:
+          type: string
+        docker_volume_name:
+          type: string
+        service_id:
+          type: string
+        mount_path:
+          type: string
+        archive_file:
+          type: string
+        archive_size_bytes:
+          type: integer
+          format: int64
+        archive_sha256:
+          type: string
+    RestoreRecord:
+      type: object
+      required:
+        - restored_generation
+        - restored_deployment_id
+        - restored_at_unix
+        - status
+      properties:
+        restored_generation:
+          type: integer
+          format: int64
+        restored_deployment_id:
+          type: string
+        restored_at_unix:
+          type: integer
+          format: int64
+        status:
+          type: string
+    BackupRecord:
+      type: object
+      required:
+        - backup_id
+        - project_id
+        - environment
+        - created_at_unix
+        - source_generation
+      properties:
+        backup_id:
+          type: string
+        project_id:
+          type: string
+        environment:
+          type: string
+        created_at_unix:
+          type: integer
+          format: int64
+        source_generation:
+          type: integer
+          format: int64
+        source_deployment_id:
+          type: string
+          nullable: true
+        services:
+          type: array
+          items:
+            type: string
+        volumes:
+          type: array
+          items:
+            $ref: '#/components/schemas/BackupVolumeRecord'
+        restores:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestoreRecord'
+    BackupList:
+      type: object
+      required:
+        - project_id
+        - environment
+        - backups
+      properties:
+        project_id:
+          type: string
+        environment:
+          type: string
+        backups:
+          type: array
+          items:
+            $ref: '#/components/schemas/BackupRecord'
+    BackupRestoreResponse:
+      type: object
+      required:
+        - backup_id
+        - restored_generation
+        - restored_deployment_id
+        - restored_at_unix
+      properties:
+        backup_id:
+          type: string
+        restored_generation:
+          type: integer
+          format: int64
+        restored_deployment_id:
+          type: string
+        restored_at_unix:
+          type: integer
+          format: int64
     EventList:
       type: object
       required:
@@ -533,6 +765,27 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/DeploymentLogs'}
+    SuccessEnvelopeBackupRecord:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/BackupRecord'}
+    SuccessEnvelopeBackupList:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/BackupList'}
+    SuccessEnvelopeBackupRestore:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/BackupRestoreResponse'}
     SuccessEnvelopeEventList:
       type: object
       required: [request_id, correlation_id, data]

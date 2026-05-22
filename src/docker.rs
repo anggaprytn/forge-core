@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::process::Command;
+use std::time::Duration;
 
+use crate::process::run_command_with_timeout;
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, ContainerVolumeMount, CreateContainerRequest,
     CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ManagedImage, ManagedVolume,
@@ -31,17 +33,25 @@ impl CommandRunner for ProcessCommandRunner {
         args: &[String],
         env: &BTreeMap<String, String>,
     ) -> Result<String, DockerRuntimeError> {
-        let output = Command::new(program)
-            .envs(env)
-            .args(args)
-            .output()
-            .map_err(|err| DockerRuntimeError::CommandFailed(err.to_string()))?;
+        let output = run_command_with_timeout(
+            Command::new(program).envs(env).args(args),
+            docker_command_timeout(args),
+        )
+        .map_err(|err| DockerRuntimeError::CommandFailed(err.to_string()))?;
         if !output.status.success() {
             return Err(DockerRuntimeError::CommandFailed(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+}
+
+fn docker_command_timeout(args: &[String]) -> Duration {
+    match args.first().map(String::as_str) {
+        Some("build") => Duration::from_secs(600),
+        Some("logs") => Duration::from_secs(20),
+        _ => Duration::from_secs(60),
     }
 }
 

@@ -9270,6 +9270,103 @@ pub mod multi_service_orchestration {
     }
 
     #[test]
+    fn rollback_does_not_restore_database_history() {
+        let root = test_root("rollback-does-not-restore-database-history");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_stateful_multi_service_forge_yaml(&root, "persistent");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![
+                RouteInspection {
+                    subtree_id: "forge:api:production:api".into(),
+                    active_target: "172.18.0.12:3000".into(),
+                    domain: Some("example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                };
+                3
+            ],
+        };
+        for deployment_id in ["dep-1", "dep-2"] {
+            queue
+                .enqueue(DeploymentRecord {
+                    deployment_id: deployment_id.into(),
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    intent: "deploy".into(),
+                    source_path: None,
+                    source_ref: None,
+                    repo_url: None,
+                    commit_sha: None,
+                })
+                .unwrap();
+            DeploymentExecutor::new(
+                &root,
+                &queue,
+                &mut docker,
+                &mut probes,
+                &mut routing,
+                ValidationPolicy::default(),
+            )
+            .with_execution_config(default_execution_config(&root))
+            .execute_next()
+            .unwrap();
+        }
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let generation_one_volume = load_generation_runtime_info(&env, 1)
+            .unwrap()
+            .unwrap()
+            .services["postgres"]
+            .volume_mounts[0]
+            .docker_volume_name
+            .clone();
+        let generation_two_volume = load_generation_runtime_info(&env, 2)
+            .unwrap()
+            .unwrap()
+            .services["postgres"]
+            .volume_mounts[0]
+            .docker_volume_name
+            .clone();
+        assert_eq!(generation_one_volume, generation_two_volume);
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn stateful_service_runtime_truth_persisted() {
         let root = test_root("stateful-service-runtime-truth-persisted");
         register_project(&root, "api", "example.com");

@@ -13,8 +13,8 @@ use forge_core::api::{
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
     EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectRecord, ProjectUpsertRequest, RetentionRole, SecretListResponse, SecretUnsetResponse,
-    ServiceRuntimeStatus,
+    ProjectRecord, ProjectUpsertRequest, RestoreLineage, RetentionRole, SecretListResponse,
+    SecretUnsetResponse, ServiceRuntimeStatus,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -248,28 +248,50 @@ where
         Command::BackupCreate {
             project_id,
             environment,
+            json,
         } => {
             let (base_url, token) = api_credentials.unwrap();
             let client = ForgeClient::new(base_url, token);
-            print_json(&client.create_backup(&project_id, &environment)?)?;
+            let backup = client.create_backup(&project_id, &environment)?;
+            if json {
+                print_json(&backup)?;
+            } else {
+                print!("{}", render_backup_record(&backup));
+            }
         }
         Command::BackupList {
             project_id,
             environment,
+            json,
         } => {
             let (base_url, token) = api_credentials.unwrap();
             let client = ForgeClient::new(base_url, token);
-            print_json(&client.list_backups(&project_id, &environment)?)?;
+            let backups = client.list_backups(&project_id, &environment)?;
+            if json {
+                print_json(&backups)?;
+            } else {
+                print!("{}", render_backup_list(&backups));
+            }
         }
-        Command::BackupInspect { backup_id } => {
+        Command::BackupInspect { backup_id, json } => {
             let (base_url, token) = api_credentials.unwrap();
             let client = ForgeClient::new(base_url, token);
-            print_json(&client.inspect_backup(&backup_id)?)?;
+            let backup = client.inspect_backup(&backup_id)?;
+            if json {
+                print_json(&backup)?;
+            } else {
+                print!("{}", render_backup_record(&backup));
+            }
         }
-        Command::BackupRestore { backup_id } => {
+        Command::BackupRestore { backup_id, json } => {
             let (base_url, token) = api_credentials.unwrap();
             let client = ForgeClient::new(base_url, token);
-            print_json(&client.restore_backup(&backup_id)?)?;
+            let restore = client.restore_backup(&backup_id)?;
+            if json {
+                print_json(&restore)?;
+            } else {
+                print!("{}", render_backup_restore(&restore));
+            }
         }
         Command::ProjectAdd {
             project_id,
@@ -732,16 +754,20 @@ enum Command {
     BackupCreate {
         project_id: String,
         environment: String,
+        json: bool,
     },
     BackupList {
         project_id: String,
         environment: String,
+        json: bool,
     },
     BackupInspect {
         backup_id: String,
+        json: bool,
     },
     BackupRestore {
         backup_id: String,
+        json: bool,
     },
     ProjectAdd {
         project_id: Option<String>,
@@ -954,28 +980,7 @@ fn parse_command(
             project_id: project_id.clone(),
             environment: environment.clone(),
         }),
-        [cmd, action, project_id, environment] if cmd == "backup" && action == "create" => {
-            Ok(Command::BackupCreate {
-                project_id: project_id.clone(),
-                environment: environment.clone(),
-            })
-        }
-        [cmd, action, project_id, environment] if cmd == "backup" && action == "list" => {
-            Ok(Command::BackupList {
-                project_id: project_id.clone(),
-                environment: environment.clone(),
-            })
-        }
-        [cmd, action, backup_id] if cmd == "backup" && action == "inspect" => {
-            Ok(Command::BackupInspect {
-                backup_id: backup_id.clone(),
-            })
-        }
-        [cmd, action, backup_id] if cmd == "backup" && action == "restore" => {
-            Ok(Command::BackupRestore {
-                backup_id: backup_id.clone(),
-            })
-        }
+        [cmd, rest @ ..] if cmd == "backup" => parse_backup_command(rest),
         [group, action] if group == "project" && action == "list" => Ok(Command::ProjectList),
         [group, action, project_id] if group == "project" && action == "show" => {
             Ok(Command::ProjectShow {
@@ -1032,10 +1037,10 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] gc [--dry-run] [--json]",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] backup create <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] backup list <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] backup inspect <backup_id>",
-        "  forge [--url URL] [--token TOKEN] backup restore <backup_id>",
+        "  forge [--url URL] [--token TOKEN] backup create [--json] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] backup list [--json] <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] backup inspect [--json] <backup_id>",
+        "  forge [--url URL] [--token TOKEN] backup restore [--json] <backup_id>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
         "  forge [--url URL] [--token TOKEN] project list",
         "  forge [--url URL] [--token TOKEN] project show <project_id>",
@@ -1264,6 +1269,37 @@ fn parse_logs_command(args: &[String]) -> Result<Command, CliError> {
             json,
         }),
         _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_backup_command(args: &[String]) -> Result<Command, CliError> {
+    let Some((action, rest)) = args.split_first() else {
+        return Err(CliError::Usage("backup action required".into()));
+    };
+    let (json, positional) = match rest {
+        [flag, tail @ ..] if flag == "--json" => (true, tail),
+        _ => (false, rest),
+    };
+    match (action.as_str(), positional) {
+        ("create", [project_id, environment]) => Ok(Command::BackupCreate {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json,
+        }),
+        ("list", [project_id, environment]) => Ok(Command::BackupList {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            json,
+        }),
+        ("inspect", [backup_id]) => Ok(Command::BackupInspect {
+            backup_id: backup_id.clone(),
+            json,
+        }),
+        ("restore", [backup_id]) => Ok(Command::BackupRestore {
+            backup_id: backup_id.clone(),
+            json,
+        }),
+        _ => Err(CliError::Usage("invalid backup command".into())),
     }
 }
 
@@ -1893,6 +1929,14 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
     }
     output.push('\n');
     output.push_str("Retention:\n");
+    if let Some(restore) = diagnostics.active_restore.as_ref() {
+        output.push_str(&format!(
+            "  Active Restore: {}\n",
+            render_restore_lineage(restore)
+        ));
+    } else {
+        output.push_str("  Active Restore: none\n");
+    }
     output.push_str(&format!(
         "  Rollback-safe Generation: {}\n",
         diagnostics
@@ -1915,6 +1959,21 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         }
     }
     output.push('\n');
+    output.push_str("Backup Restore Events:\n");
+    if diagnostics.backup_restore_events.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for event in &diagnostics.backup_restore_events {
+            output.push_str(&format!("  {event}\n"));
+        }
+    }
+    if !diagnostics.state_restore_warnings.is_empty() {
+        output.push_str("State Restore Warnings:\n");
+        for warning in &diagnostics.state_restore_warnings {
+            output.push_str(&format!("  {warning}\n"));
+        }
+    }
+    output.push('\n');
     output.push_str("Recent GC Actions:\n");
     if diagnostics.recent_gc_actions.is_empty() {
         output.push_str("  none\n");
@@ -1933,6 +1992,101 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         }
     }
     output
+}
+
+fn render_restore_lineage(lineage: &RestoreLineage) -> String {
+    let mut output = format!(
+        "backup={} source_generation={} restored_at={}",
+        lineage.backup_id, lineage.source_generation, lineage.restored_at_unix
+    );
+    if let Some(deployment_id) = lineage.source_deployment_id.as_deref() {
+        output.push_str(&format!(" source_deployment={deployment_id}"));
+    }
+    output
+}
+
+fn render_backup_record(backup: &BackupRecord) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Backup: {}\nProject: {}\nEnvironment: {}\nCreated At: {}\nSource Generation: {}\n",
+        backup.backup_id,
+        backup.project_id,
+        backup.environment,
+        backup.created_at_unix,
+        backup.source_generation
+    ));
+    if let Some(deployment_id) = backup.source_deployment_id.as_deref() {
+        output.push_str(&format!("Source Deployment: {deployment_id}\n"));
+    }
+    output.push_str("Services:\n");
+    if backup.services.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for service in &backup.services {
+            output.push_str(&format!("  {service}\n"));
+        }
+    }
+    output.push_str("Volumes:\n");
+    if backup.volumes.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for volume in &backup.volumes {
+            output.push_str(&format!(
+                "  {}:{} -> {} ({}, {} bytes)\n",
+                volume.service_id,
+                volume.volume_id,
+                volume.mount_path,
+                volume.archive_file,
+                volume.archive_size_bytes
+            ));
+        }
+    }
+    output.push_str("Restores:\n");
+    if backup.restores.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for restore in &backup.restores {
+            output.push_str(&format!(
+                "  gen-{} {} at {} ({})\n",
+                restore.restored_generation,
+                restore.restored_deployment_id,
+                restore.restored_at_unix,
+                restore.status
+            ));
+        }
+    }
+    output
+}
+
+fn render_backup_list(backups: &BackupListResponse) -> String {
+    let mut output = format!(
+        "Project: {}\nEnvironment: {}\nBackups:\n",
+        backups.project_id, backups.environment
+    );
+    if backups.backups.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for backup in &backups.backups {
+            output.push_str(&format!(
+                "  {} gen-{} volumes={} restores={}\n",
+                backup.backup_id,
+                backup.source_generation,
+                backup.volumes.len(),
+                backup.restores.len()
+            ));
+        }
+    }
+    output
+}
+
+fn render_backup_restore(restore: &BackupRestoreResponse) -> String {
+    format!(
+        "Backup: {}\nRestored Generation: {}\nRestored Deployment: {}\nRestored At: {}\n",
+        restore.backup_id,
+        restore.restored_generation,
+        restore.restored_deployment_id,
+        restore.restored_at_unix
+    )
 }
 
 fn render_environment_diff(diff: &EnvironmentDiffResponse) -> String {

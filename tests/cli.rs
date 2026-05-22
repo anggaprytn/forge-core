@@ -402,6 +402,109 @@ fn cli_rollback_posts_rollback_intent() {
 }
 
 #[test]
+fn cli_backup_create_posts_backup_request() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"backup_id":"backup-1","project_id":"api","environment":"production","created_at_unix":10,"source_generation":3,"source_deployment_id":"dep-3","services":["api"],"volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc"}],"restores":[]}}"#,
+    );
+
+    let output = run_cli(&url, &["backup", "create", "api", "production"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Backup: backup-1"));
+    assert!(body.contains("api:redis -> /data"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/production/backups"
+    );
+}
+
+#[test]
+fn cli_backup_list_reads_backup_inventory() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"production","backups":[{"backup_id":"backup-1","project_id":"api","environment":"production","created_at_unix":10,"source_generation":3,"services":["api"],"volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc"}],"restores":[]}]}}"#,
+    );
+
+    let output = run_cli(&url, &["backup", "list", "api", "production"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Project: api"));
+    assert!(body.contains("backup-1 gen-3 volumes=1 restores=0"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/production/backups"
+    );
+}
+
+#[test]
+fn cli_backup_inspect_reads_backup_manifest() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"backup_id":"backup-1","project_id":"api","environment":"production","created_at_unix":10,"source_generation":3,"services":["api"],"volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc"}],"restores":[{"restored_generation":4,"restored_deployment_id":"restore-backup-1-gen-4","restored_at_unix":20,"status":"completed"}]}}"#,
+    );
+
+    let output = run_cli(&url, &["backup", "inspect", "backup-1"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Restores:"));
+    assert!(body.contains("gen-4 restore-backup-1-gen-4"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/backups/backup-1");
+}
+
+#[test]
+fn cli_backup_restore_posts_restore_request() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"backup_id":"backup-1","restored_generation":4,"restored_deployment_id":"restore-backup-1-gen-4","restored_at_unix":20}}"#,
+    );
+
+    let output = run_cli(&url, &["backup", "restore", "--json", "backup-1"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"restored_generation\": 4"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/api/backups/backup-1/restore");
+}
+
+#[test]
+fn diagnose_reports_restore_lineage() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"production","status":"healthy","active_generation":4,"container":{"running":true},"route":{"route_required":false,"route_active":false,"matches_expected":true},"retained_generations":[],"recent_gc_actions":[],"missing_required_secrets":[],"recent_secret_mutations":[],"startup_order":[],"services":[],"recent_failures":[],"active_restore":{"backup_id":"backup-1","source_generation":3,"source_deployment_id":"dep-3","restored_at_unix":20},"backup_restore_events":["restored backup backup-1 into gen-4"]}}"#,
+    );
+
+    let output = run_cli(&url, &["diagnose", "api", "production"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Active Restore: backup=backup-1 source_generation=3"));
+    assert!(body.contains("Backup Restore Events:"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/production/diagnostics"
+    );
+}
+
+#[test]
 fn cli_secrets_set_writes_secret_without_echoing_value() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(

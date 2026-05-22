@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -675,8 +676,13 @@ struct E2eHarness {
     token: String,
     config: DaemonConfig,
     http_client: Client,
-    api_threads: Vec<JoinHandle<()>>,
+    api_servers: Vec<ApiServerHandle>,
     routing: CaddyApiRuntime,
+}
+
+struct ApiServerHandle {
+    shutdown: Sender<()>,
+    join: JoinHandle<()>,
 }
 
 impl E2eHarness {
@@ -745,7 +751,7 @@ impl E2eHarness {
             token,
             config: config.clone(),
             http_client: Client::new(),
-            api_threads: Vec::new(),
+            api_servers: Vec::new(),
             routing: CaddyApiRuntime::new(
                 format!("http://127.0.0.1:{admin_port}"),
                 format!("http://127.0.0.1:{public_port}"),
@@ -781,7 +787,7 @@ impl E2eHarness {
             None,
         );
         let app = router(state);
-        self.api_threads.push(spawn_http_server(self.api_port, app));
+        self.api_servers.push(spawn_http_server(self.api_port, app));
         self.wait_for_api_ready();
     }
 
@@ -1197,22 +1203,36 @@ impl E2eHarness {
 
 impl Drop for E2eHarness {
     fn drop(&mut self) {
+        while let Some(server) = self.api_servers.pop() {
+            let _ = server.shutdown.send(());
+            let _ = server.join.join();
+        }
         let _ = cleanup_forge_containers();
         let _ = docker(&["rm", "-f", &self.caddy_container_name]);
         let _ = docker(&["network", "rm", &self.network_name]);
     }
 }
 
-fn spawn_http_server(port: u16, app: Router) -> JoinHandle<()> {
-    thread::spawn(move || {
+fn spawn_http_server(port: u16, app: Router) -> ApiServerHandle {
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let join = thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("api runtime should start");
         runtime.block_on(async move {
             let listener = TcpListener::bind(("127.0.0.1", port))
                 .await
                 .expect("api listener should bind");
-            let _ = axum::serve(listener, app).await;
+            let shutdown = async move {
+                let _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()).await;
+            };
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
         });
-    })
+    });
+    ApiServerHandle {
+        shutdown: shutdown_tx,
+        join,
+    }
 }
 
 #[derive(Clone, Copy)]

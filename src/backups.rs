@@ -3,7 +3,9 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
+use crate::process::run_command_with_timeout;
 use sha2::{Digest, Sha256};
 
 use crate::api::{
@@ -679,14 +681,16 @@ fn archive_directory(source: &Path, archive_path: &Path) -> Result<(), BackupErr
     if let Some(parent) = archive_path.parent() {
         fs::create_dir_all(parent).map_err(|err| BackupError::Command(err.to_string()))?;
     }
-    let output = Command::new("tar")
-        .arg("-czf")
-        .arg(archive_path)
-        .arg("-C")
-        .arg(source)
-        .arg(".")
-        .output()
-        .map_err(|err| BackupError::Command(err.to_string()))?;
+    let output = run_command_with_timeout(
+        Command::new("tar")
+            .arg("-czf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(source)
+            .arg("."),
+        Duration::from_secs(60),
+    )
+    .map_err(|err| BackupError::Command(err.to_string()))?;
     if !output.status.success() {
         return Err(BackupError::Command(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -697,13 +701,15 @@ fn archive_directory(source: &Path, archive_path: &Path) -> Result<(), BackupErr
 
 fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), BackupError> {
     fs::create_dir_all(target).map_err(|err| BackupError::Command(err.to_string()))?;
-    let output = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive_path)
-        .arg("-C")
-        .arg(target)
-        .output()
-        .map_err(|err| BackupError::Command(err.to_string()))?;
+    let output = run_command_with_timeout(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(target),
+        Duration::from_secs(60),
+    )
+    .map_err(|err| BackupError::Command(err.to_string()))?;
     if !output.status.success() {
         return Err(BackupError::Command(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -1069,4 +1075,567 @@ fn primary_service_id(
                 .cloned()
                 .unwrap_or_else(|| "default".into())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::api::ProjectUpsertRequest;
+    use crate::runtime::{ManagedImage, ManagedVolume, RouteUpdateRequest, VolumeInspection};
+    use crate::secrets::seal_value;
+    use crate::storage::{
+        PersistedResolvedRuntime, PersistedResolvedRuntimeEntry, PersistedRuntimeEnvSource,
+        PersistedServiceState, PointerStore, SnapshotWriter,
+    };
+
+    #[derive(Default)]
+    struct TestRoutingRuntime {
+        routes: BTreeMap<String, RouteInspection>,
+    }
+
+    impl RoutingRuntime for TestRoutingRuntime {
+        fn update_route(
+            &mut self,
+            request: RouteUpdateRequest,
+        ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+            self.routes.insert(
+                request.subtree_id.clone(),
+                RouteInspection {
+                    subtree_id: request.subtree_id,
+                    active_target: request.target,
+                    domain: request.domain,
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: request.health_checks_enabled,
+                },
+            );
+            Ok(())
+        }
+
+        fn inspect_route(
+            &mut self,
+            subtree_id: &str,
+        ) -> Result<RouteInspection, crate::runtime::RoutingRuntimeError> {
+            self.routes.get(subtree_id).cloned().ok_or_else(|| {
+                crate::runtime::RoutingRuntimeError::InspectionFailed(subtree_id.into())
+            })
+        }
+
+        fn list_managed_routes(
+            &mut self,
+        ) -> Result<Vec<RouteInspection>, crate::runtime::RoutingRuntimeError> {
+            Ok(self.routes.values().cloned().collect())
+        }
+
+        fn remove_route(
+            &mut self,
+            subtree_id: &str,
+        ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+            self.routes.remove(subtree_id);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestDockerRuntime {
+        volume_inspections: BTreeMap<String, VolumeInspection>,
+        container_inspections: BTreeMap<String, ContainerInspection>,
+        created_containers: Vec<CreateContainerRequest>,
+        started_containers: Vec<String>,
+        next_container_ip: VecDeque<String>,
+    }
+
+    impl DockerRuntime for TestDockerRuntime {
+        fn build_image(
+            &mut self,
+            _request: crate::runtime::BuildImageRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            unreachable!("backup tests do not build images")
+        }
+
+        fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn ensure_volume(
+            &mut self,
+            request: CreateVolumeRequest,
+        ) -> Result<(), DockerRuntimeError> {
+            if self.volume_inspections.contains_key(&request.volume_name) {
+                return Ok(());
+            }
+            let mountpoint = std::env::temp_dir().join(&request.volume_name);
+            fs::create_dir_all(&mountpoint).unwrap();
+            self.volume_inspections.insert(
+                request.volume_name.clone(),
+                VolumeInspection {
+                    volume_name: request.volume_name,
+                    mountpoint,
+                    labels: request.labels,
+                },
+            );
+            Ok(())
+        }
+
+        fn create_container(
+            &mut self,
+            request: CreateContainerRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            let ip = self
+                .next_container_ip
+                .pop_front()
+                .unwrap_or_else(|| "172.19.0.20".into());
+            self.container_inspections.insert(
+                request.container_name.clone(),
+                ContainerInspection {
+                    container_name: request.container_name.clone(),
+                    running: false,
+                    state_status: "created".into(),
+                    exit_code: Some(0),
+                    restart_count: 0,
+                    started_at: Some("2026-05-23T00:00:00Z".into()),
+                    image_ref: request.image_ref.clone(),
+                    labels: request.labels.clone(),
+                    network_ips: request
+                        .network_name
+                        .clone()
+                        .into_iter()
+                        .map(|network| (network, ip.clone()))
+                        .collect(),
+                    volume_mounts: request
+                        .volume_mounts
+                        .iter()
+                        .map(|mount| crate::runtime::ContainerVolumeMount {
+                            volume_name: mount.volume_name.clone(),
+                            mount_path: mount.mount_path.clone(),
+                        })
+                        .collect(),
+                    restart_policy: "no".into(),
+                },
+            );
+            self.created_containers.push(request.clone());
+            Ok(request.container_name)
+        }
+
+        fn start_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
+            self.started_containers.push(container_name.into());
+            self.container_inspections
+                .get_mut(container_name)
+                .unwrap()
+                .running = true;
+            self.container_inspections
+                .get_mut(container_name)
+                .unwrap()
+                .state_status = "running".into();
+            Ok(())
+        }
+
+        fn inspect_container(
+            &mut self,
+            container_name: &str,
+        ) -> Result<ContainerInspection, DockerRuntimeError> {
+            self.container_inspections
+                .get(container_name)
+                .cloned()
+                .ok_or_else(|| DockerRuntimeError::CommandFailed(container_name.into()))
+        }
+
+        fn container_logs(
+            &mut self,
+            _container_name: &str,
+            _tail_lines: usize,
+        ) -> Result<String, DockerRuntimeError> {
+            Ok(String::new())
+        }
+
+        fn list_managed_containers(
+            &mut self,
+        ) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+            Ok(self.container_inspections.values().cloned().collect())
+        }
+
+        fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_volumes(&mut self) -> Result<Vec<ManagedVolume>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn inspect_volume(
+            &mut self,
+            volume_name: &str,
+        ) -> Result<VolumeInspection, DockerRuntimeError> {
+            self.volume_inspections
+                .get(volume_name)
+                .cloned()
+                .ok_or_else(|| DockerRuntimeError::CommandFailed(volume_name.into()))
+        }
+
+        fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+    }
+
+    struct SeededEnvironment {
+        root: PathBuf,
+        original_persistent_volume: String,
+        original_mountpoint: PathBuf,
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::temp_dir().join(format!(
+            "forge-backups-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn ensure_test_master_key() {
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            );
+        }
+    }
+
+    fn register_project(root: &Path) {
+        ProjectRegistryStore::new(root)
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("api".into()),
+                    repo_url: "https://github.com/example/api.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    fn seed_environment(root: &Path, docker: &mut TestDockerRuntime) -> SeededEnvironment {
+        ensure_test_master_key();
+        register_project(root);
+        let env = EnvironmentPaths::new(root, "api", "production");
+        env.ensure_exists().unwrap();
+        let generation = GenerationAllocator::new(env.clone()).allocate().unwrap();
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        let original_volume = "forge-api-production-vol-redis".to_string();
+        let original_mountpoint = root.join("volumes").join("redis-source");
+        let ephemeral_mountpoint = root.join("volumes").join("cache-source");
+        fs::create_dir_all(&original_mountpoint).unwrap();
+        fs::create_dir_all(&ephemeral_mountpoint).unwrap();
+        fs::write(original_mountpoint.join("counter.txt"), "7").unwrap();
+        fs::write(ephemeral_mountpoint.join("scratch.txt"), "warm").unwrap();
+        docker.volume_inspections.insert(
+            original_volume.clone(),
+            VolumeInspection {
+                volume_name: original_volume.clone(),
+                mountpoint: original_mountpoint.clone(),
+                labels: BTreeMap::new(),
+            },
+        );
+        docker.volume_inspections.insert(
+            "forge-api-production-gen-1-vol-cache".into(),
+            VolumeInspection {
+                volume_name: "forge-api-production-gen-1-vol-cache".into(),
+                mountpoint: ephemeral_mountpoint,
+                labels: BTreeMap::new(),
+            },
+        );
+        let persistent_mount = PersistedVolumeMount {
+            volume_id: "redis".into(),
+            docker_volume_name: original_volume.clone(),
+            mount_path: "/data".into(),
+            service_id: "api".into(),
+            generation,
+            retention: PersistedVolumeRetention::Persistent,
+        };
+        let ephemeral_mount = PersistedVolumeMount {
+            volume_id: "cache".into(),
+            docker_volume_name: "forge-api-production-gen-1-vol-cache".into(),
+            mount_path: "/cache".into(),
+            service_id: "api".into(),
+            generation,
+            retention: PersistedVolumeRetention::Ephemeral,
+        };
+        let service = PersistedServiceRuntimeInfo {
+            service_id: "api".into(),
+            container_name: "prod-api-gen-1".into(),
+            image_ref: "forge/api:production-gen-1".into(),
+            running: true,
+            state: PersistedServiceState::Healthy,
+            network_name: Some("forge-test".into()),
+            probe_path: Some("/health".into()),
+            activation: None,
+            command: None,
+            depends_on: Vec::new(),
+            required_for_promotion: true,
+            externally_exposed: false,
+            environment_variables: BTreeMap::new(),
+            state_config: None,
+            volume_mounts: vec![persistent_mount.clone(), ephemeral_mount],
+            source_ref: Some("main".into()),
+            repo_url: Some("https://github.com/example/api.git".into()),
+            commit_sha: Some("abc123".into()),
+            source_path: Some(root.join("checkout")),
+        };
+        let runtime = PersistedRuntimeInfo {
+            container_name: "prod-api-gen-1".into(),
+            running: true,
+            network_name: Some("forge-test".into()),
+            probe_path: Some("/health".into()),
+            activation: None,
+            environment_variables: BTreeMap::new(),
+            volume_mounts: vec![persistent_mount],
+            source_ref: Some("main".into()),
+            repo_url: Some("https://github.com/example/api.git".into()),
+            commit_sha: Some("abc123".into()),
+            source_path: Some(root.join("checkout")),
+            services: BTreeMap::from([("api".into(), service)]),
+            startup_order: vec!["api".into()],
+        };
+        let build = PersistedBuildInfo {
+            deployment_id: "dep-1".into(),
+            image_ref: "forge/api:production-gen-1".into(),
+            services: BTreeMap::new(),
+            source_ref: Some("main".into()),
+            repo_url: Some("https://github.com/example/api.git".into()),
+            commit_sha: Some("abc123".into()),
+            source_path: Some(root.join("checkout")),
+        };
+        let resolved = PersistedResolvedRuntime {
+            snapshot_version: 1,
+            project_id: "api".into(),
+            environment: "production".into(),
+            generation,
+            deployment_id: "dep-1".into(),
+            source_environment: "production".into(),
+            source_ref: Some("main".into()),
+            commit_sha: Some("abc123".into()),
+            domain: Some("api.example.com".into()),
+            entries: BTreeMap::from([
+                (
+                    "DATABASE_URL".into(),
+                    PersistedResolvedRuntimeEntry {
+                        source: PersistedRuntimeEnvSource::ProjectEnvironmentSecret,
+                        value: None,
+                        secret_reference: None,
+                        sealed_value: Some(seal_value("postgres://supersecret").unwrap()),
+                        sensitive: true,
+                    },
+                ),
+                (
+                    "FORGE_PROJECT_ID".into(),
+                    PersistedResolvedRuntimeEntry {
+                        source: PersistedRuntimeEnvSource::ForgeGenerated,
+                        value: Some("api".into()),
+                        secret_reference: None,
+                        sealed_value: None,
+                        sensitive: false,
+                    },
+                ),
+            ]),
+        };
+        writer
+            .write_artifact(
+                "build.json",
+                &format!("{}\n", serde_json::to_string_pretty(&build).unwrap()),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime.json",
+                &format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "resolved_runtime.json",
+                &format!("{}\n", serde_json::to_string_pretty(&resolved).unwrap()),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
+        PointerStore::new(env).swap_current(generation).unwrap();
+        SeededEnvironment {
+            root: root.to_path_buf(),
+            original_persistent_volume: original_volume,
+            original_mountpoint,
+        }
+    }
+
+    #[test]
+    fn persistent_volume_backup_created() {
+        let root = test_root("persistent-volume-backup-created");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        assert_eq!(backup.volumes.len(), 1);
+        assert!(
+            backup_dir(&root, "api", "production", &backup.backup_id)
+                .join("volumes")
+                .join(&backup.volumes[0].archive_file)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn backup_only_includes_persistent_volumes() {
+        let root = test_root("backup-only-includes-persistent");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        assert_eq!(backup.volumes.len(), 1);
+        assert_eq!(backup.volumes[0].volume_id, "redis");
+    }
+
+    #[test]
+    fn backup_excludes_ephemeral_volumes() {
+        let root = test_root("backup-excludes-ephemeral");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        assert!(
+            backup
+                .volumes
+                .iter()
+                .all(|volume| volume.volume_id != "cache")
+        );
+    }
+
+    #[test]
+    fn backup_inspect_reports_volume_manifest() {
+        let root = test_root("backup-inspect-manifest");
+        let mut docker = TestDockerRuntime::default();
+        let seeded = seed_environment(&root, &mut docker);
+        let created = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        let inspected = inspect_backup(&seeded.root, &created.backup_id).unwrap();
+
+        assert_eq!(inspected.volumes.len(), 1);
+        assert_eq!(
+            inspected.volumes[0].docker_volume_name,
+            seeded.original_persistent_volume
+        );
+        assert_eq!(inspected.volumes[0].mount_path, "/data");
+    }
+
+    #[test]
+    fn restore_creates_new_generation() {
+        let root = test_root("restore-creates-new-generation");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        let restore = restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        assert_eq!(restore.restored_generation, 2);
+        assert!(restore.restored_deployment_id.starts_with("restore-"));
+        assert_eq!(
+            PointerStore::new(EnvironmentPaths::new(&root, "api", "production"))
+                .read_authoritative_pointer()
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn restore_preserves_stateful_data() {
+        let root = test_root("restore-preserves-stateful-data");
+        let mut docker = TestDockerRuntime::default();
+        let seeded = seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let restored_volume = docker
+            .volume_inspections
+            .keys()
+            .find(|name| name.contains("restore-gen-2-vol-redis"))
+            .unwrap()
+            .clone();
+        let restored_mountpoint = docker.volume_inspections[&restored_volume]
+            .mountpoint
+            .clone();
+        assert_eq!(
+            fs::read_to_string(restored_mountpoint.join("counter.txt")).unwrap(),
+            "7"
+        );
+        assert_ne!(restored_mountpoint, seeded.original_mountpoint);
+    }
+
+    #[test]
+    fn restore_does_not_mutate_existing_persistent_volume() {
+        let root = test_root("restore-does-not-mutate-existing-volume");
+        let mut docker = TestDockerRuntime::default();
+        let seeded = seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(seeded.original_mountpoint.join("counter.txt")).unwrap(),
+            "7"
+        );
+    }
+
+    #[test]
+    fn backup_restore_rejects_missing_backup() {
+        let root = test_root("missing-backup");
+        let mut docker = TestDockerRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+
+        let err = restore_backup(&root, &mut docker, &mut routing, "backup-missing").unwrap_err();
+
+        assert!(matches!(err, BackupError::NotFound(_)));
+    }
+
+    #[test]
+    fn backup_metadata_redacts_secrets_plaintext() {
+        let root = test_root("backup-redacts-secrets");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let metadata = fs::read_to_string(
+            backup_dir(&root, "api", "production", &backup.backup_id).join("metadata.json"),
+        )
+        .unwrap();
+
+        assert!(!metadata.contains("postgres://supersecret"));
+        assert!(metadata.contains("\"sealed_value\""));
+    }
 }

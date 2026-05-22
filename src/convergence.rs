@@ -5661,6 +5661,51 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
     }
 
     #[test]
+    fn gc_preserves_backup_artifacts() {
+        let root = test_root("gc-preserves-backup-artifacts");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let backup_root = EnvironmentPaths::backups_root(&root)
+            .join("api")
+            .join("production")
+            .join("backup-1");
+        std::fs::create_dir_all(backup_root.join("volumes")).unwrap();
+        crate::storage::atomic_write(
+            backup_root.join("metadata.json"),
+            br#"{
+  "backup_version": 1,
+  "backup_id": "backup-1",
+  "project_id": "api",
+  "environment": "production",
+  "created_at_unix": 1,
+  "source_generation": 1,
+  "snapshot_metadata": {"snapshot_version":1,"project_id":"api","environment":"production","generation":1,"state":"healthy","finalized_at_unix":1},
+  "build_info": {"deployment_id":"dep-1","image_ref":"forge/api:production-gen-1","services":{}},
+  "runtime_info": {"container_name":"prod-api-gen-1","running":true,"environment_variables":{}},
+  "resolved_runtime": {"snapshot_version":1,"project_id":"api","environment":"production","generation":1,"deployment_id":"dep-1","source_environment":"production","entries":{}},
+  "services": ["api"],
+  "volumes": [],
+  "restores": [],
+  "warnings": []
+}
+"#,
+        )
+        .unwrap();
+        crate::storage::atomic_write(backup_root.join("volumes/manifest.txt"), b"present\n")
+            .unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        garbage_collect(&root, &queue, &mut docker, &mut routing, false).unwrap();
+
+        assert!(backup_root.join("metadata.json").exists());
+        assert!(backup_root.join("volumes/manifest.txt").exists());
+    }
+
+    #[test]
     fn convergence_handles_missing_gc_generation() {
         let root = test_root("convergence-handles-missing-gc-generation");
         setup_active_generation(&root, 1);
@@ -5681,6 +5726,46 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
             PointerStore::new(env).read_pointer("previous").unwrap(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn convergence_tolerates_partial_restore_failure() {
+        let root = test_root("convergence-tolerates-partial-restore-failure");
+        setup_active_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        setup_active_generation(&root, 2);
+        crate::storage::atomic_write(
+            env.generation_dir(2).join("snapshot.json"),
+            br#"{
+  "snapshot_version": 1,
+  "project_id": "api",
+  "environment": "production",
+  "generation": 2,
+  "state": "healthy",
+  "finalized_at_unix": 2
+}
+"#,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(env.generation_dir(2).join("runtime.json"));
+        PointerStore::new(env.clone()).swap_current(2).unwrap();
+        crate::storage::atomic_write(env.previous_pointer(), b"1\n").unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        assert_eq!(
+            PointerStore::new(env.clone())
+                .read_pointer("previous")
+                .unwrap(),
+            Some(1)
+        );
+        assert!(env.generation_dir(1).join("snapshot.json").exists());
     }
 
     #[test]
