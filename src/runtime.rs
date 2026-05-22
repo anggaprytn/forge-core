@@ -98,6 +98,20 @@ pub struct VolumeArchiveHelperOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecInContainerRequest {
+    pub container_name: String,
+    pub command: Vec<String>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecInContainerOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerRuntimeError {
     CommandFailed(String),
     InvalidResponse(String),
@@ -170,6 +184,15 @@ pub trait DockerRuntime {
         Err(DockerRuntimeError::CommandFailed(format!(
             "volume archive helper not implemented for {} {} in {}",
             direction, request.volume_name, archive_dir
+        )))
+    }
+    fn exec_in_container(
+        &mut self,
+        request: ExecInContainerRequest,
+    ) -> Result<ExecInContainerOutput, DockerRuntimeError> {
+        Err(DockerRuntimeError::CommandFailed(format!(
+            "container exec not implemented for {}",
+            request.container_name
         )))
     }
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;

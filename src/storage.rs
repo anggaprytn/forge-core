@@ -164,6 +164,8 @@ pub struct PersistedStateConfig {
     pub volume: String,
     pub mount_path: String,
     pub retention: PersistedVolumeRetention,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_backup_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +582,18 @@ pub struct PersistedBackupRestoreRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBackupHookRecord {
+    pub service_id: String,
+    pub volume_id: String,
+    pub command: String,
+    pub executed_at_unix: u64,
+    pub timeout_seconds: u64,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedBackupMetadata {
     pub backup_version: u64,
     pub backup_id: String,
@@ -599,6 +613,8 @@ pub struct PersistedBackupMetadata {
     pub services: Vec<String>,
     #[serde(default)]
     pub volumes: Vec<PersistedBackupVolumeRecord>,
+    #[serde(default)]
+    pub hooks: Vec<PersistedBackupHookRecord>,
     #[serde(default)]
     pub restores: Vec<PersistedBackupRestoreRecord>,
     #[serde(default)]

@@ -15,25 +15,26 @@ use crate::queue::DeploymentRecord;
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
     ContainerInspection, CreateContainerRequest, CreateVolumeRequest, DockerRuntime,
-    DockerRuntimeError, RouteInspection, RouteUpdateRequest, RoutingRuntime,
-    VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeMountRequest,
+    DockerRuntimeError, ExecInContainerRequest, RouteInspection, RouteUpdateRequest,
+    RoutingRuntime, VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeMountRequest,
 };
 use crate::runtime_env::{RuntimeEnvMetadata, generated_forge_vars, restore_runtime_env};
 use crate::status::derive_environment_domain;
 use crate::storage::{
     DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths, EventStore, GenerationAllocator,
-    GenerationHistoryRecord, LifecycleStore, PersistedActivationMode, PersistedBackupMetadata,
-    PersistedBackupRestoreRecord, PersistedBackupVolumeRecord, PersistedBuildInfo,
-    PersistedDeploymentLifecycle, PersistedPromotionSummary, PersistedResolvedRuntime,
-    PersistedResolvedRuntimeEntry, PersistedRuntimeEnvEntry, PersistedRuntimeEnvSnapshot,
-    PersistedRuntimeInfo, PersistedServiceRuntimeInfo, PersistedServiceState,
-    PersistedSnapshotMetadata, PersistedValidationSummary, PersistedVolumeMount,
-    PersistedVolumeRetention, PointerStore, RetentionStore, RuntimeHealthState, RuntimeState,
-    RuntimeStateStore, SnapshotState, SnapshotWriter, StorageError, atomic_write,
-    current_unix_timestamp, load_generation_build_info, load_generation_resolved_runtime,
-    load_generation_runtime_env_snapshot, load_generation_runtime_info,
-    load_generation_snapshot_metadata,
+    GenerationHistoryRecord, LifecycleStore, PersistedActivationMode, PersistedBackupHookRecord,
+    PersistedBackupMetadata, PersistedBackupRestoreRecord, PersistedBackupVolumeRecord,
+    PersistedBuildInfo, PersistedDeploymentLifecycle, PersistedPromotionSummary,
+    PersistedResolvedRuntime, PersistedResolvedRuntimeEntry, PersistedRuntimeEnvEntry,
+    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
+    PersistedServiceState, PersistedSnapshotMetadata, PersistedValidationSummary,
+    PersistedVolumeMount, PersistedVolumeRetention, PointerStore, RetentionStore,
+    RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
+    StorageError, atomic_write, current_unix_timestamp, load_generation_build_info,
+    load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
+use crate::topology::{runtime_with_primary_service, select_primary_service_id};
 
 #[derive(Debug)]
 pub enum BackupError {
@@ -85,6 +86,7 @@ impl From<std::io::Error> for BackupError {
 }
 
 const VOLUME_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
+const PRE_BACKUP_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn create_backup<D: DockerRuntime>(
     storage_root: &Path,
@@ -105,6 +107,7 @@ pub fn create_backup<D: DockerRuntime>(
         .ok_or_else(|| BackupError::NotFound(format!("generation {generation} build missing")))?;
     let runtime = load_generation_runtime_info(&env, generation)?
         .ok_or_else(|| BackupError::NotFound(format!("generation {generation} runtime missing")))?;
+    let runtime = runtime_with_primary_service(&runtime);
     let runtime_env_snapshot =
         load_generation_runtime_env_snapshot(&env, generation)?.ok_or_else(|| {
             BackupError::Invalid(format!(
@@ -131,7 +134,11 @@ pub fn create_backup<D: DockerRuntime>(
     let backup_id = format!("backup-{}", current_unix_timestamp());
     let backup_dir = backup_dir(storage_root, project_id, environment, &backup_id);
     fs::create_dir_all(backup_dir.join("volumes"))?;
-    let backup_result = (|| -> Result<Vec<PersistedBackupVolumeRecord>, BackupError> {
+    let backup_result = (|| -> Result<
+        (Vec<PersistedBackupHookRecord>, Vec<PersistedBackupVolumeRecord>),
+        BackupError,
+    > {
+        let hooks = run_pre_backup_hooks(docker, &services)?;
         let mut manifest = Vec::new();
         for mount in volume_mounts {
             let archive_file = format!("{}-{}.tar.gz", mount.service_id, mount.volume_id);
@@ -156,10 +163,10 @@ pub fn create_backup<D: DockerRuntime>(
                 archive_sha256: hex::encode(Sha256::digest(bytes)),
             });
         }
-        Ok(manifest)
+        Ok((hooks, manifest))
     })();
-    let manifest = match backup_result {
-        Ok(manifest) => manifest,
+    let (hooks, manifest) = match backup_result {
+        Ok(result) => result,
         Err(err) => {
             cleanup_partial_backup_dir(&backup_dir)?;
             return Err(err);
@@ -182,10 +189,12 @@ pub fn create_backup<D: DockerRuntime>(
         resolved_runtime: resolved,
         services: services.keys().cloned().collect(),
         volumes: manifest.clone(),
+        hooks,
         restores: Vec::new(),
         warnings: vec![
             "backups are crash-consistent only".into(),
             "Forge does not coordinate database quiescing".into(),
+            "DB-consistent backups require service-level pre_backup_command hooks".into(),
             "backups are not PITR snapshots".into(),
         ],
     };
@@ -333,6 +342,7 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         domain: domain.clone(),
     }));
 
+    metadata.runtime_info = runtime_with_primary_service(&metadata.runtime_info);
     let source_services = runtime_services(&metadata.runtime_info);
     let service_count = source_services.len();
     let mut restored_services = BTreeMap::new();
@@ -874,6 +884,55 @@ fn runtime_services(
     )])
 }
 
+fn run_pre_backup_hooks<D: DockerRuntime>(
+    docker: &mut D,
+    services: &BTreeMap<String, PersistedServiceRuntimeInfo>,
+) -> Result<Vec<PersistedBackupHookRecord>, BackupError> {
+    let mut hooks = Vec::new();
+    for service in services.values() {
+        for mount in &service.volume_mounts {
+            let Some(state_config) = service.state_config.as_ref() else {
+                continue;
+            };
+            let Some(command) = state_config.pre_backup_command.as_ref() else {
+                continue;
+            };
+            if mount.volume_id != state_config.volume {
+                continue;
+            }
+            if !service.running {
+                return Err(BackupError::Invalid(format!(
+                    "pre_backup_command requires running container for service `{}`",
+                    service.service_id
+                )));
+            }
+            let output = docker.exec_in_container(ExecInContainerRequest {
+                container_name: service.container_name.clone(),
+                command: vec!["sh".into(), "-lc".into(), command.clone()],
+                timeout: PRE_BACKUP_HOOK_TIMEOUT,
+            })?;
+            let record = PersistedBackupHookRecord {
+                service_id: service.service_id.clone(),
+                volume_id: mount.volume_id.clone(),
+                command: command.clone(),
+                executed_at_unix: current_unix_timestamp(),
+                timeout_seconds: PRE_BACKUP_HOOK_TIMEOUT.as_secs(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+                exit_code: output.exit_code,
+            };
+            if record.exit_code != 0 {
+                return Err(BackupError::Command(format!(
+                    "pre_backup_command failed for service `{}` volume `{}` with exit code {}",
+                    record.service_id, record.volume_id, record.exit_code
+                )));
+            }
+            hooks.push(record);
+        }
+    }
+    Ok(hooks)
+}
+
 fn restore_volume_mounts<D: DockerRuntime>(
     storage_root: &Path,
     docker: &mut D,
@@ -1289,18 +1348,13 @@ fn primary_service_id(
     runtime: &PersistedRuntimeInfo,
     restored_services: &BTreeMap<String, PersistedServiceRuntimeInfo>,
 ) -> String {
-    runtime
-        .startup_order
-        .iter()
-        .find(|service_id| restored_services.contains_key(*service_id))
-        .cloned()
-        .unwrap_or_else(|| {
-            restored_services
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| "default".into())
-        })
+    select_primary_service_id(runtime, restored_services).unwrap_or_else(|| {
+        restored_services
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "default".into())
+    })
 }
 
 #[cfg(test)]
@@ -1311,8 +1365,9 @@ mod tests {
 
     use crate::api::ProjectUpsertRequest;
     use crate::runtime::{
-        ManagedImage, ManagedVolume, RouteUpdateRequest, VolumeArchiveHelperOutput,
-        VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
+        ExecInContainerOutput, ExecInContainerRequest, ManagedImage, ManagedVolume,
+        RouteUpdateRequest, VolumeArchiveHelperOutput, VolumeArchiveHelperRequest,
+        VolumeArchiveMode, VolumeInspection,
     };
     use crate::secrets::seal_value;
     use crate::status::{load_environment_diagnostics, load_project_environment_env_report};
@@ -1381,6 +1436,9 @@ mod tests {
         next_container_ip: VecDeque<String>,
         helper_requests: Vec<VolumeArchiveHelperRequest>,
         helper_results: VecDeque<Result<VolumeArchiveHelperOutput, DockerRuntimeError>>,
+        exec_requests: Vec<ExecInContainerRequest>,
+        exec_results: VecDeque<Result<ExecInContainerOutput, DockerRuntimeError>>,
+        exec_file_writes: VecDeque<Vec<(PathBuf, Vec<u8>)>>,
         inspect_volume_calls: Vec<String>,
         fail_inspect_volume: bool,
     }
@@ -1549,6 +1607,28 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             })
+        }
+
+        fn exec_in_container(
+            &mut self,
+            request: ExecInContainerRequest,
+        ) -> Result<ExecInContainerOutput, DockerRuntimeError> {
+            self.exec_requests.push(request);
+            if let Some(writes) = self.exec_file_writes.pop_front() {
+                for (path, bytes) in writes {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).unwrap();
+                    }
+                    fs::write(path, bytes).unwrap();
+                }
+            }
+            self.exec_results
+                .pop_front()
+                .unwrap_or(Ok(ExecInContainerOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }))
         }
 
         fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
@@ -1807,6 +1887,156 @@ mod tests {
             original_persistent_volume: original_volume,
             original_mountpoint,
         }
+    }
+
+    fn seed_multiservice_environment(root: &Path, docker: &mut TestDockerRuntime) {
+        ensure_test_master_key();
+        register_project(root);
+        let env = EnvironmentPaths::new(root, "api", "production");
+        env.ensure_exists().unwrap();
+        let generation = GenerationAllocator::new(env.clone()).allocate().unwrap();
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        let redis_volume = "forge-api-production-vol-redis-data".to_string();
+        let redis_mountpoint = root.join("volumes").join("redis-source");
+        fs::create_dir_all(&redis_mountpoint).unwrap();
+        fs::write(redis_mountpoint.join("counter.txt"), "44").unwrap();
+        docker.volume_inspections.insert(
+            redis_volume.clone(),
+            VolumeInspection {
+                volume_name: redis_volume.clone(),
+                mountpoint: redis_mountpoint,
+                labels: BTreeMap::new(),
+            },
+        );
+
+        let redis_service = PersistedServiceRuntimeInfo {
+            service_id: "redis".into(),
+            container_name: "prod-api-redis-gen-1".into(),
+            image_ref: "redis:7".into(),
+            running: true,
+            state: PersistedServiceState::Healthy,
+            network_name: Some("forge-test".into()),
+            probe_path: None,
+            activation: Some(PersistedActivationMode::Direct),
+            command: None,
+            depends_on: Vec::new(),
+            required_for_promotion: true,
+            externally_exposed: false,
+            environment_variables: BTreeMap::new(),
+            state_config: Some(crate::storage::PersistedStateConfig {
+                volume: "redis-data".into(),
+                mount_path: "/data".into(),
+                retention: PersistedVolumeRetention::Persistent,
+                pre_backup_command: None,
+            }),
+            volume_mounts: vec![PersistedVolumeMount {
+                volume_id: "redis-data".into(),
+                docker_volume_name: redis_volume,
+                mount_path: "/data".into(),
+                service_id: "redis".into(),
+                generation,
+                retention: PersistedVolumeRetention::Persistent,
+            }],
+            source_ref: Some("main".into()),
+            repo_url: Some("https://github.com/example/api.git".into()),
+            commit_sha: Some("abc123".into()),
+            source_path: Some(root.join("checkout")),
+        };
+        let api_service = PersistedServiceRuntimeInfo {
+            service_id: "api".into(),
+            container_name: "prod-api-api-gen-1".into(),
+            image_ref: "forge/api:production-gen-1".into(),
+            running: true,
+            state: PersistedServiceState::Healthy,
+            network_name: Some("forge-test".into()),
+            probe_path: Some("/health".into()),
+            activation: Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                route_subtree_id: Some("forge:api:production:api".into()),
+                target_source: crate::storage::PersistedRouteTargetSource::ContainerIp,
+            }),
+            command: None,
+            depends_on: vec!["redis".into()],
+            required_for_promotion: true,
+            externally_exposed: true,
+            environment_variables: BTreeMap::new(),
+            state_config: None,
+            volume_mounts: Vec::new(),
+            source_ref: Some("main".into()),
+            repo_url: Some("https://github.com/example/api.git".into()),
+            commit_sha: Some("abc123".into()),
+            source_path: Some(root.join("checkout")),
+        };
+        let runtime = PersistedRuntimeInfo {
+            container_name: redis_service.container_name.clone(),
+            running: true,
+            network_name: redis_service.network_name.clone(),
+            probe_path: redis_service.probe_path.clone(),
+            activation: redis_service.activation.clone(),
+            environment_variables: redis_service.environment_variables.clone(),
+            volume_mounts: redis_service.volume_mounts.clone(),
+            source_ref: Some("main".into()),
+            repo_url: Some("https://github.com/example/api.git".into()),
+            commit_sha: Some("abc123".into()),
+            source_path: Some(root.join("checkout")),
+            services: BTreeMap::from([
+                ("redis".into(), redis_service),
+                ("api".into(), api_service),
+            ]),
+            startup_order: vec!["redis".into(), "api".into()],
+        };
+        let build = PersistedBuildInfo {
+            deployment_id: "dep-1".into(),
+            image_ref: "redis:7".into(),
+            services: BTreeMap::new(),
+            source_ref: Some("main".into()),
+            repo_url: Some("https://github.com/example/api.git".into()),
+            commit_sha: Some("abc123".into()),
+            source_path: Some(root.join("checkout")),
+        };
+        let resolved = PersistedResolvedRuntime {
+            snapshot_version: 1,
+            project_id: "api".into(),
+            environment: "production".into(),
+            generation,
+            deployment_id: "dep-1".into(),
+            source_environment: "production".into(),
+            source_ref: Some("main".into()),
+            commit_sha: Some("abc123".into()),
+            domain: Some("api.example.com".into()),
+            entries: BTreeMap::new(),
+        };
+        writer
+            .write_artifact(
+                "build.json",
+                &format!("{}\n", serde_json::to_string_pretty(&build).unwrap()),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime.json",
+                &format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "resolved_runtime.json",
+                &format!("{}\n", serde_json::to_string_pretty(&resolved).unwrap()),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime_env_snapshot.json",
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&derive_runtime_env_snapshot(&resolved)).unwrap()
+                ),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
+        PointerStore::new(env).swap_current(generation).unwrap();
     }
 
     #[test]
@@ -2133,6 +2363,270 @@ mod tests {
                 .values
                 .iter()
                 .any(|value| value.key == "FORGE_GENERATION")
+        );
+    }
+
+    #[test]
+    fn restored_multiservice_status_uses_exposed_service_as_primary() {
+        let root = test_root("restored-multiservice-status-uses-exposed-service-as-primary");
+        let mut docker = TestDockerRuntime::default();
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let runtime =
+            load_generation_runtime_info(&EnvironmentPaths::new(&root, "api", "production"), 2)
+                .unwrap()
+                .unwrap();
+        assert_eq!(runtime.container_name, "prod-api-api-gen-2");
+        assert_eq!(runtime.probe_path.as_deref(), Some("/health"));
+        assert!(matches!(
+            runtime.activation,
+            Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn internal_stateful_service_not_selected_as_top_level_route_target() {
+        let root = test_root("internal-stateful-service-not-selected-as-top-level-route-target");
+        let mut docker = TestDockerRuntime::default();
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let route = routing.inspect_route("forge:api:production:api").unwrap();
+        assert_eq!(route.active_target, "172.19.0.20:3000");
+    }
+
+    #[test]
+    fn diagnose_after_restore_reports_api_route_target() {
+        let root = test_root("diagnose-after-restore-reports-api-route-target");
+        let mut docker = TestDockerRuntime::default();
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let diagnostics = load_environment_diagnostics(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "production",
+        )
+        .unwrap();
+        assert_eq!(
+            diagnostics.container.container_name.as_deref(),
+            Some("prod-api-api-gen-2")
+        );
+        assert_eq!(
+            diagnostics.route.current_target.as_deref(),
+            Some("172.19.0.20:3000")
+        );
+        assert_eq!(
+            diagnostics
+                .probe_target
+                .as_ref()
+                .and_then(|value| value.port),
+            Some(3000)
+        );
+    }
+
+    #[test]
+    fn backup_runs_pre_backup_hook_before_archiving() {
+        let root = test_root("backup-runs-pre-backup-hook-before-archiving");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let mut runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        runtime.services.get_mut("api").unwrap().state_config =
+            Some(crate::storage::PersistedStateConfig {
+                volume: "redis".into(),
+                mount_path: "/data".into(),
+                retention: PersistedVolumeRetention::Persistent,
+                pre_backup_command: Some("echo saved".into()),
+            });
+        atomic_write(
+            env.generation_dir(1).join("runtime.json"),
+            format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        docker.exec_results.push_back(Ok(ExecInContainerOutput {
+            stdout: "saved".into(),
+            stderr: String::new(),
+            exit_code: 0,
+        }));
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        assert_eq!(docker.exec_requests.len(), 1);
+        assert_eq!(docker.exec_requests[0].container_name, "prod-api-gen-1");
+        assert_eq!(
+            docker.exec_requests[0].command,
+            vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "echo saved".to_string()
+            ]
+        );
+        assert_eq!(docker.helper_requests.len(), 1);
+        let metadata = find_backup_metadata(&root, &backup.backup_id).unwrap();
+        assert_eq!(metadata.hooks.len(), 1);
+        assert_eq!(metadata.hooks[0].stdout, "saved");
+    }
+
+    #[test]
+    fn backup_fails_if_pre_backup_hook_fails() {
+        let root = test_root("backup-fails-if-pre-backup-hook-fails");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let mut runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        runtime.services.get_mut("api").unwrap().state_config =
+            Some(crate::storage::PersistedStateConfig {
+                volume: "redis".into(),
+                mount_path: "/data".into(),
+                retention: PersistedVolumeRetention::Persistent,
+                pre_backup_command: Some("exit 7".into()),
+            });
+        atomic_write(
+            env.generation_dir(1).join("runtime.json"),
+            format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        docker.exec_results.push_back(Ok(ExecInContainerOutput {
+            stdout: String::new(),
+            stderr: "boom".into(),
+            exit_code: 7,
+        }));
+
+        let err = create_backup(&root, &mut docker, "api", "production").unwrap_err();
+
+        assert!(err.to_string().contains("pre_backup_command failed"));
+        assert!(docker.helper_requests.is_empty());
+    }
+
+    #[test]
+    fn backup_hook_output_persisted() {
+        let root = test_root("backup-hook-output-persisted");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let mut runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        runtime.services.get_mut("api").unwrap().state_config =
+            Some(crate::storage::PersistedStateConfig {
+                volume: "redis".into(),
+                mount_path: "/data".into(),
+                retention: PersistedVolumeRetention::Persistent,
+                pre_backup_command: Some("printf ok && printf warn >&2".into()),
+            });
+        atomic_write(
+            env.generation_dir(1).join("runtime.json"),
+            format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        docker.exec_results.push_back(Ok(ExecInContainerOutput {
+            stdout: "ok".into(),
+            stderr: "warn".into(),
+            exit_code: 0,
+        }));
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let metadata = find_backup_metadata(&root, &backup.backup_id).unwrap();
+
+        assert_eq!(metadata.hooks[0].stdout, "ok");
+        assert_eq!(metadata.hooks[0].stderr, "warn");
+    }
+
+    #[test]
+    fn redis_backup_restore_with_save_preserves_counter() {
+        let root = test_root("redis-backup-restore-with-save-preserves-counter");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let mut runtime = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        runtime.services.get_mut("api").unwrap().state_config =
+            Some(crate::storage::PersistedStateConfig {
+                volume: "redis".into(),
+                mount_path: "/data".into(),
+                retention: PersistedVolumeRetention::Persistent,
+                pre_backup_command: Some("redis-cli SAVE".into()),
+            });
+        atomic_write(
+            env.generation_dir(1).join("runtime.json"),
+            format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        docker.exec_results.push_back(Ok(ExecInContainerOutput {
+            stdout: "OK".into(),
+            stderr: String::new(),
+            exit_code: 0,
+        }));
+        docker.exec_file_writes.push_back(vec![
+            (
+                root.join("volumes")
+                    .join("redis-source")
+                    .join("counter.txt"),
+                b"1711".to_vec(),
+            ),
+            (
+                root.join("volumes").join("redis-source").join("dump.rdb"),
+                b"1711".to_vec(),
+            ),
+        ]);
+        fs::write(
+            root.join("volumes")
+                .join("redis-source")
+                .join("counter.txt"),
+            "339",
+        )
+        .unwrap();
+
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let archive_bytes = fs::read(
+            backup_dir(&root, "api", "production", &backup.backup_id)
+                .join("volumes")
+                .join("api-redis.tar.gz"),
+        )
+        .unwrap();
+        let archived_entries: Vec<(String, Vec<u8>)> =
+            serde_json::from_slice(&archive_bytes).unwrap();
+        assert!(
+            archived_entries
+                .iter()
+                .any(|(path, bytes)| { path == "dump.rdb" && bytes.as_slice() == b"1711" })
+        );
+        fs::write(
+            root.join("volumes")
+                .join("redis-source")
+                .join("counter.txt"),
+            "9999",
+        )
+        .unwrap();
+        let mut routing = TestRoutingRuntime::default();
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let restored_volume = docker
+            .volume_inspections
+            .keys()
+            .find(|name| name.contains("restore-gen-2-vol-redis"))
+            .unwrap()
+            .clone();
+        let restored_mountpoint = docker.volume_inspections[&restored_volume]
+            .mountpoint
+            .clone();
+        assert_eq!(
+            fs::read_to_string(restored_mountpoint.join("dump.rdb")).unwrap(),
+            "1711"
         );
     }
 

@@ -36,6 +36,7 @@ use crate::storage::{
     SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
     load_generation_build_info, load_generation_runtime_info, load_generation_snapshot_metadata,
 };
+use crate::topology::select_primary_service_id;
 
 #[derive(Debug)]
 pub enum DeploymentError {
@@ -147,6 +148,7 @@ fn persisted_state_config(state: &ForgeStateConfig) -> PersistedStateConfig {
         volume: state.volume.clone(),
         mount_path: state.mount_path.clone(),
         retention: state.retention.clone(),
+        pre_backup_command: state.pre_backup_command.clone(),
     }
 }
 
@@ -3563,17 +3565,25 @@ fn select_primary_service(
     config: &ForgeYamlConfig,
     runtime: &BTreeMap<String, PersistedServiceRuntimeInfo>,
 ) -> Result<String, DeploymentError> {
-    config
-        .startup_order()
-        .iter()
-        .find(|service_id| {
-            runtime
-                .get(*service_id)
-                .is_some_and(|service| service.externally_exposed)
-        })
-        .cloned()
-        .or_else(|| config.startup_order().first().cloned())
-        .ok_or_else(|| DeploymentError::InvalidInspection("service topology is empty".into()))
+    select_primary_service_id(
+        &PersistedRuntimeInfo {
+            container_name: String::new(),
+            running: false,
+            network_name: None,
+            probe_path: None,
+            activation: None,
+            environment_variables: BTreeMap::new(),
+            volume_mounts: Vec::new(),
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
+            source_path: None,
+            services: runtime.clone(),
+            startup_order: config.startup_order().to_vec(),
+        },
+        runtime,
+    )
+    .ok_or_else(|| DeploymentError::InvalidInspection("service topology is empty".into()))
 }
 
 fn is_multi_service_config(config: &ForgeYamlConfig) -> bool {
@@ -9387,6 +9397,7 @@ pub mod multi_service_orchestration {
                 volume: "postgres-data".into(),
                 mount_path: "/var/lib/postgresql/data".into(),
                 retention: PersistedVolumeRetention::Ephemeral,
+                pre_backup_command: None,
             }
         );
         assert_eq!(
@@ -9395,6 +9406,7 @@ pub mod multi_service_orchestration {
                 volume: "postgres-data".into(),
                 mount_path: "/var/lib/postgresql/data".into(),
                 retention: PersistedVolumeRetention::Ephemeral,
+                pre_backup_command: None,
             }
         );
         assert_eq!(postgres.volume_mounts.len(), 1);

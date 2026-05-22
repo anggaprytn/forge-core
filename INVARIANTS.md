@@ -253,10 +253,11 @@ Stateful backup and restore semantics:
 
 - backups are operator-triggered snapshots of persistent Docker volumes only
 - backups are crash-consistent only; Forge does not quiesce databases
+- DB-consistent backups require explicit service-level `pre_backup_command` hooks
 - backups are not WAL, PITR, or incremental history
 - restore always creates a new runtime generation with new managed volumes
 - restore never rewrites historical generations or mutates existing persistent volumes in place
-- restore is not rollback; rollback keeps topology semantics only
+- restore is not rollback; rollback keeps topology semantics only and does not restore DB history
 
 ---
 

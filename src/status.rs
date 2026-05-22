@@ -39,6 +39,7 @@ use crate::storage::{
     load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
     load_generation_runtime_info, load_generation_snapshot_metadata,
 };
+use crate::topology::runtime_with_primary_service;
 
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
 const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
@@ -1421,7 +1422,8 @@ where
     let promoted_runtime = active_generation
         .map(|generation| load_generation_runtime_info(env, generation))
         .transpose()?
-        .flatten();
+        .flatten()
+        .map(|runtime| runtime_with_primary_service(&runtime));
     let promoted_build = active_generation
         .map(|generation| load_generation_build_info(env, generation))
         .transpose()?

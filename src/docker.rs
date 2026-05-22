@@ -7,8 +7,9 @@ use std::time::Duration;
 use crate::process::run_command_with_timeout;
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, ContainerVolumeMount, CreateContainerRequest,
-    CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ManagedImage, ManagedVolume,
-    VolumeArchiveHelperOutput, VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
+    CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ExecInContainerOutput,
+    ExecInContainerRequest, ManagedImage, ManagedVolume, VolumeArchiveHelperOutput,
+    VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
 };
 
 pub trait CommandRunner {
@@ -431,6 +432,24 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         Ok(VolumeArchiveHelperOutput {
             stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    fn exec_in_container(
+        &mut self,
+        request: ExecInContainerRequest,
+    ) -> Result<ExecInContainerOutput, DockerRuntimeError> {
+        let mut command = Command::new("docker");
+        command.arg("exec").arg(&request.container_name);
+        for arg in &request.command {
+            command.arg(arg);
+        }
+        let output = run_command_with_timeout(&mut command, request.timeout)
+            .map_err(|err| DockerRuntimeError::CommandFailed(err.to_string()))?;
+        Ok(ExecInContainerOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
         })
     }
 

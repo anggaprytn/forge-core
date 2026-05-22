@@ -97,6 +97,7 @@ pub struct ForgeStateConfig {
     pub volume: String,
     pub mount_path: String,
     pub retention: PersistedVolumeRetention,
+    pub pre_backup_command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +186,8 @@ struct RawStateConfig {
     mount_path: Option<String>,
     #[serde(default)]
     retention: Option<String>,
+    #[serde(default)]
+    pre_backup_command: Option<String>,
 }
 
 pub fn load_optional_forge_yaml(
@@ -399,6 +402,7 @@ impl RawForgeYaml {
                         mount_path: state.mount_path.clone().expect("state validated"),
                         retention: parse_state_retention(service_id, state)
                             .expect("state validated"),
+                        pre_backup_command: state.pre_backup_command.clone(),
                     }),
                     depends_on,
                     validation,

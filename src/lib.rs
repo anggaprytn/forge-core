@@ -26,3 +26,4 @@ pub mod secrets;
 pub mod source;
 pub mod status;
 pub mod storage;
+pub mod topology;

@@ -399,13 +399,27 @@ forge backup inspect <backup_id>
 forge backup restore <backup_id>
 ```
 
+Example state hook:
+
+```yaml
+services:
+  redis:
+    state:
+      volume: redis-data
+      mount_path: /data
+      retention: persistent
+      pre_backup_command: redis-cli SAVE
+```
+
 Operator invariants:
 
 - backups snapshot persistent Docker volumes only
 - backups are crash-consistent only; Forge does not coordinate database quiescing
+- DB-consistent backups require app or service `pre_backup_command` hooks
 - backups are not PITR or incremental history
 - restore creates a new runtime generation and new managed volumes
 - rollback and restore are different semantics
+- rollback does not restore database history
 
 ---
 
