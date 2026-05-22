@@ -19,10 +19,11 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::api::{
-    CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
-    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, ProjectList, ProjectUpsertRequest, SecretListResponse, SecretUnsetResponse,
+    BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
+    CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
+    EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
+    ProjectUpsertRequest, SecretListResponse, SecretUnsetResponse,
 };
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{
@@ -105,6 +106,18 @@ pub trait ControlPlane: Send {
         from_generation: u64,
         to_generation: u64,
     ) -> Result<EnvironmentDiffResponse, ErrorResponse>;
+    fn create_backup(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<BackupRecord, ErrorResponse>;
+    fn list_backups(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<BackupListResponse, ErrorResponse>;
+    fn inspect_backup(&self, backup_id: &str) -> Result<BackupRecord, ErrorResponse>;
+    fn restore_backup(&mut self, backup_id: &str) -> Result<BackupRestoreResponse, ErrorResponse>;
 }
 
 impl<D, R, A> ControlPlane for Daemon<D, R, A>
@@ -193,6 +206,30 @@ where
             from_generation,
             to_generation,
         )
+    }
+
+    fn create_backup(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<BackupRecord, ErrorResponse> {
+        Daemon::create_backup(self, project_id, environment)
+    }
+
+    fn list_backups(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<BackupListResponse, ErrorResponse> {
+        Daemon::list_backups(self, project_id, environment)
+    }
+
+    fn inspect_backup(&self, backup_id: &str) -> Result<BackupRecord, ErrorResponse> {
+        Daemon::inspect_backup(self, backup_id)
+    }
+
+    fn restore_backup(&mut self, backup_id: &str) -> Result<BackupRestoreResponse, ErrorResponse> {
+        Daemon::restore_backup(self, backup_id)
     }
 }
 
@@ -809,6 +846,15 @@ pub fn router(state: HttpState) -> Router {
         .route(
             "/api/projects/{project_id}/environments/{environment}/secrets",
             get(get_environment_secrets),
+        )
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/backups",
+            post(post_backup_create).get(get_backup_list),
+        )
+        .route("/api/backups/{backup_id}", get(get_backup_inspect))
+        .route(
+            "/api/backups/{backup_id}/restore",
+            post(post_backup_restore),
         )
         .route(
             "/api/projects/{project_id}/environments/{environment}/secrets/{key}",
@@ -1976,6 +2022,102 @@ async fn get_project_environment_history(
             };
             error_response(status, &request_id, err)
         }
+    }
+}
+
+async fn post_backup_create(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+    let mut daemon = state.daemon.lock().unwrap();
+    match daemon.create_backup(&project_id, &environment) {
+        Ok(backup) => json_response(
+            StatusCode::CREATED,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: backup,
+            }),
+        ),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+    }
+}
+
+async fn get_backup_list(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+    let daemon = state.daemon.lock().unwrap();
+    match daemon.list_backups(&project_id, &environment) {
+        Ok(backups) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: backups,
+            }),
+        ),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
+    }
+}
+
+async fn get_backup_inspect(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(backup_id): AxumPath<String>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+    let daemon = state.daemon.lock().unwrap();
+    match daemon.inspect_backup(&backup_id) {
+        Ok(backup) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: backup,
+            }),
+        ),
+        Err(error) => error_response(StatusCode::NOT_FOUND, &request_id, error),
+    }
+}
+
+async fn post_backup_restore(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(backup_id): AxumPath<String>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+    let mut daemon = state.daemon.lock().unwrap();
+    match daemon.restore_backup(&backup_id) {
+        Ok(restore) => json_response(
+            StatusCode::ACCEPTED,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: restore,
+            }),
+        ),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, &request_id, error),
     }
 }
 

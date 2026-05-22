@@ -550,6 +550,57 @@ pub struct GenerationHistoryRecord {
     pub retained_reasons: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from_backup_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from_deployment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBackupVolumeRecord {
+    pub volume_id: String,
+    pub docker_volume_name: String,
+    pub service_id: String,
+    pub mount_path: String,
+    pub archive_file: String,
+    pub archive_size_bytes: u64,
+    pub archive_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBackupRestoreRecord {
+    pub restored_generation: u64,
+    pub restored_deployment_id: String,
+    pub restored_at_unix: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBackupMetadata {
+    pub backup_version: u64,
+    pub backup_id: String,
+    pub project_id: String,
+    pub environment: String,
+    pub created_at_unix: u64,
+    pub source_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_deployment_id: Option<String>,
+    pub snapshot_metadata: PersistedSnapshotMetadata,
+    pub build_info: PersistedBuildInfo,
+    pub runtime_info: PersistedRuntimeInfo,
+    pub resolved_runtime: PersistedResolvedRuntime,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub volumes: Vec<PersistedBackupVolumeRecord>,
+    #[serde(default)]
+    pub restores: Vec<PersistedBackupRestoreRecord>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -666,6 +717,10 @@ impl EnvironmentPaths {
 
     pub fn gc_file(&self) -> PathBuf {
         self.root.join("gc.json")
+    }
+
+    pub fn backups_root(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root.as_ref().join("backups")
     }
 
     fn ensure_pointer_file(&self, name: &str) -> StorageResult<()> {

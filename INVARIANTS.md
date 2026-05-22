@@ -249,6 +249,15 @@ Stateful rollback semantics:
 - immutable generations do not imply immutable data
 - ephemeral generation-scoped volumes may disappear after GC once the generation is no longer rollback-safe
 
+Stateful backup and restore semantics:
+
+- backups are operator-triggered snapshots of persistent Docker volumes only
+- backups are crash-consistent only; Forge does not quiesce databases
+- backups are not WAL, PITR, or incremental history
+- restore always creates a new runtime generation with new managed volumes
+- restore never rewrites historical generations or mutates existing persistent volumes in place
+- restore is not rollback; rollback keeps topology semantics only
+
 ---
 
 ## 14. Restart Recovery Invariants

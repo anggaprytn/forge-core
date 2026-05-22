@@ -350,6 +350,12 @@ pub struct EnvironmentDiagnostics {
     pub probe_flapping: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_stability: Option<ProbeStabilityDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_restore: Option<RestoreLineage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_restore_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_restore_events: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,6 +450,14 @@ pub struct DeploymentHistoryEntry {
     pub validation_summary: Option<PersistedValidationSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promotion_summary: Option<PersistedPromotionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from_backup_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from_deployment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +466,67 @@ pub struct DeploymentHistoryResponse {
     pub environment: String,
     #[serde(default)]
     pub entries: Vec<DeploymentHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupVolumeRecord {
+    pub volume_id: String,
+    pub docker_volume_name: String,
+    pub service_id: String,
+    pub mount_path: String,
+    pub archive_file: String,
+    pub archive_size_bytes: u64,
+    pub archive_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRecord {
+    pub restored_generation: u64,
+    pub restored_deployment_id: String,
+    pub restored_at_unix: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRecord {
+    pub backup_id: String,
+    pub project_id: String,
+    pub environment: String,
+    pub created_at_unix: u64,
+    pub source_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_deployment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<BackupVolumeRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restores: Vec<RestoreRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupListResponse {
+    pub project_id: String,
+    pub environment: String,
+    #[serde(default)]
+    pub backups: Vec<BackupRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRestoreResponse {
+    pub backup_id: String,
+    pub restored_generation: u64,
+    pub restored_deployment_id: String,
+    pub restored_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreLineage {
+    pub backup_id: String,
+    pub source_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_deployment_id: Option<String>,
+    pub restored_at_unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

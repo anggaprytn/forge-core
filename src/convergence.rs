@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::backups::scan_backup_gc_actions;
 use crate::events::EventRecord;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue};
@@ -24,8 +25,8 @@ use crate::storage::{
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedRouteTargetSource,
     PersistedRuntimeInfo, PersistedSecretReference, PersistedServiceRuntimeInfo,
     PersistedVolumeRetention, PointerStore, ProbeHistoryStore, RuntimeHealthState,
-    RuntimeStateStore, atomic_write, current_unix_timestamp, load_generation_build_info,
-    load_generation_resolved_runtime, load_generation_runtime_info,
+    RuntimeStateStore, StorageError, atomic_write, current_unix_timestamp,
+    load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
 use serde::{Deserialize, Serialize};
@@ -2066,6 +2067,29 @@ where
                 )
             });
         }
+    }
+
+    for (project_id, environment, generation, backup_id, reason) in
+        scan_backup_gc_actions(storage_root).map_err(|err| {
+            ConvergenceError::Storage(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                err.to_string(),
+            )))
+        })?
+    {
+        actions.push(gc_action_record(
+            &project_id,
+            &environment,
+            generation,
+            dry_run,
+            Some("backup"),
+            Some(backup_id),
+            "retain",
+            &reason,
+            "protected",
+            Vec::new(),
+            vec!["backups are never removed automatically".into()],
+        ));
     }
 
     if !dry_run {

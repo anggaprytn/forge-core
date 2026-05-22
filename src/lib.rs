@@ -1,4 +1,5 @@
 pub mod api;
+pub mod backups;
 pub mod bootstrap;
 pub mod caddy;
 pub mod config;

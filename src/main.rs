@@ -9,11 +9,12 @@ use std::thread;
 use std::time::Duration;
 
 use forge_core::api::{
-    CliLoginPollRequest, CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted,
-    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
-    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, ProjectList, ProjectRecord, ProjectUpsertRequest, RetentionRole, SecretListResponse,
-    SecretUnsetResponse, ServiceRuntimeStatus,
+    BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
+    CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
+    EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
+    ProjectRecord, ProjectUpsertRequest, RetentionRole, SecretListResponse, SecretUnsetResponse,
+    ServiceRuntimeStatus,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -244,6 +245,32 @@ where
             })?;
             print_json(&accepted)?;
         }
+        Command::BackupCreate {
+            project_id,
+            environment,
+        } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            print_json(&client.create_backup(&project_id, &environment)?)?;
+        }
+        Command::BackupList {
+            project_id,
+            environment,
+        } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            print_json(&client.list_backups(&project_id, &environment)?)?;
+        }
+        Command::BackupInspect { backup_id } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            print_json(&client.inspect_backup(&backup_id)?)?;
+        }
+        Command::BackupRestore { backup_id } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            print_json(&client.restore_backup(&backup_id)?)?;
+        }
         Command::ProjectAdd {
             project_id,
             repo_url,
@@ -426,6 +453,38 @@ impl ForgeClient {
             "{}/api/projects/{project_id}/environments/{environment}/env/diff?generation={from_generation}&generation={to_generation}",
             self.base_url
         )))
+    }
+
+    fn create_backup(&self, project_id: &str, environment: &str) -> Result<BackupRecord, CliError> {
+        self.send_json(self.http.post(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/backups",
+            self.base_url
+        )))
+    }
+
+    fn list_backups(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<BackupListResponse, CliError> {
+        self.send_json(self.http.get(format!(
+            "{}/api/projects/{project_id}/environments/{environment}/backups",
+            self.base_url
+        )))
+    }
+
+    fn inspect_backup(&self, backup_id: &str) -> Result<BackupRecord, CliError> {
+        self.send_json(
+            self.http
+                .get(format!("{}/api/backups/{backup_id}", self.base_url)),
+        )
+    }
+
+    fn restore_backup(&self, backup_id: &str) -> Result<BackupRestoreResponse, CliError> {
+        self.send_json(
+            self.http
+                .post(format!("{}/api/backups/{backup_id}/restore", self.base_url)),
+        )
     }
 
     fn post_secret(&self, request: SecretWriteRequest) -> Result<SecretWriteResult, CliError> {
@@ -670,6 +729,20 @@ enum Command {
         project_id: String,
         environment: String,
     },
+    BackupCreate {
+        project_id: String,
+        environment: String,
+    },
+    BackupList {
+        project_id: String,
+        environment: String,
+    },
+    BackupInspect {
+        backup_id: String,
+    },
+    BackupRestore {
+        backup_id: String,
+    },
     ProjectAdd {
         project_id: Option<String>,
         repo_url: String,
@@ -881,6 +954,28 @@ fn parse_command(
             project_id: project_id.clone(),
             environment: environment.clone(),
         }),
+        [cmd, action, project_id, environment] if cmd == "backup" && action == "create" => {
+            Ok(Command::BackupCreate {
+                project_id: project_id.clone(),
+                environment: environment.clone(),
+            })
+        }
+        [cmd, action, project_id, environment] if cmd == "backup" && action == "list" => {
+            Ok(Command::BackupList {
+                project_id: project_id.clone(),
+                environment: environment.clone(),
+            })
+        }
+        [cmd, action, backup_id] if cmd == "backup" && action == "inspect" => {
+            Ok(Command::BackupInspect {
+                backup_id: backup_id.clone(),
+            })
+        }
+        [cmd, action, backup_id] if cmd == "backup" && action == "restore" => {
+            Ok(Command::BackupRestore {
+                backup_id: backup_id.clone(),
+            })
+        }
         [group, action] if group == "project" && action == "list" => Ok(Command::ProjectList),
         [group, action, project_id] if group == "project" && action == "show" => {
             Ok(Command::ProjectShow {
@@ -937,6 +1032,10 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] events",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] gc [--dry-run] [--json]",
         "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] backup create <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] backup list <project_id> <environment>",
+        "  forge [--url URL] [--token TOKEN] backup inspect <backup_id>",
+        "  forge [--url URL] [--token TOKEN] backup restore <backup_id>",
         "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
         "  forge [--url URL] [--token TOKEN] project list",
         "  forge [--url URL] [--token TOKEN] project show <project_id>",

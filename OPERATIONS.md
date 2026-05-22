@@ -390,6 +390,23 @@ forge rollback api production
 
 Rollback restores the previous healthy finalized generation.
 
+## Manual Backup And Restore
+
+```bash
+forge backup create api production
+forge backup list api production
+forge backup inspect <backup_id>
+forge backup restore <backup_id>
+```
+
+Operator invariants:
+
+- backups snapshot persistent Docker volumes only
+- backups are crash-consistent only; Forge does not coordinate database quiescing
+- backups are not PITR or incremental history
+- restore creates a new runtime generation and new managed volumes
+- rollback and restore are different semantics
+
 ---
 
 # Deployment Failure Operations

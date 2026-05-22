@@ -5,6 +5,7 @@ use std::process::Command;
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, ContainerVolumeMount, CreateContainerRequest,
     CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ManagedImage, ManagedVolume,
+    VolumeInspection,
 };
 
 pub trait CommandRunner {
@@ -306,6 +307,28 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         Ok(volumes)
     }
 
+    fn inspect_volume(
+        &mut self,
+        volume_name: &str,
+    ) -> Result<VolumeInspection, DockerRuntimeError> {
+        let args = vec![
+            "volume".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            [
+                "name={{.Name}}",
+                "mountpoint={{.Mountpoint}}",
+                "{{range $key, $value := .Labels}}",
+                "label:{{$key}}={{$value}}",
+                "{{end}}",
+            ]
+            .join("\n"),
+            volume_name.to_string(),
+        ];
+        let inspection = self.runner.run("docker", &args)?;
+        parse_volume_full_inspection_output(&inspection)
+    }
+
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
         let args = vec!["stop".to_string(), container_name.to_string()];
         self.runner.run("docker", &args).map(|_| ())
@@ -443,6 +466,40 @@ fn parse_volume_inspection_output(output: &str) -> Result<ManagedVolume, DockerR
     Ok(ManagedVolume {
         volume_name: volume_name
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing volume name".into()))?,
+        labels,
+    })
+}
+
+fn parse_volume_full_inspection_output(
+    output: &str,
+) -> Result<VolumeInspection, DockerRuntimeError> {
+    let mut volume_name = None;
+    let mut mountpoint = None;
+    let mut labels = BTreeMap::new();
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "name" => volume_name = Some(value.to_string()),
+            "mountpoint" => mountpoint = Some(std::path::PathBuf::from(value)),
+            _ if key.starts_with("label:") => {
+                labels.insert(
+                    key.trim_start_matches("label:").to_string(),
+                    value.to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(VolumeInspection {
+        volume_name: volume_name
+            .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing volume name".into()))?,
+        mountpoint: mountpoint.ok_or_else(|| {
+            DockerRuntimeError::InvalidResponse("missing volume mountpoint".into())
+        })?,
         labels,
     })
 }

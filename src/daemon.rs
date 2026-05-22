@@ -7,10 +7,12 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest,
-    DeploymentStatus, EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport,
-    ErrorResponse, EventList, ServiceLogGroup, validate_deployment_request,
+    BackupListResponse, BackupRecord, BackupRestoreResponse, DeploymentAccepted,
+    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
+    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
+    EventList, ServiceLogGroup, validate_deployment_request,
 };
+use crate::backups::{create_backup, inspect_backup, list_backups, restore_backup};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
 use crate::config::DaemonConfig;
 use crate::convergence::{
@@ -453,6 +455,59 @@ where
             let (status, response) = crate::status::project_status_error_response(err);
             let _ = status;
             response
+        })
+    }
+
+    pub fn create_backup(
+        &mut self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<BackupRecord, ErrorResponse> {
+        create_backup(
+            &self.config.storage_root,
+            &mut self.docker_runtime,
+            project_id,
+            environment,
+        )
+        .map_err(|err| ErrorResponse {
+            code: "backup_create_failed".into(),
+            message: err.to_string(),
+        })
+    }
+
+    pub fn list_backups(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<BackupListResponse, ErrorResponse> {
+        list_backups(&self.config.storage_root, project_id, environment).map_err(|err| {
+            ErrorResponse {
+                code: "backup_list_failed".into(),
+                message: err.to_string(),
+            }
+        })
+    }
+
+    pub fn inspect_backup(&self, backup_id: &str) -> Result<BackupRecord, ErrorResponse> {
+        inspect_backup(&self.config.storage_root, backup_id).map_err(|err| ErrorResponse {
+            code: "backup_inspect_failed".into(),
+            message: err.to_string(),
+        })
+    }
+
+    pub fn restore_backup(
+        &mut self,
+        backup_id: &str,
+    ) -> Result<BackupRestoreResponse, ErrorResponse> {
+        restore_backup(
+            &self.config.storage_root,
+            &mut self.docker_runtime,
+            &mut self.routing_runtime,
+            backup_id,
+        )
+        .map_err(|err| ErrorResponse {
+            code: "backup_restore_failed".into(),
+            message: err.to_string(),
         })
     }
 

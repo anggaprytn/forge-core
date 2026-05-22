@@ -14,6 +14,7 @@ use crate::api::{
     RetentionRole, RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic,
     SecretReferenceChange, ServiceRuntimeStatus, VolumeRuntimeStatus,
 };
+use crate::backups::load_backup_restore_lineage;
 use crate::events::EventRecord;
 use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::load_optional_manifest;
@@ -381,6 +382,10 @@ fn deployment_history_entry(record: GenerationHistoryRecord) -> DeploymentHistor
         transition_reason: None,
         validation_summary: None,
         promotion_summary: None,
+        restored_from_backup_id: record.restored_from_backup_id,
+        restored_from_generation: record.restored_from_generation,
+        restored_from_deployment_id: record.restored_from_deployment_id,
+        restored_at_unix: record.restored_at_unix,
     }
 }
 
@@ -1120,6 +1125,41 @@ where
             )
         })
     });
+    let active_restore = truth.active_generation.and_then(|generation| {
+        history
+            .entries
+            .iter()
+            .find(|entry| entry.generation == generation)
+            .and_then(|entry| {
+                load_backup_restore_lineage(&GenerationHistoryRecord {
+                    generation: entry.generation,
+                    deployment_id: entry.deployment_id.clone(),
+                    commit_sha: entry.commit_sha.clone(),
+                    source_ref: entry.source_ref.clone(),
+                    image_ref: entry.image_ref.clone(),
+                    source_path: None,
+                    created_at_unix: entry.created_at_unix,
+                    finalized_at_unix: entry.finalized_at_unix,
+                    promoted_at_unix: entry.promoted_at_unix,
+                    finalized_state: entry.finalized_state.clone(),
+                    restored_by_rollback: entry.restored_by_rollback,
+                    rollback_target: entry.rollback_target,
+                    retained: entry.retained,
+                    eligible_for_gc: entry.eligible_for_gc,
+                    missing_artifacts: entry.missing_artifacts,
+                    retained_reasons: entry.retained_reasons.clone(),
+                    archived_at_unix: None,
+                    restored_from_backup_id: entry.restored_from_backup_id.clone(),
+                    restored_from_generation: entry.restored_from_generation,
+                    restored_from_deployment_id: entry.restored_from_deployment_id.clone(),
+                    restored_at_unix: entry.restored_at_unix,
+                })
+            })
+    });
+    let backup_restore_events = recent_backup_restore_events(
+        &env,
+        &truth.active_generation.into_iter().collect::<Vec<_>>(),
+    )?;
     Ok(EnvironmentDiagnostics {
         project_id: project_id.to_string(),
         environment: environment.to_string(),
@@ -1181,7 +1221,7 @@ where
         missing_required_secrets,
         env_drift,
         recent_secret_mutations,
-        orphaned_state_warnings,
+        orphaned_state_warnings: orphaned_state_warnings.clone(),
         volume_repair_events,
         active_lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
         retention_role: truth.active_generation.map(|_| RetentionRole::Current),
@@ -1204,6 +1244,9 @@ where
             .as_ref()
             .is_some_and(|assessment| assessment.flapping),
         probe_stability: probe_flapping_assessment.map(|assessment| assessment.diagnostics),
+        active_restore,
+        state_restore_warnings: orphaned_state_warnings.clone(),
+        backup_restore_events,
     })
 }
 
@@ -1906,6 +1949,40 @@ fn recent_volume_repair_events(
                 events.push(event.reason.unwrap_or_else(|| {
                     format!("generation {} volume attachment repaired", generation)
                 }));
+            }
+        }
+    }
+    events.reverse();
+    events.truncate(5);
+    Ok(events)
+}
+
+fn recent_backup_restore_events(
+    env: &EnvironmentPaths,
+    generations: &[u64],
+) -> Result<Vec<String>, ProjectStatusError> {
+    let mut events = Vec::new();
+    for generation in generations {
+        let path = env.generation_dir(*generation).join("events.jsonl");
+        if !path.exists() {
+            continue;
+        }
+        let raw = fs::read_to_string(path)?;
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<EventRecord>(line).map_err(|err| {
+                ProjectStatusError::Storage(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                )))
+            })?;
+            if matches!(
+                event.event_type.as_str(),
+                "BACKUP_CREATED" | "BACKUP_RESTORE_COMPLETED"
+            ) {
+                events.push(event.reason.unwrap_or_else(|| event.event_type));
             }
         }
     }

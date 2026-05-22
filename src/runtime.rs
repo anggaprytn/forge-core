@@ -69,6 +69,13 @@ pub struct ManagedVolume {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeInspection {
+    pub volume_name: String,
+    pub mountpoint: PathBuf,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerRuntimeError {
     CommandFailed(String),
     InvalidResponse(String),
@@ -121,6 +128,14 @@ pub trait DockerRuntime {
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError>;
     fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError>;
     fn list_managed_volumes(&mut self) -> Result<Vec<ManagedVolume>, DockerRuntimeError>;
+    fn inspect_volume(
+        &mut self,
+        volume_name: &str,
+    ) -> Result<VolumeInspection, DockerRuntimeError> {
+        Err(DockerRuntimeError::CommandFailed(format!(
+            "volume inspection not implemented for {volume_name}"
+        )))
+    }
     fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError>;
     fn remove_image(&mut self, image_ref: &str) -> Result<(), DockerRuntimeError>;
