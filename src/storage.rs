@@ -592,6 +592,8 @@ pub struct PersistedBackupMetadata {
     pub snapshot_metadata: PersistedSnapshotMetadata,
     pub build_info: PersistedBuildInfo,
     pub runtime_info: PersistedRuntimeInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_env_snapshot: Option<PersistedRuntimeEnvSnapshot>,
     pub resolved_runtime: PersistedResolvedRuntime,
     #[serde(default)]
     pub services: Vec<String>,

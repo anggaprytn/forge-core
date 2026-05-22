@@ -1276,11 +1276,18 @@ fn parse_backup_command(args: &[String]) -> Result<Command, CliError> {
     let Some((action, rest)) = args.split_first() else {
         return Err(CliError::Usage("backup action required".into()));
     };
-    let (json, positional) = match rest {
-        [flag, tail @ ..] if flag == "--json" => (true, tail),
-        _ => (false, rest),
-    };
-    match (action.as_str(), positional) {
+    let mut json = false;
+    let mut positionals = Vec::new();
+    for arg in rest {
+        match arg.as_str() {
+            "--json" => json = true,
+            value if value.starts_with("--") => {
+                return Err(CliError::Usage("invalid backup command".into()));
+            }
+            value => positionals.push(value.to_string()),
+        }
+    }
+    match (action.as_str(), positionals.as_slice()) {
         ("create", [project_id, environment]) => Ok(Command::BackupCreate {
             project_id: project_id.clone(),
             environment: environment.clone(),
@@ -2001,6 +2008,20 @@ fn render_restore_lineage(lineage: &RestoreLineage) -> String {
     );
     if let Some(deployment_id) = lineage.source_deployment_id.as_deref() {
         output.push_str(&format!(" source_deployment={deployment_id}"));
+    }
+    if !lineage.restored_volumes.is_empty() {
+        let restored_volumes = lineage
+            .restored_volumes
+            .iter()
+            .map(|volume| {
+                format!(
+                    "{}:{}->{}",
+                    volume.service_id, volume.volume_id, volume.mount_path
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(" restored_volumes=[{restored_volumes}]"));
     }
     output
 }
@@ -2945,6 +2966,99 @@ mod tests {
                 deployment_id: "dep-1".into(),
                 service: Some("worker".into()),
                 json: false,
+            }
+        );
+    }
+
+    #[test]
+    fn backup_list_json_flag_after_args() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "backup".into(),
+            "list".into(),
+            "api".into(),
+            "production".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::BackupList {
+                project_id: "api".into(),
+                environment: "production".into(),
+                json: true,
+            }
+        );
+    }
+
+    #[test]
+    fn backup_inspect_cli_parses_backup_id() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "backup".into(),
+            "inspect".into(),
+            "backup-1".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::BackupInspect {
+                backup_id: "backup-1".into(),
+                json: false,
+            }
+        );
+    }
+
+    #[test]
+    fn backup_inspect_json_flag_after_backup_id() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "backup".into(),
+            "inspect".into(),
+            "backup-1".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::BackupInspect {
+                backup_id: "backup-1".into(),
+                json: true,
+            }
+        );
+    }
+
+    #[test]
+    fn backup_restore_json_flag_after_backup_id() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "--token".into(),
+            "token".into(),
+            "backup".into(),
+            "restore".into(),
+            "backup-1".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::BackupRestore {
+                backup_id: "backup-1".into(),
+                json: true,
             }
         );
     }

@@ -1131,29 +1131,32 @@ where
             .iter()
             .find(|entry| entry.generation == generation)
             .and_then(|entry| {
-                load_backup_restore_lineage(&GenerationHistoryRecord {
-                    generation: entry.generation,
-                    deployment_id: entry.deployment_id.clone(),
-                    commit_sha: entry.commit_sha.clone(),
-                    source_ref: entry.source_ref.clone(),
-                    image_ref: entry.image_ref.clone(),
-                    source_path: None,
-                    created_at_unix: entry.created_at_unix,
-                    finalized_at_unix: entry.finalized_at_unix,
-                    promoted_at_unix: entry.promoted_at_unix,
-                    finalized_state: entry.finalized_state.clone(),
-                    restored_by_rollback: entry.restored_by_rollback,
-                    rollback_target: entry.rollback_target,
-                    retained: entry.retained,
-                    eligible_for_gc: entry.eligible_for_gc,
-                    missing_artifacts: entry.missing_artifacts,
-                    retained_reasons: entry.retained_reasons.clone(),
-                    archived_at_unix: None,
-                    restored_from_backup_id: entry.restored_from_backup_id.clone(),
-                    restored_from_generation: entry.restored_from_generation,
-                    restored_from_deployment_id: entry.restored_from_deployment_id.clone(),
-                    restored_at_unix: entry.restored_at_unix,
-                })
+                load_backup_restore_lineage(
+                    storage_root,
+                    &GenerationHistoryRecord {
+                        generation: entry.generation,
+                        deployment_id: entry.deployment_id.clone(),
+                        commit_sha: entry.commit_sha.clone(),
+                        source_ref: entry.source_ref.clone(),
+                        image_ref: entry.image_ref.clone(),
+                        source_path: None,
+                        created_at_unix: entry.created_at_unix,
+                        finalized_at_unix: entry.finalized_at_unix,
+                        promoted_at_unix: entry.promoted_at_unix,
+                        finalized_state: entry.finalized_state.clone(),
+                        restored_by_rollback: entry.restored_by_rollback,
+                        rollback_target: entry.rollback_target,
+                        retained: entry.retained,
+                        eligible_for_gc: entry.eligible_for_gc,
+                        missing_artifacts: entry.missing_artifacts,
+                        retained_reasons: entry.retained_reasons.clone(),
+                        archived_at_unix: None,
+                        restored_from_backup_id: entry.restored_from_backup_id.clone(),
+                        restored_from_generation: entry.restored_from_generation,
+                        restored_from_deployment_id: entry.restored_from_deployment_id.clone(),
+                        restored_at_unix: entry.restored_at_unix,
+                    },
+                )
             })
     });
     let backup_restore_events = recent_backup_restore_events(

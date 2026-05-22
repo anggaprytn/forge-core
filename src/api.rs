@@ -527,6 +527,8 @@ pub struct RestoreLineage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_deployment_id: Option<String>,
     pub restored_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restored_volumes: Vec<BackupVolumeRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

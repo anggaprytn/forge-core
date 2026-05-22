@@ -446,6 +446,26 @@ fn cli_backup_list_reads_backup_inventory() {
 }
 
 #[test]
+fn backup_list_json_flag_after_args() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"production","backups":[]}}"#,
+    );
+
+    let output = run_cli(&url, &["backup", "list", "api", "production", "--json"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"backups\": []"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(
+        request.path,
+        "/api/projects/api/environments/production/backups"
+    );
+}
+
+#[test]
 fn cli_backup_inspect_reads_backup_manifest() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
@@ -461,6 +481,38 @@ fn cli_backup_inspect_reads_backup_manifest() {
 
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/backups/backup-1");
+}
+
+#[test]
+fn backup_inspect_cli_parses_backup_id() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"backup_id":"backup-1","project_id":"api","environment":"production","created_at_unix":10,"source_generation":3,"services":["api"],"volumes":[],"restores":[]}}"#,
+    );
+
+    let output = run_cli(&url, &["backup", "inspect", "backup-1"]);
+    assert!(output.status.success());
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.path, "/api/backups/backup-1");
+}
+
+#[test]
+fn backup_inspect_json_flag_after_backup_id() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"backup_id":"backup-1","project_id":"api","environment":"production","created_at_unix":10,"source_generation":3,"services":["api"],"volumes":[],"restores":[]}}"#,
+    );
+
+    let output = run_cli(&url, &["backup", "inspect", "backup-1", "--json"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"backup_id\": \"backup-1\""));
+
+    let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.path, "/api/backups/backup-1");
 }
 

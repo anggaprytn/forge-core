@@ -25,12 +25,13 @@ use crate::storage::{
     GenerationHistoryRecord, LifecycleStore, PersistedActivationMode, PersistedBackupMetadata,
     PersistedBackupRestoreRecord, PersistedBackupVolumeRecord, PersistedBuildInfo,
     PersistedDeploymentLifecycle, PersistedPromotionSummary, PersistedResolvedRuntime,
-    PersistedResolvedRuntimeEntry, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
-    PersistedServiceState, PersistedSnapshotMetadata, PersistedValidationSummary,
-    PersistedVolumeMount, PersistedVolumeRetention, PointerStore, RetentionStore,
-    RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
-    StorageError, atomic_write, current_unix_timestamp, load_generation_build_info,
-    load_generation_resolved_runtime, load_generation_runtime_info,
+    PersistedResolvedRuntimeEntry, PersistedRuntimeEnvEntry, PersistedRuntimeEnvSnapshot,
+    PersistedRuntimeInfo, PersistedServiceRuntimeInfo, PersistedServiceState,
+    PersistedSnapshotMetadata, PersistedValidationSummary, PersistedVolumeMount,
+    PersistedVolumeRetention, PointerStore, RetentionStore, RuntimeHealthState, RuntimeState,
+    RuntimeStateStore, SnapshotState, SnapshotWriter, StorageError, atomic_write,
+    current_unix_timestamp, load_generation_build_info, load_generation_resolved_runtime,
+    load_generation_runtime_env_snapshot, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
 
@@ -104,6 +105,12 @@ pub fn create_backup<D: DockerRuntime>(
         .ok_or_else(|| BackupError::NotFound(format!("generation {generation} build missing")))?;
     let runtime = load_generation_runtime_info(&env, generation)?
         .ok_or_else(|| BackupError::NotFound(format!("generation {generation} runtime missing")))?;
+    let runtime_env_snapshot =
+        load_generation_runtime_env_snapshot(&env, generation)?.ok_or_else(|| {
+            BackupError::NotFound(format!(
+                "generation {generation} runtime env snapshot missing"
+            ))
+        })?;
     let resolved = load_generation_resolved_runtime(&env, generation)?.ok_or_else(|| {
         BackupError::NotFound(format!("generation {generation} resolved runtime missing"))
     })?;
@@ -160,6 +167,7 @@ pub fn create_backup<D: DockerRuntime>(
         snapshot_metadata: snapshot,
         build_info: build,
         runtime_info: runtime,
+        runtime_env_snapshot: Some(runtime_env_snapshot),
         resolved_runtime: resolved,
         services: services.keys().cloned().collect(),
         volumes: manifest.clone(),
@@ -190,18 +198,33 @@ pub fn list_backups(
 ) -> Result<BackupListResponse, BackupError> {
     let root = backups_environment_root(storage_root, project_id, environment);
     let mut backups = Vec::new();
-    if root.exists() {
-        for entry in fs::read_dir(root).map_err(|err| BackupError::Command(err.to_string()))? {
-            let entry = entry.map_err(|err| BackupError::Command(err.to_string()))?;
-            if !entry
-                .file_type()
-                .map_err(|err| BackupError::Command(err.to_string()))?
-                .is_dir()
-            {
-                continue;
-            }
-            backups.push(api_backup_record(read_backup_metadata(&entry.path())?));
+    if !root.exists() {
+        return Ok(BackupListResponse {
+            project_id: project_id.into(),
+            environment: environment.into(),
+            backups,
+        });
+    }
+
+    for entry in fs::read_dir(&root)
+        .map_err(|err| backup_scan_error("failed to read backup directory", &root, err))?
+    {
+        let entry = entry.map_err(|err| {
+            BackupError::Command(format!("failed to scan {}: {err}", root.display()))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|err| {
+                BackupError::Command(format!(
+                    "failed to inspect backup entry {}: {err}",
+                    entry.path().display()
+                ))
+            })?
+            .is_dir()
+        {
+            continue;
         }
+        backups.push(api_backup_record(read_backup_metadata(&entry.path())?));
     }
     backups.sort_by(|left, right| right.created_at_unix.cmp(&left.created_at_unix));
     Ok(BackupListResponse {
@@ -370,6 +393,17 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         &deployment_id,
         domain.clone(),
     );
+    let source_runtime_env_snapshot = metadata
+        .runtime_env_snapshot
+        .clone()
+        .unwrap_or_else(|| derive_runtime_env_snapshot(&metadata.resolved_runtime));
+    let restored_runtime_env_snapshot = rewrite_runtime_env_snapshot(
+        &source_runtime_env_snapshot,
+        &restored_resolved,
+        generation,
+        &deployment_id,
+        domain.clone(),
+    );
     let restored_snapshot = rewrite_snapshot_metadata(
         &metadata.snapshot_metadata,
         generation,
@@ -395,6 +429,13 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         &format!(
             "{}\n",
             serde_json::to_string_pretty(&restored_resolved).unwrap()
+        ),
+    )?;
+    writer.write_artifact(
+        "runtime_env_snapshot.json",
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&restored_runtime_env_snapshot).unwrap()
         ),
     )?;
     writer.finalize(
@@ -473,6 +514,26 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
             gate_reason: None,
         }),
     )?;
+    diagnostics.append_log_line(
+        &format!("runtime env snapshot restored for generation {generation}"),
+        &[],
+    )?;
+    diagnostics.append_log_line(
+        &format!(
+            "restored backup {} from gen-{}",
+            backup_id, metadata.source_generation
+        ),
+        &[],
+    )?;
+    for volume in &metadata.volumes {
+        diagnostics.append_log_line(
+            &format!(
+                "restored volume {}:{} -> {}",
+                volume.service_id, volume.volume_id, volume.mount_path
+            ),
+            &[],
+        )?;
+    }
     update_generation_history(&env, generation, |entry| {
         entry.deployment_id = Some(deployment_id.clone());
         entry.commit_sha = metadata.build_info.commit_sha.clone();
@@ -574,13 +635,33 @@ pub fn scan_backup_gc_actions(
 }
 
 pub fn load_backup_restore_lineage(
+    storage_root: &Path,
     record: &GenerationHistoryRecord,
 ) -> Option<crate::api::RestoreLineage> {
+    let backup_id = record.restored_from_backup_id.clone()?;
+    let restored_volumes = match find_backup_metadata(storage_root, &backup_id) {
+        Ok(metadata) => metadata
+            .volumes
+            .into_iter()
+            .map(|volume| BackupVolumeRecord {
+                volume_id: volume.volume_id,
+                docker_volume_name: volume.docker_volume_name,
+                service_id: volume.service_id,
+                mount_path: volume.mount_path,
+                archive_file: volume.archive_file,
+                archive_size_bytes: volume.archive_size_bytes,
+                archive_sha256: volume.archive_sha256,
+            })
+            .collect(),
+        Err(BackupError::NotFound(_)) => Vec::new(),
+        Err(_) => Vec::new(),
+    };
     Some(crate::api::RestoreLineage {
-        backup_id: record.restored_from_backup_id.clone()?,
+        backup_id,
         source_generation: record.restored_from_generation?,
         source_deployment_id: record.restored_from_deployment_id.clone(),
         restored_at_unix: record.restored_at_unix?,
+        restored_volumes,
     })
 }
 
@@ -618,9 +699,19 @@ fn write_backup_metadata(
 }
 
 fn read_backup_metadata(path: &Path) -> Result<PersistedBackupMetadata, BackupError> {
-    let raw = fs::read_to_string(path.join("metadata.json"))
-        .map_err(|err| BackupError::Command(err.to_string()))?;
-    serde_json::from_str(&raw).map_err(|err| BackupError::Invalid(err.to_string()))
+    let metadata_path = path.join("metadata.json");
+    let raw = fs::read_to_string(&metadata_path).map_err(|err| {
+        BackupError::Command(format!(
+            "failed to read backup metadata {}: {err}",
+            metadata_path.display()
+        ))
+    })?;
+    serde_json::from_str(&raw).map_err(|err| {
+        BackupError::Invalid(format!(
+            "failed to parse backup metadata {}: {err}",
+            metadata_path.display()
+        ))
+    })
 }
 
 fn find_backup_metadata(
@@ -633,12 +724,25 @@ fn find_backup_metadata(
             "backup {backup_id} not found"
         )));
     }
-    for project in fs::read_dir(&root).map_err(|err| BackupError::Command(err.to_string()))? {
-        let project = project.map_err(|err| BackupError::Command(err.to_string()))?;
-        for environment in
-            fs::read_dir(project.path()).map_err(|err| BackupError::Command(err.to_string()))?
-        {
-            let environment = environment.map_err(|err| BackupError::Command(err.to_string()))?;
+    for project in fs::read_dir(&root)
+        .map_err(|err| backup_scan_error("failed to read backup root", &root, err))?
+    {
+        let project = project.map_err(|err| {
+            BackupError::Command(format!("failed to scan {}: {err}", root.display()))
+        })?;
+        for environment in fs::read_dir(project.path()).map_err(|err| {
+            backup_scan_error(
+                "failed to read project backup directory",
+                &project.path(),
+                err,
+            )
+        })? {
+            let environment = environment.map_err(|err| {
+                BackupError::Command(format!(
+                    "failed to scan backup project directory {}: {err}",
+                    project.path().display()
+                ))
+            })?;
             let candidate = environment.path().join(backup_id);
             if candidate.exists() {
                 return read_backup_metadata(&candidate);
@@ -851,6 +955,73 @@ fn rewrite_resolved_runtime(
     restored
 }
 
+fn derive_runtime_env_snapshot(resolved: &PersistedResolvedRuntime) -> PersistedRuntimeEnvSnapshot {
+    let entries = resolved
+        .entries
+        .iter()
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                PersistedRuntimeEnvEntry {
+                    source: entry.source.clone(),
+                    value: if entry.sensitive {
+                        None
+                    } else {
+                        entry.value.clone()
+                    },
+                    secret_reference: entry.secret_reference.clone(),
+                    sensitive: entry.sensitive,
+                    redacted: entry.sensitive,
+                },
+            )
+        })
+        .collect();
+    PersistedRuntimeEnvSnapshot {
+        snapshot_version: resolved.snapshot_version,
+        project_id: resolved.project_id.clone(),
+        environment: resolved.environment.clone(),
+        generation: resolved.generation,
+        deployment_id: resolved.deployment_id.clone(),
+        source_environment: resolved.source_environment.clone(),
+        source_ref: resolved.source_ref.clone(),
+        commit_sha: resolved.commit_sha.clone(),
+        domain: resolved.domain.clone(),
+        resolution_order: Vec::new(),
+        entries,
+    }
+}
+
+fn rewrite_runtime_env_snapshot(
+    snapshot: &PersistedRuntimeEnvSnapshot,
+    resolved: &PersistedResolvedRuntime,
+    generation: u64,
+    deployment_id: &str,
+    domain: Option<String>,
+) -> PersistedRuntimeEnvSnapshot {
+    let mut restored = snapshot.clone();
+    restored.generation = generation;
+    restored.deployment_id = deployment_id.into();
+    restored.domain = domain;
+    for (key, entry) in &resolved.entries {
+        let rendered_value = if entry.sensitive {
+            None
+        } else {
+            entry.value.clone()
+        };
+        restored.entries.insert(
+            key.clone(),
+            PersistedRuntimeEnvEntry {
+                source: entry.source.clone(),
+                value: rendered_value,
+                secret_reference: entry.secret_reference.clone(),
+                sensitive: entry.sensitive,
+                redacted: entry.sensitive,
+            },
+        );
+    }
+    restored
+}
+
 fn rewrite_snapshot_metadata(
     snapshot: &PersistedSnapshotMetadata,
     generation: u64,
@@ -956,6 +1127,10 @@ fn append_backup_event(
         reason: reason.map(|value| value.to_string()),
     })?;
     Ok(())
+}
+
+fn backup_scan_error(prefix: &str, path: &Path, err: std::io::Error) -> BackupError {
+    BackupError::Command(format!("{prefix} {}: {err}", path.display()))
 }
 
 fn validate_inspection(
@@ -1090,9 +1265,10 @@ mod tests {
         VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
     };
     use crate::secrets::seal_value;
+    use crate::status::{load_environment_diagnostics, load_project_environment_env_report};
     use crate::storage::{
         PersistedResolvedRuntime, PersistedResolvedRuntimeEntry, PersistedRuntimeEnvSource,
-        PersistedServiceState, PointerStore, SnapshotWriter,
+        PersistedServiceState, PointerStore, SnapshotWriter, load_generation_runtime_env_snapshot,
     };
 
     #[derive(Default)]
@@ -1544,6 +1720,7 @@ mod tests {
                 ),
             ]),
         };
+        let runtime_env_snapshot = derive_runtime_env_snapshot(&resolved);
         writer
             .write_artifact(
                 "build.json",
@@ -1560,6 +1737,15 @@ mod tests {
             .write_artifact(
                 "resolved_runtime.json",
                 &format!("{}\n", serde_json::to_string_pretty(&resolved).unwrap()),
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime_env_snapshot.json",
+                &format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&runtime_env_snapshot).unwrap()
+                ),
             )
             .unwrap();
         writer
@@ -1667,6 +1853,29 @@ mod tests {
     }
 
     #[test]
+    fn backup_create_metadata_listed_by_backup_list() {
+        let root = test_root("backup-create-metadata-listed-by-backup-list");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let created = create_backup(&root, &mut docker, "api", "production").unwrap();
+
+        let listed = list_backups(&root, "api", "production").unwrap();
+
+        assert_eq!(listed.backups.len(), 1);
+        assert_eq!(listed.backups[0].backup_id, created.backup_id);
+    }
+
+    #[test]
+    fn backup_list_empty_when_no_backups() {
+        let root = test_root("backup-list-empty-when-no-backups");
+        register_project(&root);
+
+        let listed = list_backups(&root, "api", "production").unwrap();
+
+        assert!(listed.backups.is_empty());
+    }
+
+    #[test]
     fn restore_creates_new_generation() {
         let root = test_root("restore-creates-new-generation");
         let mut docker = TestDockerRuntime::default();
@@ -1751,6 +1960,113 @@ mod tests {
             fs::read_to_string(seeded.original_mountpoint.join("counter.txt")).unwrap(),
             "7"
         );
+    }
+
+    #[test]
+    fn restore_persists_runtime_env_snapshot() {
+        let root = test_root("restore-persists-runtime-env-snapshot");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        let restore = restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let snapshot = load_generation_runtime_env_snapshot(&env, restore.restored_generation)
+            .unwrap()
+            .expect("runtime env snapshot should exist");
+
+        assert_eq!(snapshot.generation, restore.restored_generation);
+        assert_eq!(snapshot.deployment_id, restore.restored_deployment_id);
+        assert_eq!(
+            snapshot
+                .entries
+                .get("FORGE_GENERATION")
+                .and_then(|entry| entry.value.as_deref()),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn diagnose_works_after_backup_restore() {
+        let root = test_root("diagnose-works-after-backup-restore");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let diagnostics = load_environment_diagnostics(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "production",
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.active_generation, Some(2));
+        assert_eq!(
+            diagnostics
+                .runtime_env_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.generation),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn env_works_after_backup_restore() {
+        let root = test_root("env-works-after-backup-restore");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        let restore = restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let report = load_project_environment_env_report(&root, "api", "production").unwrap();
+
+        assert_eq!(report.generation, restore.restored_generation);
+        assert_eq!(report.deployment_id, restore.restored_deployment_id);
+        assert!(
+            report
+                .values
+                .iter()
+                .any(|value| value.key == "FORGE_GENERATION")
+        );
+    }
+
+    #[test]
+    fn restore_lineage_visible_in_diagnose() {
+        let root = test_root("restore-lineage-visible-in-diagnose");
+        let mut docker = TestDockerRuntime::default();
+        seed_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let diagnostics = load_environment_diagnostics(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "production",
+        )
+        .unwrap();
+
+        let lineage = diagnostics
+            .active_restore
+            .expect("restore lineage should exist");
+        assert_eq!(lineage.backup_id, backup.backup_id);
+        assert_eq!(lineage.source_generation, 1);
+        assert_eq!(lineage.source_deployment_id.as_deref(), Some("dep-1"));
+        assert_eq!(lineage.restored_volumes.len(), 1);
+        assert_eq!(lineage.restored_volumes[0].volume_id, "redis");
     }
 
     #[test]
