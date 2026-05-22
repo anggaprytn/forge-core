@@ -3,6 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -518,6 +520,12 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         .as_bytes(),
     )?;
 
+    for service in source_services.values() {
+        if service.externally_exposed {
+            continue;
+        }
+        docker.stop_container(&service.container_name)?;
+    }
     for (service_id, service) in &restored_services {
         if !service.externally_exposed {
             continue;
@@ -550,12 +558,6 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         })?;
         let route = routing.inspect_route(&subtree_id)?;
         validate_route_activation(&route, &target)?;
-    }
-    for service in source_services.values() {
-        if service.externally_exposed {
-            continue;
-        }
-        docker.stop_container(&service.container_name)?;
     }
 
     PointerStore::new(env.clone()).swap_current(generation)?;
@@ -1545,6 +1547,7 @@ mod tests {
     #[derive(Default)]
     struct TestRoutingRuntime {
         routes: BTreeMap<String, RouteInspection>,
+        event_log: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl RoutingRuntime for TestRoutingRuntime {
@@ -1552,6 +1555,11 @@ mod tests {
             &mut self,
             request: RouteUpdateRequest,
         ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+            if let Some(log) = &self.event_log {
+                log.lock()
+                    .unwrap()
+                    .push(format!("route:update:{}", request.subtree_id));
+            }
             self.routes.insert(
                 request.subtree_id.clone(),
                 RouteInspection {
@@ -1573,6 +1581,11 @@ mod tests {
             &mut self,
             subtree_id: &str,
         ) -> Result<RouteInspection, crate::runtime::RoutingRuntimeError> {
+            if let Some(log) = &self.event_log {
+                log.lock()
+                    .unwrap()
+                    .push(format!("route:inspect:{subtree_id}"));
+            }
             self.routes.get(subtree_id).cloned().ok_or_else(|| {
                 crate::runtime::RoutingRuntimeError::InspectionFailed(subtree_id.into())
             })
@@ -1599,6 +1612,7 @@ mod tests {
         container_inspections: BTreeMap<String, ContainerInspection>,
         created_containers: Vec<CreateContainerRequest>,
         started_containers: Vec<String>,
+        stopped_containers: Vec<String>,
         next_container_ip: VecDeque<String>,
         helper_requests: Vec<VolumeArchiveHelperRequest>,
         helper_results: VecDeque<Result<VolumeArchiveHelperOutput, DockerRuntimeError>>,
@@ -1607,6 +1621,7 @@ mod tests {
         exec_file_writes: VecDeque<Vec<(PathBuf, Vec<u8>)>>,
         inspect_volume_calls: Vec<String>,
         fail_inspect_volume: bool,
+        event_log: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl DockerRuntime for TestDockerRuntime {
@@ -1797,7 +1812,13 @@ mod tests {
                 }))
         }
 
-        fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+        fn stop_container(&mut self, container_name: &str) -> Result<(), DockerRuntimeError> {
+            self.stopped_containers.push(container_name.into());
+            if let Some(log) = &self.event_log {
+                log.lock()
+                    .unwrap()
+                    .push(format!("docker:stop:{container_name}"));
+            }
             Ok(())
         }
 
@@ -2203,6 +2224,10 @@ mod tests {
             .finalize("api", "production", SnapshotState::Healthy)
             .unwrap();
         PointerStore::new(env).swap_current(generation).unwrap();
+    }
+
+    fn multiservice_restore_event_log() -> Arc<Mutex<Vec<String>>> {
+        Arc::new(Mutex::new(Vec::new()))
     }
 
     #[test]
@@ -2925,6 +2950,118 @@ mod tests {
             fs::read_to_string(restored_mountpoint.join("counter.txt")).unwrap(),
             "44"
         );
+    }
+
+    #[test]
+    fn restore_removes_old_internal_service_alias_before_validation() {
+        let root = test_root("restore-removes-old-internal-service-alias-before-validation");
+        let event_log = multiservice_restore_event_log();
+        let mut docker = TestDockerRuntime {
+            event_log: Some(event_log.clone()),
+            ..Default::default()
+        };
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime {
+            event_log: Some(event_log.clone()),
+            ..Default::default()
+        };
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let events = event_log.lock().unwrap().clone();
+        let stop_index = events
+            .iter()
+            .position(|event| event == "docker:stop:prod-api-redis-gen-1")
+            .expect("source redis should be retired");
+        let inspect_index = events
+            .iter()
+            .position(|event| event == "route:inspect:forge:api:production:api")
+            .expect("restored route should be inspected");
+        assert!(stop_index < inspect_index);
+    }
+
+    #[test]
+    fn restored_api_reads_restored_redis_not_old_redis() {
+        let root = test_root("restored-api-reads-restored-redis-not-old-redis");
+        let mut docker = TestDockerRuntime::default();
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        fs::write(
+            root.join("volumes")
+                .join("redis-source")
+                .join("counter.txt"),
+            "99",
+        )
+        .unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let runtime =
+            load_generation_runtime_info(&EnvironmentPaths::new(&root, "api", "production"), 2)
+                .unwrap()
+                .unwrap();
+        let restored_mount = runtime
+            .services
+            .get("redis")
+            .unwrap()
+            .volume_mounts
+            .first()
+            .unwrap();
+        let restored_mountpoint = docker.volume_inspections[&restored_mount.docker_volume_name]
+            .mountpoint
+            .clone();
+        assert_eq!(
+            fs::read_to_string(restored_mountpoint.join("counter.txt")).unwrap(),
+            "44"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                root.join("volumes")
+                    .join("redis-source")
+                    .join("counter.txt")
+            )
+            .unwrap(),
+            "99"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_service_aliases_after_restore() {
+        let root = test_root("no-duplicate-service-aliases-after-restore");
+        let mut docker = TestDockerRuntime::default();
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let redis_container = docker
+            .created_containers
+            .iter()
+            .find(|request| request.container_name == "prod-api-redis-gen-2")
+            .expect("restored redis container should be created");
+        assert_eq!(
+            redis_container.network_aliases,
+            vec!["redis".to_string(), "prod-api-redis-gen-2".to_string()]
+        );
+        assert_eq!(docker.stopped_containers, vec!["prod-api-redis-gen-1"]);
+    }
+
+    #[test]
+    fn caddy_route_still_targets_restored_api_after_internal_retirement() {
+        let root = test_root("caddy-route-still-targets-restored-api-after-internal-retirement");
+        let mut docker = TestDockerRuntime::default();
+        seed_multiservice_environment(&root, &mut docker);
+        let backup = create_backup(&root, &mut docker, "api", "production").unwrap();
+        let mut routing = TestRoutingRuntime::default();
+
+        restore_backup(&root, &mut docker, &mut routing, &backup.backup_id).unwrap();
+
+        let route = routing.inspect_route("forge:api:production:api").unwrap();
+        assert_eq!(route.active_target, "172.19.0.20:3000");
+        assert_eq!(docker.stopped_containers, vec!["prod-api-redis-gen-1"]);
     }
 
     #[test]

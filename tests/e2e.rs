@@ -32,6 +32,7 @@ use forge_core::runtime::{
     DockerRuntimeError, RouteUpdateRequest, RoutingRuntime,
 };
 use forge_core::secrets::SecretStore;
+use forge_core::status::derive_environment_domain;
 use forge_core::storage::{EnvironmentPaths, EventStore, PointerStore};
 use hmac::{Hmac, Mac};
 use reqwest::StatusCode;
@@ -56,8 +57,7 @@ fn dogfood_sample_app_deploys_public_route() {
     assert_eq!(execution.generation, 1);
 
     let response = harness
-        .http_client
-        .get(harness.public_url("health"))
+        .public_get("health")
         .send()
         .expect("public route should be reachable");
     assert_eq!(response.status(), StatusCode::OK);
@@ -602,8 +602,7 @@ fn runtime_secret_is_injected_into_container() {
         .unwrap();
 
     let response = harness
-        .http_client
-        .get(harness.public_url("secret-present"))
+        .public_get("secret-present")
         .send()
         .expect("secret presence marker should be reachable");
     assert_eq!(response.status(), StatusCode::OK);
@@ -851,6 +850,7 @@ impl E2eHarness {
 
     fn restart_api_server<A: ActiveDeploymentDecider + Send + 'static>(&mut self, decider: A) {
         std::fs::create_dir_all(&self.runtime_root).unwrap();
+        self.wait_for_caddy();
         self.api_port = common::available_port();
         self.config.api_bind = format!("127.0.0.1:{}", self.api_port);
 
@@ -916,6 +916,7 @@ impl E2eHarness {
         forge_core::deployments::DeploymentExecution,
         forge_core::deployments::DeploymentError,
     > {
+        self.wait_for_caddy();
         let queue = PersistentQueue::new(self.runtime_root.join("queue")).unwrap();
         let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
         let mut probes = DockerNetworkProbeRuntime::new(self.network_name.clone(), 3000);
@@ -1242,6 +1243,7 @@ impl E2eHarness {
         ticks: &[u64],
         http_health_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.wait_for_caddy();
         let queue = PersistentQueue::new(self.runtime_root.join("queue"))?;
         let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
         let mut probes = DockerNetworkProbeRuntime::new(self.network_name.clone(), 3000);
@@ -1283,6 +1285,21 @@ impl E2eHarness {
         )
     }
 
+    fn public_host(&self) -> Option<String> {
+        let project = ProjectRegistryStore::new(&self.runtime_root)
+            .get("api")
+            .unwrap();
+        project.map(|project| derive_environment_domain(&project.base_domain, "production"))
+    }
+
+    fn public_get(&self, path: &str) -> reqwest::blocking::RequestBuilder {
+        let mut request = self.http_client.get(self.public_url(path));
+        if let Some(host) = self.public_host() {
+            request = request.header("Host", host);
+        }
+        request
+    }
+
     fn api_url(&self, path: &str) -> String {
         format!(
             "http://127.0.0.1:{}/{}",
@@ -1307,7 +1324,10 @@ impl E2eHarness {
             }
             thread::sleep(Duration::from_millis(250));
         }
-        panic!("caddy admin endpoint did not become ready");
+        panic!(
+            "caddy admin endpoint did not become ready: {}",
+            self.caddy_debug_context()
+        );
     }
 
     fn wait_for_api_ready(&self) {
@@ -1328,18 +1348,13 @@ impl E2eHarness {
         expected_body: &str,
     ) -> Result<reqwest::blocking::Response, String> {
         let mut last_body = String::new();
-        let url = self.public_url(path);
         for _ in 0..40 {
-            match self.http_client.get(&url).send() {
+            match self.public_get(path).send() {
                 Ok(response) => {
                     let status = response.status();
                     let body = response.text().unwrap_or_default();
                     if status == StatusCode::OK && body == expected_body {
-                        return self
-                            .http_client
-                            .get(&url)
-                            .send()
-                            .map_err(|err| err.to_string());
+                        return self.public_get(path).send().map_err(|err| err.to_string());
                     }
                     last_body = body;
                 }
@@ -1347,7 +1362,7 @@ impl E2eHarness {
             }
             thread::sleep(Duration::from_millis(250));
         }
-        Err(last_body)
+        Err(format!("{last_body}; {}", self.caddy_debug_context()))
     }
 
     fn install_ready_placeholder(&self) {
@@ -1382,6 +1397,17 @@ impl E2eHarness {
             "ready placeholder install failed: {}",
             response.status()
         );
+    }
+
+    fn caddy_debug_context(&self) -> String {
+        let admin_url = self.admin_base_url();
+        let config = self
+            .http_client
+            .get(format!("{admin_url}/config/"))
+            .send()
+            .and_then(|response| response.text())
+            .unwrap_or_else(|err| format!("config unavailable: {err}"));
+        format!("admin_url={admin_url} config={config}")
     }
 }
 
