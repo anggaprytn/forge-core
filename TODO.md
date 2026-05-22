@@ -1,79 +1,62 @@
 # Forge TODO
 
-Current baseline: CLI implemented.
-Goal: reach usable alpha without scope creep.
-
-Current runtime note: many runtime pieces already exist. The next alpha step is product-semantics and command-taxonomy alignment before more implementation breadth.
+Current baseline: Alpha Core Loop v3 is validated.
+Goal: harden the frozen single-node stateful runtime without reopening core scope.
 
 ---
 
-# Next Alpha Order
+# Frozen Milestone
 
-## Phase 0: Lock product semantics
+Validated and frozen in Alpha Core Loop v3:
 
-- [x] Document binary model: `forge` client/operator CLI, `forged` future server/runtime authority binary name
-- [x] Document shared control-plane model across CLI, API, and web
-- [x] Document git-first canonical source model and source revision identity chain
-- [x] Document fixed alpha environments: `development`, `staging`, `production`
-- [x] Document default branch mapping: `development -> development`, `staging -> staging`, `production -> main`
-- [x] Document planned derived domain semantics
-- [x] Document explicit non-goals for alpha scope
-- [x] Document web as visibility/control, not primary deployment engine
+- [x] Multi-service topology
+- [x] Per-service build/runtime
+- [x] Internal service DNS aliases
+- [x] Per-service logs/status/diagnostics
+- [x] Stateful service volumes
+- [x] Persistent vs ephemeral volume semantics
+- [x] Stateful rollback boundary
+- [x] Backup/restore primitives
+- [x] Helper-container Docker volume archive/restore
+- [x] Backup hooks such as `redis-cli SAVE`
+- [x] Restore lineage
+- [x] Restored primary service truth
+- [x] GC preserves backups and persistent volumes
 
-## Phase 1: `forged` server command taxonomy
+# Next Work
 
-- [ ] Define server/runtime authority command taxonomy
-- [ ] Keep binary split as product direction unless code split is trivial
+## Operator UX
 
-## Phase 2: `forge` client login/whoami/logout/doctor
+- [ ] Improve `forge diagnose` restore lineage readability
+- [ ] Improve `forge history` / backup history cross-linking
+- [ ] Improve per-service status/log formatting
+- [ ] Improve restore safety messaging in CLI and API output
 
-- [x] Confirm `forge login`
+## Recovery Hardening
+
+- [ ] Crash during backup creation recovery
+- [ ] Crash during backup restore recovery
+- [ ] Docker unavailable recovery for restore paths
+- [ ] Caddy unavailable recovery during restore promotion
+
+## Auth And Operator Flows
+
 - [ ] Confirm `forge whoami`
 - [ ] Confirm `forge logout`
-- [x] Confirm `forge doctor`
+- [ ] Expand `forge doctor` stateful workload checks
 
-## Phase 3: `forge.yml` manifest contract
-
-- [x] Lock `forge.yml` alpha manifest contract
-- [x] Keep manifest narrow and deterministic
-
-## Phase 4: git-backed source acquisition
-
-- [x] Resolve deploy source from repository + ref
-- [x] Materialize immutable local source checkout
-- [x] Keep local `--from` as alpha/dev mode
-
-## Phase 5: deploy by git ref
-
-- [x] Route CLI/API/webhook deploy intent through the same git-ref pipeline
-- [x] Avoid creating a separate Git deployment FSM
-
-## Phase 6: derived domain routing
-
-- [x] `production -> <base_domain>`
-- [x] `staging -> staging-<base_domain>`
-- [x] `development -> development-<base_domain>`
-
-## Phase 7: status/events/diagnostics UX
-
-- [ ] Improve operator visibility for status, events, and diagnostics
-
-## Phase 8: rollback UX
-
-- [ ] Improve rollback operator flow and visibility
-
-## Phase 9: minimal read-only web visibility
+## Web Visibility
 
 - [ ] Login
 - [ ] Projects
 - [ ] Environments
 - [ ] Current/previous generation visibility
 - [ ] Events/logs/diagnostics
-
----
+- [ ] Backup and restore lineage visibility
 
 # Current Completed Baseline
 
+- [x] **Alpha Core Loop v3 Validated (May 2026)**
 - [x] **Alpha Core Loop v2 Validated (May 2026)**
 - [x] **Alpha Core Loop v1 Validated (May 2026)**
 - [x] Core architecture defined

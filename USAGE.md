@@ -137,6 +137,15 @@ View detailed diagnostic information for a specific deployment or environment.
 forge diagnose my-app production
 ```
 
+After a backup restore, `forge diagnose` reports active lineage similar to:
+
+```txt
+Active Restore: backup=backup-1 source_generation=3 hook_succeeded=true
+restored_volume=forge-my-app-production-restore-gen-4-vol-redis
+Backup Restore Events:
+- restored backup backup-1 into gen-4
+```
+
 ### View Deployment History
 See a history of recent deployments for a project.
 ```bash
@@ -167,6 +176,15 @@ forge env diff my-app production
 Restore the previous healthy generation immediately.
 ```bash
 forge rollback my-app production
+```
+
+### Backup Lifecycle
+Create, inspect, and restore a persistent-volume backup.
+```bash
+forge backup create my-app production
+forge backup list my-app production
+forge backup inspect backup-1
+forge backup restore backup-1
 ```
 
 ### Garbage Collection Dry-Run
@@ -210,6 +228,68 @@ The installer is **idempotent** and performs the following:
 - It does **not** install Docker or Caddy.
 - It does **not** modify your firewall or Nginx configuration.
 - It does **not** expose the Forge API publicly (remains localhost-bound by default).
+
+---
+
+# Manifest Examples
+
+## Multi-Service App With Internal Redis
+
+```yaml
+version: 1
+name: my-app
+type: web
+
+build:
+  dockerfile: Dockerfile
+  context: .
+
+services:
+  redis:
+    runtime:
+      image: redis:7
+    state:
+      volume: redis-data
+      mount_path: /data
+      retention: persistent
+      pre_backup_command: redis-cli SAVE
+    expose: false
+  api:
+    build:
+      dockerfile: Dockerfile
+      context: .
+    runtime:
+      port: 3000
+      healthcheck:
+        path: /health
+        expected_status: 200
+      depends_on:
+        - redis
+    expose: true
+```
+
+Notes:
+
+- `redis` is an internal service and is not publicly routed.
+- `api` can reach Redis over the Forge-managed internal service alias.
+- `retention: persistent` keeps the Redis volume across deploys, rollback, and GC.
+- `pre_backup_command: redis-cli SAVE` flushes Redis state before backup archive creation.
+
+## Ephemeral Volume Variant
+
+```yaml
+services:
+  redis:
+    runtime:
+      image: redis:7
+    state:
+      volume: redis-cache
+      mount_path: /data
+      retention: ephemeral
+    expose: false
+```
+
+Use `ephemeral` only when the service state is generation-scoped and safe to discard after the generation is no longer rollback-safe.
 
 ---
 
@@ -314,35 +394,33 @@ Forge strictly validates `forge.yml`. Unsupported or unknown fields are rejected
 ```yaml
 version: 1
 name: api
-type: web # Only single-service web apps supported currently
+type: web
 
 build:
   dockerfile: Dockerfile
   context: .
 
-runtime:
-  port: 3000
-  healthcheck:
-    path: /health
-    expected_status: 200
-
-invariants:
-  - name: health
-    path: /health
-    expect_status: 200
+services:
+  api:
+    runtime:
+      port: 3000
+      healthcheck:
+        path: /health
+        expected_status: 200
+    expose: true
 ```
 
 | Field | Purpose |
 |-------|---------|
 | `version` | Manifest schema version. |
 | `name` | Project identifier used in CLI and routing. |
-| `type` | Service type (currently only `web` is supported). |
+| `type` | Project type (currently only `web` is supported). |
 | `build.dockerfile` | Path to the Dockerfile (relative to context). |
 | `build.context` | Docker build context path (relative to `forge.yml`). |
-| `runtime.port` | Internal port the application binds to. |
-| `runtime.healthcheck.path` | HTTP path for health validation. |
-| `runtime.healthcheck.expected_status` | Expected success status for health check. |
-| `invariants` | List of runtime assertions enforced by convergence. |
+| `services` | Service map for exposed and internal services. |
+| `services.<id>.runtime.port` | Internal port the service binds to. |
+| `services.<id>.runtime.healthcheck.path` | HTTP path for health validation. |
+| `services.<id>.runtime.healthcheck.expected_status` | Expected success status for health check. |
 
 ### Overwriting Configuration
 
@@ -633,6 +711,11 @@ forge doctor
 # Rollback
 
 Rollback restores the previous healthy finalized generation.
+
+Hard boundary:
+
+- rollback restores topology, not database history
+- restore is the stateful recovery workflow when persistent data must be replayed
 
 ## CLI
 

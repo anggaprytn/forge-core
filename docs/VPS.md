@@ -10,6 +10,25 @@ forge daemon
 
 It is intentionally aligned to the current implementation, not an aspirational installer.
 
+## Alpha Core Loop v3 Validated (May 2026)
+
+The Forge Alpha Core Loop v3 milestone freezes the current single-node stateful orchestration loop on VPS infrastructure.
+
+### Validated Capabilities (v3)
+
+- **Multi-Service Topology**: One project can deploy multiple services.
+- **Per-Service Build/Runtime**: Each service can define its own build/runtime settings.
+- **Internal Service DNS Aliases**: Internal services resolve over the Forge network.
+- **Per-Service Logs/Status/Diagnostics**: Diagnose and status expose service-specific runtime truth.
+- **Stateful Service Volumes**: Docker volume backed state can be attached per service.
+- **Persistent vs Ephemeral Volume Semantics**: Volume lifecycle is explicit.
+- **Stateful Rollback Boundary**: Rollback restores topology, not database history.
+- **Backup/Restore Primitives**: Backup create/list/inspect/restore are available.
+- **Helper-Container Docker Volume Archive/Restore**: Forge archives volume data via helper containers.
+- **Backup Hooks**: `pre_backup_command` can flush state before archive.
+- **Restore Lineage**: Restored generations report source backup lineage.
+- **GC Safety**: Backups and persistent volumes are preserved.
+
 ## Alpha Core Loop v2 Validated (May 2026)
 
 The Forge Alpha Core Loop v2 milestone formalizes the second validated operational maturity milestone for the Forge platform. This milestone freezes the core orchestration loop after extensive validation of progressive lifecycles, lifecycle persistence, retention/GC, immutable environment snapshots, and convergence-driven runtime truth alignment.
@@ -260,6 +279,18 @@ forge deploy api production --ref main
 forge deploy api production --from /srv/forge/sample-http-app
 forge events
 ```
+
+Stateful workflow examples:
+
+```bash
+forge backup create api production
+forge backup list api production
+forge backup inspect backup-1
+forge backup restore backup-1
+forge diagnose api production
+```
+
+After restore, `forge diagnose api production` should show restore lineage, including the backup ID, source generation, and restored Docker volume names for stateful services.
 
 Project registry examples:
 

@@ -13,7 +13,7 @@ This document records the implementation-oriented v1 model. For the next alpha p
 
 ## 1. Scope
 
-Forge v1 is a single-node, self-hosted runtime convergence daemon for deploying one containerized service per project onto one VPS.
+Forge v1 is a single-node, self-hosted runtime convergence daemon for deploying one containerized project, potentially composed of multiple services, onto one VPS.
 
 Included in v1:
 
@@ -21,12 +21,13 @@ Included in v1:
 - GitHub webhook deploys
 - manual API deploys
 - local `--from` deploys for alpha/dev mode
-- single-service deployments
+- single-service and multi-service deployments on one managed Docker network
 - Runtime Contracts v1
 - Caddy HTTP routing
 - blue-green deployments
 - immutable deployment snapshots
 - rollback
+- backup and restore of persistent Docker volumes
 - environment isolation
 - encrypted secret management
 - single global serialized deployment queue
@@ -34,16 +35,15 @@ Included in v1:
 - startup convergence
 - bounded log streaming
 - append-only event stream
+- restore lineage tracking
 
 Excluded from v1:
 
-- multi-service graphs
 - preview environments
 - custom environments
 - custom per-environment domains
 - distributed workers
 - Redis/distributed queue
-- persistent volumes
 - standalone worker workloads
 - UDP workloads
 - autoscaling
@@ -129,7 +129,7 @@ The current alpha surface is the narrower `forge.yml` contract already used by t
 - manifest version MUST match the supported alpha schema
 - project identity MUST be stable after first successful deployment
 - runtime port MUST be a valid TCP port
-- current alpha service type is single-service web
+- current alpha project type is `web`, supporting one or more services in a single-node topology
 - secret values MUST NOT appear in manifest
 - manifest validation remains intentionally narrow and deterministic
 
@@ -557,7 +557,7 @@ Not supported in v1:
 - non-network workers
 - multi-port services
 - distributed storage
-- volume snapshotting
+- database-native snapshots
 
 Single-node Docker volume workloads are supported with two roles:
 
@@ -565,6 +565,16 @@ Single-node Docker volume workloads are supported with two roles:
 - `ephemeral`: scoped to a generation and removed by GC after the generation stops being rollback-safe
 
 Rollback restores runtime topology and volume attachment intent only. Forge does not snapshot database contents or rewind persistent data.
+
+Backup and restore semantics:
+
+- backups archive persistent Docker volumes only
+- helper containers perform archive and restore operations
+- `pre_backup_command` hooks can flush service state before archive
+- backups are crash-consistent by default
+- restore creates a new generation with newly managed restored volumes
+- restore lineage is recorded in generation diagnostics and backup metadata
+- no PITR, distributed storage, or automatic quiescing
 
 ## 15. Routing Model
 

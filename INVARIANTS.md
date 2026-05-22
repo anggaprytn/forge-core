@@ -244,7 +244,7 @@ resolve rollback target
 Stateful rollback semantics:
 
 - rollback restores runtime topology, not database history
-- Forge does not snapshot databases or copy Docker volume contents
+- Forge does not snapshot database history during rollback
 - persistent volumes are operator-owned durability and must be reattached without rewrite
 - immutable generations do not imply immutable data
 - ephemeral generation-scoped volumes may disappear after GC once the generation is no longer rollback-safe
@@ -252,12 +252,13 @@ Stateful rollback semantics:
 Stateful backup and restore semantics:
 
 - backups are operator-triggered snapshots of persistent Docker volumes only
-- backups are crash-consistent only; Forge does not quiesce databases
+- backups are crash-consistent unless hooks are configured; Forge does not quiesce databases automatically
 - DB-consistent backups require explicit service-level `pre_backup_command` hooks
 - backups are not WAL, PITR, or incremental history
 - restore always creates a new runtime generation with new managed volumes
 - restore never rewrites historical generations or mutates existing persistent volumes in place
 - restore is not rollback; rollback keeps topology semantics only and does not restore DB history
+- Forge remains single-node and Docker-volume only for stateful workloads
 
 ---
 

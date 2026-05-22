@@ -31,6 +31,25 @@ Current stage:
 alpha
 ```
 
+**Alpha Core Loop v3 Validated (May 2026)**:
+
+The Forge Alpha Core Loop v3 milestone freezes the stateful single-node application orchestration loop. This milestone extends the runtime from single-service stateless promotion semantics into validated multi-service Docker-volume backed workloads with explicit restore lineage and stateful safety boundaries.
+
+### Validated Capabilities (v3)
+
+- **Multi-Service Topology**: Multiple services per project with deterministic dependency ordering.
+- **Per-Service Build/Runtime**: Build and runtime configuration can be declared independently per service.
+- **Internal Service DNS Aliases**: Services resolve each other through Forge-managed internal aliases.
+- **Per-Service Logs/Status/Diagnostics**: Operator visibility is grouped per service, including restore and volume state.
+- **Stateful Service Volumes**: Services can declare attached Docker volumes.
+- **Persistent vs Ephemeral Semantics**: Volume retention is explicit and enforced.
+- **Stateful Rollback Boundary**: Rollback restores topology and generation truth without pretending to rewind database history.
+- **Backup/Restore Primitives**: CLI/API support create, list, inspect, and restore workflows.
+- **Helper-Container Volume Archive/Restore**: Backups and restores use Docker helper containers rather than direct host mount assumptions.
+- **Backup Hooks**: Service-level `pre_backup_command` hooks allow DB-aware flushes such as `redis-cli SAVE`.
+- **Restore Lineage**: Restored generations record backup source, prior generation, and restored volume lineage.
+- **GC Safety**: Garbage collection preserves backups and persistent volumes.
+
 **Alpha Core Loop v2 Validated (May 2026)**:
 
 The Forge Alpha Core Loop v2 milestone formalizes the second validated operational maturity milestone for the Forge platform. This milestone freezes the core orchestration loop after extensive validation of progressive lifecycles, lifecycle persistence, retention/GC, immutable environment snapshots, and convergence-driven runtime truth alignment.
@@ -94,7 +113,7 @@ Forge Alpha Core Loop v1 proves that git-backed immutable deployments can achiev
 
 Current runtime note:
 
-Forge already contains many alpha runtime pieces. The next phase is not broad feature expansion first; it is product semantics alignment and command taxonomy hardening.
+Forge has now frozen the single-node stateful orchestration loop. The next phase should favor UX hardening, recovery depth, and operator ergonomics over broad new runtime scope.
 
 ---
 
@@ -102,94 +121,31 @@ Forge already contains many alpha runtime pieces. The next phase is not broad fe
 
 Recommended implementation order for the next alpha phase:
 
-## Phase 0 — Lock Product Semantics
+## Phase 0 — Harden Operator UX
 
 Goal:
 
 ```txt
-align product model, source model, environment model, and command taxonomy before more implementation breadth
+improve visibility, recovery confidence, and operator ergonomics around the frozen v3 runtime
 ```
 
 Scope:
 
-- document `forge` as client/operator CLI
-- document `forged` as the future server/runtime authority binary name
-- lock the control-plane model across CLI, API, and web
-- lock git-first source semantics and the source revision identity chain
-- lock fixed alpha environments and derived domain semantics
+- backup/restore UX polish
+- status and diagnose improvements for multi-service generations
+- clearer volume and retention visibility
+- restore lineage inspection and history UX
+- auth and doctor command polish
 
-## Phase 1 — `forged` Server Command Taxonomy
-
-Goal:
-
-```txt
-separate server/runtime authority taxonomy from client/operator taxonomy without forcing an immediate binary split
-```
-
-## Phase 2 — `forge` Client Auth And Diagnostics
+## Phase 1 — Recovery Hardening
 
 Goal:
 
 ```txt
-stabilize operator identity and health workflows
+prove more crash and restart failure paths around stateful workloads
 ```
 
-Planned focus:
-
-- `forge login`
-- `forge whoami`
-- `forge logout`
-- `forge doctor`
-
-## Phase 3 — `forge.yml` Manifest Contract
-
-Goal:
-
-```txt
-lock the alpha manifest surface before deeper source and deploy work
-```
-
-## Phase 4 — Git-Backed Source Acquisition
-
-Goal:
-
-```txt
-make repository plus ref the canonical deploy source path
-```
-
-## Phase 5 — Deploy By Git Ref
-
-Goal:
-
-```txt
-ensure manual, API, webhook, and future web flows all resolve through the same git-ref deployment pipeline
-```
-
-## Phase 6 — Derived Domain Routing
-
-Goal:
-
-```txt
-standardize alpha environment-to-domain derivation
-```
-
-## Phase 7 — Status, Events, And Diagnostics UX
-
-Goal:
-
-```txt
-improve visibility without moving orchestration authority out of the server
-```
-
-## Phase 8 — Rollback UX
-
-Goal:
-
-```txt
-make rollback intent and visibility clearer while preserving existing rollback authority semantics
-```
-
-## Phase 9 — Minimal Read-Only Web Visibility
+## Phase 2 — Minimal Read-Only Web Visibility
 
 Goal:
 
@@ -219,7 +175,7 @@ before attempting:
 
 - distributed scheduling
 - cluster orchestration
-- multi-service graphs
+- distributed service graphs beyond one single-node project
 - enterprise abstractions
 - platform extensibility
 
@@ -286,7 +242,7 @@ Completed:
 Goal achieved:
 
 ```txt
-single-service deployments converge deterministically
+single-node deployments converge deterministically
 ```
 
 ---
@@ -532,21 +488,15 @@ AI agents generate operationally deployable applications first try
 Status:
 
 ```txt
-intentionally deferred
+completed in alpha core loop v3
 ```
 
-Potential future scope:
+Validated in v3:
 
-- [ ] service dependency ordering
-- [ ] internal service discovery
-- [ ] worker workloads
-- [ ] multi-container applications
-
-Blocked until:
-
-```txt
-single-service convergence semantics are fully hardened
-```
+- [x] service dependency ordering
+- [x] internal service discovery
+- [x] worker workloads
+- [x] multi-container applications
 
 ---
 
@@ -555,17 +505,23 @@ single-service convergence semantics are fully hardened
 Status:
 
 ```txt
-research phase
+completed in alpha core loop v3 for single-node Docker volumes
 ```
 
-Potential future scope:
+Validated in v3:
 
-- [ ] persistent volume semantics
-- [ ] state-aware rollback constraints
-- [ ] snapshot-aware persistence policies
-- [ ] recovery-safe data workloads
+- [x] persistent volume semantics
+- [x] ephemeral volume semantics
+- [x] state-aware rollback constraints
+- [x] backup/restore primitives
+- [x] restore lineage
 
-Not part of alpha scope.
+Still out of scope:
+
+- [ ] PITR
+- [ ] distributed storage
+- [ ] automatic quiescing
+- [ ] database-native snapshot orchestration
 
 ---
 
@@ -604,10 +560,10 @@ Forge is intentionally not optimizing for:
 - [ ] custom environments
 - [ ] custom per-environment domains
 - [ ] preview environments
-- [ ] multi-service orchestration in alpha
+- [x] multi-service orchestration in alpha
 - [ ] RBAC or teams
 - [ ] DNS automation
-- [ ] stateful database ownership
+- [ ] distributed or database-native stateful storage ownership
 - [ ] a web deploy button as the primary product surface
 
 The system is optimized for:

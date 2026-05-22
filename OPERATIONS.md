@@ -39,6 +39,25 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 ---
 
+# Alpha Core Loop v3 Validated (May 2026)
+
+The Forge Alpha Core Loop v3 milestone freezes the current single-node stateful orchestration model.
+
+### Validated Capabilities
+
+- **Multi-Service Topology**: A project can run multiple coordinated services in one generation.
+- **Per-Service Build/Runtime**: Each service can define its own image/build/runtime contract.
+- **Internal Service DNS**: Services can resolve each other on the Forge-managed network.
+- **Per-Service Logs/Status/Diagnostics**: Operators can inspect runtime truth per service.
+- **Stateful Volumes**: Services can attach persistent or ephemeral Docker volumes.
+- **Stateful Rollback Boundary**: Rollback restores topology and runtime/env truth, not database history.
+- **Backup/Restore Primitives**: Operators can create, list, inspect, and restore backups.
+- **Backup Hooks**: Services may run `pre_backup_command` hooks such as `redis-cli SAVE`.
+- **Restore Lineage**: Restored generations expose source backup and restored volume lineage.
+- **GC Safety**: Garbage collection preserves backups and persistent volumes.
+
+---
+
 # Alpha Core Loop v2 Validated (May 2026)
 
 The Forge Alpha Core Loop v2 milestone formalizes the second validated operational maturity milestone for the Forge platform. This milestone freezes the core orchestration loop after extensive validation of progressive lifecycles, lifecycle persistence, retention/GC, immutable environment snapshots, and convergence-driven runtime truth alignment.
@@ -72,6 +91,8 @@ Forge is **NOT** yet:
 - **Multi-node orchestrator**: No cross-host workload awareness.
 - **Service mesh**: No mTLS, sidecars, or complex traffic shaping.
 - **Autoscaling platform**: Scaling is currently manual or vertical only.
+- **PITR engine**: No WAL shipping, PITR, or incremental restore chain.
+- **Distributed storage system**: Stateful support is Docker-volume only on one node.
 
 ### Progressive Deployment Lifecycle
 Forge enforces a strict, linear state machine for every deployment:
@@ -108,6 +129,16 @@ The `runtime_env_snapshot.json` is the authoritative record of the environment v
 - **Finalized snapshots are immutable**: Secrets used during a deployment are "locked" into that generation's snapshot.
 - **Rollback restores historical runtime env**: Rolling back to a previous generation restores the exact secret values that were active when that generation was first promoted.
 - **Secrets only affect future deploys**: Changing a secret value via `forge secrets set` does not affect currently running generations until a redeploy or convergence-triggered restart occurs.
+
+### Stateful Runtime Semantics
+
+- **Persistent volumes survive deploy/rollback/GC boundaries** until explicitly removed by the operator.
+- **Ephemeral volumes are generation-scoped** and may be collected after the generation is no longer rollback-safe.
+- **Backup scope is persistent volumes only**.
+- **Backups are crash-consistent by default**; application-consistent backups require hooks.
+- **Restore creates a new generation** with new managed volumes and new runtime truth.
+- **Restore does not mutate existing persistent volumes in place**.
+- **Rollback is not restore**; it reuses runtime topology semantics and does not recover database history.
 
 ### Convergence and Runtime Truth
 Forge does not assume its internal metadata matches reality. It performs "Runtime Truth" repair:
@@ -217,10 +248,10 @@ The following environment variables and configuration values are required for VP
 # Known Constraints (Alpha)
 
 - **Single-node only**: Forge manages one host at a time.
-- **Single-service HTTP**: Only one HTTP service per project generation is supported.
+- **Docker-volume only state**: No distributed storage backend.
 - **Daemon WorkingDirectory**: Manual `forge deploy` builds from the daemon's `WorkingDirectory`.
-- **Stateful DB**: No native stateful database ownership or volume management yet.
-- **Orchestration**: No multi-service application orchestration yet.
+- **Backups are not quiesced automatically**: Use `pre_backup_command` where needed.
+- **No PITR**: Restore is full backup replay into a new generation, not point-in-time rewind.
 - **Public API**: Should remain bound to `localhost` behind Nginx/CLI unless intentionally exposed.
 
 ---
