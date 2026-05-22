@@ -90,7 +90,7 @@ pub struct ServiceLogGroup {
     pub lines: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeTargetDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -100,7 +100,7 @@ pub struct ProbeTargetDiagnostics {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerRuntimeDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
@@ -150,7 +150,7 @@ pub struct ServiceRuntimeStatus {
     pub logs_tail: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteDiagnostics {
     pub route_required: bool,
     pub route_active: bool,
@@ -279,7 +279,9 @@ pub struct EnvironmentDiagnostics {
     pub active_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_deployment_id: Option<String>,
+    #[serde(default)]
     pub container: ContainerRuntimeDiagnostics,
+    #[serde(default)]
     pub route: RouteDiagnostics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target: Option<ProbeTargetDiagnostics>,

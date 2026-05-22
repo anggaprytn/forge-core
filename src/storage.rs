@@ -979,6 +979,9 @@ impl DiagnosticsStore {
             .generation_dir(self.generation)
             .join("diagnostics")
             .join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let redacted = redact_text(contents, secrets);
         let bounded = truncate_to_recent_bytes(&redacted, DIAGNOSTIC_LOG_MAX_BYTES);
         atomic_write(path, bounded.as_bytes())

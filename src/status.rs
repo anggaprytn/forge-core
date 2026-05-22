@@ -190,6 +190,7 @@ pub struct ProjectEnvironmentStatus {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_generation: Option<u64>,
+    #[serde(default)]
     pub domain: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_sha: Option<String>,
@@ -197,6 +198,7 @@ pub struct ProjectEnvironmentStatus {
     pub source_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+    #[serde(default)]
     pub container_running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_status: Option<String>,
@@ -204,6 +206,7 @@ pub struct ProjectEnvironmentStatus {
     pub network_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_ip: Option<String>,
+    #[serde(default)]
     pub route_active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_path: Option<String>,
@@ -1938,13 +1941,17 @@ fn service_logs_artifact_name(service_id: &str) -> String {
     format!("service-{service_id}-container_logs_tail.log")
 }
 
+fn structured_service_logs_artifact_name(service_id: &str) -> String {
+    format!("services/{service_id}/container_logs_tail.log")
+}
+
 fn load_service_logs_tail(
     diagnostics: &DiagnosticsStore,
     service_id: &str,
 ) -> Result<Vec<String>, ProjectStatusError> {
-    let artifact_name = service_logs_artifact_name(service_id);
     let logs = diagnostics
-        .read_text_artifact(&artifact_name)?
+        .read_text_artifact(&structured_service_logs_artifact_name(service_id))?
+        .or(diagnostics.read_text_artifact(&service_logs_artifact_name(service_id))?)
         .or(if service_id == "default" {
             diagnostics.read_text_artifact("container_logs_tail.log")?
         } else {

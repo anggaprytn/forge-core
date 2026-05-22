@@ -128,6 +128,59 @@ fn cli_project_status_json_reads_authoritative_runtime_status() {
 }
 
 #[test]
+fn cli_decodes_multiservice_status_response() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        concat!(
+            r#"{"data":{"project_id":"forge-multiservice-test","environment":"staging","status":"healthy","active_generation":7,"domain":"staging-forge-multiservice-test.example.com","container_name":"staging-forge-multiservice-test-api-gen-7","container_running":true,"route_active":true,"startup_order":["api","worker"],"services":[{"service_id":"api","role":"exposed","depends_on":[],"dns_aliases":["api"],"container_name":"staging-forge-multiservice-test-api-gen-7","image_ref":"forge/api:staging-gen-7","running":true,"state_status":"running","network_name":"forge-managed","container_ip":"172.29.0.2","internal_port":3000,"probe_path":"/health","route":"active","health":"running","logs_tail":["api booted"]},{"service_id":"worker","role":"internal","depends_on":["api"],"dns_aliases":["worker"],"container_name":"staging-forge-multiservice-test-worker-gen-7","image_ref":"forge/worker:staging-gen-7","running":true,"state_status":"running","network_name":"forge-managed","container_ip":"172.29.0.3","route":"none","health":"running","logs_tail":["worker polling"]}]}}"#
+        ),
+    );
+
+    let output = run_cli(&url, &["status", "forge-multiservice-test", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Services:"));
+    assert!(body.contains("worker"));
+    assert!(body.contains("depends_on: api"));
+    assert!(body.contains("dns_aliases: worker"));
+}
+
+#[test]
+fn cli_decodes_multiservice_diagnostics_response() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        concat!(
+            r#"{"data":{"project_id":"forge-multiservice-test","environment":"staging","status":"degraded","active_generation":7,"last_deployment_id":"dep-ms-7","container":{"container_name":"staging-forge-multiservice-test-api-gen-7","running":true,"state_status":"running","network_name":"forge-managed","container_ip":"172.29.0.2"},"route":{"route_required":true,"route_active":true,"matches_expected":true,"current_target":"172.29.0.2:3000","expected_target":"172.29.0.2:3000","domain":"staging-forge-multiservice-test.example.com"},"probe_target":{"host":"172.29.0.2","port":3000,"path":"/health"},"startup_order":["api","worker"],"services":[{"service_id":"api","role":"exposed","depends_on":[],"dns_aliases":["api"],"container_name":"staging-forge-multiservice-test-api-gen-7","image_ref":"forge/api:staging-gen-7","running":true,"state_status":"running","network_name":"forge-managed","container_ip":"172.29.0.2","internal_port":3000,"probe_path":"/health","route":"active","health":"running","logs_tail":["api booted"]},{"service_id":"worker","role":"internal","depends_on":["api"],"dns_aliases":["worker"],"container_name":"staging-forge-multiservice-test-worker-gen-7","image_ref":"forge/worker:staging-gen-7","running":true,"state_status":"running","network_name":"forge-managed","container_ip":"172.29.0.3","route":"none","health":"failed","failure_reason":"worker queue disconnected","logs_tail":["worker retrying"]}],"recent_failures":[{"deployment_id":"dep-ms-7","generation":7,"failure_stage":"warming","failure_reason":"worker queue disconnected","diagnostics_source":"projects/forge-multiservice-test/environments/staging/generations/7/diagnostics"}],"likely_failure_stage":"warming","diagnostics_source":"projects/forge-multiservice-test/environments/staging/generations/7/diagnostics"}}"#
+        ),
+    );
+
+    let output = run_cli(&url, &["diagnose", "forge-multiservice-test", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Services:"));
+    assert!(body.contains("worker queue disconnected"));
+    assert!(body.contains("worker retrying"));
+}
+
+#[test]
+fn status_response_backward_compatible_for_single_service() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"staging","status":"healthy","container_name":"staging-api-gen-7","route_active":true}}"#,
+    );
+
+    let output = run_cli(&url, &["status", "--json", "api", "staging"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"project_id\": \"api\""));
+    assert!(body.contains("\"domain\": \"\""));
+    assert!(body.contains("\"container_running\": false"));
+}
+
+#[test]
 fn cli_diagnose_reads_environment_diagnostics() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(

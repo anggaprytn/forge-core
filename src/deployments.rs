@@ -2701,6 +2701,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
     ) -> Result<(), DeploymentError> {
         let logs_tail = self.read_container_logs_tail(container_name);
         diagnostics.write_artifact(
+            &format!("services/{service_id}/container_logs_tail.log"),
+            &logs_tail,
+            secret_values,
+        )?;
+        diagnostics.write_artifact(
             &format!("service-{service_id}-container_logs_tail.log"),
             &logs_tail,
             secret_values,
@@ -8470,6 +8475,7 @@ pub mod multi_service_orchestration {
     struct MultiServiceDockerRuntime {
         containers: BTreeMap<String, bool>,
         container_images: BTreeMap<String, String>,
+        container_logs: BTreeMap<String, String>,
         build_requests: Vec<BuildImageRequest>,
         created: Vec<String>,
         create_requests: Vec<CreateContainerRequest>,
@@ -8552,10 +8558,14 @@ pub mod multi_service_orchestration {
 
         fn container_logs(
             &mut self,
-            _container_name: &str,
+            container_name: &str,
             _tail_lines: usize,
         ) -> Result<String, DockerRuntimeError> {
-            Ok(String::new())
+            Ok(self
+                .container_logs
+                .get(container_name)
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn list_managed_containers(
@@ -8819,6 +8829,91 @@ pub mod multi_service_orchestration {
                 "prod-api-api-gen-1".to_string(),
                 "prod-api-worker-gen-1".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn successful_multiservice_deploy_captures_service_logs() {
+        let root = test_root("successful-multiservice-deploy-captures-service-logs");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: vec![],
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production:api".into(),
+                active_target: "172.18.0.12:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            }],
+        };
+
+        docker.container_images.insert(
+            "prod-api-api-gen-1".into(),
+            "forge/api:production-gen-1".into(),
+        );
+        docker
+            .container_logs
+            .insert("prod-api-api-gen-1".into(), "api ready\n".into());
+        docker.container_images.insert(
+            "prod-api-worker-gen-1".into(),
+            "forge/worker:production-gen-1".into(),
+        );
+        docker
+            .container_logs
+            .insert("prod-api-worker-gen-1".into(), "worker polling\n".into());
+        docker
+            .container_images
+            .insert("prod-api-redis-gen-1".into(), "redis:7".into());
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next()
+        .unwrap();
+
+        let diagnostics =
+            DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1);
+        assert!(
+            diagnostics
+                .artifact_path("services/api/container_logs_tail.log")
+                .exists()
+        );
+        assert!(
+            diagnostics
+                .artifact_path("services/worker/container_logs_tail.log")
+                .exists()
+        );
+        assert_eq!(
+            diagnostics
+                .read_text_artifact("services/api/container_logs_tail.log")
+                .unwrap()
+                .unwrap()
+                .trim(),
+            "api ready"
+        );
+        assert_eq!(
+            diagnostics
+                .read_text_artifact("services/worker/container_logs_tail.log")
+                .unwrap()
+                .unwrap()
+                .trim(),
+            "worker polling"
         );
     }
 

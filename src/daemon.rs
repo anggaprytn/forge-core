@@ -1,4 +1,5 @@
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -87,6 +88,69 @@ fn service_log_groups_from_runtime(runtime: &PersistedRuntimeInfo) -> Vec<Servic
             })
         })
         .collect()
+}
+
+fn structured_service_log_artifact_name(service_id: &str) -> String {
+    format!("services/{service_id}/container_logs_tail.log")
+}
+
+fn flat_service_log_artifact_name(service_id: &str) -> String {
+    format!("service-{service_id}-container_logs_tail.log")
+}
+
+fn read_service_log_lines(
+    diagnostics: &DiagnosticsStore,
+    service_id: &str,
+) -> Result<Option<Vec<String>>, ErrorResponse> {
+    let logs = diagnostics
+        .read_text_artifact(&structured_service_log_artifact_name(service_id))
+        .map_err(|err| ErrorResponse {
+            code: "logs_unavailable".into(),
+            message: err.to_string(),
+        })?
+        .or(diagnostics
+            .read_text_artifact(&flat_service_log_artifact_name(service_id))
+            .map_err(|err| ErrorResponse {
+                code: "logs_unavailable".into(),
+                message: err.to_string(),
+            })?);
+    Ok(logs.map(|value| value.lines().map(|line| line.to_string()).collect()))
+}
+
+fn discover_service_log_artifacts(
+    diagnostics: &DiagnosticsStore,
+) -> Result<Vec<String>, ErrorResponse> {
+    let dir = diagnostics.diagnostics_dir();
+    let mut service_ids = std::collections::BTreeSet::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries {
+            let entry = entry.map_err(|err| ErrorResponse {
+                code: "logs_unavailable".into(),
+                message: err.to_string(),
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(service_id) = name
+                .strip_prefix("service-")
+                .and_then(|value| value.strip_suffix("-container_logs_tail.log"))
+            {
+                service_ids.insert(service_id.to_string());
+            }
+        }
+    }
+    let services_dir = dir.join("services");
+    if let Ok(entries) = fs::read_dir(services_dir) {
+        for entry in entries {
+            let entry = entry.map_err(|err| ErrorResponse {
+                code: "logs_unavailable".into(),
+                message: err.to_string(),
+            })?;
+            if entry.path().join("container_logs_tail.log").exists() {
+                service_ids.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(service_ids.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -430,18 +494,44 @@ where
             .as_ref()
             .map(service_log_groups_from_runtime)
             .unwrap_or_default();
-        for group in &mut services {
-            let artifact_name = format!("service-{}-container_logs_tail.log", group.service_id);
-            group.lines = diagnostics
-                .read_text_artifact(&artifact_name)
-                .map_err(|err| ErrorResponse {
-                    code: "logs_unavailable".into(),
-                    message: err.to_string(),
-                })?
-                .unwrap_or_default()
-                .lines()
-                .map(|line| line.to_string())
+        let discovered_service_ids = discover_service_log_artifacts(&diagnostics)?;
+        if services.is_empty() && !discovered_service_ids.is_empty() {
+            services = discovered_service_ids
+                .iter()
+                .map(|service_id| {
+                    let runtime_service = runtime
+                        .as_ref()
+                        .and_then(|value| value.services.get(service_id));
+                    ServiceLogGroup {
+                        service_id: service_id.clone(),
+                        role: runtime_service
+                            .map(|service| {
+                                if service.externally_exposed {
+                                    "exposed".to_string()
+                                } else {
+                                    "internal".to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "unknown".into()),
+                        container_name: runtime_service
+                            .map(|service| service.container_name.clone()),
+                        lines: Vec::new(),
+                    }
+                })
                 .collect();
+        }
+        let runtime_is_multiservice = runtime
+            .as_ref()
+            .is_some_and(|value| !value.services.is_empty());
+        for group in &mut services {
+            group.lines =
+                read_service_log_lines(&diagnostics, &group.service_id)?.unwrap_or_else(|| {
+                    if runtime_is_multiservice {
+                        vec!["service logs unavailable for this generation".into()]
+                    } else {
+                        Vec::new()
+                    }
+                });
         }
         if services.is_empty() {
             let container_logs = diagnostics

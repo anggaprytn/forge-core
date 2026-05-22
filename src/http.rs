@@ -3760,6 +3760,68 @@ pub mod deployment_diagnostics_endpoints {
     use serde_json::Value;
     use tower::util::ServiceExt;
 
+    fn write_multiservice_logs_fixture(root: &std::path::Path, include_service_logs: bool) {
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        let writer = crate::storage::SnapshotWriter::new(env.clone(), 1).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-ms-logs-1\",\n  \"image_ref\": \"forge/api:staging-gen-1\"\n}\n",
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime.json",
+                concat!(
+                    "{\n",
+                    "  \"container_name\": \"staging-api-gen-1\",\n",
+                    "  \"running\": true,\n",
+                    "  \"services\": {\n",
+                    "    \"api\": {\n",
+                    "      \"service_id\": \"api\",\n",
+                    "      \"container_name\": \"staging-api-api-gen-1\",\n",
+                    "      \"image_ref\": \"forge/api:staging-gen-1\",\n",
+                    "      \"running\": true,\n",
+                    "      \"externally_exposed\": true,\n",
+                    "      \"activation\": {\"Http\": {\"internal_port\": 3000, \"route_subtree_id\": \"forge:api:staging:api\", \"target_source\": \"ContainerIp\"}}\n",
+                    "    },\n",
+                    "    \"worker\": {\n",
+                    "      \"service_id\": \"worker\",\n",
+                    "      \"container_name\": \"staging-api-worker-gen-1\",\n",
+                    "      \"image_ref\": \"forge/worker:staging-gen-1\",\n",
+                    "      \"running\": true,\n",
+                    "      \"depends_on\": [\"api\"],\n",
+                    "      \"activation\": \"Direct\"\n",
+                    "    }\n",
+                    "  },\n",
+                    "  \"startup_order\": [\"api\", \"worker\"],\n",
+                    "  \"activation\": {\"Http\": {\"internal_port\": 3000, \"route_subtree_id\": \"forge:api:staging\", \"target_source\": \"ContainerIp\"}},\n",
+                    "  \"environment_variables\": {}\n",
+                    "}\n"
+                ),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", crate::storage::SnapshotState::Healthy)
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env, 1);
+        diagnostics
+            .append_log_line("generation promoted", &[])
+            .unwrap();
+        if include_service_logs {
+            diagnostics
+                .write_artifact("services/api/container_logs_tail.log", "api ready\n", &[])
+                .unwrap();
+            diagnostics
+                .write_artifact(
+                    "services/worker/container_logs_tail.log",
+                    "worker polling\n",
+                    &[],
+                )
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn logs_returns_persisted_deployment_log() {
         let (state, root) = build_state_with_root(true);
@@ -3929,6 +3991,96 @@ pub mod deployment_diagnostics_endpoints {
         assert_eq!(
             json["data"]["latest_validation_failure"]["last_error"],
             "http health probe returned unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_grouped_multiservice_logs_by_default() {
+        let (state, root) = build_state_with_root(true);
+        write_multiservice_logs_fixture(&root, true);
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/deployments/dep-ms-logs-1/logs")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["services"].as_array().unwrap().len(), 2);
+        assert_eq!(json["data"]["services"][0]["service_id"], "api");
+        assert_eq!(json["data"]["services"][0]["lines"][0], "api ready");
+        assert_eq!(json["data"]["services"][1]["service_id"], "worker");
+        assert_eq!(json["data"]["services"][1]["lines"][0], "worker polling");
+    }
+
+    #[tokio::test]
+    async fn logs_service_filter_returns_only_requested_service() {
+        let (state, root) = build_state_with_root(true);
+        write_multiservice_logs_fixture(&root, true);
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/deployments/dep-ms-logs-1/logs?service=worker")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["selected_service"], "worker");
+        assert_eq!(json["data"]["services"].as_array().unwrap().len(), 1);
+        assert_eq!(json["data"]["services"][0]["service_id"], "worker");
+        assert_eq!(json["data"]["services"][0]["lines"][0], "worker polling");
+    }
+
+    #[tokio::test]
+    async fn logs_invalid_service_returns_service_not_found() {
+        let (state, root) = build_state_with_root(true);
+        write_multiservice_logs_fixture(&root, true);
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/deployments/dep-ms-logs-1/logs?service=cron")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "service_not_found");
+    }
+
+    #[tokio::test]
+    async fn legacy_multiservice_generation_reports_service_logs_unavailable() {
+        let (state, root) = build_state_with_root(true);
+        write_multiservice_logs_fixture(&root, false);
+
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/api/deployments/dep-ms-logs-1/logs?service=api")
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["services"][0]["lines"][0],
+            "service logs unavailable for this generation"
         );
     }
 }

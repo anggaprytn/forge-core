@@ -531,15 +531,27 @@ impl ForgeClient {
         response: reqwest::blocking::Response,
     ) -> Result<T, CliError> {
         let status = response.status();
+        let body = response
+            .bytes()
+            .map_err(|err| CliError::Http(err.to_string()))?;
+        let body_text = String::from_utf8_lossy(&body).into_owned();
         if status.is_success() {
-            let envelope = response
-                .json::<SuccessEnvelope<T>>()
-                .map_err(|err| CliError::Http(err.to_string()))?;
+            let envelope = serde_json::from_slice::<SuccessEnvelope<T>>(&body).map_err(|err| {
+                CliError::Http(format!(
+                    "error decoding response body: {err}; status: {}; body: {}",
+                    status.as_u16(),
+                    summarize_response_body(&body_text)
+                ))
+            })?;
             Ok(envelope.data)
         } else {
-            let envelope = response
-                .json::<ErrorEnvelope>()
-                .map_err(|err| CliError::Http(err.to_string()))?;
+            let envelope = serde_json::from_slice::<ErrorEnvelope>(&body).map_err(|err| {
+                CliError::Http(format!(
+                    "error decoding error response body: {err}; status: {}; body: {}",
+                    status.as_u16(),
+                    summarize_response_body(&body_text)
+                ))
+            })?;
             Err(CliError::Api(
                 status,
                 ErrorResponse {
@@ -548,6 +560,16 @@ impl ForgeClient {
                 },
             ))
         }
+    }
+}
+
+fn summarize_response_body(body: &str) -> String {
+    const MAX_LEN: usize = 600;
+    let compact = body.trim().replace('\n', "\\n");
+    if compact.len() <= MAX_LEN {
+        compact
+    } else {
+        format!("{}...", &compact[..MAX_LEN])
     }
 }
 
