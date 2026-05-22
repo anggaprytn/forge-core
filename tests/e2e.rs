@@ -28,8 +28,8 @@ use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
 use forge_core::runtime::{
-    BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
-    DockerRuntimeError, RouteUpdateRequest, RoutingRuntime,
+    BuildImageRequest, ContainerInspection, ContainerRuntimePolicy, CreateContainerRequest,
+    DockerRuntime, DockerRuntimeError, RouteUpdateRequest, RoutingRuntime,
 };
 use forge_core::secrets::SecretStore;
 use forge_core::status::derive_environment_domain;
@@ -1103,6 +1103,10 @@ impl E2eHarness {
                 network_aliases: Vec::new(),
                 volume_mounts: Vec::new(),
                 command: None,
+                runtime_policy: ContainerRuntimePolicy {
+                    restart_policy: "no".into(),
+                    ..ContainerRuntimePolicy::default()
+                },
             })
             .unwrap();
         docker
@@ -1499,11 +1503,19 @@ impl DockerRuntime for NoopDockerRuntime {
             exit_code: Some(0),
             restart_count: 0,
             started_at: None,
+            finished_at: None,
+            oom_killed: false,
+            error: None,
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: Default::default(),
             volume_mounts: Vec::new(),
             restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            exit_signal: None,
+            termination_reason: None,
         })
     }
 

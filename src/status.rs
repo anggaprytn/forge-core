@@ -32,8 +32,9 @@ use crate::storage::{
     DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary, PersistedResolvedRuntime,
-    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
-    PersistedServiceState, PersistedSnapshotMetadata, PersistedValidationSummary,
+    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedRuntimePolicy,
+    PersistedRuntimeUsageSnapshot, PersistedServiceRuntimeInfo, PersistedServiceState,
+    PersistedSnapshotMetadata, PersistedTerminationInfo, PersistedValidationSummary,
     PersistedVolumeRetention, PointerStore, RetentionMetadata, RetentionStore, StorageError,
     load_generation_build_info, load_generation_lifecycle, load_generation_probe_history,
     load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
@@ -216,6 +217,14 @@ pub struct ProjectEnvironmentStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
     #[serde(default)]
+    pub runtime_policy: PersistedRuntimePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_usage: Option<PersistedRuntimeUsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<PersistedTerminationInfo>,
+    #[serde(default)]
+    pub restart_count: u64,
+    #[serde(default)]
     pub startup_order: Vec<String>,
     #[serde(default)]
     pub services: Vec<ServiceRuntimeStatus>,
@@ -336,6 +345,10 @@ struct EnvironmentRuntimeTruth {
     network_name: Option<String>,
     container_ip: Option<String>,
     image_ref: Option<String>,
+    runtime_policy: PersistedRuntimePolicy,
+    runtime_usage: Option<PersistedRuntimeUsageSnapshot>,
+    termination: Option<PersistedTerminationInfo>,
+    restart_count: u64,
     startup_order: Vec<String>,
     services: Vec<ServiceRuntimeStatus>,
     route_details: Option<RouteStatusDetails>,
@@ -889,6 +902,10 @@ where
             .as_ref()
             .and_then(|runtime| runtime.probe_path.clone()),
         image_ref: truth.image_ref,
+        runtime_policy: truth.runtime_policy.clone(),
+        runtime_usage: truth.runtime_usage.clone(),
+        termination: truth.termination.clone(),
+        restart_count: truth.restart_count,
         startup_order: truth.startup_order.clone(),
         services: truth.services.clone(),
         last_deployment_id: truth
@@ -1180,6 +1197,9 @@ where
             network_name: truth.network_name,
             container_ip: status.container_ip,
             started_at: status.container_started_at,
+            runtime_policy: Some(status.runtime_policy.clone()),
+            runtime_usage: status.runtime_usage.clone(),
+            termination: status.termination.clone(),
         },
         route,
         probe_target,
@@ -1253,6 +1273,10 @@ where
         active_restore,
         state_restore_warnings: orphaned_state_warnings.clone(),
         backup_restore_events,
+        policy_drift_repairs: recent_policy_drift_repairs(
+            &env,
+            &truth.active_generation.into_iter().collect::<Vec<_>>(),
+        )?,
     })
 }
 
@@ -1496,6 +1520,50 @@ where
         .as_ref()
         .map(|inspection| inspection.image_ref.clone())
         .or_else(|| promoted_build.as_ref().map(|build| build.image_ref.clone()));
+    let runtime_policy = container_inspection
+        .as_ref()
+        .map(|inspection| PersistedRuntimePolicy {
+            cpu_limit: inspection.cpu_limit.clone(),
+            memory_limit_mb: inspection.memory_limit_mb,
+            restart_policy: inspection.restart_policy.clone(),
+            max_retries: inspection.restart_max_retries,
+        })
+        .or_else(|| {
+            promoted_runtime
+                .as_ref()
+                .map(|runtime| runtime.runtime_policy.clone())
+        })
+        .unwrap_or_else(|| PersistedRuntimePolicy {
+            restart_policy: "no".into(),
+            ..PersistedRuntimePolicy::default()
+        });
+    let runtime_usage = container_inspection.as_ref().and_then(|inspection| {
+        docker
+            .container_usage(&inspection.container_name)
+            .ok()
+            .map(|usage| PersistedRuntimeUsageSnapshot {
+                captured_at_unix: usage.captured_at_unix,
+                cpu_percent: usage.cpu_percent,
+                memory_usage_mb: usage.memory_usage_mb,
+                memory_limit_mb: usage.memory_limit_mb,
+            })
+    });
+    let termination = container_inspection
+        .as_ref()
+        .map(|inspection| PersistedTerminationInfo {
+            oom_killed: inspection.oom_killed,
+            exit_code: inspection.exit_code,
+            exit_signal: inspection.exit_signal,
+            finished_at: inspection.finished_at.clone(),
+            error: inspection.error.clone(),
+            reason: inspection.termination_reason.clone(),
+            stderr_tail: None,
+            restart_count: inspection.restart_count,
+        });
+    let restart_count = container_inspection
+        .as_ref()
+        .map(|inspection| inspection.restart_count)
+        .unwrap_or(0);
     let startup_order = promoted_runtime
         .as_ref()
         .map(service_startup_order)
@@ -1538,6 +1606,10 @@ where
         network_name,
         container_ip,
         image_ref,
+        runtime_policy,
+        runtime_usage,
+        termination,
+        restart_count,
         startup_order,
         services,
         route_details,
@@ -1582,6 +1654,9 @@ fn collect_service_runtime_truth<D: DockerRuntime, R: RoutingRuntime>(
                 probe_path: runtime.probe_path.clone(),
                 activation: runtime.activation.clone(),
                 command: None,
+                runtime_policy: runtime.runtime_policy.clone(),
+                runtime_usage: runtime.runtime_usage.clone(),
+                termination: runtime.termination.clone(),
                 depends_on: Vec::new(),
                 required_for_promotion: true,
                 externally_exposed: matches!(
@@ -1648,6 +1723,41 @@ fn collect_service_runtime_truth<D: DockerRuntime, R: RoutingRuntime>(
                 container_ip,
                 internal_port: service_internal_port(service),
                 probe_path: service.probe_path.clone(),
+                runtime_policy: inspection
+                    .as_ref()
+                    .map(|value| PersistedRuntimePolicy {
+                        cpu_limit: value.cpu_limit.clone(),
+                        memory_limit_mb: value.memory_limit_mb,
+                        restart_policy: value.restart_policy.clone(),
+                        max_retries: value.restart_max_retries,
+                    })
+                    .unwrap_or_else(|| service.runtime_policy.clone()),
+                runtime_usage: inspection.as_ref().and_then(|value| {
+                    docker
+                        .container_usage(&value.container_name)
+                        .ok()
+                        .map(|usage| PersistedRuntimeUsageSnapshot {
+                            captured_at_unix: usage.captured_at_unix,
+                            cpu_percent: usage.cpu_percent,
+                            memory_usage_mb: usage.memory_usage_mb,
+                            memory_limit_mb: usage.memory_limit_mb,
+                        })
+                }),
+                termination: inspection.as_ref().map(|value| PersistedTerminationInfo {
+                    oom_killed: value.oom_killed,
+                    exit_code: value.exit_code,
+                    exit_signal: value.exit_signal,
+                    finished_at: value.finished_at.clone(),
+                    error: value.error.clone(),
+                    reason: value.termination_reason.clone(),
+                    stderr_tail: None,
+                    restart_count: value.restart_count,
+                }),
+                restart_count: inspection
+                    .as_ref()
+                    .map(|value| value.restart_count)
+                    .unwrap_or(0),
+                last_exit_code: inspection.as_ref().and_then(|value| value.exit_code),
                 route: if is_multi_service {
                     service_route_status(
                         routing,
@@ -1875,6 +1985,10 @@ fn build_environment_status_from_truth(
             .as_ref()
             .and_then(|runtime| runtime.probe_path.clone()),
         image_ref: truth.image_ref.clone(),
+        runtime_policy: truth.runtime_policy.clone(),
+        runtime_usage: truth.runtime_usage.clone(),
+        termination: truth.termination.clone(),
+        restart_count: truth.restart_count,
         startup_order: truth.startup_order.clone(),
         services: truth.services.clone(),
         last_deployment_id: truth
@@ -1990,6 +2104,39 @@ fn recent_backup_restore_events(
                 "BACKUP_CREATED" | "BACKUP_RESTORE_COMPLETED"
             ) {
                 events.push(event.reason.unwrap_or_else(|| event.event_type));
+            }
+        }
+    }
+    events.reverse();
+    events.truncate(5);
+    Ok(events)
+}
+
+fn recent_policy_drift_repairs(
+    env: &EnvironmentPaths,
+    generations: &[u64],
+) -> Result<Vec<String>, ProjectStatusError> {
+    let mut events = Vec::new();
+    for generation in generations {
+        let path = env.generation_dir(*generation).join("events.jsonl");
+        if !path.exists() {
+            continue;
+        }
+        let raw = fs::read_to_string(path)?;
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<EventRecord>(line).map_err(|err| {
+                ProjectStatusError::Storage(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                )))
+            })?;
+            if event.event_type == "RUNTIME_POLICY_DRIFT_REPAIRED" {
+                events.push(event.reason.unwrap_or_else(|| {
+                    format!("generation {} runtime policy drift repaired", generation)
+                }));
             }
         }
     }
@@ -2656,6 +2803,9 @@ fn inspect_service_route_status<R: RoutingRuntime>(
         network_name: service.network_name.clone(),
         probe_path: service.probe_path.clone(),
         activation: service.activation.clone(),
+        runtime_policy: service.runtime_policy.clone(),
+        runtime_usage: service.runtime_usage.clone(),
+        termination: service.termination.clone(),
         environment_variables: service.environment_variables.clone(),
         volume_mounts: service.volume_mounts.clone(),
         source_ref: service.source_ref.clone(),
@@ -2874,6 +3024,12 @@ mod tests {
                 route_subtree_id: Some("forge:api:staging".into()),
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: Vec::new(),
             source_ref: Some("main".into()),
@@ -2992,6 +3148,12 @@ mod tests {
                 route_subtree_id: Some("forge:api:staging:api".into()),
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: Vec::new(),
             source_ref: Some("main".into()),
@@ -3015,6 +3177,12 @@ mod tests {
                             target_source: PersistedRouteTargetSource::ContainerIp,
                         }),
                         command: None,
+                        runtime_policy: PersistedRuntimePolicy {
+                            restart_policy: "no".into(),
+                            ..PersistedRuntimePolicy::default()
+                        },
+                        runtime_usage: None,
+                        termination: None,
                         depends_on: Vec::new(),
                         required_for_promotion: true,
                         externally_exposed: true,
@@ -3039,6 +3207,12 @@ mod tests {
                         probe_path: None,
                         activation: Some(PersistedActivationMode::Direct),
                         command: None,
+                        runtime_policy: PersistedRuntimePolicy {
+                            restart_policy: "no".into(),
+                            ..PersistedRuntimePolicy::default()
+                        },
+                        runtime_usage: None,
+                        termination: None,
                         depends_on: vec!["api".into()],
                         required_for_promotion: false,
                         externally_exposed: false,
@@ -3100,6 +3274,12 @@ mod tests {
             network_name: Some("forge-managed".into()),
             probe_path: None,
             activation: Some(PersistedActivationMode::Direct),
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: vec![crate::storage::PersistedVolumeMount {
                 volume_id: "postgres-data".into(),
@@ -3125,6 +3305,12 @@ mod tests {
                     probe_path: None,
                     activation: Some(PersistedActivationMode::Direct),
                     command: None,
+                    runtime_policy: PersistedRuntimePolicy {
+                        restart_policy: "no".into(),
+                        ..PersistedRuntimePolicy::default()
+                    },
+                    runtime_usage: None,
+                    termination: None,
                     depends_on: Vec::new(),
                     required_for_promotion: true,
                     externally_exposed: false,
@@ -3335,6 +3521,12 @@ mod tests {
                 route_subtree_id: Some("forge:api:staging".into()),
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: Vec::new(),
             source_ref: Some("main".into()),
@@ -3432,11 +3624,19 @@ mod tests {
             exit_code: Some(0),
             restart_count: 0,
             started_at: Some("2026-05-21T12:00:00Z".into()),
+            finished_at: None,
+            oom_killed: false,
+            error: None,
             image_ref: format!("forge/api:staging-gen-{generation}"),
             labels: BTreeMap::new(),
             network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
             volume_mounts: Vec::new(),
             restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            exit_signal: None,
+            termination_reason: None,
         }
     }
 
@@ -3793,6 +3993,9 @@ mod tests {
                 route_verification_stable: true,
                 validation_succeeded: true,
                 last_probe_error: None,
+                unstable_probe_failures: 0,
+                restart_storm_detected: false,
+                oom_detected: false,
             },
             PersistedPromotionSummary {
                 warmup_succeeded: true,
@@ -3854,6 +4057,9 @@ mod tests {
                 route_verification_stable: true,
                 validation_succeeded: true,
                 last_probe_error: Some("http health probe returned unhealthy for /health".into()),
+                unstable_probe_failures: 0,
+                restart_storm_detected: false,
+                oom_detected: false,
             },
             PersistedPromotionSummary {
                 warmup_succeeded: true,
@@ -3937,6 +4143,9 @@ mod tests {
                 route_verification_stable: true,
                 validation_succeeded: true,
                 last_probe_error: None,
+                unstable_probe_failures: 0,
+                restart_storm_detected: false,
+                oom_detected: false,
             },
             PersistedPromotionSummary {
                 warmup_succeeded: true,
@@ -4002,6 +4211,9 @@ mod tests {
                 route_verification_stable: true,
                 validation_succeeded: true,
                 last_probe_error: None,
+                unstable_probe_failures: 0,
+                restart_storm_detected: false,
+                oom_detected: false,
             },
             PersistedPromotionSummary {
                 warmup_succeeded: true,
@@ -4081,6 +4293,9 @@ mod tests {
                 route_verification_stable: true,
                 validation_succeeded: true,
                 last_probe_error: Some("http health probe returned unhealthy for /health".into()),
+                unstable_probe_failures: 0,
+                restart_storm_detected: false,
+                oom_detected: false,
             },
             PersistedPromotionSummary {
                 warmup_succeeded: true,
@@ -4486,6 +4701,9 @@ mod tests {
                 route_verification_stable: true,
                 validation_succeeded: false,
                 last_probe_error: None,
+                unstable_probe_failures: 0,
+                restart_storm_detected: false,
+                oom_detected: false,
             }),
             Some(PersistedPromotionSummary {
                 gate_reason: Some("warmup pending".into()),
@@ -5394,11 +5612,19 @@ mod tests {
                 exit_code: None,
                 restart_count: 0,
                 started_at: None,
+                finished_at: None,
+                oom_killed: false,
+                error: None,
                 image_ref: "forge/api:staging-gen-7".into(),
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
                 volume_mounts: Vec::new(),
                 restart_policy: "always".into(),
+                restart_max_retries: None,
+                cpu_limit: None,
+                memory_limit_mb: None,
+                exit_signal: None,
+                termination_reason: None,
             }),
         };
         let mut routing = StubRoutingRuntime {
@@ -5449,11 +5675,19 @@ mod tests {
                 exit_code: None,
                 restart_count: 0,
                 started_at: None,
+                finished_at: None,
+                oom_killed: false,
+                error: None,
                 image_ref: "forge/api:staging-gen-9".into(),
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
                 volume_mounts: Vec::new(),
                 restart_policy: "always".into(),
+                restart_max_retries: None,
+                cpu_limit: None,
+                memory_limit_mb: None,
+                exit_signal: None,
+                termination_reason: None,
             }),
         };
         let mut routing = StubRoutingRuntime {
@@ -5501,6 +5735,9 @@ mod tests {
                 exit_code: None,
                 restart_count: 0,
                 started_at: None,
+                finished_at: None,
+                oom_killed: false,
+                error: None,
                 image_ref: "postgres:16".into(),
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.9".into())]),
@@ -5509,6 +5746,11 @@ mod tests {
                     mount_path: "/var/lib/postgresql/data".into(),
                 }],
                 restart_policy: "always".into(),
+                restart_max_retries: None,
+                cpu_limit: None,
+                memory_limit_mb: None,
+                exit_signal: None,
+                termination_reason: None,
             }),
         };
         let mut routing = StubRoutingRuntime::default();

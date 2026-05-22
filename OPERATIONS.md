@@ -662,9 +662,14 @@ docker inspect <container>
 
 ## Important Constraint
 
-Docker restart policy must remain disabled.
+Docker restart policy is part of the persisted runtime policy.
 
-Forge owns restart semantics.
+Forge still owns deployment promotion semantics, but container restart behavior may be configured per service as `no`, `always`, `on-failure`, or `unless-stopped`. Convergence treats drift in that policy as repairable runtime drift and recreates the container to restore the stored policy.
+
+Single-node isolation boundaries:
+- Forge depends on Docker for CPU and memory enforcement on one host.
+- This is not a security-grade tenant boundary. Co-located workloads still share the same kernel, daemon, disks, and operator trust domain.
+- OOM during warmup, restart storms, or repeated unstable probes block promotion and surface through `forge diagnose`.
 
 ---
 

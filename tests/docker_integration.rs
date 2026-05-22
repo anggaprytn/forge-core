@@ -12,8 +12,8 @@ use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
 use forge_core::runtime::{
-    BuildImageRequest, CreateContainerRequest, DockerRuntime, RouteInspection, RouteUpdateRequest,
-    RoutingRuntime, RoutingRuntimeError,
+    BuildImageRequest, ContainerRuntimePolicy, CreateContainerRequest, DockerRuntime,
+    RouteInspection, RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError,
 };
 use forge_core::storage::{EnvironmentPaths, PointerStore};
 
@@ -69,6 +69,10 @@ fn docker_integration_real_adapter_honors_runtime_invariants() {
             network_aliases: Vec::new(),
             volume_mounts: Vec::new(),
             command: None,
+            runtime_policy: ContainerRuntimePolicy {
+                restart_policy: "no".into(),
+                ..ContainerRuntimePolicy::default()
+            },
         })
         .expect("generation-named container should be created");
 

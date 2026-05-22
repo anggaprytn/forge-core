@@ -1,6 +1,7 @@
 use crate::events::EventRecord;
 use crate::storage::{
-    DeploymentLifecycleState, PersistedPromotionSummary, PersistedServiceState,
+    DeploymentLifecycleState, PersistedPromotionSummary, PersistedRuntimePolicy,
+    PersistedRuntimeUsageSnapshot, PersistedServiceState, PersistedTerminationInfo,
     PersistedValidationSummary,
 };
 use serde::{Deserialize, Serialize};
@@ -115,6 +116,12 @@ pub struct ContainerRuntimeDiagnostics {
     pub container_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy: Option<PersistedRuntimePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_usage: Option<PersistedRuntimeUsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<PersistedTerminationInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +149,16 @@ pub struct ServiceRuntimeStatus {
     pub internal_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_path: Option<String>,
+    #[serde(default)]
+    pub runtime_policy: PersistedRuntimePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_usage: Option<PersistedRuntimeUsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<PersistedTerminationInfo>,
+    #[serde(default)]
+    pub restart_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
     pub route: String,
     pub health: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,6 +373,8 @@ pub struct EnvironmentDiagnostics {
     pub state_restore_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backup_restore_events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_drift_repairs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

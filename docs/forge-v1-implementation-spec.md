@@ -60,7 +60,7 @@ Forge v1 MUST enforce these invariants:
 - Docker is the execution engine only.
 - Forge is the orchestration authority.
 - The deployment server is the control-plane authority.
-- Docker restart policies are disabled for Forge-managed containers.
+- Docker restart policy, CPU limit, and memory limit are persisted per service and must round-trip through deployment, rollback, and convergence.
 - Desired state is defined by the resolved `forge.yml` plus deploy request intent.
 - Observed state is defined by Docker/Linux inspection.
 - Snapshot state is the immutable rollback artifact.
@@ -267,7 +267,12 @@ Runtime Contracts are validated at deploy time and continuously in steady state.
 - bind must be externally reachable inside the container namespace
 - container must expose required TCP service
 - container labels must be present
-- Docker restart policy must not override Forge recovery
+- Docker restart behavior may be configured per service, but Forge must treat restart storms, OOM kills, and unstable warmup behavior as promotion blockers.
+
+Single-node isolation assumptions:
+- Forge relies on Docker cgroup and namespace controls on a single host.
+- These controls provide operational containment only. They do not turn Forge into a hardened hostile-tenant platform.
+- Resource exhaustion must be reported in runtime metadata (`runtime.json`, `lifecycle.json`, diagnostics) and must block promotion when observed during warmup.
 
 ## 8. Filesystem Layout
 

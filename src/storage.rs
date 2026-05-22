@@ -201,6 +201,12 @@ pub struct PersistedServiceRuntimeInfo {
     #[serde(default)]
     pub command: Option<Vec<String>>,
     #[serde(default)]
+    pub runtime_policy: PersistedRuntimePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_usage: Option<PersistedRuntimeUsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<PersistedTerminationInfo>,
+    #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub required_for_promotion: bool,
@@ -242,6 +248,12 @@ pub struct PersistedRuntimeInfo {
     #[serde(default)]
     pub activation: Option<PersistedActivationMode>,
     #[serde(default)]
+    pub runtime_policy: PersistedRuntimePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_usage: Option<PersistedRuntimeUsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<PersistedTerminationInfo>,
+    #[serde(default)]
     pub environment_variables: BTreeMap<String, PersistedSecretReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volume_mounts: Vec<PersistedVolumeMount>,
@@ -267,6 +279,9 @@ pub enum DeploymentLifecycleState {
     Starting,
     Warming,
     Validating,
+    Unstable,
+    CrashLoop,
+    OomKilled,
     Promoted,
     Rollback,
     Failed,
@@ -281,6 +296,9 @@ impl DeploymentLifecycleState {
             Self::Starting => "starting",
             Self::Warming => "warming",
             Self::Validating => "validating",
+            Self::Unstable => "unstable",
+            Self::CrashLoop => "crash_loop",
+            Self::OomKilled => "oom_killed",
             Self::Promoted => "promoted",
             Self::Rollback => "rollback",
             Self::Failed => "failed",
@@ -313,6 +331,56 @@ pub struct PersistedValidationSummary {
     pub validation_succeeded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe_error: Option<String>,
+    #[serde(default)]
+    pub unstable_probe_failures: u32,
+    #[serde(default)]
+    pub restart_storm_detected: bool,
+    #[serde(default)]
+    pub oom_detected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedRuntimePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default = "default_restart_policy")]
+    pub restart_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedRuntimeUsageSnapshot {
+    #[serde(default)]
+    pub captured_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_usage_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_mb: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedTerminationInfo {
+    #[serde(default)]
+    pub oom_killed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+    #[serde(default)]
+    pub restart_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1547,6 +1615,10 @@ fn unique_suffix() -> u128 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_restart_policy() -> String {
+    "no".into()
 }
 
 fn truncate_to_recent_bytes(input: &str, max_bytes: usize) -> String {

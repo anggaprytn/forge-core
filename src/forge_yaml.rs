@@ -85,11 +85,20 @@ pub struct ForgeServiceConfig {
     pub build: Option<ForgeBuildConfig>,
     pub image: Option<String>,
     pub command: Option<String>,
+    pub runtime_policy: ForgeRuntimePolicy,
     pub state: Option<ForgeStateConfig>,
     pub depends_on: Vec<String>,
     pub validation: ValidationPolicy,
     pub required_for_promotion: bool,
     pub externally_exposed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ForgeRuntimePolicy {
+    pub cpu_limit: Option<String>,
+    pub memory_limit_mb: Option<u64>,
+    pub restart_policy: String,
+    pub max_retries: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +153,32 @@ struct RawRuntimeConfig {
     healthcheck: Option<RawHealthcheckConfig>,
     #[serde(default)]
     depends_on: Vec<String>,
+    #[serde(default)]
+    cpu: Option<RawCpuConfig>,
+    #[serde(default)]
+    memory: Option<RawMemoryConfig>,
+    #[serde(default)]
+    restart: Option<RawRestartConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCpuConfig {
+    limit: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMemoryConfig {
+    limit_mb: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRestartConfig {
+    policy: String,
+    #[serde(default)]
+    max_retries: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,6 +326,7 @@ impl RawForgeYaml {
             build: None,
             image: None,
             command: runtime.command.clone(),
+            runtime_policy: runtime_policy_for_runtime(&runtime)?,
             state: None,
             depends_on: Vec::new(),
             validation: validation.clone(),
@@ -397,6 +433,7 @@ impl RawForgeYaml {
                     }),
                     image: raw.runtime.image.clone(),
                     command: raw.runtime.command.clone(),
+                    runtime_policy: runtime_policy_for_runtime(&raw.runtime)?,
                     state: raw.state.as_ref().map(|state| ForgeStateConfig {
                         volume: state.volume.clone().expect("state validated"),
                         mount_path: state.mount_path.clone().expect("state validated"),
@@ -554,6 +591,63 @@ fn validation_for_runtime(
         activation,
         ..ValidationPolicy::default()
     })
+}
+
+fn runtime_policy_for_runtime(
+    runtime: &RawRuntimeConfig,
+) -> Result<ForgeRuntimePolicy, ForgeYamlError> {
+    let cpu_limit = runtime
+        .cpu
+        .as_ref()
+        .map(|cpu| validate_cpu_limit(&cpu.limit))
+        .transpose()?;
+    let memory_limit_mb = runtime
+        .memory
+        .as_ref()
+        .map(|memory| {
+            if memory.limit_mb == 0 {
+                Err(ForgeYamlError::Invalid(
+                    "forge.yml runtime.memory.limit_mb must be greater than 0".into(),
+                ))
+            } else {
+                Ok(memory.limit_mb)
+            }
+        })
+        .transpose()?;
+    let (restart_policy, max_retries) = match runtime.restart.as_ref() {
+        Some(restart) => validate_restart_policy(restart)?,
+        None => ("no".into(), None),
+    };
+    Ok(ForgeRuntimePolicy {
+        cpu_limit,
+        memory_limit_mb,
+        restart_policy,
+        max_retries,
+    })
+}
+
+fn validate_cpu_limit(value: &str) -> Result<String, ForgeYamlError> {
+    let parsed = value.parse::<f64>().map_err(|_| {
+        ForgeYamlError::Invalid("forge.yml runtime.cpu.limit must be a positive number".into())
+    })?;
+    if parsed <= 0.0 {
+        return Err(ForgeYamlError::Invalid(
+            "forge.yml runtime.cpu.limit must be a positive number".into(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_restart_policy(
+    restart: &RawRestartConfig,
+) -> Result<(String, Option<u64>), ForgeYamlError> {
+    match restart.policy.as_str() {
+        "always" | "unless-stopped" | "no" => Ok((restart.policy.clone(), None)),
+        "on-failure" => Ok((restart.policy.clone(), restart.max_retries)),
+        other => Err(ForgeYamlError::Invalid(format!(
+            "forge.yml runtime.restart.policy `{other}` must be one of always, on-failure, unless-stopped, no"
+        ))),
+    }
 }
 
 fn topological_service_order(

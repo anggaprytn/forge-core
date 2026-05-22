@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use crate::events::{EventRecord, redact_text};
 use crate::forge_yaml::{
-    ForgeServiceConfig, ForgeStateConfig, ForgeYamlConfig, load_optional_forge_yaml,
+    ForgeRuntimePolicy, ForgeServiceConfig, ForgeStateConfig, ForgeYamlConfig,
+    load_optional_forge_yaml,
 };
 use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
@@ -17,9 +18,9 @@ use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
-    BuildImageRequest, ContainerInspection, CreateContainerRequest, CreateVolumeRequest,
-    DockerRuntime, DockerRuntimeError, ProbeError, ProbeRuntime, RouteInspection,
-    RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError, VolumeMountRequest,
+    BuildImageRequest, ContainerInspection, ContainerRuntimePolicy, CreateContainerRequest,
+    CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ProbeError, ProbeRuntime,
+    RouteInspection, RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError, VolumeMountRequest,
 };
 use crate::runtime_env::{RuntimeEnvMetadata, build_runtime_env_artifacts};
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
@@ -29,8 +30,9 @@ use crate::storage::{
     EnvironmentPaths, EventStore, GenerationAllocator, GenerationHistoryRecord, LifecycleStore,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedPromotionSummary,
-    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedServiceBuildInfo,
-    PersistedServiceRuntimeInfo, PersistedServiceState, PersistedStateConfig,
+    PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedRuntimePolicy,
+    PersistedRuntimeUsageSnapshot, PersistedServiceBuildInfo, PersistedServiceRuntimeInfo,
+    PersistedServiceState, PersistedStateConfig, PersistedTerminationInfo,
     PersistedValidationSummary, PersistedVolumeMount, PersistedVolumeRetention, PointerStore,
     ProbeHistoryStore, RetentionStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
     SnapshotState, SnapshotWriter, StorageError, current_unix_timestamp,
@@ -706,6 +708,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 })
                 .collect(),
             command: None,
+            runtime_policy: ContainerRuntimePolicy {
+                restart_policy: "no".into(),
+                ..ContainerRuntimePolicy::default()
+            },
         }) {
             Ok(_) => {}
             Err(err) => {
@@ -834,7 +840,8 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 return Err(err.into());
             }
         };
-        if let Err(err) = validate_inspection(&inspection, &container_name) {
+        let runtime_policy = default_runtime_policy();
+        if let Err(err) = validate_inspection(&inspection, &container_name, &runtime_policy) {
             let failure_reason = err.to_string();
             persist_lifecycle_transition(
                 &lifecycle_store,
@@ -895,6 +902,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     target_source: PersistedRouteTargetSource::ContainerIp,
                 },
             }),
+            runtime_policy: runtime_policy.clone(),
+            runtime_usage: inspection_runtime_usage(self.docker, &inspection.container_name),
+            termination: Some(inspection_termination_info(&inspection, None)),
             environment_variables: runtime_env
                 .snapshot
                 .entries
@@ -1530,10 +1540,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     })
                     .collect(),
                 command: service_command(service),
+                runtime_policy: container_runtime_policy(&service.runtime_policy),
             })?;
             self.docker.start_container(&container_name)?;
             let inspection = self.docker.inspect_container(&container_name)?;
-            validate_inspection(&inspection, &container_name)?;
+            let runtime_policy = persisted_runtime_policy(&service.runtime_policy);
+            validate_inspection(&inspection, &container_name, &runtime_policy)?;
             diagnostics.append_log_line(
                 &format!("[service:{service_id}] validating"),
                 &secret_values,
@@ -1574,6 +1586,12 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         },
                     }),
                     command: service_command(service),
+                    runtime_policy,
+                    runtime_usage: inspection_runtime_usage(
+                        self.docker,
+                        &inspection.container_name,
+                    ),
+                    termination: Some(inspection_termination_info(&inspection, None)),
                     depends_on: service.depends_on.clone(),
                     required_for_promotion: service.required_for_promotion,
                     externally_exposed: service.externally_exposed,
@@ -1622,6 +1640,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             network_name: primary_runtime.network_name.clone(),
             probe_path: primary_runtime.probe_path.clone(),
             activation: primary_runtime.activation.clone(),
+            runtime_policy: primary_runtime.runtime_policy.clone(),
+            runtime_usage: primary_runtime.runtime_usage.clone(),
+            termination: primary_runtime.termination.clone(),
             environment_variables: primary_runtime.environment_variables.clone(),
             volume_mounts: primary_runtime.volume_mounts.clone(),
             source_ref: record.source_ref.clone(),
@@ -2166,6 +2187,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     route_verification_stable: true,
                     validation_succeeded: false,
                     last_probe_error: Some(failure_reason.clone()),
+                    oom_detected: current_inspection.oom_killed,
+                    restart_storm_detected: false,
+                    unstable_probe_failures: 0,
                 };
                 let promotion_summary = PersistedPromotionSummary {
                     runtime_snapshot_persisted: true,
@@ -2236,6 +2260,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     route_verification_stable: true,
                     validation_succeeded: false,
                     last_probe_error: Some(failure_reason.clone()),
+                    oom_detected: current_inspection.oom_killed,
+                    restart_storm_detected: true,
+                    unstable_probe_failures: 0,
                 };
                 let promotion_summary = PersistedPromotionSummary {
                     runtime_snapshot_persisted: true,
@@ -2398,6 +2425,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 route_verification_stable: true,
                 validation_succeeded: false,
                 last_probe_error: last_probe_error.clone(),
+                oom_detected: current_inspection.oom_killed,
+                restart_storm_detected: false,
+                unstable_probe_failures: 0,
             };
             let promotion_summary = PersistedPromotionSummary {
                 runtime_snapshot_persisted: true,
@@ -3299,6 +3329,7 @@ fn append_simple_event(
 fn validate_inspection(
     inspection: &ContainerInspection,
     expected_container_name: &str,
+    expected_policy: &PersistedRuntimePolicy,
 ) -> Result<(), DeploymentError> {
     if inspection.container_name != expected_container_name {
         return Err(DeploymentError::InvalidInspection(
@@ -3310,10 +3341,12 @@ fn validate_inspection(
             "container is not running".into(),
         ));
     }
-    if inspection.restart_policy != "no" {
-        return Err(DeploymentError::InvalidInspection(
-            "restart policy must be disabled".into(),
-        ));
+    let actual_policy = inspection_runtime_policy(inspection);
+    if actual_policy != *expected_policy {
+        return Err(DeploymentError::InvalidInspection(format!(
+            "runtime policy mismatch: expected {:?}, got {:?}",
+            expected_policy, actual_policy
+        )));
     }
     Ok(())
 }
@@ -3572,6 +3605,12 @@ fn select_primary_service(
             network_name: None,
             probe_path: None,
             activation: None,
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: Vec::new(),
             source_ref: None,
@@ -3608,6 +3647,9 @@ fn runtime_services(
             probe_path: runtime.probe_path.clone(),
             activation: runtime.activation.clone(),
             command: None,
+            runtime_policy: runtime.runtime_policy.clone(),
+            runtime_usage: runtime.runtime_usage.clone(),
+            termination: runtime.termination.clone(),
             depends_on: Vec::new(),
             required_for_promotion: true,
             externally_exposed: matches!(
@@ -3653,6 +3695,79 @@ fn caddy_network_reachability_note(network_name: Option<&str>) -> Option<String>
             "route activation assumes Caddy is attached to docker network {network_name}; upstream target reachability is only guaranteed when Caddy shares the selected deploy network."
         )
     })
+}
+
+fn container_runtime_policy(policy: &ForgeRuntimePolicy) -> ContainerRuntimePolicy {
+    ContainerRuntimePolicy {
+        cpu_limit: policy.cpu_limit.clone(),
+        memory_limit_mb: policy.memory_limit_mb,
+        restart_policy: if policy.restart_policy.trim().is_empty() {
+            "no".into()
+        } else {
+            policy.restart_policy.clone()
+        },
+        max_retries: policy.max_retries,
+    }
+}
+
+fn default_runtime_policy() -> PersistedRuntimePolicy {
+    PersistedRuntimePolicy {
+        restart_policy: "no".into(),
+        ..PersistedRuntimePolicy::default()
+    }
+}
+
+fn persisted_runtime_policy(policy: &ForgeRuntimePolicy) -> PersistedRuntimePolicy {
+    PersistedRuntimePolicy {
+        cpu_limit: policy.cpu_limit.clone(),
+        memory_limit_mb: policy.memory_limit_mb,
+        restart_policy: if policy.restart_policy.trim().is_empty() {
+            "no".into()
+        } else {
+            policy.restart_policy.clone()
+        },
+        max_retries: policy.max_retries,
+    }
+}
+
+fn inspection_runtime_policy(inspection: &ContainerInspection) -> PersistedRuntimePolicy {
+    PersistedRuntimePolicy {
+        cpu_limit: inspection.cpu_limit.clone(),
+        memory_limit_mb: inspection.memory_limit_mb,
+        restart_policy: inspection.restart_policy.clone(),
+        max_retries: inspection.restart_max_retries,
+    }
+}
+
+fn inspection_runtime_usage<D: DockerRuntime>(
+    docker: &mut D,
+    container_name: &str,
+) -> Option<PersistedRuntimeUsageSnapshot> {
+    docker
+        .container_usage(container_name)
+        .ok()
+        .map(|usage| PersistedRuntimeUsageSnapshot {
+            captured_at_unix: usage.captured_at_unix,
+            cpu_percent: usage.cpu_percent,
+            memory_usage_mb: usage.memory_usage_mb,
+            memory_limit_mb: usage.memory_limit_mb,
+        })
+}
+
+fn inspection_termination_info(
+    inspection: &ContainerInspection,
+    stderr_tail: Option<String>,
+) -> PersistedTerminationInfo {
+    PersistedTerminationInfo {
+        oom_killed: inspection.oom_killed,
+        exit_code: inspection.exit_code,
+        exit_signal: inspection.exit_signal,
+        finished_at: inspection.finished_at.clone(),
+        error: inspection.error.clone(),
+        reason: inspection.termination_reason.clone(),
+        stderr_tail,
+        restart_count: inspection.restart_count,
+    }
 }
 
 fn validate_route_activation(
@@ -5016,6 +5131,12 @@ pub mod git_backed_rollback_status_correctness {
                 route_subtree_id: Some(format!("forge:{project_id}:{environment}")),
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: Vec::new(),
             source_ref: Some(source_ref.into()),
@@ -5201,11 +5322,19 @@ pub mod git_backed_rollback_status_correctness {
             exit_code: Some(0),
             restart_count: 0,
             started_at: Some("2026-05-21T12:00:00Z".into()),
+            finished_at: None,
+            oom_killed: false,
+            error: None,
             image_ref: format!("forge/{project_id}:{environment}-gen-{generation}"),
             labels: BTreeMap::new(),
             network_ips: BTreeMap::from([(FORGE_MANAGED_DOCKER_NETWORK.into(), ip.into())]),
             volume_mounts: Vec::new(),
             restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            exit_signal: None,
+            termination_reason: None,
         }
     }
 
@@ -6619,11 +6748,19 @@ pub mod runtime_environment_snapshots {
                 exit_code: Some(0),
                 restart_count: 0,
                 started_at: Some("2026-05-21T12:00:00Z".into()),
+                finished_at: None,
+                oom_killed: false,
+                error: None,
                 image_ref: "forge/api:production-gen-1".into(),
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([("forge-net".into(), "172.19.0.5".into())]),
                 volume_mounts: Vec::new(),
                 restart_policy: "no".into(),
+                restart_max_retries: None,
+                cpu_limit: None,
+                memory_limit_mb: None,
+                exit_signal: None,
+                termination_reason: None,
             },
         };
         let mut status_routing = StickyRoutingRuntime {
@@ -8805,11 +8942,19 @@ pub mod multi_service_orchestration {
                 exit_code: Some(0),
                 restart_count: 0,
                 started_at: Some("2026-05-22T00:00:00Z".into()),
+                finished_at: None,
+                oom_killed: false,
+                error: None,
                 image_ref,
                 labels: BTreeMap::new(),
                 network_ips: BTreeMap::from([(FORGE_MANAGED_DOCKER_NETWORK.into(), ip.into())]),
                 volume_mounts: request_volume_mounts(&self.create_requests, container_name),
                 restart_policy: "no".into(),
+                restart_max_retries: None,
+                cpu_limit: None,
+                memory_limit_mb: None,
+                exit_signal: None,
+                termination_reason: None,
             })
         }
 

@@ -397,10 +397,16 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
                 })
                 .collect(),
             command: service.command.clone(),
+            runtime_policy: crate::runtime::ContainerRuntimePolicy {
+                cpu_limit: service.runtime_policy.cpu_limit.clone(),
+                memory_limit_mb: service.runtime_policy.memory_limit_mb,
+                restart_policy: service.runtime_policy.restart_policy.clone(),
+                max_retries: service.runtime_policy.max_retries,
+            },
         })?;
         docker.start_container(&container_name)?;
         let inspection = docker.inspect_container(&container_name)?;
-        validate_inspection(&inspection, &container_name)?;
+        validate_inspection(&inspection, &container_name, &service.runtime_policy)?;
         restored_services.insert(
             service_id.clone(),
             PersistedServiceRuntimeInfo {
@@ -413,6 +419,9 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
                 probe_path: service.probe_path.clone(),
                 activation: service.activation.clone(),
                 command: service.command.clone(),
+                runtime_policy: service.runtime_policy.clone(),
+                runtime_usage: service.runtime_usage.clone(),
+                termination: service.termination.clone(),
                 depends_on: service.depends_on.clone(),
                 required_for_promotion: service.required_for_promotion,
                 externally_exposed: service.externally_exposed,
@@ -437,6 +446,9 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         network_name: primary_runtime.network_name.clone(),
         probe_path: primary_runtime.probe_path.clone(),
         activation: primary_runtime.activation.clone(),
+        runtime_policy: primary_runtime.runtime_policy.clone(),
+        runtime_usage: primary_runtime.runtime_usage.clone(),
+        termination: primary_runtime.termination.clone(),
         environment_variables: primary_runtime.environment_variables.clone(),
         volume_mounts: primary_runtime.volume_mounts.clone(),
         source_ref: metadata.build_info.source_ref.clone(),
@@ -1014,6 +1026,9 @@ fn runtime_services(
             probe_path: runtime.probe_path.clone(),
             activation: runtime.activation.clone(),
             command: None,
+            runtime_policy: runtime.runtime_policy.clone(),
+            runtime_usage: runtime.runtime_usage.clone(),
+            termination: runtime.termination.clone(),
             depends_on: Vec::new(),
             required_for_promotion: true,
             externally_exposed: matches!(
@@ -1413,6 +1428,7 @@ fn backup_scan_error(prefix: &str, path: &Path, err: std::io::Error) -> BackupEr
 fn validate_inspection(
     inspection: &ContainerInspection,
     expected_container_name: &str,
+    expected_policy: &crate::storage::PersistedRuntimePolicy,
 ) -> Result<(), BackupError> {
     if inspection.container_name != expected_container_name {
         return Err(BackupError::Invalid(
@@ -1424,9 +1440,13 @@ fn validate_inspection(
             "restored container is not running".into(),
         ));
     }
-    if inspection.restart_policy != "no" {
+    if inspection.restart_policy != expected_policy.restart_policy
+        || inspection.restart_max_retries != expected_policy.max_retries
+        || inspection.cpu_limit != expected_policy.cpu_limit
+        || inspection.memory_limit_mb != expected_policy.memory_limit_mb
+    {
         return Err(BackupError::Invalid(
-            "restart policy must remain disabled".into(),
+            "restored container runtime policy mismatch".into(),
         ));
     }
     Ok(())
@@ -1673,6 +1693,9 @@ mod tests {
                     exit_code: Some(0),
                     restart_count: 0,
                     started_at: Some("2026-05-23T00:00:00Z".into()),
+                    finished_at: None,
+                    oom_killed: false,
+                    error: None,
                     image_ref: request.image_ref.clone(),
                     labels: request.labels.clone(),
                     network_ips: request
@@ -1689,7 +1712,12 @@ mod tests {
                             mount_path: mount.mount_path.clone(),
                         })
                         .collect(),
-                    restart_policy: "no".into(),
+                    restart_policy: request.runtime_policy.restart_policy.clone(),
+                    restart_max_retries: request.runtime_policy.max_retries,
+                    cpu_limit: request.runtime_policy.cpu_limit.clone(),
+                    memory_limit_mb: request.runtime_policy.memory_limit_mb,
+                    exit_signal: None,
+                    termination_reason: None,
                 },
             );
             self.created_containers.push(request.clone());
@@ -1969,6 +1997,12 @@ mod tests {
             probe_path: Some("/health".into()),
             activation: None,
             command: None,
+            runtime_policy: crate::storage::PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..crate::storage::PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             depends_on: Vec::new(),
             required_for_promotion: true,
             externally_exposed: false,
@@ -1986,6 +2020,12 @@ mod tests {
             network_name: Some("forge-test".into()),
             probe_path: Some("/health".into()),
             activation: None,
+            runtime_policy: crate::storage::PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..crate::storage::PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: vec![persistent_mount],
             source_ref: Some("main".into()),
@@ -2106,6 +2146,12 @@ mod tests {
             probe_path: None,
             activation: Some(PersistedActivationMode::Direct),
             command: None,
+            runtime_policy: crate::storage::PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..crate::storage::PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             depends_on: Vec::new(),
             required_for_promotion: true,
             externally_exposed: false,
@@ -2143,6 +2189,12 @@ mod tests {
                 target_source: crate::storage::PersistedRouteTargetSource::ContainerIp,
             }),
             command: None,
+            runtime_policy: crate::storage::PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..crate::storage::PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             depends_on: vec!["redis".into()],
             required_for_promotion: true,
             externally_exposed: true,
@@ -2160,6 +2212,9 @@ mod tests {
             network_name: redis_service.network_name.clone(),
             probe_path: redis_service.probe_path.clone(),
             activation: redis_service.activation.clone(),
+            runtime_policy: redis_service.runtime_policy.clone(),
+            runtime_usage: redis_service.runtime_usage.clone(),
+            termination: redis_service.termination.clone(),
             environment_variables: redis_service.environment_variables.clone(),
             volume_mounts: redis_service.volume_mounts.clone(),
             source_ref: Some("main".into()),

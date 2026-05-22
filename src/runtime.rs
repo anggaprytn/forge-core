@@ -22,6 +22,7 @@ pub struct CreateContainerRequest {
     pub network_aliases: Vec<String>,
     pub volume_mounts: Vec<VolumeMountRequest>,
     pub command: Option<Vec<String>>,
+    pub runtime_policy: ContainerRuntimePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,41 @@ pub struct ContainerInspection {
     pub network_ips: BTreeMap<String, String>,
     pub volume_mounts: Vec<ContainerVolumeMount>,
     pub restart_policy: String,
+    pub restart_max_retries: Option<u64>,
+    pub cpu_limit: Option<String>,
+    pub memory_limit_mb: Option<u64>,
+    pub oom_killed: bool,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub exit_signal: Option<i32>,
+    pub termination_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContainerRuntimePolicy {
+    pub cpu_limit: Option<String>,
+    pub memory_limit_mb: Option<u64>,
+    pub restart_policy: String,
+    pub max_retries: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContainerUsageSnapshot {
+    pub captured_at_unix: u64,
+    pub cpu_percent: Option<String>,
+    pub memory_usage_mb: Option<u64>,
+    pub memory_limit_mb: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContainerTerminationInfo {
+    pub oom_killed: bool,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub reason: Option<String>,
+    pub stderr_tail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +197,14 @@ pub trait DockerRuntime {
         container_name: &str,
         tail_lines: usize,
     ) -> Result<String, DockerRuntimeError>;
+    fn container_usage(
+        &mut self,
+        container_name: &str,
+    ) -> Result<ContainerUsageSnapshot, DockerRuntimeError> {
+        Err(DockerRuntimeError::CommandFailed(format!(
+            "container usage not implemented for {container_name}"
+        )))
+    }
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError>;
     fn list_managed_images(&mut self) -> Result<Vec<ManagedImage>, DockerRuntimeError>;
     fn list_managed_volumes(&mut self) -> Result<Vec<ManagedVolume>, DockerRuntimeError>;

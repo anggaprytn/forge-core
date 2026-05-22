@@ -33,7 +33,7 @@ alpha
 
 **Alpha Core Loop v3 Validated (May 2026)**:
 
-The Forge Alpha Core Loop v3 milestone freezes the stateful single-node application orchestration loop. This milestone extends the runtime from single-service stateless promotion semantics into validated multi-service Docker-volume backed workloads with explicit restore lineage and stateful safety boundaries.
+The Forge Alpha Core Loop v4 milestone hardens the single-node application orchestration loop with persisted per-service resource policy, restart semantics, crash/OOM diagnostics, and promotion safety gates for unstable runtimes.
 
 ### Validated Capabilities (v3)
 
@@ -114,6 +114,12 @@ Forge Alpha Core Loop v1 proves that git-backed immutable deployments can achiev
 Current runtime note:
 
 Forge has now frozen the single-node stateful orchestration loop. The next phase should favor UX hardening, recovery depth, and operator ergonomics over broad new runtime scope.
+
+Alpha Core Loop v4 focus:
+- per-service CPU and memory limits persisted into generation metadata
+- Docker restart policy convergence and rollback fidelity
+- OOM/restart-loop warmup gating before promotion
+- operator-facing status and diagnose surfacing effective policy and runtime usage
 
 ---
 

@@ -22,7 +22,7 @@ Forge treats deployment as a continuous state machine, not a one-time event. It 
 ## Technical Grounding
 
 ### 1. Simple Configuration (`forge.yml`)
-Forge Alpha Core Loop v3 supports single-node multi-service topologies with per-service runtime/build config, internal DNS aliases, and stateful Docker volume attachments.
+Forge Alpha Core Loop v4 extends the single-node multi-service model with per-service runtime policy persistence, Docker restart policy mapping, warmup crash gating, and basic runtime isolation signals.
 
 ```yaml
 version: 1
@@ -111,6 +111,12 @@ forge deploy <project_id> production --from ./
 
 ## Operational Reality
 Forge is intentionally narrow to remain bulletproof. It is a single-node orchestrator designed for vertical scale on VPS or bare metal. It optimizes for **operational calm** over feature breadth.
+
+Isolation and tenancy notes:
+- Forge relies on Docker cgroups and namespace isolation on a single node. This is an operational isolation boundary, not a security-grade multi-tenant sandbox.
+- CPU and memory limits are enforced through Docker `HostConfig` and are persisted per generation so rollback and convergence restore the exact historical policy.
+- Promotion now blocks when warmup detects OOM kills, restart storms, unstable health behavior, or unstable required dependencies.
+- Resource exhaustion is handled as a degraded runtime event. Forge records OOM/crash metadata and refuses silent promotion of degraded containers.
 
 - **Single-Node Authority:** No Kubernetes complexity. Just deterministic execution.
 - **Stateful Alpha Scope:** Docker-volume backed stateful services are supported on one host with backup/restore primitives.

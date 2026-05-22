@@ -10,9 +10,9 @@ use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue};
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
-    ContainerInspection, ContainerVolumeMount, CreateContainerRequest, CreateVolumeRequest,
-    DockerRuntime, ManagedImage, ManagedVolume, ProbeRuntime, RouteInspection, RouteUpdateRequest,
-    RoutingRuntime, VolumeMountRequest,
+    ContainerInspection, ContainerRuntimePolicy, ContainerVolumeMount, CreateContainerRequest,
+    CreateVolumeRequest, DockerRuntime, ManagedImage, ManagedVolume, ProbeRuntime, RouteInspection,
+    RouteUpdateRequest, RoutingRuntime, VolumeMountRequest,
 };
 use crate::runtime_env::restore_runtime_env;
 use crate::secrets::SecretStore;
@@ -23,9 +23,9 @@ use crate::storage::{
     CleanupRecord, CleanupStore, DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, EventStore,
     GcActionRecord, GcStore, PersistedActivationMode, PersistedBuildInfo,
     PersistedProbeHistoryEntry, PersistedProbeType, PersistedRouteTargetSource,
-    PersistedRuntimeInfo, PersistedSecretReference, PersistedServiceRuntimeInfo,
-    PersistedVolumeRetention, PointerStore, ProbeHistoryStore, RuntimeHealthState,
-    RuntimeStateStore, StorageError, atomic_write, current_unix_timestamp,
+    PersistedRuntimeInfo, PersistedRuntimePolicy, PersistedSecretReference,
+    PersistedServiceRuntimeInfo, PersistedVolumeRetention, PointerStore, ProbeHistoryStore,
+    RuntimeHealthState, RuntimeStateStore, StorageError, atomic_write, current_unix_timestamp,
     load_generation_build_info, load_generation_resolved_runtime, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
@@ -57,6 +57,29 @@ fn volume_mounts_match(expected: &[ContainerVolumeMount], actual: &[ContainerVol
         values
     };
     normalize(expected) == normalize(actual)
+}
+
+fn runtime_policy_matches(
+    expected: &PersistedRuntimePolicy,
+    inspection: &ContainerInspection,
+) -> bool {
+    expected.cpu_limit == inspection.cpu_limit
+        && expected.memory_limit_mb == inspection.memory_limit_mb
+        && expected.restart_policy == inspection.restart_policy
+        && expected.max_retries == inspection.restart_max_retries
+}
+
+fn runtime_policy_as_container(expected: &PersistedRuntimePolicy) -> ContainerRuntimePolicy {
+    ContainerRuntimePolicy {
+        cpu_limit: expected.cpu_limit.clone(),
+        memory_limit_mb: expected.memory_limit_mb,
+        restart_policy: if expected.restart_policy.trim().is_empty() {
+            "no".into()
+        } else {
+            expected.restart_policy.clone()
+        },
+        max_retries: expected.max_retries,
+    }
 }
 
 fn ensure_runtime_volumes<RtD: DockerRuntime>(
@@ -1243,6 +1266,9 @@ fn runtime_services(
             probe_path: runtime_info.probe_path.clone(),
             activation: runtime_info.activation.clone(),
             command: None,
+            runtime_policy: runtime_info.runtime_policy.clone(),
+            runtime_usage: runtime_info.runtime_usage.clone(),
+            termination: runtime_info.termination.clone(),
             depends_on: Vec::new(),
             required_for_promotion: true,
             externally_exposed: matches!(
@@ -3247,6 +3273,7 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
     match docker.inspect_container(&runtime.container_name) {
         Ok(inspection)
             if inspection.running
+                && runtime_policy_matches(&runtime.runtime_policy, &inspection)
                 && volume_mounts_match(&expected_mounts, &inspection.volume_mounts) =>
         {
             return Ok(inspection);
@@ -3257,11 +3284,26 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
                 &docker
                     .inspect_container(&runtime.container_name)?
                     .volume_mounts,
+            ) && runtime_policy_matches(
+                &runtime.runtime_policy,
+                &docker.inspect_container(&runtime.container_name)?,
             ) {
                 docker.start_container(&runtime.container_name)?;
                 return Ok(docker.inspect_container(&runtime.container_name)?);
             }
             docker.remove_container(&runtime.container_name)?;
+            append_cleanup_event(
+                &EnvironmentPaths::new(storage_root, project_id, environment),
+                project_id,
+                environment,
+                generation,
+                Some(deployment_id.to_string()),
+                "RUNTIME_POLICY_DRIFT_REPAIRED",
+                Some(format!(
+                    "recreated container {} to restore runtime policy {:?}",
+                    runtime.container_name, runtime.runtime_policy
+                )),
+            )?;
             append_cleanup_event(
                 &EnvironmentPaths::new(storage_root, project_id, environment),
                 project_id,
@@ -3309,6 +3351,7 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
             })
             .collect(),
         command: runtime.command.clone(),
+        runtime_policy: runtime_policy_as_container(&runtime.runtime_policy),
     })?;
     docker.start_container(&runtime.container_name)?;
     let inspection = docker.inspect_container(&runtime.container_name)?;
@@ -3626,6 +3669,14 @@ impl DockerRuntime for TestDockerRuntime {
                 .cloned()
                 .unwrap_or_default(),
             restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            oom_killed: false,
+            finished_at: None,
+            error: None,
+            exit_signal: None,
+            termination_reason: None,
         })
     }
 
@@ -3675,6 +3726,14 @@ impl DockerRuntime for TestDockerRuntime {
                     .cloned()
                     .unwrap_or_default(),
                 restart_policy: "no".into(),
+                restart_max_retries: None,
+                cpu_limit: None,
+                memory_limit_mb: None,
+                oom_killed: false,
+                finished_at: None,
+                error: None,
+                exit_signal: None,
+                termination_reason: None,
             })
             .collect())
     }
@@ -6055,6 +6114,12 @@ pub mod multi_service_convergence_and_gc {
                         target_source: PersistedRouteTargetSource::ContainerIp,
                     }),
                     command: None,
+                    runtime_policy: PersistedRuntimePolicy {
+                        restart_policy: "no".into(),
+                        ..PersistedRuntimePolicy::default()
+                    },
+                    runtime_usage: None,
+                    termination: None,
                     depends_on: vec!["redis".into()],
                     required_for_promotion: true,
                     externally_exposed: true,
@@ -6079,6 +6144,12 @@ pub mod multi_service_convergence_and_gc {
                     probe_path: None,
                     activation: Some(PersistedActivationMode::Direct),
                     command: Some(vec!["sh".into(), "-lc".into(), "node worker.js".into()]),
+                    runtime_policy: PersistedRuntimePolicy {
+                        restart_policy: "no".into(),
+                        ..PersistedRuntimePolicy::default()
+                    },
+                    runtime_usage: None,
+                    termination: None,
                     depends_on: vec!["api".into()],
                     required_for_promotion: true,
                     externally_exposed: false,
@@ -6102,6 +6173,12 @@ pub mod multi_service_convergence_and_gc {
                 route_subtree_id: Some("forge:api:production:api".into()),
                 target_source: PersistedRouteTargetSource::ContainerIp,
             }),
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: Vec::new(),
             source_ref: None,
@@ -6143,6 +6220,12 @@ pub mod multi_service_convergence_and_gc {
             network_name: Some("forge-test".into()),
             probe_path: None,
             activation: Some(PersistedActivationMode::Direct),
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
             environment_variables: BTreeMap::new(),
             volume_mounts: vec![crate::storage::PersistedVolumeMount {
                 volume_id: "postgres-data".into(),
@@ -6168,6 +6251,12 @@ pub mod multi_service_convergence_and_gc {
                     probe_path: None,
                     activation: Some(PersistedActivationMode::Direct),
                     command: None,
+                    runtime_policy: PersistedRuntimePolicy {
+                        restart_policy: "no".into(),
+                        ..PersistedRuntimePolicy::default()
+                    },
+                    runtime_usage: None,
+                    termination: None,
                     depends_on: Vec::new(),
                     required_for_promotion: true,
                     externally_exposed: false,

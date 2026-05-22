@@ -1480,6 +1480,46 @@ fn render_services_section(services: &[ServiceRuntimeStatus], include_logs: bool
         if let Some(port) = service.internal_port {
             output.push_str(&format!("    port: {port}\n"));
         }
+        output.push_str(&format!(
+            "    resources: cpu={} memory={}MB\n",
+            service
+                .runtime_policy
+                .cpu_limit
+                .as_deref()
+                .unwrap_or("unlimited"),
+            service
+                .runtime_policy
+                .memory_limit_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unlimited".into())
+        ));
+        output.push_str(&format!(
+            "    restart: {}{}\n",
+            service.runtime_policy.restart_policy,
+            service
+                .runtime_policy
+                .max_retries
+                .map(|value| format!(" (max_retries={value})"))
+                .unwrap_or_default()
+        ));
+        output.push_str(&format!("    restart_count: {}\n", service.restart_count));
+        if let Some(exit_code) = service.last_exit_code {
+            output.push_str(&format!("    last_exit_code: {exit_code}\n"));
+        }
+        if let Some(usage) = service.runtime_usage.as_ref() {
+            output.push_str(&format!(
+                "    usage: cpu={}%% memory={}MB/{}MB\n",
+                usage.cpu_percent.as_deref().unwrap_or("unknown"),
+                usage
+                    .memory_usage_mb
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                usage
+                    .memory_limit_mb
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
+        }
         output.push_str(&format!("    route: {}\n", service.route));
         output.push_str(&format!("    health: {}\n", service.health));
         if !service.depends_on.is_empty() {
@@ -1556,6 +1596,40 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
         status.container_name.as_deref().unwrap_or("unknown")
     ));
     output.push_str(&format!("  Running: {}\n", status.container_running));
+    output.push_str(&format!(
+        "  Resources: cpu={} memory={}MB restart={}{}\n",
+        status
+            .runtime_policy
+            .cpu_limit
+            .as_deref()
+            .unwrap_or("unlimited"),
+        status
+            .runtime_policy
+            .memory_limit_mb
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unlimited".into()),
+        status.runtime_policy.restart_policy,
+        status
+            .runtime_policy
+            .max_retries
+            .map(|value| format!(" (max_retries={value})"))
+            .unwrap_or_default()
+    ));
+    output.push_str(&format!("  Restart Count: {}\n", status.restart_count));
+    if let Some(usage) = status.runtime_usage.as_ref() {
+        output.push_str(&format!(
+            "  Usage Snapshot: cpu={}%% memory={}MB/{}MB\n",
+            usage.cpu_percent.as_deref().unwrap_or("unknown"),
+            usage
+                .memory_usage_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            usage
+                .memory_limit_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ));
+    }
     output.push_str(&format!(
         "  Network: {}\n",
         status.network_name.as_deref().unwrap_or("unknown")
@@ -1740,6 +1814,47 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
             .as_deref()
             .unwrap_or("unknown")
     ));
+    if let Some(policy) = diagnostics.container.runtime_policy.as_ref() {
+        output.push_str(&format!(
+            "  Runtime Policy: cpu={} memory={}MB restart={}{}\n",
+            policy.cpu_limit.as_deref().unwrap_or("unlimited"),
+            policy
+                .memory_limit_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unlimited".into()),
+            policy.restart_policy,
+            policy
+                .max_retries
+                .map(|value| format!(" (max_retries={value})"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(usage) = diagnostics.container.runtime_usage.as_ref() {
+        output.push_str(&format!(
+            "  Usage Snapshot: cpu={}%% memory={}MB/{}MB\n",
+            usage.cpu_percent.as_deref().unwrap_or("unknown"),
+            usage
+                .memory_usage_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            usage
+                .memory_limit_mb
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ));
+    }
+    if let Some(termination) = diagnostics.container.termination.as_ref() {
+        output.push_str(&format!(
+            "  Termination: reason={} exit_code={} oom_killed={} restart_count={}\n",
+            termination.reason.as_deref().unwrap_or("unknown"),
+            termination
+                .exit_code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            termination.oom_killed,
+            termination.restart_count
+        ));
+    }
     output.push_str(&format!(
         "  Route Target: {}\n",
         diagnostics
@@ -1817,6 +1932,13 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
             "  restart_instability: {}\n  probe_flapping: {}\n",
             diagnostics.restart_instability, diagnostics.probe_flapping
         ));
+    }
+    if !diagnostics.policy_drift_repairs.is_empty() {
+        output.push('\n');
+        output.push_str("Policy Drift Repairs:\n");
+        for repair in &diagnostics.policy_drift_repairs {
+            output.push_str(&format!("  {repair}\n"));
+        }
     }
     if let Some(probe_stability) = diagnostics.probe_stability.as_ref() {
         output.push('\n');
@@ -2905,6 +3027,13 @@ mod tests {
             route_active: true,
             probe_path: Some("/health".into()),
             image_ref: None,
+            runtime_policy: forge_core::storage::PersistedRuntimePolicy {
+                restart_policy: "no".into(),
+                ..forge_core::storage::PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
+            restart_count: 0,
             startup_order: vec!["api".into(), "worker".into()],
             services: vec![
                 ServiceRuntimeStatus {
@@ -2921,6 +3050,14 @@ mod tests {
                     container_ip: Some("172.29.0.2".into()),
                     internal_port: Some(3000),
                     probe_path: Some("/health".into()),
+                    runtime_policy: forge_core::storage::PersistedRuntimePolicy {
+                        restart_policy: "no".into(),
+                        ..forge_core::storage::PersistedRuntimePolicy::default()
+                    },
+                    runtime_usage: None,
+                    termination: None,
+                    restart_count: 0,
+                    last_exit_code: None,
                     route: "active".into(),
                     health: "healthy".into(),
                     failure_reason: None,
@@ -2941,6 +3078,14 @@ mod tests {
                     container_ip: Some("172.29.0.3".into()),
                     internal_port: None,
                     probe_path: None,
+                    runtime_policy: forge_core::storage::PersistedRuntimePolicy {
+                        restart_policy: "no".into(),
+                        ..forge_core::storage::PersistedRuntimePolicy::default()
+                    },
+                    runtime_usage: None,
+                    termination: None,
+                    restart_count: 0,
+                    last_exit_code: None,
                     route: "none".into(),
                     health: "running".into(),
                     failure_reason: None,

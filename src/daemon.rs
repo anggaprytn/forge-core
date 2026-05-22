@@ -1027,6 +1027,9 @@ impl DockerRuntime for NoopDockerRuntime {
             exit_code: Some(0),
             restart_count: 0,
             started_at: None,
+            finished_at: None,
+            oom_killed: false,
+            error: None,
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: std::collections::BTreeMap::from([(
@@ -1035,6 +1038,11 @@ impl DockerRuntime for NoopDockerRuntime {
             )]),
             volume_mounts: Vec::new(),
             restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            exit_signal: None,
+            termination_reason: None,
         })
     }
 

@@ -763,11 +763,19 @@ impl DockerRuntime for FakeDockerRuntime {
             exit_code: Some(0),
             restart_count: 0,
             started_at: None,
+            finished_at: None,
+            oom_killed: false,
+            error: None,
             image_ref: "forge:test".into(),
             labels: fake_container_labels(container_name),
             network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(container_name))]),
             volume_mounts: Vec::new(),
             restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            exit_signal: None,
+            termination_reason: None,
         })
     }
 
@@ -790,11 +798,19 @@ impl DockerRuntime for FakeDockerRuntime {
                 exit_code: Some(0),
                 restart_count: 0,
                 started_at: None,
+                finished_at: None,
+                oom_killed: false,
+                error: None,
                 image_ref: "forge:test".into(),
                 labels: fake_container_labels(name),
                 network_ips: BTreeMap::from([("forge-test".into(), fake_container_ip(name))]),
                 volume_mounts: Vec::new(),
                 restart_policy: "no".into(),
+                restart_max_retries: None,
+                cpu_limit: None,
+                memory_limit_mb: None,
+                exit_signal: None,
+                termination_reason: None,
             })
             .collect())
     }

@@ -3,13 +3,14 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::process::Command;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::process::run_command_with_timeout;
 use crate::runtime::{
-    BuildImageRequest, ContainerInspection, ContainerVolumeMount, CreateContainerRequest,
-    CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ExecInContainerOutput,
-    ExecInContainerRequest, ManagedImage, ManagedVolume, VolumeArchiveHelperOutput,
-    VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
+    BuildImageRequest, ContainerInspection, ContainerRuntimePolicy, ContainerUsageSnapshot,
+    ContainerVolumeMount, CreateContainerRequest, CreateVolumeRequest, DockerRuntime,
+    DockerRuntimeError, ExecInContainerOutput, ExecInContainerRequest, ManagedImage, ManagedVolume,
+    VolumeArchiveHelperOutput, VolumeArchiveHelperRequest, VolumeArchiveMode, VolumeInspection,
 };
 
 pub trait CommandRunner {
@@ -134,13 +135,22 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         &mut self,
         request: CreateContainerRequest,
     ) -> Result<String, DockerRuntimeError> {
+        let restart_policy = normalize_restart_policy(&request.runtime_policy)?;
         let mut args = vec![
             "create".to_string(),
             "--name".to_string(),
             request.container_name.clone(),
             "--restart".to_string(),
-            "no".to_string(),
+            restart_policy,
         ];
+        if let Some(cpu_limit) = request.runtime_policy.cpu_limit.as_deref() {
+            args.push("--cpus".to_string());
+            args.push(cpu_limit.to_string());
+        }
+        if let Some(memory_limit_mb) = request.runtime_policy.memory_limit_mb {
+            args.push("--memory".to_string());
+            args.push(format!("{memory_limit_mb}m"));
+        }
         if let Some(network_name) = &request.network_name {
             args.push("--network".to_string());
             args.push(network_name.clone());
@@ -194,8 +204,14 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
                 "exit_code={{.State.ExitCode}}",
                 "restart_count={{.RestartCount}}",
                 "started_at={{.State.StartedAt}}",
+                "finished_at={{.State.FinishedAt}}",
+                "oom_killed={{.State.OOMKilled}}",
+                "error={{.State.Error}}",
                 "image={{.Config.Image}}",
                 "restart_policy={{.HostConfig.RestartPolicy.Name}}",
+                "restart_max_retries={{.HostConfig.RestartPolicy.MaximumRetryCount}}",
+                "nano_cpus={{.HostConfig.NanoCpus}}",
+                "memory_bytes={{.HostConfig.Memory}}",
                 "{{range $key, $value := .Config.Labels}}",
                 "label:{{$key}}={{$value}}",
                 "{{end}}",
@@ -226,6 +242,21 @@ impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
         self.runner
             .run("sh", &["-lc".to_string(), command])
             .map(|output| output.trim().to_string())
+    }
+
+    fn container_usage(
+        &mut self,
+        container_name: &str,
+    ) -> Result<ContainerUsageSnapshot, DockerRuntimeError> {
+        let args = vec![
+            "stats".to_string(),
+            "--no-stream".to_string(),
+            "--format".to_string(),
+            "name={{.Name}}\ncpu={{.CPUPerc}}\nmem={{.MemUsage}}".to_string(),
+            container_name.to_string(),
+        ];
+        let output = self.runner.run("docker", &args)?;
+        parse_usage_output(&output, container_name)
     }
 
     fn list_managed_containers(&mut self) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
@@ -509,6 +540,12 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
     let mut started_at = None;
     let mut image_ref = None;
     let mut restart_policy = None;
+    let mut restart_max_retries = None;
+    let mut nano_cpus = None;
+    let mut memory_bytes = None;
+    let mut oom_killed = false;
+    let mut finished_at = None;
+    let mut error = None;
     let mut labels = BTreeMap::new();
     let mut network_ips = BTreeMap::new();
     let mut volume_mounts = Vec::new();
@@ -528,8 +565,22 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
                     started_at = Some(value.to_string());
                 }
             }
+            "finished_at" => {
+                if !value.is_empty() && value != "0001-01-01T00:00:00Z" {
+                    finished_at = Some(value.to_string());
+                }
+            }
+            "oom_killed" => oom_killed = value == "true",
+            "error" => {
+                if !value.is_empty() {
+                    error = Some(value.to_string());
+                }
+            }
             "image" => image_ref = Some(value.to_string()),
             "restart_policy" => restart_policy = Some(value.to_string()),
+            "restart_max_retries" => restart_max_retries = value.parse::<u64>().ok(),
+            "nano_cpus" => nano_cpus = value.parse::<u64>().ok(),
+            "memory_bytes" => memory_bytes = value.parse::<i64>().ok(),
             _ if key.starts_with("label:") => {
                 labels.insert(
                     key.trim_start_matches("label:").to_string(),
@@ -551,6 +602,17 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
             _ => {}
         }
     }
+
+    let exit_code = exit_code.filter(|value| *value != 0 || !running.unwrap_or(false));
+    let exit_signal = exit_code.and_then(infer_exit_signal);
+    let cpu_limit = nano_cpus
+        .filter(|value| *value > 0)
+        .map(|value| format!("{:.3}", value as f64 / 1_000_000_000_f64))
+        .map(trim_trailing_zeroes);
+    let memory_limit_mb = memory_bytes
+        .filter(|value| *value > 0)
+        .map(|value| ((value as u64) + (1024 * 1024 - 1)) / (1024 * 1024));
+    let termination_reason = infer_termination_reason(oom_killed, exit_code, error.as_deref());
 
     Ok(ContainerInspection {
         container_name: container_name
@@ -574,7 +636,136 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
         volume_mounts,
         restart_policy: restart_policy
             .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing restart policy".into()))?,
+        restart_max_retries,
+        cpu_limit,
+        memory_limit_mb,
+        oom_killed,
+        finished_at,
+        error,
+        exit_signal,
+        termination_reason,
     })
+}
+
+fn parse_usage_output(
+    output: &str,
+    expected_container_name: &str,
+) -> Result<ContainerUsageSnapshot, DockerRuntimeError> {
+    let mut name = None;
+    let mut cpu_percent = None;
+    let mut memory_usage_mb = None;
+    let mut memory_limit_mb = None;
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "name" => name = Some(value.to_string()),
+            "cpu" => cpu_percent = Some(value.trim_end_matches('%').trim().to_string()),
+            "mem" => {
+                let (usage, limit) = value.split_once('/').unwrap_or((value, ""));
+                memory_usage_mb = parse_memory_to_mb(usage.trim());
+                memory_limit_mb = parse_memory_to_mb(limit.trim());
+            }
+            _ => {}
+        }
+    }
+
+    let parsed_name = name.ok_or_else(|| {
+        DockerRuntimeError::InvalidResponse("missing stats container name".into())
+    })?;
+    if parsed_name != expected_container_name {
+        return Err(DockerRuntimeError::InvalidResponse(format!(
+            "stats container name mismatch: expected {expected_container_name}, got {parsed_name}"
+        )));
+    }
+
+    Ok(ContainerUsageSnapshot {
+        captured_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        cpu_percent,
+        memory_usage_mb,
+        memory_limit_mb,
+    })
+}
+
+fn normalize_restart_policy(policy: &ContainerRuntimePolicy) -> Result<String, DockerRuntimeError> {
+    let name = if policy.restart_policy.trim().is_empty() {
+        "no"
+    } else {
+        policy.restart_policy.trim()
+    };
+    Ok(match name {
+        "always" => "always".to_string(),
+        "on-failure" => match policy.max_retries {
+            Some(max_retries) => format!("on-failure:{max_retries}"),
+            None => "on-failure".to_string(),
+        },
+        "unless-stopped" => "unless-stopped".to_string(),
+        "no" => "no".to_string(),
+        other => {
+            return Err(DockerRuntimeError::CommandFailed(format!(
+                "unsupported restart policy {other}"
+            )));
+        }
+    })
+}
+
+fn infer_exit_signal(exit_code: i32) -> Option<i32> {
+    (exit_code >= 128).then_some(exit_code - 128)
+}
+
+fn infer_termination_reason(
+    oom_killed: bool,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+) -> Option<String> {
+    if oom_killed {
+        return Some("oom_killed".into());
+    }
+    if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
+        return Some(error.to_string());
+    }
+    exit_code.map(|code| {
+        if let Some(signal) = infer_exit_signal(code) {
+            format!("signal:{signal}")
+        } else {
+            format!("exit_code:{code}")
+        }
+    })
+}
+
+fn trim_trailing_zeroes(mut value: String) -> String {
+    while value.contains('.') && value.ends_with('0') {
+        value.pop();
+    }
+    if value.ends_with('.') {
+        value.pop();
+    }
+    value
+}
+
+fn parse_memory_to_mb(value: &str) -> Option<u64> {
+    let normalized = value.trim().to_ascii_uppercase();
+    let normalized = normalized.replace("IB", "B");
+    let normalized = normalized.replace(' ', "");
+    let units = [("GB", 1024_u64), ("MB", 1_u64), ("KB", 0_u64), ("B", 0_u64)];
+    for (suffix, mb_factor) in units {
+        if let Some(number) = normalized.strip_suffix(suffix) {
+            let parsed = number.parse::<f64>().ok()?;
+            return match suffix {
+                "GB" => Some((parsed * mb_factor as f64).ceil() as u64),
+                "MB" => Some(parsed.ceil() as u64),
+                "KB" => Some((parsed / 1024.0).ceil() as u64),
+                "B" => Some((parsed / (1024.0 * 1024.0)).ceil() as u64),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn parse_volume_inspection_output(output: &str) -> Result<ManagedVolume, DockerRuntimeError> {
@@ -789,6 +980,10 @@ pub mod docker_adapter_starts_generation_named_container {
                 network_aliases: Vec::new(),
                 volume_mounts: Vec::new(),
                 command: None,
+                runtime_policy: ContainerRuntimePolicy {
+                    restart_policy: "no".into(),
+                    ..ContainerRuntimePolicy::default()
+                },
             })
             .unwrap();
         docker.start_container(&name).unwrap();
@@ -817,6 +1012,10 @@ pub mod docker_adapter_disables_restart_policy {
                 network_aliases: Vec::new(),
                 volume_mounts: Vec::new(),
                 command: None,
+                runtime_policy: ContainerRuntimePolicy {
+                    restart_policy: "no".into(),
+                    ..ContainerRuntimePolicy::default()
+                },
             })
             .unwrap();
 

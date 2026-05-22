@@ -2779,6 +2779,9 @@ impl DockerRuntime for NoopDockerRuntime {
             exit_code: Some(0),
             restart_count: 0,
             started_at: None,
+            finished_at: None,
+            oom_killed: false,
+            error: None,
             image_ref: "noop".into(),
             labels: Default::default(),
             network_ips: std::collections::BTreeMap::from([(
@@ -2787,6 +2790,11 @@ impl DockerRuntime for NoopDockerRuntime {
             )]),
             volume_mounts: Vec::new(),
             restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            exit_signal: None,
+            termination_reason: None,
         })
     }
 
@@ -3012,6 +3020,12 @@ fn seed_project_status_runtime(root: &Path, generation: u64) {
             route_subtree_id: Some("forge:api:staging".into()),
             target_source: PersistedRouteTargetSource::ContainerIp,
         }),
+        runtime_policy: crate::storage::PersistedRuntimePolicy {
+            restart_policy: "no".into(),
+            ..crate::storage::PersistedRuntimePolicy::default()
+        },
+        runtime_usage: None,
+        termination: None,
         environment_variables: std::collections::BTreeMap::new(),
         volume_mounts: Vec::new(),
         source_ref: Some("main".into()),

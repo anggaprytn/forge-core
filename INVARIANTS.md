@@ -318,9 +318,9 @@ forge.generation=<generation>
 forge.deployment_id=<deployment_id>
 ```
 
-Docker restart policy must be disabled for Forge-managed containers.
+Docker restart policy must match the persisted per-generation runtime policy for each Forge-managed container.
 
-Forge owns restart decisions.
+Forge owns promotion decisions. A container may restart according to its configured Docker policy, but Forge must not promote or continue treating that generation as healthy when warmup observes restart storms, OOM kills, or unstable dependency chains.
 
 ---
 
