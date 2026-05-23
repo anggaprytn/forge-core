@@ -2345,12 +2345,39 @@ fn persist_cleanup_state(
     let store = CleanupStore::new(env.clone(), generation);
     let merged = if let Some(existing) = store.read_record()? {
         CleanupRecord {
+            timestamp: new_record.timestamp,
             timestamp_unix: new_record.timestamp_unix,
-            failure_reason: if existing.failure_reason.is_empty() {
-                new_record.failure_reason.clone()
+            generation_failure_reason: if existing.generation_failure_reason.is_empty() {
+                new_record.generation_failure_reason.clone()
             } else {
-                format!("{}, {}", existing.failure_reason, new_record.failure_reason)
+                format!(
+                    "{}, {}",
+                    existing.generation_failure_reason, new_record.generation_failure_reason
+                )
             },
+            failure_reason: new_record.failure_reason.or(existing.failure_reason),
+            cleanup_attempted: true,
+            cleanup_completed: false,
+            removed_containers: existing
+                .removed_containers
+                .into_iter()
+                .chain(new_record.removed_containers)
+                .collect(),
+            removed_images: existing
+                .removed_images
+                .into_iter()
+                .chain(new_record.removed_images)
+                .collect(),
+            removed_volumes: existing
+                .removed_volumes
+                .into_iter()
+                .chain(new_record.removed_volumes)
+                .collect(),
+            skipped: existing
+                .skipped
+                .into_iter()
+                .chain(new_record.skipped)
+                .collect(),
             container_name: existing
                 .container_name
                 .or(new_record.container_name.clone()),
@@ -2372,8 +2399,8 @@ fn persist_cleanup_state(
     DiagnosticsStore::new(env.clone(), generation).write_summary(&DiagnosticSummary {
         deployment_id,
         failure_stage: "startup_recovery".into(),
-        failure_reason: merged.failure_reason.clone(),
-        blocking_reason: Some(merged.failure_reason.clone()),
+        failure_reason: merged.generation_failure_reason.clone(),
+        blocking_reason: Some(merged.generation_failure_reason.clone()),
         container_name: merged.container_name.clone().unwrap_or_default(),
         failed_service_name: None,
         blocking_service_name: None,
@@ -2392,6 +2419,13 @@ fn persist_cleanup_state(
         runtime_env_preview: Vec::new(),
     })?;
     Ok(())
+}
+
+fn cleanup_event_reason(cleanup: &CleanupRecord) -> String {
+    cleanup
+        .failure_reason
+        .clone()
+        .unwrap_or_else(|| cleanup.generation_failure_reason.clone())
 }
 
 fn append_cleanup_event(
@@ -2638,7 +2672,7 @@ where
     }
 
     let cleanup = CleanupRecord::new(
-        cleanup.failure_reason,
+        cleanup.generation_failure_reason,
         cleanup.container_name,
         cleanup.route_subtree_id,
         container_removed,
@@ -2662,7 +2696,7 @@ where
         } else {
             success_event
         },
-        Some(cleanup.failure_reason.clone()),
+        Some(cleanup_event_reason(&cleanup)),
     )?;
     append_gc_action(
         env,
@@ -2674,7 +2708,7 @@ where
         } else {
             success_event
         },
-        &cleanup.failure_reason,
+        &cleanup_event_reason(&cleanup),
         if cleanup.tombstoned {
             "tombstoned"
         } else {
@@ -3341,7 +3375,7 @@ where
             environment,
             generation,
             "GENERATION_RETENTION_TOMBSTONED",
-            Some(cleanup.failure_reason.clone()),
+            Some(cleanup_event_reason(&cleanup)),
         )?;
         return Ok(cleanup);
     }
@@ -3391,7 +3425,7 @@ where
         }
         Err(err) => {
             let cleanup = CleanupRecord {
-                failure_reason: format!("retention directory removal failed: {err}"),
+                failure_reason: Some(format!("retention directory removal failed: {err}")),
                 tombstoned: true,
                 ..cleanup
             };
@@ -3403,7 +3437,7 @@ where
                 environment,
                 generation,
                 "GENERATION_RETENTION_TOMBSTONED",
-                Some(cleanup.failure_reason.clone()),
+                Some(cleanup_event_reason(&cleanup)),
             )?;
             append_gc_action(
                 env,
@@ -3411,7 +3445,7 @@ where
                 environment,
                 Some(generation),
                 "GENERATION_RETENTION_TOMBSTONED",
-                &cleanup.failure_reason,
+                &cleanup_event_reason(&cleanup),
                 "tombstoned",
                 Vec::new(),
                 Vec::new(),

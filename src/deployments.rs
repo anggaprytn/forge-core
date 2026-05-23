@@ -527,6 +527,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &[],
                     &[],
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 return Err(DeploymentError::InvalidInspection(message));
             }
@@ -580,6 +581,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &[],
                     &[],
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 return Err(err);
             }
@@ -598,6 +600,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &[],
                     &[],
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 append_event(
                     &artifacts.events,
@@ -662,6 +665,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &[],
                     &[],
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 return Err(err.into());
             }
@@ -709,6 +713,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "building",
                     &failure_reason,
+                    CleanupRecord::skipped_failed_generation(&failure_reason),
                     None,
                     FailureSummaryDetails::default(),
                     &redacted_env_preview,
@@ -739,6 +744,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         ..PersistedPromotionSummary::default()
                     }),
                 )?;
+                let cleanup = self.cleanup_failed_generation_artifacts(
+                    &env,
+                    generation,
+                    &failure_reason,
+                    None,
+                    Some(image_ref.clone()),
+                    None,
+                )?;
                 self.record_failed_attempt(
                     &events,
                     &diagnostics,
@@ -746,6 +759,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "preparing",
                     &failure_reason,
+                    cleanup,
                     None,
                     FailureSummaryDetails::default(),
                     &redacted_env_preview,
@@ -794,6 +808,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         ..PersistedPromotionSummary::default()
                     }),
                 )?;
+                let cleanup = self.cleanup_failed_generation_artifacts(
+                    &env,
+                    generation,
+                    &failure_reason,
+                    None,
+                    Some(image_ref.clone()),
+                    None,
+                )?;
                 self.record_failed_attempt(
                     &events,
                     &diagnostics,
@@ -801,6 +823,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "preparing",
                     &failure_reason,
+                    cleanup,
                     None,
                     FailureSummaryDetails::default(),
                     &redacted_env_preview,
@@ -1358,6 +1381,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &[],
                     &[],
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 return Err(err);
             }
@@ -1384,6 +1408,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &[],
                     &[],
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 return Err(err);
             }
@@ -1423,6 +1448,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &[],
                     &[],
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 return Err(err.into());
             }
@@ -1463,6 +1489,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     FailureSummaryDetails::default(),
                     &redacted_env_preview,
                     &secret_values,
+                    CleanupRecord::skipped_failed_generation(&message),
                 )?;
                 return Err(err.into());
             }
@@ -1531,6 +1558,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     },
                     &redacted_env_preview,
                     &secret_values,
+                    CleanupRecord::skipped_failed_generation(&failure_reason),
                 )?;
                 persist_lifecycle_transition(
                     &lifecycle_store,
@@ -1613,6 +1641,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                             FailureSummaryDetails::default(),
                             &redacted_env_preview,
                             &secret_values,
+                            CleanupRecord::skipped_failed_generation(&message),
                         )?;
                         return Err(err.into());
                     }
@@ -2007,6 +2036,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         ..PersistedPromotionSummary::default()
                     }),
                 )?;
+                let cleanup = self.cleanup_failed_generation_artifacts(
+                    env,
+                    generation,
+                    &failure_reason,
+                    Some(container_name.to_string()),
+                    Some(initial_inspection.image_ref.clone()),
+                    None,
+                )?;
                 self.record_failed_attempt(
                     events,
                     diagnostics,
@@ -2014,6 +2051,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "warming",
                     &failure_reason,
+                    cleanup,
                     None,
                     FailureSummaryDetails {
                         blocking_service_name: Some(service_id.to_string()),
@@ -2139,6 +2177,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     port,
                     path: service.validation.http_health_path.clone(),
                 });
+                let cleanup = self.cleanup_failed_generation_artifacts(
+                    env,
+                    generation,
+                    &failure_reason,
+                    Some(container_name.to_string()),
+                    Some(inspection.image_ref.clone()),
+                    None,
+                )?;
                 self.record_failed_attempt(
                     events,
                     diagnostics,
@@ -2146,6 +2192,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "warming",
                     &failure_reason,
+                    cleanup,
                     probe_target.as_ref(),
                     FailureSummaryDetails {
                         blocking_service_name: Some(service_id.to_string()),
@@ -2212,6 +2259,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     port,
                     path: service.validation.http_health_path.clone(),
                 });
+                let cleanup = self.cleanup_failed_generation_artifacts(
+                    env,
+                    generation,
+                    &failure_reason,
+                    Some(container_name.to_string()),
+                    Some(inspection.image_ref.clone()),
+                    None,
+                )?;
                 self.record_failed_attempt(
                     events,
                     diagnostics,
@@ -2219,6 +2274,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "warming",
                     &failure_reason,
+                    cleanup,
                     probe_target.as_ref(),
                     FailureSummaryDetails {
                         blocking_service_name: Some(service_id.to_string()),
@@ -2363,6 +2419,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     port,
                     path: service.validation.http_health_path.clone(),
                 });
+                let cleanup = self.cleanup_failed_generation_artifacts(
+                    env,
+                    generation,
+                    &failure_reason,
+                    Some(container_name.to_string()),
+                    Some(inspection.image_ref.clone()),
+                    None,
+                )?;
                 self.record_failed_attempt(
                     events,
                     diagnostics,
@@ -2370,6 +2434,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "warming",
                     &failure_reason,
+                    cleanup,
                     probe_target.as_ref(),
                     FailureSummaryDetails {
                         blocking_service_name: Some(service_id.to_string()),
@@ -2405,6 +2470,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     container_name,
                     secret_values,
                 )?;
+                let cleanup = self.cleanup_failed_generation_artifacts(
+                    env,
+                    generation,
+                    &failure_reason,
+                    Some(container_name.to_string()),
+                    Some(inspection.image_ref.clone()),
+                    None,
+                )?;
                 self.record_failed_attempt(
                     events,
                     diagnostics,
@@ -2412,6 +2485,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation,
                     "warming",
                     &failure_reason,
+                    cleanup,
                     probe_target.as_ref(),
                     FailureSummaryDetails {
                         blocking_service_name: Some(service_id.to_string()),
@@ -3193,6 +3267,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         generation: u64,
         failure_stage: &str,
         failure_reason: &str,
+        cleanup: CleanupRecord,
         probe_target: Option<&ProbeTargetContext>,
         summary_details: FailureSummaryDetails,
         redacted_env_preview: &[String],
@@ -3211,6 +3286,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Some(failure_reason.into()),
             secret_values,
         )?;
+        let env =
+            EnvironmentPaths::new(&self.storage_root, &record.project_id, &record.environment);
+        CleanupStore::new(env, generation).write_record(&cleanup)?;
         diagnostics.write_summary(&DiagnosticSummary {
             deployment_id: Some(record.deployment_id.clone()),
             failure_stage: failure_stage.into(),
@@ -3232,7 +3310,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             last_exit_code: summary_details.last_exit_code,
             exit_signal: summary_details.exit_signal,
             termination_reason: summary_details.termination_reason,
-            cleanup_recorded: false,
+            cleanup_recorded: true,
             dependency_graph_summary: None,
             runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
@@ -3253,6 +3331,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         summary_details: FailureSummaryDetails,
         redacted_env_preview: &[String],
         secret_values: &[String],
+        cleanup: CleanupRecord,
     ) -> Result<(), DeploymentError> {
         persist_lifecycle_transition(
             &artifacts.lifecycle_store,
@@ -3291,6 +3370,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             Some(failure_reason.into()),
             secret_values,
         )?;
+        CleanupStore::new(artifacts.env.clone(), artifacts.generation).write_record(&cleanup)?;
         artifacts.diagnostics.write_summary(&DiagnosticSummary {
             deployment_id: Some(record.deployment_id.clone()),
             failure_stage: failure_stage.into(),
@@ -3314,7 +3394,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             last_exit_code: summary_details.last_exit_code,
             exit_signal: summary_details.exit_signal,
             termination_reason: summary_details.termination_reason,
-            cleanup_recorded: false,
+            cleanup_recorded: true,
             dependency_graph_summary,
             runtime_env_preview: redacted_env_preview.to_vec(),
         })?;
@@ -3656,34 +3736,62 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         route_subtree_id: Option<String>,
         failure_reason: &str,
     ) -> Result<CleanupRecord, DeploymentError> {
-        let _ = self.docker.stop_container(container_name);
-        let container_removed = self.docker.remove_container(container_name).is_ok();
-        let route_removed = if let Some(subtree_id) = route_subtree_id.clone() {
-            self.routing.remove_route(&subtree_id).is_ok()
+        self.cleanup_failed_generation_artifacts(
+            env,
+            generation,
+            failure_reason,
+            Some(container_name.into()),
+            image_ref.map(str::to_string),
+            route_subtree_id,
+        )
+    }
+
+    fn cleanup_failed_generation_artifacts(
+        &mut self,
+        env: &EnvironmentPaths,
+        generation: u64,
+        generation_failure_reason: &str,
+        container_name: Option<String>,
+        image_ref: Option<String>,
+        route_subtree_id: Option<String>,
+    ) -> Result<CleanupRecord, DeploymentError> {
+        let container_removed = if let Some(container_name) = container_name.as_deref() {
+            let _ = self.docker.stop_container(container_name);
+            self.docker.remove_container(container_name).is_ok()
         } else {
             true
         };
-        let cleanup = CleanupRecord::new(
-            failure_reason,
-            Some(container_name.into()),
-            route_subtree_id,
-            container_removed,
-            route_removed,
-            !(container_removed && route_removed),
-        );
-        let image_removed = if let Some(image_ref) = image_ref {
+        let route_removed = if let Some(route_subtree_id) = route_subtree_id.as_deref() {
+            self.routing.remove_route(route_subtree_id).is_ok()
+        } else {
+            true
+        };
+        let image_removed = if let Some(image_ref) = image_ref.as_deref() {
             self.docker.remove_image(image_ref).is_ok()
         } else {
             true
         };
-        let cleanup = CleanupRecord {
-            image_ref: image_ref.map(|value| value.to_string()),
-            image_removed,
-            tombstoned: !(container_removed && route_removed && image_removed),
-            ..cleanup
-        };
+        let mut cleanup = CleanupRecord::new(
+            generation_failure_reason,
+            container_name,
+            route_subtree_id,
+            container_removed,
+            route_removed,
+            !(container_removed && route_removed && image_removed),
+        );
+        cleanup.image_ref = image_ref;
+        cleanup.image_removed = image_removed;
+        if cleanup.container_name.is_none() {
+            cleanup.skipped.push("container:not_created".into());
+        }
+        if cleanup.image_ref.is_none() {
+            cleanup.skipped.push("image:not_built".into());
+        }
+        if cleanup.route_subtree_id.is_none() {
+            cleanup.skipped.push("route:not_created".into());
+        }
         CleanupStore::new(env.clone(), generation).write_record(&cleanup)?;
-        Ok(cleanup)
+        Ok(cleanup.normalized())
     }
 
     fn activate_generation(
@@ -5719,6 +5827,10 @@ pub mod failed_generation_is_cleaned_up {
     use super::*;
     use crate::docker::DockerCliRuntime;
     use crate::docker::RecordingCommandRunner;
+    use crate::runtime::DockerRuntimeError;
+    use crate::storage::CleanupStore;
+    use std::collections::VecDeque;
+    use std::fs;
 
     #[test]
     fn failed_generation_is_stopped_and_removed() {
@@ -5759,6 +5871,348 @@ pub mod failed_generation_is_cleaned_up {
                 .iter()
                 .any(|cmd| cmd.args.first() == Some(&"rmi".to_string()))
         );
+    }
+
+    #[derive(Default)]
+    struct BuildFailDockerRuntime;
+
+    impl DockerRuntime for BuildFailDockerRuntime {
+        fn build_image(
+            &mut self,
+            _request: BuildImageRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            Err(DockerRuntimeError::CommandFailed("boom".into()))
+        }
+
+        fn ensure_network(&mut self, _network_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn ensure_volume(
+            &mut self,
+            _request: crate::runtime::CreateVolumeRequest,
+        ) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn create_container(
+            &mut self,
+            _request: CreateContainerRequest,
+        ) -> Result<String, DockerRuntimeError> {
+            unreachable!("build failure should not create containers")
+        }
+
+        fn start_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            unreachable!("build failure should not start containers")
+        }
+
+        fn inspect_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<ContainerInspection, DockerRuntimeError> {
+            unreachable!("build failure should not inspect containers")
+        }
+
+        fn container_logs(
+            &mut self,
+            _container_name: &str,
+            _tail_lines: usize,
+        ) -> Result<String, DockerRuntimeError> {
+            Ok(String::new())
+        }
+
+        fn list_managed_containers(
+            &mut self,
+        ) -> Result<Vec<ContainerInspection>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_images(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedImage>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_volumes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedVolume>, DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn stop_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_container(&mut self, _container_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_image(&mut self, _image_ref: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_volume(&mut self, _volume_name: &str) -> Result<(), DockerRuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn cleanup_record(root: &std::path::Path) -> CleanupRecord {
+        let env = EnvironmentPaths::new(root, "api", "production");
+        CleanupStore::new(env, 1)
+            .read_record()
+            .unwrap()
+            .expect("cleanup record should exist")
+    }
+
+    fn write_test_forge_yaml(root: &std::path::Path, timeout_ms: u64) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("forge.yml"),
+            format!(
+                concat!(
+                    "version: 1\n",
+                    "name: api\n",
+                    "type: web\n",
+                    "build:\n",
+                    "  dockerfile: Dockerfile\n",
+                    "  context: .\n",
+                    "runtime:\n",
+                    "  port: 3000\n",
+                    "  healthcheck:\n",
+                    "    path: /health\n",
+                    "    expected_status: 200\n",
+                    "invariants:\n",
+                    "  - name: health\n",
+                    "    path: /health\n",
+                    "    expect_status: 200\n",
+                    "    timeout_ms: {timeout_ms}\n",
+                ),
+                timeout_ms = timeout_ms
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_generation_always_writes_cleanup_json() {
+        let root = test_root("failed-generation-always-writes-cleanup-json");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: false,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next();
+
+        let cleanup = cleanup_record(&root);
+        assert!(cleanup.cleanup_attempted);
+        assert!(cleanup.cleanup_completed);
+        assert_eq!(
+            cleanup.removed_containers,
+            vec!["prod-api-gen-1".to_string()]
+        );
+        assert_eq!(
+            cleanup.removed_images,
+            vec!["forge/api:production-gen-1".to_string()]
+        );
+        assert!(cleanup.removed_volumes.is_empty());
+        assert!(cleanup.skipped.contains(&"route:not_created".to_string()));
+        assert!(cleanup.failure_reason.is_none());
+        assert!(cleanup.timestamp > 0);
+    }
+
+    #[test]
+    fn build_failure_writes_cleanup_json() {
+        let root = test_root("build-failure-writes-cleanup-json");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = BuildFailDockerRuntime;
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next();
+
+        assert!(result.is_err());
+        let cleanup = cleanup_record(&root);
+        assert!(cleanup.cleanup_attempted);
+        assert!(cleanup.cleanup_completed);
+        assert!(cleanup.removed_containers.is_empty());
+        assert!(cleanup.removed_images.is_empty());
+        assert!(cleanup.removed_volumes.is_empty());
+        assert!(
+            cleanup
+                .skipped
+                .contains(&"container:not_created".to_string())
+        );
+        assert!(cleanup.skipped.contains(&"image:not_built".to_string()));
+        assert!(cleanup.skipped.contains(&"route:not_created".to_string()));
+    }
+
+    #[test]
+    fn validation_failure_writes_cleanup_json() {
+        let root = test_root("validation-failure-writes-cleanup-json");
+        let source_root = root.join("source");
+        write_test_forge_yaml(&source_root, 250);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(source_root),
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            "image_ref=forge/api:production-gen-1".into(),
+            String::new(),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.29.0.2")],
+            ),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.29.0.2")],
+            ),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.29.0.2")],
+            ),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.29.0.2")],
+            ),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.29.0.2")],
+            ),
+            inspection_output(
+                1,
+                "running",
+                true,
+                0,
+                &[(FORGE_MANAGED_DOCKER_NETWORK, "172.29.0.2")],
+            ),
+            "npm start\nnode backend/index.js".into(),
+        ]));
+        let mut probes = SequencedProbeRuntime {
+            tcp_results: VecDeque::from(vec![Ok(false), Ok(false), Ok(false)]),
+            http_results: VecDeque::new(),
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next();
+
+        let cleanup = cleanup_record(&root);
+        assert!(cleanup.cleanup_attempted);
+        assert!(cleanup.cleanup_completed);
+        assert_eq!(
+            cleanup.removed_containers,
+            vec!["prod-api-gen-1".to_string()]
+        );
+        assert_eq!(
+            cleanup.removed_images,
+            vec!["forge/api:production-gen-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn pre_container_failure_writes_empty_cleanup_json() {
+        let root = test_root("pre-container-failure-writes-empty-cleanup-json");
+        let source_root = root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("forge.yml"), "version: [\n").unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(source_root),
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        let mut docker = BuildFailDockerRuntime;
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next();
+
+        let cleanup = cleanup_record(&root);
+        assert!(cleanup.cleanup_attempted);
+        assert!(cleanup.cleanup_completed);
+        assert!(cleanup.removed_containers.is_empty());
+        assert!(cleanup.removed_images.is_empty());
+        assert!(cleanup.removed_volumes.is_empty());
+        assert!(
+            cleanup
+                .skipped
+                .contains(&"container:not_created".to_string())
+        );
+        assert!(cleanup.skipped.contains(&"image:not_built".to_string()));
+        assert!(cleanup.skipped.contains(&"route:not_created".to_string()));
     }
 }
 

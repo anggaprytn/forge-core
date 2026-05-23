@@ -428,8 +428,9 @@ fn dogfood_bad_app_failed_generation_is_cleaned() {
     assert!(!docker_container_exists("prod-api-gen-1"));
     let cleanup = fs::read_to_string(harness.generation_dir(1).join("cleanup.json"))
         .expect("cleanup record should exist for failed generation");
-    assert!(cleanup.contains("\"container_removed\": true"));
-    assert!(cleanup.contains("\"tombstoned\": false"));
+    assert!(cleanup.contains("\"cleanup_attempted\": true"));
+    assert!(cleanup.contains("\"cleanup_completed\": true"));
+    assert!(cleanup.contains("\"removed_containers\": ["));
 }
 
 #[test]
@@ -514,6 +515,7 @@ fn dogfood_crash_during_route_activation_recovers_without_orphan_route() {
     let cleanup = fs::read_to_string(harness.generation_dir(1).join("cleanup.json"))
         .expect("startup cleanup should be recorded");
     assert!(cleanup.contains("\"route_removed\": true"));
+    assert!(cleanup.contains("\"cleanup_attempted\": true"));
 }
 
 #[test]

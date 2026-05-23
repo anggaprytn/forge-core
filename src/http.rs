@@ -1344,13 +1344,19 @@ async fn post_cli_login_poll(
 
 async fn get_readyz(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
-    let (ready, readiness_status) = tokio::task::block_in_place(|| {
-        state
-            .daemon
-            .lock()
-            .map(|mut daemon| (daemon.is_ready(), daemon.readyz_status()))
-            .unwrap_or((false, "not_ready"))
-    });
+    let daemon = state.daemon.clone();
+    let (ready, readiness_status) =
+        match tokio::task::spawn_blocking(move || {
+            daemon
+                .lock()
+                .map(|mut daemon| (daemon.is_ready(), daemon.readyz_status()))
+                .unwrap_or((false, "not_ready"))
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(_) => (false, "not_ready"),
+        };
     let status = if ready {
         StatusCode::OK
     } else {

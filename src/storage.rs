@@ -565,16 +565,39 @@ pub struct PersistedResolvedRuntime {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupRecord {
+    #[serde(default)]
+    pub timestamp: u64,
+    #[serde(default)]
     pub timestamp_unix: u64,
-    pub failure_reason: String,
+    #[serde(default)]
+    pub generation_failure_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default = "default_true")]
+    pub cleanup_attempted: bool,
+    #[serde(default)]
+    pub cleanup_completed: bool,
+    #[serde(default)]
+    pub removed_containers: Vec<String>,
+    #[serde(default)]
+    pub removed_images: Vec<String>,
+    #[serde(default)]
+    pub removed_volumes: Vec<String>,
+    #[serde(default)]
+    pub skipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_subtree_id: Option<String>,
     #[serde(default)]
     pub image_ref: Option<String>,
+    #[serde(default)]
     pub container_removed: bool,
+    #[serde(default)]
     pub route_removed: bool,
     #[serde(default = "default_true")]
     pub image_removed: bool,
+    #[serde(default)]
     pub tombstoned: bool,
 }
 
@@ -1420,19 +1443,25 @@ impl GcStore {
 
 impl CleanupRecord {
     pub fn new(
-        failure_reason: impl Into<String>,
+        generation_failure_reason: impl Into<String>,
         container_name: Option<String>,
         route_subtree_id: Option<String>,
         container_removed: bool,
         route_removed: bool,
         tombstoned: bool,
     ) -> Self {
+        let timestamp = current_unix_timestamp();
         Self {
-            timestamp_unix: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            failure_reason: failure_reason.into(),
+            timestamp,
+            timestamp_unix: timestamp,
+            generation_failure_reason: generation_failure_reason.into(),
+            failure_reason: None,
+            cleanup_attempted: true,
+            cleanup_completed: !tombstoned,
+            removed_containers: Vec::new(),
+            removed_images: Vec::new(),
+            removed_volumes: Vec::new(),
+            skipped: Vec::new(),
             container_name,
             route_subtree_id,
             image_ref: None,
@@ -1440,6 +1469,102 @@ impl CleanupRecord {
             route_removed,
             image_removed: true,
             tombstoned,
+        }
+    }
+
+    pub fn skipped_failed_generation(generation_failure_reason: impl Into<String>) -> Self {
+        let mut cleanup = Self::new(generation_failure_reason, None, None, true, true, false);
+        cleanup.skipped = vec![
+            "container:not_created".into(),
+            "image:not_built".into(),
+            "route:not_created".into(),
+        ];
+        cleanup
+    }
+
+    pub fn normalized(mut self) -> Self {
+        if self.timestamp == 0 {
+            self.timestamp = current_unix_timestamp();
+        }
+        if self.timestamp_unix == 0 {
+            self.timestamp_unix = self.timestamp;
+        }
+        self.cleanup_attempted = true;
+        if self.container_removed
+            && self.removed_containers.is_empty()
+            && self.container_name.is_some()
+        {
+            self.removed_containers
+                .push(self.container_name.clone().expect("checked is_some"));
+        }
+        if self.image_removed && self.removed_images.is_empty() && self.image_ref.is_some() {
+            self.removed_images
+                .push(self.image_ref.clone().expect("checked is_some"));
+        }
+        if !self.container_removed
+            && let Some(container_name) = self.container_name.as_deref()
+        {
+            self.skipped.push(format!("container:{container_name}"));
+        }
+        if !self.route_removed
+            && let Some(route_subtree_id) = self.route_subtree_id.as_deref()
+        {
+            self.skipped.push(format!("route:{route_subtree_id}"));
+        }
+        if !self.image_removed
+            && let Some(image_ref) = self.image_ref.as_deref()
+        {
+            self.skipped.push(format!("image:{image_ref}"));
+        }
+        self.removed_containers.sort();
+        self.removed_containers.dedup();
+        self.removed_images.sort();
+        self.removed_images.dedup();
+        self.removed_volumes.sort();
+        self.removed_volumes.dedup();
+        self.skipped.sort();
+        self.skipped.dedup();
+        self.cleanup_completed = self.failure_reason.is_none()
+            && self.container_removed
+            && self.route_removed
+            && self.image_removed;
+        if !self.cleanup_completed && self.failure_reason.is_none() {
+            self.failure_reason = Some(self.cleanup_failure_reason());
+        }
+        self.tombstoned = !self.cleanup_completed;
+        self
+    }
+
+    fn cleanup_failure_reason(&self) -> String {
+        let mut pending = Vec::new();
+        if !self.container_removed {
+            pending.push(
+                self.container_name
+                    .as_deref()
+                    .map(|value| format!("container `{value}`"))
+                    .unwrap_or_else(|| "container".into()),
+            );
+        }
+        if !self.route_removed {
+            pending.push(
+                self.route_subtree_id
+                    .as_deref()
+                    .map(|value| format!("route `{value}`"))
+                    .unwrap_or_else(|| "route".into()),
+            );
+        }
+        if !self.image_removed {
+            pending.push(
+                self.image_ref
+                    .as_deref()
+                    .map(|value| format!("image `{value}`"))
+                    .unwrap_or_else(|| "image".into()),
+            );
+        }
+        if pending.is_empty() {
+            "cleanup incomplete".into()
+        } else {
+            format!("cleanup incomplete for {}", pending.join(", "))
         }
     }
 }
@@ -1457,7 +1582,8 @@ impl CleanupStore {
     pub fn write_record(&self, record: &CleanupRecord) -> StorageResult<()> {
         self.env.ensure_exists()?;
         fs::create_dir_all(self.env.generation_dir(self.generation))?;
-        let bytes = serde_json::to_vec_pretty(record).map_err(|err| {
+        let record = record.clone().normalized();
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|err| {
             StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 err.to_string(),
