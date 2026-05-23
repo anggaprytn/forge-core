@@ -690,7 +690,7 @@ where
         self.last_recovery_outcome.as_ref()
     }
 
-    pub fn readyz_status(&self) -> &'static str {
+    pub fn readyz_status(&mut self) -> &'static str {
         if self.state() != &DaemonState::Ready {
             return "not_ready";
         }
@@ -709,7 +709,7 @@ where
         (&self.docker_runtime, &self.routing_runtime)
     }
 
-    fn has_route_repair_failures(&self) -> bool {
+    fn has_route_repair_failures(&mut self) -> bool {
         let projects_root = self.config.storage_root.join("projects");
         let Ok(projects) = fs::read_dir(projects_root) else {
             return false;
@@ -721,18 +721,18 @@ where
             };
             for env_entry in envs.flatten() {
                 let environment = env_entry.file_name().to_string_lossy().into_owned();
-                let env = EnvironmentPaths::new(
+                let project_id = project.file_name().to_string_lossy().into_owned();
+                let Ok(status) = load_project_environment_status(
                     &self.config.storage_root,
-                    &project.file_name().to_string_lossy(),
+                    self.queue.as_ref(),
+                    &mut self.docker_runtime,
+                    &mut self.routing_runtime,
+                    &project_id,
                     &environment,
-                );
-                let Ok(runtime_state) = RuntimeStateStore::new(env).load() else {
+                ) else {
                     continue;
                 };
-                if runtime_state.health_state == RuntimeHealthState::Degraded
-                    && runtime_state.last_error_code.as_deref()
-                        == Some("route_activation_verification_failed")
-                {
+                if status.status == "degraded" && status.active_generation.is_some() {
                     return true;
                 }
             }
@@ -1472,7 +1472,7 @@ pub mod daemon_readyz_route_repair_resolution {
     }
 
     #[test]
-    fn readyz_clears_after_route_repair_success() {
+    fn resolved_route_failure_clears_readyz_degraded_state() {
         let root = test_root("readyz-clears-after-route-repair-success");
         seed_runtime_state(
             &root,
@@ -1493,7 +1493,7 @@ pub mod daemon_readyz_route_repair_resolution {
     }
 
     #[test]
-    fn stale_route_repair_failure_does_not_keep_readyz_degraded() {
+    fn historical_route_failure_does_not_degrade_readyz() {
         let root = test_root("stale-route-repair-failure-does-not-keep-readyz-degraded");
         seed_runtime_state(
             &root,
@@ -1501,6 +1501,22 @@ pub mod daemon_readyz_route_repair_resolution {
             "healthy",
             Some("route_activation_verification_failed"),
         );
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_status(), "ready");
+    }
+
+    #[test]
+    fn readyz_ok_when_all_active_environments_healthy() {
+        let root = test_root("readyz-ok-when-all-active-environments-healthy");
+        seed_runtime_state(&root, RuntimeHealthState::Healthy, "healthy", None);
 
         let mut daemon = Daemon::new(
             config_with_root(root),

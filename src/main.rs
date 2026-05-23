@@ -1935,13 +1935,6 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
             diagnostics.restart_instability, diagnostics.probe_flapping
         ));
     }
-    if !diagnostics.policy_drift_repairs.is_empty() {
-        output.push('\n');
-        output.push_str("Policy Drift Repairs:\n");
-        for repair in &diagnostics.policy_drift_repairs {
-            output.push_str(&format!("  {repair}\n"));
-        }
-    }
     if let Some(probe_stability) = diagnostics.probe_stability.as_ref() {
         output.push('\n');
         output.push_str("Probe Stability:\n");
@@ -1983,12 +1976,8 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
             output.push_str(&format!("  {warning}\n"));
         }
     }
-    if !diagnostics.volume_repair_events.is_empty() {
-        output.push('\n');
-        output.push_str("Volume Repairs:\n");
-        for event in &diagnostics.volume_repair_events {
-            output.push_str(&format!("  {event}\n"));
-        }
+    if let Some(historical_repairs) = render_historical_repairs_section(diagnostics) {
+        output.push_str(&historical_repairs);
     }
     output.push('\n');
     output.push_str("Recent Failures:\n");
@@ -2158,6 +2147,34 @@ fn render_restore_lineage(lineage: &RestoreLineage) -> String {
         output.push_str(&format!(" restored_volumes=[{restored_volumes}]"));
     }
     output
+}
+
+fn normalize_historical_repair_line(line: &str) -> String {
+    line.replace("restart_policy: \"\"", "restart_policy: no")
+        .replace("restart_policy=\"\"", "restart_policy=no")
+}
+
+fn render_historical_repairs_section(diagnostics: &EnvironmentDiagnostics) -> Option<String> {
+    if diagnostics.status == "healthy" {
+        return None;
+    }
+
+    let entries = diagnostics
+        .policy_drift_repairs
+        .iter()
+        .chain(diagnostics.volume_repair_events.iter())
+        .map(|entry| normalize_historical_repair_line(entry))
+        .take(3)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut output = String::from("\nHistorical Repairs:\n");
+    for entry in entries {
+        output.push_str(&format!("  {entry}\n"));
+    }
+    Some(output)
 }
 
 fn render_backup_record(backup: &BackupRecord) -> String {
@@ -2856,6 +2873,55 @@ impl ActiveDeploymentDecider for ResumeActiveDeployments {
 mod tests {
     use super::*;
 
+    fn diagnostics_fixture(status: &str) -> EnvironmentDiagnostics {
+        EnvironmentDiagnostics {
+            project_id: "api".into(),
+            environment: "staging".into(),
+            status: status.into(),
+            active_generation: Some(7),
+            last_deployment_id: None,
+            container: forge_core::api::ContainerRuntimeDiagnostics {
+                running: true,
+                ..forge_core::api::ContainerRuntimeDiagnostics::default()
+            },
+            route: forge_core::api::RouteDiagnostics {
+                matches_expected: true,
+                ..forge_core::api::RouteDiagnostics::default()
+            },
+            probe_target: None,
+            startup_order: Vec::new(),
+            services: Vec::new(),
+            recent_failures: Vec::new(),
+            latest_validation_failure: None,
+            latest_route_activation_failure: None,
+            likely_failure_stage: None,
+            diagnostics_source: None,
+            runtime_env_snapshot: None,
+            retained_generations: Vec::new(),
+            rollback_safe_generation: None,
+            recent_gc_actions: Vec::new(),
+            missing_required_secrets: Vec::new(),
+            env_drift: None,
+            recent_secret_mutations: Vec::new(),
+            orphaned_state_warnings: Vec::new(),
+            volume_repair_events: Vec::new(),
+            active_lifecycle_state: None,
+            retention_role: None,
+            validation_summary: None,
+            promotion_summary: None,
+            last_failed_transition: None,
+            promotion_gate_reason: None,
+            warmup_failure_summary: None,
+            restart_instability: false,
+            probe_flapping: false,
+            probe_stability: None,
+            active_restore: None,
+            state_restore_warnings: Vec::new(),
+            backup_restore_events: Vec::new(),
+            policy_drift_repairs: Vec::new(),
+        }
+    }
+
     #[test]
     fn daemon_command_dispatches_to_launcher() {
         let mut launched = None;
@@ -3262,5 +3328,37 @@ mod tests {
                 json: true,
             }
         );
+    }
+
+    #[test]
+    fn diagnose_healthy_environment_hides_historical_policy_repairs() {
+        let mut diagnostics = diagnostics_fixture("healthy");
+        diagnostics.policy_drift_repairs = vec!["historical gen-7: restart_policy: \"\"".into()];
+        let rendered = render_environment_diagnostics(&diagnostics);
+
+        assert!(!rendered.contains("Policy Drift Repairs:"));
+        assert!(!rendered.contains("Historical Repairs:"));
+    }
+
+    #[test]
+    fn diagnose_healthy_environment_hides_historical_volume_repairs() {
+        let mut diagnostics = diagnostics_fixture("healthy");
+        diagnostics.volume_repair_events =
+            vec!["historical gen-7: repaired empty volume set".into()];
+        let rendered = render_environment_diagnostics(&diagnostics);
+
+        assert!(!rendered.contains("Volume Repairs:"));
+        assert!(!rendered.contains("Historical Repairs:"));
+    }
+
+    #[test]
+    fn historical_repair_output_normalizes_restart_policy() {
+        let mut diagnostics = diagnostics_fixture("degraded");
+        diagnostics.policy_drift_repairs = vec!["historical gen-7: restart_policy: \"\"".into()];
+        let rendered = render_environment_diagnostics(&diagnostics);
+
+        assert!(rendered.contains("Historical Repairs:"));
+        assert!(rendered.contains("restart_policy: no"));
+        assert!(!rendered.contains("restart_policy: \"\""));
     }
 }

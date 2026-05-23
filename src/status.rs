@@ -985,11 +985,17 @@ where
         .map(|generation| load_failure_details_internal(&env, generation))
         .transpose()?
         .flatten();
+    let latest_failure_is_current = latest_failed_generation.is_some_and(|generation| {
+        status.status != "healthy"
+            && (truth.active_generation == Some(generation) || truth.active_generation.is_none())
+    });
     let services = enrich_services_with_diagnostics(
         &env,
         truth.active_generation.or(latest_failed_generation),
         &truth.services,
-        latest_failure.as_ref(),
+        latest_failure
+            .as_ref()
+            .filter(|_| latest_failure_is_current),
     )?;
     let recent_failures = recent_failure_generations
         .into_iter()
@@ -1001,11 +1007,6 @@ where
             mark_failure_historical(failure, truth.active_generation, status.status.as_str())
         })
         .collect::<Vec<_>>();
-
-    let latest_failure_is_current = latest_failed_generation.is_some_and(|generation| {
-        truth.active_generation == Some(generation)
-            || (truth.active_generation.is_none() && status.status != "healthy")
-    });
 
     let probe_target = latest_failure
         .as_ref()
@@ -3158,6 +3159,96 @@ mod tests {
                 last_error_code: None,
             })
             .unwrap();
+    }
+
+    fn write_backup_metadata_fixture(
+        root: &Path,
+        backup_id: &str,
+        restored_generation: u64,
+        restored_deployment_id: &str,
+        restored_at_unix: u64,
+    ) {
+        let backup_dir = EnvironmentPaths::backups_root(root)
+            .join("api")
+            .join("staging")
+            .join(backup_id);
+        fs::create_dir_all(&backup_dir).unwrap();
+        let metadata = crate::storage::PersistedBackupMetadata {
+            backup_version: 1,
+            backup_id: backup_id.into(),
+            project_id: "api".into(),
+            environment: "staging".into(),
+            created_at_unix: 10,
+            source_generation: 3,
+            source_deployment_id: Some("dep-3".into()),
+            snapshot_metadata: crate::storage::PersistedSnapshotMetadata {
+                snapshot_version: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation: 3,
+                state: "healthy".into(),
+                finalized_at_unix: 10,
+            },
+            build_info: crate::storage::PersistedBuildInfo {
+                deployment_id: "dep-3".into(),
+                image_ref: "forge/api:staging-gen-3".into(),
+                services: BTreeMap::new(),
+                source_ref: Some("main".into()),
+                repo_url: None,
+                commit_sha: Some("deadbeef".into()),
+                source_path: None,
+            },
+            runtime_info: crate::storage::PersistedRuntimeInfo {
+                container_name: "staging-api-gen-3".into(),
+                running: true,
+                network_name: Some("forge-managed".into()),
+                probe_path: Some("/health".into()),
+                activation: Some(PersistedActivationMode::Http {
+                    internal_port: 3000,
+                    route_subtree_id: Some("forge:api:staging".into()),
+                    target_source: crate::storage::PersistedRouteTargetSource::ContainerIp,
+                }),
+                runtime_policy: PersistedRuntimePolicy::default(),
+                runtime_usage: None,
+                termination: None,
+                environment_variables: BTreeMap::new(),
+                volume_mounts: Vec::new(),
+                source_ref: Some("main".into()),
+                repo_url: None,
+                commit_sha: Some("deadbeef".into()),
+                source_path: None,
+                services: BTreeMap::new(),
+                startup_order: Vec::new(),
+            },
+            runtime_env_snapshot: None,
+            resolved_runtime: crate::storage::PersistedResolvedRuntime {
+                snapshot_version: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation: 3,
+                deployment_id: "dep-3".into(),
+                source_environment: "staging".into(),
+                source_ref: Some("main".into()),
+                commit_sha: Some("deadbeef".into()),
+                domain: Some("staging-api.example.com".into()),
+                entries: BTreeMap::new(),
+            },
+            services: vec!["default".into()],
+            volumes: Vec::new(),
+            hooks: Vec::new(),
+            restores: vec![crate::storage::PersistedBackupRestoreRecord {
+                restored_generation,
+                restored_deployment_id: restored_deployment_id.into(),
+                restored_at_unix,
+                status: "completed".into(),
+            }],
+            warnings: Vec::new(),
+        };
+        fs::write(
+            backup_dir.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
     }
 
     fn write_multiservice_generation(root: &Path, generation: u64) {
@@ -5756,6 +5847,162 @@ mod tests {
             Some("worker queue disconnected")
         );
         assert_eq!(worker.logs_tail, vec!["worker polling".to_string()]);
+    }
+
+    #[test]
+    fn healthy_service_does_not_show_stale_failure_reason() {
+        let root = test_root("healthy-service-does-not-show-stale-failure-reason");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "staging"), 7)
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some("dep-7".into()),
+                failure_stage: "warming".into(),
+                failure_reason: "route activation verification failed".into(),
+                blocking_reason: Some("route activation verification failed".into()),
+                container_name: "staging-api-gen-7".into(),
+                failed_service_name: Some("default".into()),
+                blocking_service_name: Some("default".into()),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let service = diagnostics
+            .services
+            .iter()
+            .find(|service| service.service_id == "default")
+            .unwrap();
+        assert_eq!(diagnostics.status, "healthy");
+        assert_eq!(service.route, "active");
+        assert_eq!(service.failure_reason, None);
+        assert_eq!(diagnostics.recent_failures.len(), 1);
+        assert!(diagnostics.recent_failures[0].historical);
+    }
+
+    #[test]
+    fn route_repair_success_clears_service_failure_reason() {
+        let root = test_root("route-repair-success-clears-service-failure-reason");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "staging"), 7)
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some("dep-7".into()),
+                failure_stage: "warming".into(),
+                failure_reason: "route activation verification failed".into(),
+                blocking_reason: Some("route activation verification failed".into()),
+                container_name: "staging-api-gen-7".into(),
+                failed_service_name: Some("default".into()),
+                blocking_service_name: Some("default".into()),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.status, "healthy");
+        assert!(
+            diagnostics
+                .services
+                .iter()
+                .all(|service| service.failure_reason.is_none())
+        );
+    }
+
+    #[test]
+    fn active_restored_generation_reports_active_restore_lineage() {
+        let root = test_root("active-restored-generation-reports-active-restore-lineage");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 9);
+        write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        RetentionStore::new(env.clone())
+            .write(&RetentionMetadata {
+                updated_at_unix: Some(20),
+                generations: vec![GenerationHistoryRecord {
+                    generation: 9,
+                    deployment_id: Some("restore-backup-1-gen-9".into()),
+                    retained: true,
+                    ..GenerationHistoryRecord::default()
+                }],
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(9)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let active_restore = diagnostics.active_restore.unwrap();
+        assert_eq!(active_restore.backup_id, "backup-1");
+        assert_eq!(active_restore.source_generation, 3);
+        assert_eq!(active_restore.restored_at_unix, 20);
+    }
+
+    #[test]
+    fn non_restored_generation_reports_active_restore_none() {
+        let root = test_root("non-restored-generation-reports-active-restore-none");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 9);
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(9)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.active_restore, None);
     }
 
     #[test]

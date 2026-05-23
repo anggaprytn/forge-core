@@ -64,7 +64,7 @@ const CLI_LOGIN_POLL_INTERVAL_SECONDS: u64 = 1;
 
 pub trait ControlPlane: Send {
     fn is_ready(&self) -> bool;
-    fn readyz_status(&self) -> &'static str {
+    fn readyz_status(&mut self) -> &'static str {
         if self.is_ready() {
             "ready"
         } else {
@@ -137,7 +137,7 @@ where
         self.state() == &DaemonState::Ready
     }
 
-    fn readyz_status(&self) -> &'static str {
+    fn readyz_status(&mut self) -> &'static str {
         Daemon::readyz_status(self)
     }
 
@@ -1344,11 +1344,13 @@ async fn post_cli_login_poll(
 
 async fn get_readyz(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
-    let (ready, readiness_status) = state
-        .daemon
-        .lock()
-        .map(|daemon| (daemon.is_ready(), daemon.readyz_status()))
-        .unwrap_or((false, "not_ready"));
+    let (ready, readiness_status) = tokio::task::block_in_place(|| {
+        state
+            .daemon
+            .lock()
+            .map(|mut daemon| (daemon.is_ready(), daemon.readyz_status()))
+            .unwrap_or((false, "not_ready"))
+    });
     let status = if ready {
         StatusCode::OK
     } else {

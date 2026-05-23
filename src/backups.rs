@@ -726,8 +726,22 @@ pub fn load_backup_restore_lineage(
     environment: &str,
     record: &GenerationHistoryRecord,
 ) -> Option<crate::api::RestoreLineage> {
-    let backup_id = record.restored_from_backup_id.clone()?;
-    let metadata = find_backup_metadata(storage_root, &backup_id).ok()?;
+    let (backup_id, metadata, restore_record) =
+        if let Some(backup_id) = record.restored_from_backup_id.clone() {
+            let metadata = find_backup_metadata(storage_root, &backup_id).ok()?;
+            let restore_record = metadata
+                .restores
+                .iter()
+                .find(|restore| {
+                    restore.restored_generation == record.generation
+                        || Some(restore.restored_deployment_id.as_str())
+                            == record.deployment_id.as_deref()
+                })
+                .cloned();
+            (backup_id, metadata, restore_record)
+        } else {
+            find_backup_restore_metadata(storage_root, project_id, environment, record)?
+        };
     let restored_runtime = load_generation_runtime_info(
         &EnvironmentPaths::new(storage_root, project_id, environment),
         record.generation,
@@ -774,13 +788,50 @@ pub fn load_backup_restore_lineage(
         .collect();
     Some(crate::api::RestoreLineage {
         backup_id,
-        source_generation: record.restored_from_generation?,
-        source_deployment_id: record.restored_from_deployment_id.clone(),
-        restored_at_unix: record.restored_at_unix?,
+        source_generation: record
+            .restored_from_generation
+            .unwrap_or(metadata.source_generation),
+        source_deployment_id: record
+            .restored_from_deployment_id
+            .clone()
+            .or(metadata.source_deployment_id.clone()),
+        restored_at_unix: record.restored_at_unix.or(restore_record
+            .as_ref()
+            .map(|restore| restore.restored_at_unix))?,
         hook_succeeded: (!metadata.hooks.is_empty())
             .then(|| metadata.hooks.iter().all(|hook| hook.exit_code == 0)),
         restored_volumes,
     })
+}
+
+fn find_backup_restore_metadata(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+    record: &GenerationHistoryRecord,
+) -> Option<(
+    String,
+    PersistedBackupMetadata,
+    Option<PersistedBackupRestoreRecord>,
+)> {
+    let backups_root = backups_environment_root(storage_root, project_id, environment);
+    let entries = fs::read_dir(backups_root).ok()?;
+    for entry in entries.flatten() {
+        let metadata = read_backup_metadata(&entry.path()).ok()?;
+        let restore_record = metadata
+            .restores
+            .iter()
+            .find(|restore| {
+                restore.restored_generation == record.generation
+                    || Some(restore.restored_deployment_id.as_str())
+                        == record.deployment_id.as_deref()
+            })
+            .cloned();
+        if restore_record.is_some() {
+            return Some((metadata.backup_id.clone(), metadata, restore_record));
+        }
+    }
+    None
 }
 
 fn inspect_archive_files(
