@@ -554,6 +554,25 @@ fn backup_current_binary(current: &Path, previous: &str) -> Result<(), UpgradeEr
 }
 
 fn restore_previous_binary(previous: &Path, current: &Path) -> Result<(), UpgradeError> {
+    if path_requires_sudo(previous) || path_requires_sudo(current) {
+        let target_tmp = current.with_extension(format!("tmp.{}", current_unix_timestamp()));
+        run_command(
+            privileged_command("install")
+                .args(["-m", "0755"])
+                .arg(previous)
+                .arg(&target_tmp),
+            SUDO_TIMEOUT,
+            format!(
+                "failed to stage rollback binary at {}",
+                target_tmp.display()
+            ),
+        )?;
+        return run_command(
+            privileged_command("mv").arg(&target_tmp).arg(current),
+            SUDO_TIMEOUT,
+            format!("failed to restore rollback binary at {}", current.display()),
+        );
+    }
     let contents = fs::read(previous)?;
     write_binary_atomically(current, &contents)
 }

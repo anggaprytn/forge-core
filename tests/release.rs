@@ -1157,6 +1157,58 @@ fn upgrade_rollback_restores_previous_binary() {
 }
 
 #[test]
+fn upgrade_rollback_uses_sudo_for_system_paths() {
+    let root = test_root("upgrade-rollback-sudo");
+    let current = root.join("bin/forge");
+    let previous = root.join("bin/forge.previous");
+    fs::create_dir_all(current.parent().unwrap()).unwrap();
+    make_fake_binary(&current, "2.0.0");
+    make_fake_binary(&previous, "1.0.0");
+    write_upgrade_config(&root, "temp-token");
+    write_upgrade_env(&root, "temp-master-key");
+    fs::create_dir_all(root.join("storage/projects")).unwrap();
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
+    let sudo_log = root.join("sudo.log");
+    write_executable(
+        &fake_bin.join("sudo"),
+        &format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> '{}'\nexec \"$@\"\n",
+            sudo_log.display()
+        ),
+    );
+    let (url, _handle) = spawn_ok_server();
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "FORGE_UPGRADE_PREVIOUS_BINARY_PATH",
+                previous.display().to_string(),
+            ),
+            (
+                "FORGE_SUDO_BIN",
+                fake_bin.join("sudo").display().to_string(),
+            ),
+            ("FORGE_UPGRADE_FORCE_SUDO", "1".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+            ("FORGE_UPGRADE_READYZ_URL", url),
+            ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
+        ],
+        || rollback(&root.join("forge.conf")).unwrap(),
+    );
+
+    let log = fs::read_to_string(sudo_log).unwrap();
+    assert!(log.contains("install -m 0755"));
+    assert!(log.contains("mv"));
+    assert!(log.contains("systemctl restart forge.service"));
+}
+
+#[test]
 fn upgrade_rollback_test_does_not_touch_real_system_paths() {
     let root = test_root("upgrade-rollback-temp-paths");
     let current = root.join("bin/forge");
