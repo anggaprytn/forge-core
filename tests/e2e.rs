@@ -201,6 +201,7 @@ fn dogfood_readyz_and_metrics_return_quickly() {
 
     harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
+    harness.wait_for_readyz_status("ready", Duration::from_secs(5));
 
     let (readyz, readyz_elapsed) = harness.get_readyz();
     let (metrics, metrics_elapsed) = harness.get_metrics();
@@ -220,6 +221,7 @@ fn dogfood_single_node_starts_as_leader() {
 
     harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
+    harness.wait_for_readyz_status("ready", Duration::from_secs(5));
 
     let (readyz, readyz_elapsed) = harness.get_readyz();
     let (metrics, metrics_elapsed) = harness.get_metrics();
@@ -242,7 +244,9 @@ fn dogfood_daemon_restart_preserves_cache_initialization_behavior() {
 
     harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
+    harness.wait_for_readyz_status("ready", Duration::from_secs(5));
     harness.restart_api_server(AllowAllDecider(true));
+    harness.wait_for_readyz_status("ready", Duration::from_secs(5));
 
     let (readyz, readyz_elapsed) = harness.get_readyz();
     let (metrics, metrics_elapsed) = harness.get_metrics();
@@ -262,6 +266,7 @@ fn dogfood_reboot_recovery_restores_container_and_route() {
 
     harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
+    harness.wait_for_readyz_status("ready", Duration::from_secs(5));
 
     docker(&["rm", "-f", "prod-api-gen-1"]).expect("active generation should be removable");
     harness
@@ -288,6 +293,23 @@ fn dogfood_reboot_recovery_restores_container_and_route() {
         .wait_for_public_text("health", "ok\n")
         .expect("public route should be reachable after startup recovery");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
+fn dogfood_startup_wait_has_bounded_deadline() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("startup-wait-deadline") else {
+        return;
+    };
+
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+
+    let started = std::time::Instant::now();
+    let readyz = harness.wait_for_readyz_status("ready", Duration::from_secs(5));
+
+    assert_eq!(readyz.status, "ready");
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
@@ -1543,6 +1565,31 @@ impl E2eHarness {
             thread::sleep(Duration::from_millis(100));
         }
         panic!("api readyz did not become ready");
+    }
+
+    fn wait_for_readyz_status(&self, expected: &str, timeout: Duration) -> ReadyzResponse {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = None;
+        loop {
+            let (readyz, _) = self.get_readyz();
+            if readyz.status == expected {
+                return readyz;
+            }
+            last = Some(readyz);
+            if std::time::Instant::now() >= deadline {
+                let summary = last
+                    .as_ref()
+                    .map(|value| {
+                        serde_json::to_string(value).unwrap_or_else(|_| value.status.clone())
+                    })
+                    .unwrap_or_else(|| "no readyz response".into());
+                panic!(
+                    "readyz did not become {expected} within {:?}: {summary}",
+                    timeout
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn wait_for_public_text(

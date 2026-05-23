@@ -73,6 +73,12 @@ pub struct ReconciliationCursor {
     #[serde(default)]
     pub lease_fencing_failures: u64,
     #[serde(default)]
+    pub replay_cursor_corrupted: bool,
+    #[serde(default)]
+    pub reconciliation_log_corrupted: bool,
+    #[serde(default)]
+    pub destructive_replay_blocked: bool,
+    #[serde(default)]
     pub recovered_operations: Vec<String>,
     #[serde(default)]
     pub skipped_operations: Vec<String>,
@@ -341,6 +347,9 @@ impl ReconciliationStore {
             next.lease_fencing_failures = next
                 .lease_fencing_failures
                 .max(current.lease_fencing_failures);
+            next.replay_cursor_corrupted |= current.replay_cursor_corrupted;
+            next.reconciliation_log_corrupted |= current.reconciliation_log_corrupted;
+            next.destructive_replay_blocked |= current.destructive_replay_blocked;
         }
         atomic_write(
             path,
@@ -357,11 +366,13 @@ impl ReconciliationStore {
         lease_epoch: u64,
         options: ReplayOptions,
     ) -> StorageResult<ReplayOutcome> {
-        self.sanitize_log_and_quarantine_corruption()?;
+        let log_was_corrupted = self.sanitize_log_and_quarantine_corruption()?;
         let log = self.read_all()?;
         let cursor_result = self.load_cursor();
         let cursor_corrupted = cursor_result.is_err();
         let mut cursor = cursor_result.unwrap_or_default().unwrap_or_default();
+        cursor.replay_cursor_corrupted |= cursor_corrupted;
+        cursor.reconciliation_log_corrupted |= log_was_corrupted || log.corrupted;
         let now = current_unix_timestamp();
         cursor.replay_started_at = Some(now);
         cursor.replay_finished_at = None;
@@ -396,7 +407,7 @@ impl ReconciliationStore {
                     &cursor,
                     replay_failures_total,
                     unrecoverable_operations,
-                    cursor_corrupted || log.corrupted,
+                    cursor_corrupted || log_was_corrupted || log.corrupted,
                 ),
                 cursor,
                 intents: log.intents,
@@ -429,7 +440,7 @@ impl ReconciliationStore {
                         &cursor,
                         replay_failures_total,
                         unrecoverable_operations,
-                        cursor_corrupted || log.corrupted,
+                        cursor_corrupted || log_was_corrupted || log.corrupted,
                     ),
                     cursor,
                     intents: self.read_all()?.intents,
@@ -456,7 +467,7 @@ impl ReconciliationStore {
                         &cursor,
                         replay_failures_total,
                         unrecoverable_operations,
-                        cursor_corrupted,
+                        cursor_corrupted || log_was_corrupted || log.corrupted,
                     ),
                     cursor,
                     intents: log.intents,
@@ -489,7 +500,7 @@ impl ReconciliationStore {
                                         &cursor,
                                         replay_failures_total,
                                         unrecoverable_operations,
-                                        cursor_corrupted || log.corrupted,
+                                        cursor_corrupted || log_was_corrupted || log.corrupted,
                                     ),
                                     cursor,
                                     intents: self.read_all()?.intents,
@@ -543,6 +554,7 @@ impl ReconciliationStore {
                 }
                 ReplaySafety::Destructive => {
                     destructive_replay_blocked = true;
+                    cursor.destructive_replay_blocked = true;
                     unrecoverable_operations = unrecoverable_operations.saturating_add(1);
                     self.quarantine_intent(entry, "destructive_replay_blocked", None, &mut cursor)?;
                     let _ = self.append_status(
@@ -578,7 +590,7 @@ impl ReconciliationStore {
             &cursor,
             replay_failures_total,
             unrecoverable_operations,
-            cursor_corrupted || log.corrupted,
+            cursor_corrupted || log_was_corrupted || log.corrupted,
         );
         Ok(ReplayOutcome {
             cursor,
@@ -628,10 +640,10 @@ impl ReconciliationStore {
         Ok(false)
     }
 
-    fn sanitize_log_and_quarantine_corruption(&self) -> StorageResult<()> {
+    fn sanitize_log_and_quarantine_corruption(&self) -> StorageResult<bool> {
         let path = EnvironmentPaths::reconciliation_log_file(&self.storage_root);
         if !path.exists() {
-            return Ok(());
+            return Ok(false);
         }
         let raw = fs::read_to_string(&path)?;
         let mut valid_lines = Vec::new();
@@ -655,7 +667,7 @@ impl ReconciliationStore {
             };
             atomic_write(path, rewritten.as_bytes())?;
         }
-        Ok(())
+        Ok(corrupted)
     }
 
     fn quarantine_raw_line(&self, reason: &str, raw_line: &str) -> StorageResult<()> {
@@ -874,10 +886,11 @@ fn build_diagnostics(
         unrecoverable_operations: unrecoverable_operations.max(unique_skipped.len()),
         last_replayed_intent: cursor.last_applied_intent.clone(),
         reconciliation_log_size_bytes: log.size_bytes,
-        replay_cursor_corrupted: corrupted && cursor.replay_status.is_none(),
-        reconciliation_log_corrupted: log.corrupted,
+        replay_cursor_corrupted: cursor.replay_cursor_corrupted
+            || (corrupted && cursor.replay_status.is_none()),
+        reconciliation_log_corrupted: cursor.reconciliation_log_corrupted || log.corrupted,
         replay_incomplete: !pending.is_empty(),
-        destructive_replay_blocked: destructive_pending,
+        destructive_replay_blocked: cursor.destructive_replay_blocked || destructive_pending,
         unrecoverable_pending_intents: unrecoverable_pending,
     }
 }
