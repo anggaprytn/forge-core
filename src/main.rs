@@ -63,6 +63,8 @@ where
     F: FnOnce(DaemonCommand) -> Result<(), CliError>,
 {
     let parsed = ParsedArgs::parse(args)?;
+    let control_plane_remote_client = parsed.remote_client_if_logged_in()?;
+    let config_path_explicit = parsed.config_path_explicit;
     let api_credentials = if matches!(
         parsed.command,
         Command::Doctor { .. }
@@ -73,6 +75,8 @@ where
             | Command::Login { .. }
             | Command::Logout
             | Command::WhoAmI
+            | Command::ControlPlaneLeader { .. }
+            | Command::ControlPlaneLease { .. }
     ) {
         None
     } else {
@@ -101,8 +105,16 @@ where
         Command::Login { server_url } => run_login(server_url)?,
         Command::Logout => run_logout()?,
         Command::WhoAmI => run_whoami(&parsed)?,
-        Command::ControlPlaneLeader { config_path } => run_control_plane_leader(config_path)?,
-        Command::ControlPlaneLease { config_path } => run_control_plane_lease(config_path)?,
+        Command::ControlPlaneLeader { config_path } => run_control_plane_leader(
+            control_plane_remote_client,
+            config_path,
+            config_path_explicit,
+        )?,
+        Command::ControlPlaneLease { config_path } => run_control_plane_lease(
+            control_plane_remote_client,
+            config_path,
+            config_path_explicit,
+        )?,
         Command::Deploy {
             project_id,
             environment,
@@ -598,6 +610,20 @@ impl ForgeClient {
         Ok(response.status().is_success())
     }
 
+    fn get_metrics(&self) -> Result<MetricsResponse, CliError> {
+        let request = self.http.get(format!("{}/metrics", self.base_url));
+        let request = if self.token.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.token)
+        };
+        decode_raw_json(
+            request
+                .send()
+                .map_err(|err| CliError::Http(err.to_string()))?,
+        )
+    }
+
     fn send_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, CliError> {
         self.decode_response(
             request
@@ -831,6 +857,7 @@ impl std::error::Error for CliError {}
 struct ParsedArgs {
     base_url: Option<String>,
     token: Option<String>,
+    config_path_explicit: bool,
     command: Command,
 }
 
@@ -974,6 +1001,7 @@ impl ParsedArgs {
         let mut caddy_admin_url = None;
         let mut caddy_public_url = None;
         let mut metrics_url = None;
+        let mut config_path_from_flag = false;
 
         loop {
             if args.first().map(String::as_str) == Some("--url") {
@@ -997,6 +1025,7 @@ impl ParsedArgs {
                     return Err(CliError::Usage("--config requires a value".into()));
                 }
                 config_path = Some(PathBuf::from(args[1].clone()));
+                config_path_from_flag = true;
                 args.drain(0..2);
                 continue;
             }
@@ -1029,10 +1058,11 @@ impl ParsedArgs {
             break;
         }
 
+        let config_path_from_env = env::var("FORGE_CONFIG").ok().map(PathBuf::from);
         let command = parse_command(
             args,
             config_path
-                .or_else(|| env::var("FORGE_CONFIG").ok().map(PathBuf::from))
+                .or_else(|| config_path_from_env.clone())
                 .unwrap_or_else(|| PathBuf::from("forge.conf")),
             caddy_admin_url
                 .or_else(|| env::var("FORGE_CADDY_ADMIN_URL").ok())
@@ -1045,6 +1075,7 @@ impl ParsedArgs {
         Ok(Self {
             base_url,
             token,
+            config_path_explicit: config_path_from_flag || config_path_from_env.is_some(),
             command,
         })
     }
@@ -1090,6 +1121,16 @@ impl ParsedArgs {
         }
         let config = load_saved_cli_config()?;
         Ok((config.token, "config"))
+    }
+
+    fn remote_client_if_logged_in(&self) -> Result<Option<ForgeClient>, CliError> {
+        let Some(base_url) = self.resolved_server_url()? else {
+            return Ok(None);
+        };
+        let (Some(token), _) = self.resolved_token()? else {
+            return Ok(None);
+        };
+        Ok(Some(ForgeClient::new(base_url, token)))
     }
 }
 
@@ -2848,12 +2889,188 @@ struct ControlPlaneLeaderView {
     leader_node_id: Option<String>,
     leader: bool,
     lease_epoch: u64,
+    lease_age_ms: u64,
+    lease_expiry_ms: u64,
+    reconciliation_enabled: bool,
+    follower_mode: bool,
     acquired_at_unix: Option<u64>,
     expires_at_unix: Option<u64>,
     last_heartbeat_unix: Option<u64>,
 }
 
-fn run_control_plane_leader(config_path: PathBuf) -> Result<(), CliError> {
+#[derive(Debug, Serialize)]
+struct ControlPlaneLeaseView {
+    leader_node_id: Option<String>,
+    lease_epoch: u64,
+    lease_age_ms: u64,
+    lease_expiry_ms: u64,
+    acquired_at_unix: Option<u64>,
+    expires_at_unix: Option<u64>,
+    last_heartbeat_unix: Option<u64>,
+}
+
+fn run_control_plane_leader(
+    remote_client: Option<ForgeClient>,
+    config_path: PathBuf,
+    config_path_explicit: bool,
+) -> Result<(), CliError> {
+    let view = if let Some(client) = remote_client {
+        control_plane_leader_view_from_metrics(&client.get_metrics()?)
+    } else {
+        let (local_node_id, lease) =
+            load_local_control_plane_state(&config_path, config_path_explicit)?;
+        control_plane_leader_view_from_storage(&local_node_id, lease.as_ref())
+    };
+    print!("{}", render_control_plane_leader(&view));
+    Ok(())
+}
+
+fn run_control_plane_lease(
+    remote_client: Option<ForgeClient>,
+    config_path: PathBuf,
+    config_path_explicit: bool,
+) -> Result<(), CliError> {
+    let view = if let Some(client) = remote_client {
+        control_plane_lease_view_from_metrics(&client.get_metrics()?)
+    } else {
+        let (_, lease) = load_local_control_plane_state(&config_path, config_path_explicit)?;
+        control_plane_lease_view_from_storage(lease.as_ref())
+    };
+    print!("{}", render_control_plane_lease(&view));
+    Ok(())
+}
+
+fn control_plane_leader_view_from_metrics(metrics: &MetricsResponse) -> ControlPlaneLeaderView {
+    ControlPlaneLeaderView {
+        local_node_id: metrics
+            .node
+            .as_ref()
+            .map(|value| value.node_id.clone())
+            .unwrap_or_else(|| "unknown".into()),
+        leader_node_id: (!metrics.convergence_owner.is_empty())
+            .then(|| metrics.convergence_owner.clone()),
+        leader: metrics.leader,
+        lease_epoch: metrics.lease_epoch,
+        lease_age_ms: metrics.lease_age_ms,
+        lease_expiry_ms: metrics.lease_expiry_ms,
+        reconciliation_enabled: metrics.reconciliation_enabled,
+        follower_mode: metrics.follower_mode,
+        acquired_at_unix: None,
+        expires_at_unix: None,
+        last_heartbeat_unix: None,
+    }
+}
+
+fn control_plane_leader_view_from_storage(
+    local_node_id: &str,
+    lease: Option<&PersistedLeaderLease>,
+) -> ControlPlaneLeaderView {
+    let now_unix = now_unix();
+    ControlPlaneLeaderView {
+        local_node_id: local_node_id.into(),
+        leader_node_id: lease.map(|value| value.leader_node_id.clone()),
+        leader: lease.is_some_and(|value| value.leader_node_id == local_node_id),
+        lease_epoch: lease.map(|value| value.lease_epoch).unwrap_or(0),
+        lease_age_ms: lease_age_ms(lease, now_unix),
+        lease_expiry_ms: lease_expiry_ms(lease, now_unix),
+        reconciliation_enabled: lease.is_some_and(|value| {
+            value.leader_node_id == local_node_id && value.expires_at_unix > now_unix
+        }),
+        follower_mode: lease.is_some_and(|value| {
+            value.leader_node_id != local_node_id && value.expires_at_unix > now_unix
+        }),
+        acquired_at_unix: lease.map(|value| value.acquired_at_unix),
+        expires_at_unix: lease.map(|value| value.expires_at_unix),
+        last_heartbeat_unix: lease.map(|value| value.last_heartbeat_unix),
+    }
+}
+
+fn control_plane_lease_view_from_metrics(metrics: &MetricsResponse) -> ControlPlaneLeaseView {
+    ControlPlaneLeaseView {
+        leader_node_id: (!metrics.convergence_owner.is_empty())
+            .then(|| metrics.convergence_owner.clone()),
+        lease_epoch: metrics.lease_epoch,
+        lease_age_ms: metrics.lease_age_ms,
+        lease_expiry_ms: metrics.lease_expiry_ms,
+        acquired_at_unix: None,
+        expires_at_unix: None,
+        last_heartbeat_unix: None,
+    }
+}
+
+fn control_plane_lease_view_from_storage(
+    lease: Option<&PersistedLeaderLease>,
+) -> ControlPlaneLeaseView {
+    let now_unix = now_unix();
+    ControlPlaneLeaseView {
+        leader_node_id: lease.map(|value| value.leader_node_id.clone()),
+        lease_epoch: lease.map(|value| value.lease_epoch).unwrap_or(0),
+        lease_age_ms: lease_age_ms(lease, now_unix),
+        lease_expiry_ms: lease_expiry_ms(lease, now_unix),
+        acquired_at_unix: lease.map(|value| value.acquired_at_unix),
+        expires_at_unix: lease.map(|value| value.expires_at_unix),
+        last_heartbeat_unix: lease.map(|value| value.last_heartbeat_unix),
+    }
+}
+
+fn render_control_plane_leader(view: &ControlPlaneLeaderView) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("local_node_id: {}\n", view.local_node_id));
+    output.push_str(&format!(
+        "leader_node_id: {}\n",
+        view.leader_node_id.as_deref().unwrap_or("none")
+    ));
+    output.push_str(&format!("leader: {}\n", view.leader));
+    output.push_str(&format!("lease_epoch: {}\n", view.lease_epoch));
+    output.push_str(&format!("lease_age_ms: {}\n", view.lease_age_ms));
+    output.push_str(&format!("lease_expiry_ms: {}\n", view.lease_expiry_ms));
+    output.push_str(&format!(
+        "reconciliation_enabled: {}\n",
+        view.reconciliation_enabled
+    ));
+    output.push_str(&format!("follower_mode: {}\n", view.follower_mode));
+    if let Some(value) = view.acquired_at_unix {
+        output.push_str(&format!("acquired_at_unix: {value}\n"));
+    }
+    if let Some(value) = view.expires_at_unix {
+        output.push_str(&format!("expires_at_unix: {value}\n"));
+    }
+    if let Some(value) = view.last_heartbeat_unix {
+        output.push_str(&format!("last_heartbeat_unix: {value}\n"));
+    }
+    output
+}
+
+fn render_control_plane_lease(view: &ControlPlaneLeaseView) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "leader_node_id: {}\n",
+        view.leader_node_id.as_deref().unwrap_or("none")
+    ));
+    output.push_str(&format!("lease_epoch: {}\n", view.lease_epoch));
+    output.push_str(&format!("lease_age_ms: {}\n", view.lease_age_ms));
+    output.push_str(&format!("lease_expiry_ms: {}\n", view.lease_expiry_ms));
+    if let Some(value) = view.acquired_at_unix {
+        output.push_str(&format!("acquired_at_unix: {value}\n"));
+    }
+    if let Some(value) = view.expires_at_unix {
+        output.push_str(&format!("expires_at_unix: {value}\n"));
+    }
+    if let Some(value) = view.last_heartbeat_unix {
+        output.push_str(&format!("last_heartbeat_unix: {value}\n"));
+    }
+    output
+}
+
+fn load_local_control_plane_state(
+    config_path: &Path,
+    config_path_explicit: bool,
+) -> Result<(String, Option<PersistedLeaderLease>), CliError> {
+    if !config_path_explicit && !config_path.exists() {
+        return Err(CliError::Usage(
+            "missing config path; use --config /etc/forge/forge.conf".into(),
+        ));
+    }
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let local_node = NodeMetadataStore::new(&config.storage_root)
@@ -2863,28 +3080,26 @@ fn run_control_plane_leader(config_path: PathBuf) -> Result<(), CliError> {
     let lease = LeaderLeaseStore::new(&config.storage_root)
         .load()
         .map_err(|err| CliError::Usage(err.to_string()))?;
-    let view = ControlPlaneLeaderView {
-        local_node_id: local_node.node_id.clone(),
-        leader_node_id: lease.as_ref().map(|value| value.leader_node_id.clone()),
-        leader: lease
-            .as_ref()
-            .is_some_and(|value| value.leader_node_id == local_node.node_id),
-        lease_epoch: lease.as_ref().map(|value| value.lease_epoch).unwrap_or(0),
-        acquired_at_unix: lease.as_ref().map(|value| value.acquired_at_unix),
-        expires_at_unix: lease.as_ref().map(|value| value.expires_at_unix),
-        last_heartbeat_unix: lease.as_ref().map(|value| value.last_heartbeat_unix),
-    };
-    print_json(&view)
+    Ok((local_node.node_id, lease))
 }
 
-fn run_control_plane_lease(config_path: PathBuf) -> Result<(), CliError> {
-    let config = DaemonConfig::load_from_file(config_path)
-        .map_err(|err| CliError::Usage(err.to_string()))?;
-    let lease = LeaderLeaseStore::new(&config.storage_root)
-        .load()
-        .map_err(|err| CliError::Usage(err.to_string()))?
-        .unwrap_or_default();
-    print_json(&lease)
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn lease_age_ms(lease: Option<&PersistedLeaderLease>, now_unix: u64) -> u64 {
+    lease
+        .map(|value| now_unix.saturating_sub(value.last_heartbeat_unix) * 1_000)
+        .unwrap_or(0)
+}
+
+fn lease_expiry_ms(lease: Option<&PersistedLeaderLease>, now_unix: u64) -> u64 {
+    lease
+        .map(|value| value.expires_at_unix.saturating_sub(now_unix) * 1_000)
+        .unwrap_or(0)
 }
 
 fn require_local_leader(storage_root: &Path) -> Result<PersistedLeaderLease, CliError> {

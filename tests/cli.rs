@@ -10,6 +10,8 @@ use std::{env, fs};
 use serde_json::Value;
 use serde_yaml::Value as YamlValue;
 
+use forge_core::storage::{LeaderLeaseStore, NodeMetadataStore};
+
 #[derive(Debug, Clone)]
 struct CapturedRequest {
     method: String,
@@ -947,6 +949,142 @@ fn bench_diagnostics_completes_under_timeout() {
     assert!(output.status.success(), "{output:?}");
 }
 
+#[test]
+fn control_plane_leader_uses_remote_api_when_logged_in() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":0,"convergence_failures_total":0,"docker_probe_latency_ms":8,"caddy_probe_latency_ms":6,"leader":true,"lease_epoch":1,"lease_age_ms":12,"lease_expiry_ms":3456,"convergence_owner":"node-a","reconciliation_enabled":true,"follower_mode":false,"node":{"node_id":"node-a","booted_at_unix":1779320500,"hostname":"forge-a","capabilities":["control_plane"]},"docker":{"probe_latency_ms":8,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":6,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["control-plane", "leader"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("leader: true"));
+    assert!(body.contains("local_node_id: node-a"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/metrics");
+}
+
+#[test]
+fn control_plane_lease_uses_remote_api_when_logged_in() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":0,"convergence_failures_total":0,"docker_probe_latency_ms":8,"caddy_probe_latency_ms":6,"leader":true,"lease_epoch":7,"lease_age_ms":44,"lease_expiry_ms":9000,"convergence_owner":"node-b","reconciliation_enabled":true,"follower_mode":false,"docker":{"probe_latency_ms":8,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":6,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["control-plane", "lease"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("lease_epoch: 7"));
+    assert!(body.contains("leader_node_id: node-b"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/metrics");
+}
+
+#[test]
+fn control_plane_local_missing_config_returns_helpful_error() {
+    let root = test_root("control-plane-local-missing-config-returns-helpful-error");
+    let output = run_cli_in_dir(&root, &["control-plane", "leader"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing config path; use --config /etc/forge/forge.conf"));
+    assert!(!stderr.contains("os error 2"));
+}
+
+#[test]
+fn control_plane_leader_renders_metrics_leader_state() {
+    let root = test_root("control-plane-leader-renders-metrics-leader-state");
+    let storage_root = root.join("storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let node = NodeMetadataStore::new(&storage_root)
+        .load_or_create()
+        .unwrap();
+    let lease = match LeaderLeaseStore::new(&storage_root)
+        .try_acquire_or_renew(&node.node_id, 100, 60)
+        .unwrap()
+    {
+        forge_core::storage::LeaseAcquireOutcome::Leader(lease) => lease,
+        forge_core::storage::LeaseAcquireOutcome::Follower(_) => {
+            panic!("expected local node to hold the lease")
+        }
+    };
+    let config_path = root.join("forge.conf");
+    std::fs::write(
+        &config_path,
+        format!(
+            "storage_root={}\napi_bind=127.0.0.1:8080\nbearer_token=test-token\n",
+            storage_root.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "control-plane",
+            "leader",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("leader: true"));
+    assert!(body.contains(&format!("leader_node_id: {}", lease.leader_node_id)));
+}
+
+#[test]
+fn control_plane_lease_renders_lease_epoch_and_owner() {
+    let root = test_root("control-plane-lease-renders-lease-epoch-and-owner");
+    let storage_root = root.join("storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let node = NodeMetadataStore::new(&storage_root)
+        .load_or_create()
+        .unwrap();
+    let lease = match LeaderLeaseStore::new(&storage_root)
+        .try_acquire_or_renew(&node.node_id, 100, 60)
+        .unwrap()
+    {
+        forge_core::storage::LeaseAcquireOutcome::Leader(lease) => lease,
+        forge_core::storage::LeaseAcquireOutcome::Follower(_) => {
+            panic!("expected local node to hold the lease")
+        }
+    };
+    let config_path = root.join("forge.conf");
+    std::fs::write(
+        &config_path,
+        format!(
+            "storage_root={}\napi_bind=127.0.0.1:8080\nbearer_token=test-token\n",
+            storage_root.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "control-plane",
+            "lease",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains(&format!("lease_epoch: {}", lease.lease_epoch)));
+    assert!(body.contains(&format!("leader_node_id: {}", lease.leader_node_id)));
+}
+
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)
@@ -960,6 +1098,11 @@ fn run_cli_in_dir(workdir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)
         .current_dir(workdir)
+        .env("HOME", workdir)
+        .env("XDG_CONFIG_HOME", workdir.join(".config"))
+        .env_remove("FORGE_URL")
+        .env_remove("FORGE_TOKEN")
+        .env_remove("FORGE_CONFIG")
         .output()
         .unwrap()
 }
