@@ -2473,14 +2473,22 @@ fn runtime_env_snapshot_metadata(
 }
 
 fn latest_domain_summaries(env: &EnvironmentPaths) -> Vec<ConvergenceDomainSummary> {
-    let Ok(Some(snapshot)) =
+    if let Ok(Some(snapshot)) =
         ControlPlaneSnapshotStore::new(env.clone()).latest_by_kind("runtime_snapshot")
-    else {
+    {
+        return snapshot
+            .payload
+            .get("domains")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+    }
+    let Ok(Some(checkpoint)) = ConvergenceCheckpointStore::new(env.clone()).load() else {
         return Vec::new();
     };
-    snapshot
-        .payload
-        .get("domains")
+    checkpoint
+        .extra
+        .get("convergence_domains")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
@@ -2975,11 +2983,12 @@ mod tests {
         BuildImageRequest, CreateContainerRequest, ManagedImage, RouteUpdateRequest,
     };
     use crate::storage::{
-        DiagnosticSummary, EventStore, LifecycleStore, PersistedProbeHistory,
-        PersistedProbeHistoryEntry, PersistedProbeType, PersistedRouteTargetSource,
-        PersistedRuntimeInfo, PersistedServiceRuntimeInfo, PersistedServiceState, PointerStore,
-        ProbeHistoryStore, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
-        SnapshotWriter, atomic_write,
+        ControlPlaneSnapshotStore, ConvergenceCheckpointStore, DiagnosticSummary, EventStore,
+        LifecycleStore, PersistedControlPlaneSnapshot, PersistedEnvironmentCheckpoint,
+        PersistedProbeHistory, PersistedProbeHistoryEntry, PersistedProbeType,
+        PersistedRouteTargetSource, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
+        PersistedServiceState, PointerStore, ProbeHistoryStore, RuntimeHealthState, RuntimeState,
+        RuntimeStateStore, SnapshotState, SnapshotWriter, atomic_write,
     };
 
     #[derive(Default)]
@@ -4768,6 +4777,135 @@ mod tests {
         assert!(diagnostics.latest_validation_failure.is_none());
         assert!(diagnostics.route.mismatch_reason.is_some());
         assert!(diagnostics.diagnostics_source.is_none());
+    }
+
+    #[test]
+    fn diagnostics_render_without_live_runtime() {
+        let root = test_root("diagnostics-render-without-live-runtime");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let mut docker = StubDockerRuntime::default();
+        let mut routing = StubRoutingRuntime::default();
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.project_id, "api");
+        assert_eq!(diagnostics.environment, "staging");
+        assert_eq!(
+            diagnostics
+                .runtime_env_snapshot
+                .as_ref()
+                .map(|v| v.generation),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn diagnostics_reports_snapshot_source() {
+        let root = test_root("diagnostics-reports-snapshot-source");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        ControlPlaneSnapshotStore::new(env.clone())
+            .append(
+                &PersistedControlPlaneSnapshot {
+                    schema_version: 1,
+                    snapshot_kind: "runtime_snapshot".into(),
+                    project_id: "api".into(),
+                    environment: "staging".into(),
+                    cycle_id: "cycle-7".into(),
+                    created_at_unix: 7,
+                    generation: Some(7),
+                    payload: serde_json::json!({
+                        "domains": [{
+                            "domain": "metrics_refresh",
+                            "status": "healthy",
+                            "duration_ms": 0
+                        }]
+                    }),
+                },
+                12,
+            )
+            .unwrap();
+        let diagnostics = DiagnosticsStore::new(env, 7);
+        diagnostics
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some("dep-7".into()),
+                failure_stage: "runtime".into(),
+                failure_reason: "probe failed".into(),
+                blocking_reason: None,
+                container_name: "staging-api-gen-7".into(),
+                failed_service_name: None,
+                blocking_service_name: None,
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime::default();
+        let mut routing = StubRoutingRuntime::default();
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(diagnostics.diagnostics_source.is_some());
+        assert_eq!(diagnostics.domain_summaries.len(), 1);
+    }
+
+    #[test]
+    fn domain_metrics_are_persisted_to_checkpoint() {
+        let root = test_root("status-domain-metrics-are-persisted-to-checkpoint");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        ConvergenceCheckpointStore::new(env.clone())
+            .save(&PersistedEnvironmentCheckpoint {
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                checkpointed_at_unix: 7,
+                last_successful_convergence_unix: Some(7),
+                last_convergence_duration_ms: 10,
+                last_convergence_generation: Some(7),
+                last_convergence_error: None,
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Healthy,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                readyz_reasons: Vec::new(),
+                extra: BTreeMap::from([(
+                    "convergence_domains".into(),
+                    serde_json::json!([{
+                        "domain": "metrics_refresh",
+                        "status": "healthy",
+                        "duration_ms": 0
+                    }]),
+                )]),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime::default();
+        let mut routing = StubRoutingRuntime::default();
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.domain_summaries.len(), 1);
+        assert_eq!(diagnostics.domain_summaries[0].domain, "metrics_refresh");
     }
 
     #[test]

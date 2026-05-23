@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use std::{env, fs};
 
 use serde_json::Value;
@@ -912,6 +913,38 @@ fn bench_does_not_expect_api_envelope_for_control_plane_endpoints() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("missing field data"));
+}
+
+#[test]
+fn bench_snapshots_completes_under_timeout() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests,
+        vec![
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":0,"convergence_failures_total":0,"docker_probe_latency_ms":8,"caddy_probe_latency_ms":6,"docker":{"probe_latency_ms":8,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":6,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let started = std::time::Instant::now();
+    let output = run_cli(&url, &["bench", "snapshots", "--samples", "1"]);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn bench_diagnostics_completes_under_timeout() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests,
+        vec![
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":0,"convergence_failures_total":0,"docker_probe_latency_ms":8,"caddy_probe_latency_ms":6,"convergence_domains":[{"domain":"metrics_refresh","status":"healthy","duration_ms":0}],"docker":{"probe_latency_ms":8,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":6,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let started = std::time::Instant::now();
+    let output = run_cli(&url, &["bench", "diagnostics", "--samples", "1"]);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(output.status.success(), "{output:?}");
 }
 
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {

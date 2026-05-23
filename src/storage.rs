@@ -1659,8 +1659,14 @@ impl ControlPlaneSnapshotStore {
         paths.sort();
         let mut snapshots = Vec::new();
         for path in paths {
-            if let Some(snapshot) = load_json_file(path)? {
-                snapshots.push(snapshot);
+            match load_json_file(&path) {
+                Ok(Some(snapshot)) => snapshots.push(snapshot),
+                Ok(None) => {}
+                Err(err) => eprintln!(
+                    "warning: ignoring malformed control plane snapshot {}: {}",
+                    path.display(),
+                    err
+                ),
             }
         }
         Ok(snapshots)
@@ -1707,10 +1713,12 @@ impl NodeMetadataStore {
         }
     }
 
+    pub fn load(&self) -> StorageResult<Option<PersistedNodeMetadata>> {
+        load_json_file(EnvironmentPaths::node_metadata_file(&self.storage_root))
+    }
+
     pub fn load_or_create(&self) -> StorageResult<PersistedNodeMetadata> {
-        if let Some(metadata) =
-            load_json_file(EnvironmentPaths::node_metadata_file(&self.storage_root))?
-        {
+        if let Some(metadata) = self.load()? {
             return Ok(metadata);
         }
         let metadata = PersistedNodeMetadata {
@@ -1770,8 +1778,14 @@ impl OperationalJournalStore {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let parsed = serde_json::from_str(line).map_err(json_io_error)?;
-                entries.push(parsed);
+                match serde_json::from_str(line) {
+                    Ok(parsed) => entries.push(parsed),
+                    Err(err) => eprintln!(
+                        "warning: skipping malformed journal entry in {}: {}",
+                        path.display(),
+                        err
+                    ),
+                }
             }
         }
         Ok(entries)
@@ -2266,6 +2280,152 @@ pub mod snapshot_atomicity {
 
         assert!(writer.generation_dir().join("snapshot.json").exists());
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+pub mod control_plane_persistence_semantics {
+    use super::*;
+
+    #[test]
+    fn snapshot_write_is_atomic() {
+        let root = test_root("snapshot-write-is-atomic");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let store = ControlPlaneSnapshotStore::new(env.clone());
+        store
+            .append(
+                &PersistedControlPlaneSnapshot {
+                    schema_version: 1,
+                    snapshot_kind: "runtime_snapshot".into(),
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    cycle_id: "cycle-1".into(),
+                    created_at_unix: 1,
+                    generation: Some(1),
+                    payload: serde_json::json!({"ok": true}),
+                },
+                12,
+            )
+            .unwrap();
+
+        let dir = env.control_plane_snapshots_dir();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp"))
+        );
+    }
+
+    #[test]
+    fn corrupted_snapshot_ignored_and_rebuilt() {
+        let root = test_root("corrupted-snapshot-ignored-and-rebuilt");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        fs::create_dir_all(env.control_plane_snapshots_dir()).unwrap();
+        fs::write(
+            env.control_plane_snapshots_dir()
+                .join("1-runtime_snapshot.json"),
+            "{ invalid json",
+        )
+        .unwrap();
+        let store = ControlPlaneSnapshotStore::new(env.clone());
+        assert!(store.latest_by_kind("runtime_snapshot").unwrap().is_none());
+
+        store
+            .append(
+                &PersistedControlPlaneSnapshot {
+                    schema_version: 1,
+                    snapshot_kind: "runtime_snapshot".into(),
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    cycle_id: "cycle-2".into(),
+                    created_at_unix: 2,
+                    generation: Some(2),
+                    payload: serde_json::json!({"rebuilt": true}),
+                },
+                12,
+            )
+            .unwrap();
+
+        let latest = store.latest_by_kind("runtime_snapshot").unwrap().unwrap();
+        assert_eq!(latest.generation, Some(2));
+    }
+
+    #[test]
+    fn snapshot_gc_preserves_recent_snapshots() {
+        let root = test_root("snapshot-gc-preserves-recent-snapshots");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let store = ControlPlaneSnapshotStore::new(env.clone());
+        for created_at_unix in 1..=5 {
+            store
+                .append(
+                    &PersistedControlPlaneSnapshot {
+                        schema_version: 1,
+                        snapshot_kind: "runtime_snapshot".into(),
+                        project_id: "api".into(),
+                        environment: "production".into(),
+                        cycle_id: format!("cycle-{created_at_unix}"),
+                        created_at_unix,
+                        generation: Some(created_at_unix),
+                        payload: serde_json::json!({ "generation": created_at_unix }),
+                    },
+                    2,
+                )
+                .unwrap();
+        }
+
+        let generations = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|snapshot| snapshot.generation.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(generations, vec![4, 5]);
+    }
+
+    #[test]
+    fn malformed_journal_entry_skipped() {
+        let root = test_root("storage-malformed-journal-entry-skipped");
+        let path = EnvironmentPaths::operational_journal_file(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            concat!(
+                "{\"schema_version\":1,\"timestamp_unix\":1,\"event_type\":\"ok\",\"payload\":{}}\n",
+                "{ invalid json\n"
+            ),
+        )
+        .unwrap();
+
+        let entries = OperationalJournalStore::new(root).read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "ok");
+    }
+
+    #[test]
+    fn journal_rotation_keeps_recent_entries() {
+        let root = test_root("journal-rotation-keeps-recent-entries");
+        let journal = OperationalJournalStore::new(&root);
+        for index in 0..2000 {
+            journal
+                .append(&OperationalJournalEntry {
+                    schema_version: 1,
+                    timestamp_unix: current_unix_timestamp(),
+                    event_type: "gc_action".into(),
+                    project_id: None,
+                    environment: None,
+                    generation: None,
+                    payload: serde_json::json!({
+                        "index": index,
+                        "padding": "x".repeat(256),
+                    }),
+                })
+                .unwrap();
+        }
+
+        let entries = journal.read_all().unwrap();
+        assert!(entries.iter().any(|entry| entry.payload["index"] == 1999));
     }
 }
 

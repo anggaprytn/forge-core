@@ -44,6 +44,7 @@ use crate::storage::{
     PersistedNodeMetadata, PersistedRuntimeInfo, PersistedServiceRuntimeInfo, RuntimeHealthState,
     RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
 };
+use serde_json::Value;
 
 pub const READYZ_CACHE_STALE_AFTER_MS: u64 = 5_000;
 pub const READYZ_HANDLER_TIMEOUT_MS: u64 = 500;
@@ -382,7 +383,9 @@ where
     ) -> Self {
         let startup_steps = vec![StartupStep::ConfigLoaded];
         let node_metadata = NodeMetadataStore::new(&config.storage_root)
-            .load_or_create()
+            .load()
+            .ok()
+            .flatten()
             .unwrap_or_default();
         Self {
             config,
@@ -419,6 +422,9 @@ where
                 Ok(())
             }
             BootstrapState::Ready => {
+                self.node_metadata = NodeMetadataStore::new(&self.config.storage_root)
+                    .load_or_create()
+                    .unwrap_or_default();
                 self.state = DaemonState::Recovering;
                 self.startup_steps.push(StartupStep::BootstrapReady);
                 let _ = OperationalJournalStore::new(&self.config.storage_root).append(
@@ -1088,7 +1094,10 @@ where
                 })
                 .map(|reason| reason.message.clone())
                 .collect(),
-            extra: BTreeMap::new(),
+            extra: BTreeMap::from([(
+                "convergence_domains".into(),
+                serde_json::to_value(&self.convergence_domains).unwrap_or(Value::Array(Vec::new())),
+            )]),
         };
         let _ = ConvergenceCheckpointStore::new(env.clone()).save(&checkpoint);
         self.persist_runtime_truth_snapshots(env, &checkpoint);
@@ -3224,7 +3233,7 @@ pub mod daemon_readyz_cache_behavior {
         );
         daemon.start().unwrap();
 
-        let readiness = daemon.readyz_response();
+        let readiness = daemon.readyz_cache_snapshot().response;
         assert_eq!(readiness.status, "degraded");
         assert_eq!(readiness.reasons.len(), 64);
     }
@@ -4349,6 +4358,26 @@ mod daemon_control_plane_durability {
     }
 
     #[test]
+    fn checkpoint_corruption_does_not_block_daemon_startup() {
+        let root = test_root("checkpoint-corruption-does-not-block-daemon-startup");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        std::fs::write(env.checkpoint_file(), "{ invalid json").unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.state(), &DaemonState::Ready);
+        assert!(daemon.readyz_cache_snapshot().updated_at_unix_ms > 0);
+    }
+
+    #[test]
     fn runtime_snapshot_written_after_convergence() {
         let root = test_root("runtime-snapshot-written-after-convergence");
         seed_project(&root);
@@ -4379,6 +4408,43 @@ mod daemon_control_plane_durability {
     }
 
     #[test]
+    fn corrupted_snapshot_rebuilds_cleanly() {
+        let root = test_root("corrupted-snapshot-rebuilds-cleanly");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        std::fs::create_dir_all(env.control_plane_snapshots_dir()).unwrap();
+        std::fs::write(
+            env.control_plane_snapshots_dir()
+                .join("1-runtime_snapshot.json"),
+            "{ invalid json",
+        )
+        .unwrap();
+        RuntimeStateStore::new(env.clone())
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Healthy,
+                ..crate::storage::RuntimeState::default()
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let latest = ControlPlaneSnapshotStore::new(env)
+            .latest_by_kind("runtime_snapshot")
+            .unwrap()
+            .expect("runtime snapshot should be rebuilt");
+        assert_eq!(latest.generation, Some(7));
+    }
+
+    #[test]
     fn breaker_transition_written_to_journal() {
         let root = test_root("breaker-transition-written-to-journal");
         seed_project(&root);
@@ -4399,6 +4465,25 @@ mod daemon_control_plane_durability {
                 .iter()
                 .any(|entry| entry.event_type == "breaker_transition")
         );
+    }
+
+    #[test]
+    fn malformed_journal_entry_skipped() {
+        let root = test_root("malformed-journal-entry-skipped");
+        let path = EnvironmentPaths::operational_journal_file(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"schema_version\":1,\"timestamp_unix\":1,\"event_type\":\"ok\",\"payload\":{}}\n",
+                "{ invalid json\n"
+            ),
+        )
+        .unwrap();
+
+        let entries = OperationalJournalStore::new(root).read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "ok");
     }
 
     #[test]
@@ -4451,5 +4536,182 @@ mod daemon_control_plane_durability {
         }
         let entries = journal.read_all().unwrap();
         assert!(entries.iter().any(|entry| entry.payload["index"] == 1999));
+    }
+
+    #[test]
+    fn journal_write_failure_does_not_abort_convergence() {
+        let root = test_root("journal-write-failure-does-not-abort-convergence");
+        seed_project(&root);
+        std::fs::create_dir_all(EnvironmentPaths::operational_journal_file(&root)).unwrap();
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        RuntimeStateStore::new(env.clone())
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Degraded,
+                ..crate::storage::RuntimeState::default()
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let checkpoint = ConvergenceCheckpointStore::new(env).load().unwrap();
+        assert!(checkpoint.is_some());
+        assert_eq!(daemon.state(), &DaemonState::Ready);
+    }
+
+    #[test]
+    fn journal_write_failure_degrades_observability_not_daemon() {
+        journal_write_failure_does_not_abort_convergence();
+    }
+
+    #[test]
+    fn failed_caddy_domain_does_not_block_metrics_refresh() {
+        let root = test_root("failed-caddy-domain-does-not-block-metrics-refresh");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            UnavailableRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let domains = daemon.control_plane_snapshot().metrics.convergence_domains;
+        assert!(domains.iter().any(|domain| {
+            domain.domain == "routing_reconciliation" && domain.status == "degraded"
+        }));
+        assert!(
+            domains
+                .iter()
+                .any(|domain| { domain.domain == "metrics_refresh" && domain.status == "healthy" })
+        );
+    }
+
+    #[test]
+    fn convergence_domains_run_independently() {
+        let root = test_root("convergence-domains-run-independently");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        RuntimeStateStore::new(env)
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(2),
+                health_state: RuntimeHealthState::Degraded,
+                last_error_code: Some("tcp_unreachable".into()),
+                ..crate::storage::RuntimeState::default()
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let domains = daemon.control_plane_snapshot().metrics.convergence_domains;
+        assert!(domains.iter().any(|domain| {
+            domain.domain == "runtime_container_reconciliation" && domain.status == "degraded"
+        }));
+        assert!(domains.iter().any(|domain| {
+            domain.domain == "routing_reconciliation" && domain.status == "healthy"
+        }));
+    }
+
+    #[test]
+    fn domain_failure_recorded_without_aborting_convergence() {
+        let root = test_root("domain-failure-recorded-without-aborting-convergence");
+        let fail_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            SwitchableDockerRuntime { fail_probe },
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert_eq!(daemon.state(), &DaemonState::Ready);
+        assert!(
+            daemon
+                .readyz_cache_snapshot()
+                .response
+                .reasons
+                .iter()
+                .any(|reason| reason.project_id == "_control_plane")
+        );
+    }
+
+    #[test]
+    fn domain_metrics_are_persisted_to_checkpoint() {
+        let root = test_root("domain-metrics-are-persisted-to-checkpoint");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        RuntimeStateStore::new(env.clone())
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(3),
+                health_state: RuntimeHealthState::Healthy,
+                ..crate::storage::RuntimeState::default()
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let checkpoint = ConvergenceCheckpointStore::new(env)
+            .load()
+            .unwrap()
+            .expect("checkpoint should exist");
+        let domains = checkpoint.extra["convergence_domains"]
+            .as_array()
+            .expect("domain summaries should be persisted");
+        assert!(!domains.is_empty());
+    }
+
+    #[test]
+    fn daemon_survives_missing_docker() {
+        let root = test_root("daemon-survives-missing-docker");
+        let fail_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            SwitchableDockerRuntime { fail_probe },
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert_eq!(daemon.state(), &DaemonState::Ready);
+        assert_eq!(daemon.readyz_cache_snapshot().response.status, "degraded");
+    }
+
+    #[test]
+    fn daemon_survives_caddy_outage() {
+        let root = test_root("daemon-survives-caddy-outage");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            UnavailableRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert_eq!(daemon.state(), &DaemonState::Ready);
+        assert_eq!(daemon.readyz_cache_snapshot().response.status, "degraded");
     }
 }

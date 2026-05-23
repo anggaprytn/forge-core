@@ -4175,6 +4175,35 @@ pub mod http_readyz_cache_latency {
     }
 
     #[tokio::test]
+    async fn readyz_does_not_read_checkpoint_files_on_request_path() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: Default::default(),
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn stale_convergence_degrades_readyz_without_blocking() {
         let state = build_cached_only_state(ControlPlaneSnapshot {
             readyz: DaemonReadyzCache {
@@ -4416,6 +4445,41 @@ pub mod metrics_endpoint_exposes_cached_json {
         let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(metrics.queue_depth, 7);
     }
+
+    #[tokio::test]
+    async fn metrics_does_not_read_snapshot_files_on_request_path() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                queue_depth: 11,
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.queue_depth, 11);
+    }
 }
 
 #[cfg(test)]
@@ -4557,6 +4621,7 @@ pub mod deployment_diagnostics_endpoints {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use serde_json::Value;
+    use std::time::{Duration, Instant};
     use tower::util::ServiceExt;
 
     fn write_multiservice_logs_fixture(root: &std::path::Path, include_service_logs: bool) {
@@ -4890,6 +4955,32 @@ pub mod deployment_diagnostics_endpoints {
             json["data"]["services"][0]["lines"][0],
             "service logs unavailable for this generation"
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_snapshot_mode_is_bounded() {
+        let (state, root) = build_state_with_root(true);
+        write_multiservice_logs_fixture(&root, true);
+        let app = router(state);
+
+        let started = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments/staging/diagnostics")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
     }
 }
 
