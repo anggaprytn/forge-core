@@ -349,6 +349,10 @@ pub struct EnvironmentDiagnostics {
     pub orphaned_state_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volume_repair_events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_volume_repair_events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub historical_volume_repair_events: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_lifecycle_state: Option<DeploymentLifecycleState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -377,6 +381,10 @@ pub struct EnvironmentDiagnostics {
     pub backup_restore_events: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_drift_repairs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_policy_drift_repairs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub historical_policy_drift_repairs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -51,6 +51,12 @@ const PROBE_MIN_FAILURES_FOR_FLAPPING: usize = 2;
 const PROBE_MIN_ALTERNATIONS_FOR_FLAPPING: usize = 3;
 const PROBE_SUCCESS_RATE_THRESHOLD: f64 = 0.75;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RepairEventBuckets {
+    current: Vec<String>,
+    historical: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ProbeFlappingAssessment {
     flapping: bool,
@@ -1149,6 +1155,8 @@ where
         .into_iter()
         .flatten()
         .collect::<Vec<_>>(),
+        truth.active_generation,
+        &status_value,
     )?;
     let visible_lifecycle = truth
         .active_lifecycle
@@ -1198,6 +1206,12 @@ where
     let backup_restore_events = recent_backup_restore_events(
         &env,
         &truth.active_generation.into_iter().collect::<Vec<_>>(),
+    )?;
+    let policy_drift_repairs = recent_policy_drift_repairs(
+        &env,
+        &truth.active_generation.into_iter().collect::<Vec<_>>(),
+        truth.active_generation,
+        &status_value,
     )?;
     Ok(EnvironmentDiagnostics {
         project_id: project_id.to_string(),
@@ -1264,7 +1278,9 @@ where
         env_drift,
         recent_secret_mutations,
         orphaned_state_warnings: orphaned_state_warnings.clone(),
-        volume_repair_events,
+        volume_repair_events: volume_repair_events.current.clone(),
+        current_volume_repair_events: volume_repair_events.current,
+        historical_volume_repair_events: volume_repair_events.historical,
         active_lifecycle_state: visible_lifecycle.map(|lifecycle| lifecycle.state.clone()),
         retention_role: truth.active_generation.map(|_| RetentionRole::Current),
         validation_summary,
@@ -1289,10 +1305,9 @@ where
         active_restore,
         state_restore_warnings: orphaned_state_warnings.clone(),
         backup_restore_events,
-        policy_drift_repairs: recent_policy_drift_repairs(
-            &env,
-            &truth.active_generation.into_iter().collect::<Vec<_>>(),
-        )?,
+        policy_drift_repairs: policy_drift_repairs.current.clone(),
+        current_policy_drift_repairs: policy_drift_repairs.current,
+        historical_policy_drift_repairs: policy_drift_repairs.historical,
     })
 }
 
@@ -2085,12 +2100,28 @@ fn orphaned_state_warnings(services: &[ServiceRuntimeStatus]) -> Vec<String> {
         .collect()
 }
 
-fn recent_volume_repair_events(
-    env: &EnvironmentPaths,
+fn normalize_repair_event_line(line: &str) -> String {
+    line.replace("restart_policy: \"\"", "restart_policy: no")
+        .replace("restart_policy=\"\"", "restart_policy=no")
+}
+
+fn bucket_repair_events(
+    env_status: &str,
+    active_generation: Option<u64>,
     generations: &[u64],
-) -> Result<Vec<String>, ProjectStatusError> {
-    let mut events = Vec::new();
-    let mut seen = BTreeSet::new();
+    matches_event: impl Fn(&EventRecord) -> bool,
+    render_default_reason: impl Fn(u64) -> String,
+    env: &EnvironmentPaths,
+) -> Result<RepairEventBuckets, ProjectStatusError> {
+    if env_status == "healthy" {
+        return Ok(RepairEventBuckets::default());
+    }
+
+    let mut current = Vec::new();
+    let mut historical = Vec::new();
+    let mut seen_current = BTreeSet::new();
+    let mut seen_historical = BTreeSet::new();
+
     for generation in generations {
         let path = env.generation_dir(*generation).join("events.jsonl");
         if !path.exists() {
@@ -2107,23 +2138,55 @@ fn recent_volume_repair_events(
                     err.to_string(),
                 )))
             })?;
-            if event.event_type == "VOLUME_ATTACHMENT_REPAIRED" {
-                let rendered = format!(
-                    "historical gen-{}: {}",
-                    generation,
-                    event.reason.unwrap_or_else(|| {
-                        format!("generation {} volume attachment repaired", generation)
-                    })
-                );
-                if seen.insert(rendered.clone()) {
-                    events.push(rendered);
+            if !matches_event(&event) {
+                continue;
+            }
+
+            let rendered = normalize_repair_event_line(&format!(
+                "gen-{}: {}",
+                generation,
+                event
+                    .reason
+                    .unwrap_or_else(|| render_default_reason(*generation))
+            ));
+            if Some(*generation) == active_generation {
+                if seen_current.insert(rendered.clone()) {
+                    current.push(rendered);
+                }
+            } else {
+                let rendered = format!("historical {rendered}");
+                if seen_historical.insert(rendered.clone()) {
+                    historical.push(rendered);
                 }
             }
         }
     }
-    events.reverse();
-    events.truncate(5);
-    Ok(events)
+
+    current.reverse();
+    current.truncate(5);
+    historical.reverse();
+    historical.truncate(5);
+
+    Ok(RepairEventBuckets {
+        current,
+        historical,
+    })
+}
+
+fn recent_volume_repair_events(
+    env: &EnvironmentPaths,
+    generations: &[u64],
+    active_generation: Option<u64>,
+    env_status: &str,
+) -> Result<RepairEventBuckets, ProjectStatusError> {
+    bucket_repair_events(
+        env_status,
+        active_generation,
+        generations,
+        |event| event.event_type == "VOLUME_ATTACHMENT_REPAIRED",
+        |generation| format!("generation {} volume attachment repaired", generation),
+        env,
+    )
 }
 
 fn recent_backup_restore_events(
@@ -2163,42 +2226,17 @@ fn recent_backup_restore_events(
 fn recent_policy_drift_repairs(
     env: &EnvironmentPaths,
     generations: &[u64],
-) -> Result<Vec<String>, ProjectStatusError> {
-    let mut events = Vec::new();
-    let mut seen = BTreeSet::new();
-    for generation in generations {
-        let path = env.generation_dir(*generation).join("events.jsonl");
-        if !path.exists() {
-            continue;
-        }
-        let raw = fs::read_to_string(path)?;
-        for line in raw.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event = serde_json::from_str::<EventRecord>(line).map_err(|err| {
-                ProjectStatusError::Storage(StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    err.to_string(),
-                )))
-            })?;
-            if event.event_type == "RUNTIME_POLICY_DRIFT_REPAIRED" {
-                let rendered = format!(
-                    "historical gen-{}: {}",
-                    generation,
-                    event.reason.unwrap_or_else(|| {
-                        format!("generation {} runtime policy drift repaired", generation)
-                    })
-                );
-                if seen.insert(rendered.clone()) {
-                    events.push(rendered);
-                }
-            }
-        }
-    }
-    events.reverse();
-    events.truncate(5);
-    Ok(events)
+    active_generation: Option<u64>,
+    env_status: &str,
+) -> Result<RepairEventBuckets, ProjectStatusError> {
+    bucket_repair_events(
+        env_status,
+        active_generation,
+        generations,
+        |event| event.event_type == "RUNTIME_POLICY_DRIFT_REPAIRED",
+        |generation| format!("generation {} runtime policy drift repaired", generation),
+        env,
+    )
 }
 
 fn list_generation_numbers(env: &EnvironmentPaths) -> Result<Vec<u64>, ProjectStatusError> {
@@ -6347,17 +6385,47 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_label_repair_events_as_historical_and_deduplicate_volume_lines() {
-        let root = test_root("diagnostics-label-repair-events-as-historical-and-deduplicate");
+    fn diagnostics_api_hides_historical_policy_repairs_for_healthy_env() {
+        let root = test_root("diagnostics-api-hides-historical-policy-repairs-for-healthy-env");
         register_project(&root, "api", "api.example.com");
         write_generation(&root, 7);
         let env = EnvironmentPaths::new(&root, "api", "staging");
         let events = EventStore::new(env.clone(), 7);
-        for event_type in [
-            "VOLUME_ATTACHMENT_REPAIRED",
-            "VOLUME_ATTACHMENT_REPAIRED",
-            "RUNTIME_POLICY_DRIFT_REPAIRED",
-        ] {
+        events
+            .append(&EventRecord {
+                timestamp_unix: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation: Some(7),
+                deployment_id: Some("dep-7".into()),
+                event_type: "RUNTIME_POLICY_DRIFT_REPAIRED".into(),
+                reason: Some("recreated container staging-api-gen-7".into()),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(diagnostics.policy_drift_repairs.is_empty());
+        assert!(diagnostics.current_policy_drift_repairs.is_empty());
+        assert!(diagnostics.historical_policy_drift_repairs.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_api_hides_historical_volume_repairs_for_healthy_env() {
+        let root = test_root("diagnostics-api-hides-historical-volume-repairs-for-healthy-env");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let events = EventStore::new(env.clone(), 7);
+        for _ in 0..2 {
             events
                 .append(&EventRecord {
                     timestamp_unix: 1,
@@ -6365,7 +6433,7 @@ mod tests {
                     environment: "staging".into(),
                     generation: Some(7),
                     deployment_id: Some("dep-7".into()),
-                    event_type: event_type.into(),
+                    event_type: "VOLUME_ATTACHMENT_REPAIRED".into(),
                     reason: Some("recreated container staging-api-gen-7".into()),
                 })
                 .unwrap();
@@ -6381,9 +6449,114 @@ mod tests {
             load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
                 .unwrap();
 
+        assert!(diagnostics.volume_repair_events.is_empty());
+        assert!(diagnostics.current_volume_repair_events.is_empty());
+        assert!(diagnostics.historical_volume_repair_events.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_api_keeps_current_unresolved_repairs_visible() {
+        let root = test_root("diagnostics-api-keeps-current-unresolved-repairs-visible");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let events = EventStore::new(env.clone(), 7);
+        events
+            .append(&EventRecord {
+                timestamp_unix: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation: Some(7),
+                deployment_id: Some("dep-7".into()),
+                event_type: "VOLUME_ATTACHMENT_REPAIRED".into(),
+                reason: Some(
+                    "recreated container staging-api-gen-7 due to stale volume attachment state"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        events
+            .append(&EventRecord {
+                timestamp_unix: 2,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation: Some(7),
+                deployment_id: Some("dep-7".into()),
+                event_type: "RUNTIME_POLICY_DRIFT_REPAIRED".into(),
+                reason: Some("recreated container staging-api-gen-7 to restore runtime policy PersistedRuntimePolicy { restart_policy: \"\", max_retries: None, cpu_limit: None, memory_limit_mb: None }".into()),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(ContainerInspection {
+                running: false,
+                state_status: "exited".into(),
+                ..healthy_container(7)
+            }),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.status, "degraded");
         assert_eq!(diagnostics.volume_repair_events.len(), 1);
-        assert!(diagnostics.volume_repair_events[0].starts_with("historical gen-7:"));
+        assert_eq!(diagnostics.current_volume_repair_events.len(), 1);
+        assert!(diagnostics.historical_volume_repair_events.is_empty());
+        assert!(diagnostics.volume_repair_events[0].starts_with("gen-7:"));
         assert_eq!(diagnostics.policy_drift_repairs.len(), 1);
-        assert!(diagnostics.policy_drift_repairs[0].starts_with("historical gen-7:"));
+        assert_eq!(diagnostics.current_policy_drift_repairs.len(), 1);
+        assert!(diagnostics.historical_policy_drift_repairs.is_empty());
+        assert!(diagnostics.policy_drift_repairs[0].contains("restart_policy: no"));
+        assert!(!diagnostics.policy_drift_repairs[0].contains("restart_policy: \"\""));
+    }
+
+    #[test]
+    fn diagnostics_api_does_not_expose_empty_restart_policy() {
+        let root = test_root("diagnostics-api-does-not-expose-empty-restart-policy");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let events = EventStore::new(env.clone(), 7);
+        events
+            .append(&EventRecord {
+                timestamp_unix: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                generation: Some(7),
+                deployment_id: Some("dep-7".into()),
+                event_type: "RUNTIME_POLICY_DRIFT_REPAIRED".into(),
+                reason: Some("recreated container staging-api-gen-7 to restore runtime policy PersistedRuntimePolicy { restart_policy: \"\", max_retries: None }".into()),
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(ContainerInspection {
+                running: false,
+                state_status: "exited".into(),
+                ..healthy_container(7)
+            }),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(
+            diagnostics
+                .current_policy_drift_repairs
+                .iter()
+                .all(|line| !line.contains("restart_policy: \"\""))
+        );
+        assert!(
+            diagnostics
+                .current_policy_drift_repairs
+                .iter()
+                .any(|line| line.contains("restart_policy: no"))
+        );
     }
 }

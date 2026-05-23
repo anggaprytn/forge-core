@@ -2168,9 +2168,9 @@ fn render_historical_repairs_section(diagnostics: &EnvironmentDiagnostics) -> Op
     }
 
     let entries = diagnostics
-        .policy_drift_repairs
+        .historical_policy_drift_repairs
         .iter()
-        .chain(diagnostics.volume_repair_events.iter())
+        .chain(diagnostics.historical_volume_repair_events.iter())
         .map(|entry| normalize_historical_repair_line(entry))
         .take(3)
         .collect::<Vec<_>>();
@@ -2913,6 +2913,8 @@ mod tests {
             recent_secret_mutations: Vec::new(),
             orphaned_state_warnings: Vec::new(),
             volume_repair_events: Vec::new(),
+            current_volume_repair_events: Vec::new(),
+            historical_volume_repair_events: Vec::new(),
             active_lifecycle_state: None,
             retention_role: None,
             validation_summary: None,
@@ -2927,6 +2929,8 @@ mod tests {
             state_restore_warnings: Vec::new(),
             backup_restore_events: Vec::new(),
             policy_drift_repairs: Vec::new(),
+            current_policy_drift_repairs: Vec::new(),
+            historical_policy_drift_repairs: Vec::new(),
         }
     }
 
@@ -3341,7 +3345,8 @@ mod tests {
     #[test]
     fn diagnose_healthy_environment_hides_historical_policy_repairs() {
         let mut diagnostics = diagnostics_fixture("healthy");
-        diagnostics.policy_drift_repairs = vec!["historical gen-7: restart_policy: \"\"".into()];
+        diagnostics.historical_policy_drift_repairs =
+            vec!["historical gen-7: restart_policy: \"\"".into()];
         let rendered = render_environment_diagnostics(&diagnostics);
 
         assert!(!rendered.contains("Policy Drift Repairs:"));
@@ -3351,7 +3356,7 @@ mod tests {
     #[test]
     fn diagnose_healthy_environment_hides_historical_volume_repairs() {
         let mut diagnostics = diagnostics_fixture("healthy");
-        diagnostics.volume_repair_events =
+        diagnostics.historical_volume_repair_events =
             vec!["historical gen-7: repaired empty volume set".into()];
         let rendered = render_environment_diagnostics(&diagnostics);
 
@@ -3362,7 +3367,8 @@ mod tests {
     #[test]
     fn historical_repair_output_normalizes_restart_policy() {
         let mut diagnostics = diagnostics_fixture("degraded");
-        diagnostics.policy_drift_repairs = vec!["historical gen-7: restart_policy: \"\"".into()];
+        diagnostics.historical_policy_drift_repairs =
+            vec!["historical gen-7: restart_policy: \"\"".into()];
         let rendered = render_environment_diagnostics(&diagnostics);
 
         assert!(rendered.contains("Historical Repairs:"));
