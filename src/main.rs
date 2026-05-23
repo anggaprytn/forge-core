@@ -10,11 +10,11 @@ use std::time::{Duration, SystemTime};
 
 use forge_core::api::{
     BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
-    CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
-    EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, MetricsResponse,
-    ProjectList, ProjectRecord, ProjectUpsertRequest, ReadyzResponse, RestoreLineage,
-    RetentionRole, SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus,
+    CliLoginPollResponse, CliLoginStartResponse, ClusterDiagnostics, DeploymentAccepted,
+    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
+    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
+    EventList, MetricsResponse, ProjectList, ProjectRecord, ProjectUpsertRequest, ReadyzResponse,
+    RestoreLineage, RetentionRole, SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -22,7 +22,7 @@ use forge_core::convergence::ActiveDeploymentDecider;
 use forge_core::convergence::garbage_collect;
 use forge_core::daemon::{
     Daemon, DeploymentWorkerSettings, WorkerLeadership, run_deployment_worker_loop,
-    run_readyz_refresh_loop,
+    run_heartbeat_loop, run_readyz_refresh_loop,
 };
 use forge_core::deployments::{
     ActivationMode, ExecutionConfig, FORGE_MANAGED_DOCKER_NETWORK, ValidationPolicy,
@@ -40,7 +40,9 @@ use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
-use forge_core::storage::{LeaderLeaseStore, NodeMetadataStore, PersistedLeaderLease};
+use forge_core::storage::{
+    ClusterTopologyStore, LeaderLeaseStore, NodeMetadataStore, PersistedLeaderLease,
+};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
@@ -2260,6 +2262,41 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         output.push_str("Diagnostics Source:\n");
         output.push_str(&format!("  {source}\n"));
     }
+    if diagnostics.cluster.observed_nodes > 0
+        || diagnostics.cluster.split_brain_suspected
+        || diagnostics.cluster.lease_epoch_divergence
+    {
+        output.push('\n');
+        output.push_str("Cluster:\n");
+        output.push_str(&format!(
+            "  observed_nodes: {}\n",
+            diagnostics.cluster.observed_nodes
+        ));
+        output.push_str(&format!(
+            "  active_reconcilers: {}\n",
+            diagnostics.cluster.active_reconcilers
+        ));
+        output.push_str(&format!(
+            "  cluster_size: {}\n",
+            diagnostics.cluster.cluster_size
+        ));
+        output.push_str(&format!(
+            "  local_role: {}\n",
+            diagnostics.cluster.local_role
+        ));
+        output.push_str(&format!(
+            "  heartbeat_age_ms: {}\n",
+            diagnostics.cluster.heartbeat_age_ms
+        ));
+        output.push_str(&format!(
+            "  split_brain_suspected: {}\n",
+            diagnostics.cluster.split_brain_suspected
+        ));
+        output.push_str(&format!(
+            "  lease_epoch_divergence: {}\n",
+            diagnostics.cluster.lease_epoch_divergence
+        ));
+    }
     if let Some(snapshot) = diagnostics.runtime_env_snapshot.as_ref() {
         output.push('\n');
         output.push_str("Runtime Env Snapshot:\n");
@@ -2896,6 +2933,7 @@ struct ControlPlaneLeaderView {
     acquired_at_unix: Option<u64>,
     expires_at_unix: Option<u64>,
     last_heartbeat_unix: Option<u64>,
+    cluster: ClusterDiagnostics,
 }
 
 #[derive(Debug, Serialize)]
@@ -2907,6 +2945,7 @@ struct ControlPlaneLeaseView {
     acquired_at_unix: Option<u64>,
     expires_at_unix: Option<u64>,
     last_heartbeat_unix: Option<u64>,
+    cluster: ClusterDiagnostics,
 }
 
 fn run_control_plane_leader(
@@ -2917,9 +2956,9 @@ fn run_control_plane_leader(
     let view = if let Some(client) = remote_client {
         control_plane_leader_view_from_metrics(&client.get_metrics()?)
     } else {
-        let (local_node_id, lease) =
+        let (local_node_id, lease, cluster) =
             load_local_control_plane_state(&config_path, config_path_explicit)?;
-        control_plane_leader_view_from_storage(&local_node_id, lease.as_ref())
+        control_plane_leader_view_from_storage(&local_node_id, lease.as_ref(), cluster)
     };
     print!("{}", render_control_plane_leader(&view));
     Ok(())
@@ -2933,8 +2972,9 @@ fn run_control_plane_lease(
     let view = if let Some(client) = remote_client {
         control_plane_lease_view_from_metrics(&client.get_metrics()?)
     } else {
-        let (_, lease) = load_local_control_plane_state(&config_path, config_path_explicit)?;
-        control_plane_lease_view_from_storage(lease.as_ref())
+        let (_, lease, cluster) =
+            load_local_control_plane_state(&config_path, config_path_explicit)?;
+        control_plane_lease_view_from_storage(lease.as_ref(), cluster)
     };
     print!("{}", render_control_plane_lease(&view));
     Ok(())
@@ -2958,12 +2998,14 @@ fn control_plane_leader_view_from_metrics(metrics: &MetricsResponse) -> ControlP
         acquired_at_unix: None,
         expires_at_unix: None,
         last_heartbeat_unix: None,
+        cluster: metrics.cluster.clone(),
     }
 }
 
 fn control_plane_leader_view_from_storage(
     local_node_id: &str,
     lease: Option<&PersistedLeaderLease>,
+    cluster: ClusterDiagnostics,
 ) -> ControlPlaneLeaderView {
     let now_unix = now_unix();
     ControlPlaneLeaderView {
@@ -2982,6 +3024,7 @@ fn control_plane_leader_view_from_storage(
         acquired_at_unix: lease.map(|value| value.acquired_at_unix),
         expires_at_unix: lease.map(|value| value.expires_at_unix),
         last_heartbeat_unix: lease.map(|value| value.last_heartbeat_unix),
+        cluster,
     }
 }
 
@@ -2995,11 +3038,13 @@ fn control_plane_lease_view_from_metrics(metrics: &MetricsResponse) -> ControlPl
         acquired_at_unix: None,
         expires_at_unix: None,
         last_heartbeat_unix: None,
+        cluster: metrics.cluster.clone(),
     }
 }
 
 fn control_plane_lease_view_from_storage(
     lease: Option<&PersistedLeaderLease>,
+    cluster: ClusterDiagnostics,
 ) -> ControlPlaneLeaseView {
     let now_unix = now_unix();
     ControlPlaneLeaseView {
@@ -3010,6 +3055,7 @@ fn control_plane_lease_view_from_storage(
         acquired_at_unix: lease.map(|value| value.acquired_at_unix),
         expires_at_unix: lease.map(|value| value.expires_at_unix),
         last_heartbeat_unix: lease.map(|value| value.last_heartbeat_unix),
+        cluster,
     }
 }
 
@@ -3038,6 +3084,28 @@ fn render_control_plane_leader(view: &ControlPlaneLeaderView) -> String {
     if let Some(value) = view.last_heartbeat_unix {
         output.push_str(&format!("last_heartbeat_unix: {value}\n"));
     }
+    output.push_str(&format!(
+        "observed_nodes: {}\n",
+        view.cluster.observed_nodes
+    ));
+    output.push_str(&format!(
+        "active_reconcilers: {}\n",
+        view.cluster.active_reconcilers
+    ));
+    output.push_str(&format!(
+        "lease_epoch_divergence: {}\n",
+        view.cluster.lease_epoch_divergence
+    ));
+    output.push_str(&format!(
+        "split_brain_suspected: {}\n",
+        view.cluster.split_brain_suspected
+    ));
+    output.push_str(&format!("cluster_size: {}\n", view.cluster.cluster_size));
+    output.push_str(&format!("local_role: {}\n", view.cluster.local_role));
+    output.push_str(&format!(
+        "heartbeat_age_ms: {}\n",
+        view.cluster.heartbeat_age_ms
+    ));
     output
 }
 
@@ -3059,13 +3127,35 @@ fn render_control_plane_lease(view: &ControlPlaneLeaseView) -> String {
     if let Some(value) = view.last_heartbeat_unix {
         output.push_str(&format!("last_heartbeat_unix: {value}\n"));
     }
+    output.push_str(&format!(
+        "observed_nodes: {}\n",
+        view.cluster.observed_nodes
+    ));
+    output.push_str(&format!(
+        "active_reconcilers: {}\n",
+        view.cluster.active_reconcilers
+    ));
+    output.push_str(&format!(
+        "lease_epoch_divergence: {}\n",
+        view.cluster.lease_epoch_divergence
+    ));
+    output.push_str(&format!(
+        "split_brain_suspected: {}\n",
+        view.cluster.split_brain_suspected
+    ));
+    output.push_str(&format!("cluster_size: {}\n", view.cluster.cluster_size));
+    output.push_str(&format!("local_role: {}\n", view.cluster.local_role));
+    output.push_str(&format!(
+        "heartbeat_age_ms: {}\n",
+        view.cluster.heartbeat_age_ms
+    ));
     output
 }
 
 fn load_local_control_plane_state(
     config_path: &Path,
     config_path_explicit: bool,
-) -> Result<(String, Option<PersistedLeaderLease>), CliError> {
+) -> Result<(String, Option<PersistedLeaderLease>, ClusterDiagnostics), CliError> {
     if !config_path_explicit && !config_path.exists() {
         return Err(CliError::Usage(
             "missing config path; use --config /etc/forge/forge.conf".into(),
@@ -3080,7 +3170,54 @@ fn load_local_control_plane_state(
     let lease = LeaderLeaseStore::new(&config.storage_root)
         .load()
         .map_err(|err| CliError::Usage(err.to_string()))?;
-    Ok((local_node.node_id, lease))
+    let nodes = ClusterTopologyStore::new(&config.storage_root)
+        .load()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .nodes;
+    let now_unix = now_unix();
+    let active_reconcilers = nodes.iter().filter(|node| node.active_reconciler).count();
+    let mut epochs = nodes
+        .iter()
+        .filter_map(|node| (node.lease_epoch_seen > 0).then_some(node.lease_epoch_seen))
+        .collect::<Vec<_>>();
+    epochs.sort_unstable();
+    epochs.dedup();
+    let leader_claims = nodes
+        .iter()
+        .filter(|node| node.role == "leader" && node.active_reconciler)
+        .count();
+    let local_role = if lease.as_ref().is_some_and(|value| {
+        value.leader_node_id == local_node.node_id && value.expires_at_unix > now_unix
+    }) {
+        "leader"
+    } else if lease
+        .as_ref()
+        .is_some_and(|value| value.expires_at_unix > now_unix)
+    {
+        "follower"
+    } else {
+        "candidate"
+    };
+    let heartbeat_age_ms = nodes
+        .iter()
+        .find(|node| node.node_id == local_node.node_id)
+        .map(|node| now_unix.saturating_sub(node.last_seen_unix) * 1_000)
+        .unwrap_or(0);
+    Ok((
+        local_node.node_id,
+        lease,
+        ClusterDiagnostics {
+            observed_nodes: nodes.len(),
+            active_reconcilers,
+            lease_epoch_divergence: epochs.len() > 1,
+            split_brain_suspected: leader_claims > 1,
+            cluster_size: nodes.len(),
+            local_role: local_role.into(),
+            heartbeat_age_ms,
+            multiple_active_reconcilers: active_reconcilers > 1,
+            ..ClusterDiagnostics::default()
+        },
+    ))
 }
 
 fn now_unix() -> u64 {
@@ -3292,6 +3429,8 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
     };
     let control_plane_cache = Arc::new(RwLock::new(daemon.control_plane_snapshot()));
     let daemon = Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>));
+    let heartbeat_daemon = daemon.clone();
+    thread::spawn(move || run_heartbeat_loop(heartbeat_daemon));
     let readyz_daemon = daemon.clone();
     let control_plane_cache_loop = control_plane_cache.clone();
     thread::spawn(move || run_readyz_refresh_loop(readyz_daemon, control_plane_cache_loop));
@@ -3454,6 +3593,7 @@ mod tests {
             convergence_checkpoint: None,
             domain_summaries: Vec::new(),
             node: None,
+            cluster: ClusterDiagnostics::default(),
         }
     }
 

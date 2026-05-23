@@ -66,6 +66,10 @@ const CLI_LOGIN_POLL_INTERVAL_SECONDS: u64 = 1;
 
 pub trait ControlPlane: Send {
     fn is_ready(&self) -> bool;
+    fn heartbeat_interval_ms(&self) -> u64 {
+        1_000
+    }
+    fn heartbeat_tick(&mut self) {}
     fn readyz_status(&mut self) -> &'static str {
         if self.is_ready() {
             "ready"
@@ -165,6 +169,14 @@ where
 {
     fn is_ready(&self) -> bool {
         self.state() == &DaemonState::Ready
+    }
+
+    fn heartbeat_interval_ms(&self) -> u64 {
+        Daemon::heartbeat_interval_ms(self)
+    }
+
+    fn heartbeat_tick(&mut self) {
+        Daemon::heartbeat_tick(self)
     }
 
     fn readyz_status(&mut self) -> &'static str {
@@ -2977,6 +2989,7 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
         storage_root: root.clone(),
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
+        heartbeat_interval_ms: 1_000,
         github_webhook_secret: None,
         repository_cache_root: None,
         sqlite_path: None,
@@ -3126,6 +3139,7 @@ fn build_cached_only_state(snapshot: ControlPlaneSnapshot) -> HttpState {
         storage_root: root.clone(),
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
+        heartbeat_interval_ms: 1_000,
         github_webhook_secret: None,
         repository_cache_root: None,
         sqlite_path: None,

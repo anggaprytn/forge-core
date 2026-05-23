@@ -156,6 +156,7 @@ Forge Alpha Core Loop v4 freezes the single-node stateful orchestration loop wit
 - **Runtime Usage Snapshots:** Status and diagnostics surface captured CPU and memory usage snapshots for active services.
 - **Cache-Backed Readiness:** The convergence loop computes readiness asynchronously and `/readyz` serves cached control-plane truth in bounded time.
 - **Single-Writer Lease Semantics:** Forge now persists a bounded filesystem lease under `control_plane/leader_lease.json` so only one node is allowed to reconcile shared control-plane state at a time.
+- **Distributed-Reconciliation Preparation:** Forge now persists `control_plane/cluster_nodes.json`, runs a separate heartbeat loop, and exposes heuristic split-brain signals without adding cross-node dependencies to request paths.
 - **Cache-Backed Metrics:** `/metrics` exposes cached convergence timings, readiness counters, cache age, and Docker/Caddy breaker state without live scans on the request path.
 - **Dependency Circuit Breakers:** Docker and Caddy probing use bounded retries with automatic degraded-mode backoff and automatic recovery closure.
 - **Non-Fatal Route Repair Failures:** Startup route-repair failure degrades readiness reporting without failing basic liveness.
@@ -194,7 +195,10 @@ Forge is still not a distributed orchestrator. The new lease layer is a safety p
 - Lease takeover is allowed only after expiry and each successful acquisition advances a monotonic `lease_epoch`.
 - Mutating APIs require the active leader. Deploy, backup/restore, retention, and other shared-state mutation paths are rejected on followers.
 - The filesystem-backed lease is not safe for true multi-writer distributed storage unless every node uses the same shared filesystem with correct atomic create/write/rename semantics.
-- `/readyz` now degrades for leadership-specific uncertainty such as `leadership uncertain`, `convergence ownership lost`, `lease stale`, and `checkpoint epoch mismatch`.
+- `control_plane/cluster_nodes.json` is topology and heartbeat state only. It is not consensus membership, not a lock service, and not an authority for automatic repair.
+- Split-brain handling is heuristic detection and degraded signaling only. Forge does not attempt automatic multi-node repair.
+- `/readyz` now degrades for leadership-specific uncertainty such as `leadership uncertain`, `convergence ownership lost`, `lease stale`, `checkpoint epoch mismatch`, `split_brain_suspected`, `multiple_active_reconcilers`, `checkpoint_owner_mismatch`, and `lease_epoch_divergence`.
+- Request paths remain isolated from reconciliation and cross-node communication. Followers stay read-only during divergence and continue serving cache-backed reads in bounded time.
 
 ---
 

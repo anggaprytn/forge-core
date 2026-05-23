@@ -941,6 +941,7 @@ impl E2eHarness {
             storage_root: runtime_root.clone(),
             api_bind: format!("127.0.0.1:{api_port}"),
             bearer_token: token.clone(),
+            heartbeat_interval_ms: 1_000,
             github_webhook_secret: Some("github-test-secret".into()),
             repository_cache_root: Some(runtime_root.join("repo-cache")),
             sqlite_path: None,

@@ -198,6 +198,40 @@ pub struct PersistedNodeMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedClusterNode {
+    #[serde(default = "default_control_plane_schema_version")]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub advertised_addr: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub last_seen_unix: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub lease_epoch_seen: u64,
+    #[serde(default)]
+    pub control_plane_version: String,
+    #[serde(default)]
+    pub reconciliation_enabled: bool,
+    #[serde(default)]
+    pub active_reconciler: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedClusterTopology {
+    #[serde(default = "default_control_plane_schema_version")]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub nodes: Vec<PersistedClusterNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct OperationalJournalEntry {
     #[serde(default = "default_control_plane_schema_version")]
     pub schema_version: u64,
@@ -1069,6 +1103,13 @@ impl EnvironmentPaths {
             .join("operations.jsonl")
     }
 
+    pub fn cluster_nodes_file(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root
+            .as_ref()
+            .join("control_plane")
+            .join("cluster_nodes.json")
+    }
+
     fn ensure_pointer_file(&self, name: &str) -> StorageResult<()> {
         let path = self.root.join(name);
         if !path.exists() {
@@ -1198,6 +1239,10 @@ pub struct LeaderLeaseStore {
 }
 
 pub struct NodeMetadataStore {
+    storage_root: PathBuf,
+}
+
+pub struct ClusterTopologyStore {
     storage_root: PathBuf,
 }
 
@@ -1857,6 +1902,54 @@ impl NodeMetadataStore {
             &metadata,
         )?;
         Ok(metadata)
+    }
+}
+
+impl ClusterTopologyStore {
+    pub fn new(storage_root: impl AsRef<Path>) -> Self {
+        Self {
+            storage_root: storage_root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn load(&self) -> StorageResult<PersistedClusterTopology> {
+        Ok(
+            load_json_file(EnvironmentPaths::cluster_nodes_file(&self.storage_root))?
+                .unwrap_or_else(|| PersistedClusterTopology {
+                    schema_version: CONTROL_PLANE_SCHEMA_VERSION,
+                    nodes: Vec::new(),
+                }),
+        )
+    }
+
+    pub fn save(&self, topology: &PersistedClusterTopology) -> StorageResult<()> {
+        write_pretty_json(
+            EnvironmentPaths::cluster_nodes_file(&self.storage_root),
+            topology,
+        )
+    }
+
+    pub fn upsert_node(&self, node: &PersistedClusterNode) -> StorageResult<()> {
+        let path = EnvironmentPaths::cluster_nodes_file(&self.storage_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _guard = FileLock::acquire(path.with_extension("lock"))?;
+        let mut topology = self.load()?;
+        topology.schema_version = CONTROL_PLANE_SCHEMA_VERSION;
+        if let Some(existing) = topology
+            .nodes
+            .iter_mut()
+            .find(|existing| existing.node_id == node.node_id)
+        {
+            *existing = node.clone();
+        } else {
+            topology.nodes.push(node.clone());
+        }
+        topology
+            .nodes
+            .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        write_pretty_json(path, &topology)
     }
 }
 

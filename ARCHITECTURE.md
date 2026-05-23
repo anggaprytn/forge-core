@@ -114,7 +114,16 @@ Durability model:
 - Each environment now carries a bounded, atomic convergence checkpoint.
 - Each convergence cycle can emit immutable runtime, route, and dependency snapshots for replayable debugging.
 - Node identity is durable and informational only. It does not imply clustering, leader election, or distributed control.
+- `control_plane/cluster_nodes.json` persists observed node topology, heartbeat state, lease epochs, and capability hints for future distributed reconciliation work.
+- The cluster topology document is advisory coordination state, not consensus membership and not distributed locking.
 - An append-only operational journal records durable control-plane events without adding writes to the request path.
+
+Single-writer coordination model:
+
+- Forge remains single-writer. One lease holder is allowed to reconcile shared control-plane state at a time.
+- The filesystem lease is advisory coordination, not Raft, not quorum, and not automatic failover consensus.
+- Heartbeats and split-brain signals are used for detection and degraded readiness only.
+- Request paths remain cache-backed and must never depend on live cross-node communication.
 
 Convergence domains:
 

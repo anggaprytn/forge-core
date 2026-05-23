@@ -391,6 +391,8 @@ pub struct EnvironmentDiagnostics {
     pub domain_summaries: Vec<ConvergenceDomainSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeInfo>,
+    #[serde(default)]
+    pub cluster: ClusterDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -653,6 +655,61 @@ pub struct MetricsDependencySnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ClusterNodeStatus {
+    pub node_id: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub advertised_addr: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub last_seen_unix: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub lease_epoch_seen: u64,
+    #[serde(default)]
+    pub control_plane_version: String,
+    #[serde(default)]
+    pub reconciliation_enabled: bool,
+    #[serde(default)]
+    pub active_reconciler: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ClusterDiagnostics {
+    #[serde(default)]
+    pub observed_nodes: usize,
+    #[serde(default)]
+    pub active_reconcilers: usize,
+    #[serde(default)]
+    pub lease_epoch_divergence: bool,
+    #[serde(default)]
+    pub split_brain_suspected: bool,
+    #[serde(default)]
+    pub cluster_size: usize,
+    #[serde(default)]
+    pub local_role: String,
+    #[serde(default)]
+    pub heartbeat_age_ms: u64,
+    #[serde(default)]
+    pub multiple_active_reconcilers: bool,
+    #[serde(default)]
+    pub checkpoint_owner_mismatch: bool,
+    #[serde(default)]
+    pub snapshot_owner_mismatch: bool,
+    #[serde(default)]
+    pub stale_reconciler: bool,
+    #[serde(default)]
+    pub reconciliation_blocked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<ClusterNodeStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MetricsResponse {
     pub queue_depth: usize,
     pub convergence_loop_duration_ms: u64,
@@ -683,6 +740,8 @@ pub struct MetricsResponse {
     pub follower_mode: bool,
     pub docker: MetricsDependencySnapshot,
     pub caddy: MetricsDependencySnapshot,
+    #[serde(default)]
+    pub cluster: ClusterDiagnostics,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub convergence_domains: Vec<ConvergenceDomainSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

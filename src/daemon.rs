@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    BackupListResponse, BackupRecord, BackupRestoreResponse, ConvergenceDomainSummary,
-    DependencyBreakerDiagnostics, DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs,
-    DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics, EnvironmentDiffResponse,
-    EnvironmentVariableReport, ErrorResponse, EventList, MetricsDependencySnapshot,
-    MetricsResponse, NodeInfo, ReadyzReason, ReadyzResponse, ServiceLogGroup,
-    validate_deployment_request,
+    BackupListResponse, BackupRecord, BackupRestoreResponse, ClusterDiagnostics, ClusterNodeStatus,
+    ConvergenceDomainSummary, DependencyBreakerDiagnostics, DeploymentAccepted,
+    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
+    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
+    EventList, MetricsDependencySnapshot, MetricsResponse, NodeInfo, ReadyzReason, ReadyzResponse,
+    ServiceLogGroup, validate_deployment_request,
 };
 use crate::backups::{create_backup, inspect_backup, list_backups, restore_backup};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
@@ -37,13 +37,13 @@ use crate::status::{
     load_project_environment_status,
 };
 use crate::storage::{
-    CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT, ControlPlaneSnapshotStore, ConvergenceCheckpointStore,
-    DiagnosticsStore, EnvironmentPaths, EventStore, LeaderLeaseStore, LeaseAcquireOutcome,
-    NodeMetadataStore, OperationalJournalEntry, OperationalJournalStore, PersistedActivationMode,
-    PersistedBreakerState, PersistedControlPlaneSnapshot, PersistedDependencyState,
-    PersistedEnvironmentCheckpoint, PersistedLeaderLease, PersistedNodeMetadata,
-    PersistedRuntimeInfo, PersistedServiceRuntimeInfo, RuntimeHealthState, RuntimeStateStore,
-    current_unix_timestamp, load_generation_runtime_info,
+    CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT, ClusterTopologyStore, ControlPlaneSnapshotStore,
+    ConvergenceCheckpointStore, DiagnosticsStore, EnvironmentPaths, EventStore, LeaderLeaseStore,
+    LeaseAcquireOutcome, NodeMetadataStore, OperationalJournalEntry, OperationalJournalStore,
+    PersistedActivationMode, PersistedBreakerState, PersistedClusterNode,
+    PersistedControlPlaneSnapshot, PersistedDependencyState, PersistedEnvironmentCheckpoint,
+    PersistedLeaderLease, PersistedNodeMetadata, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
+    RuntimeHealthState, RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
 };
 use serde_json::Value;
 
@@ -56,6 +56,7 @@ const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_INITIAL_BACKOFF_MS: u64 = 250;
 const CIRCUIT_BREAKER_MAX_BACKOFF_MS: u64 = 5_000;
 const LEADER_LEASE_TTL_SECONDS: u64 = 5;
+const HEARTBEAT_STALE_AFTER_SECONDS: u64 = LEADER_LEASE_TTL_SECONDS * 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeadershipState {
@@ -374,6 +375,16 @@ pub struct ControlPlaneSnapshot {
     pub metrics: MetricsResponse,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ClusterSignalState {
+    split_brain_suspected: bool,
+    multiple_active_reconcilers: bool,
+    checkpoint_owner_mismatch: bool,
+    snapshot_owner_mismatch: bool,
+    lease_epoch_divergence: bool,
+    stale_reconciler: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonReadyzCache {
     pub response: ReadyzResponse,
@@ -416,6 +427,8 @@ pub struct Daemon<D, R, A> {
     node_metadata: PersistedNodeMetadata,
     leadership: LeadershipState,
     convergence_domains: Vec<ConvergenceDomainSummary>,
+    cluster_diagnostics: ClusterDiagnostics,
+    cluster_signals: ClusterSignalState,
 }
 
 impl<D, R, A> Drop for Daemon<D, R, A> {
@@ -466,6 +479,8 @@ where
             node_metadata,
             leadership: LeadershipState::default(),
             convergence_domains: Vec::new(),
+            cluster_diagnostics: ClusterDiagnostics::default(),
+            cluster_signals: ClusterSignalState::default(),
         }
     }
 
@@ -667,7 +682,7 @@ where
         project_id: &str,
         environment: &str,
     ) -> Result<EnvironmentDiagnostics, ErrorResponse> {
-        load_environment_diagnostics(
+        let mut diagnostics = load_environment_diagnostics(
             &self.config.storage_root,
             self.queue.as_ref(),
             &mut self.docker_runtime,
@@ -679,7 +694,9 @@ where
             let (status, response) = crate::status::project_status_error_response(err);
             let _ = status;
             response
-        })
+        })?;
+        diagnostics.cluster = self.cluster_diagnostics.clone();
+        Ok(diagnostics)
     }
 
     pub fn get_project_environment_history(
@@ -1123,8 +1140,161 @@ where
         &self.node_metadata.node_id
     }
 
+    pub fn heartbeat_interval_ms(&self) -> u64 {
+        self.config.heartbeat_interval_ms.max(100)
+    }
+
+    pub fn heartbeat_tick(&mut self) {
+        if matches!(
+            self.state(),
+            DaemonState::WaitingForBootstrap(_) | DaemonState::ShuttingDown | DaemonState::Stopped
+        ) {
+            return;
+        }
+        self.refresh_leadership(current_unix_timestamp());
+        self.persist_local_cluster_node(current_unix_timestamp());
+    }
+
     fn reconciliation_enabled(&self, now_unix: u64) -> bool {
         !self.leadership.uncertain && self.leadership.is_leader(self.node_id(), now_unix)
+    }
+
+    fn local_role(&self, now_unix: u64) -> String {
+        if self.leadership.uncertain {
+            "uncertain".into()
+        } else if self.reconciliation_enabled(now_unix) {
+            "leader".into()
+        } else if self
+            .leadership
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at_unix > now_unix)
+        {
+            "follower".into()
+        } else {
+            "candidate".into()
+        }
+    }
+
+    fn persist_local_cluster_node(&self, now_unix: u64) {
+        let node = PersistedClusterNode {
+            schema_version: 1,
+            node_id: self.node_metadata.node_id.clone(),
+            hostname: self.node_metadata.hostname.clone(),
+            advertised_addr: self.config.api_bind.clone(),
+            role: self.local_role(now_unix),
+            last_seen_unix: now_unix,
+            capabilities: self.node_metadata.capabilities.clone(),
+            lease_epoch_seen: self.leadership.lease_epoch(),
+            control_plane_version: env!("CARGO_PKG_VERSION").into(),
+            reconciliation_enabled: self.reconciliation_enabled(now_unix),
+            active_reconciler: self.reconciliation_enabled(now_unix),
+        };
+        let _ = ClusterTopologyStore::new(&self.config.storage_root).upsert_node(&node);
+    }
+
+    fn load_cluster_diagnostics(&self, now_unix: u64) -> (ClusterDiagnostics, ClusterSignalState) {
+        let nodes = ClusterTopologyStore::new(&self.config.storage_root)
+            .load()
+            .map(|topology| topology.nodes)
+            .unwrap_or_default();
+        let current_epoch = self.leadership.lease_epoch();
+        let recent_nodes = nodes
+            .iter()
+            .filter(|node| {
+                now_unix.saturating_sub(node.last_seen_unix) <= HEARTBEAT_STALE_AFTER_SECONDS
+            })
+            .collect::<Vec<_>>();
+        let observed_nodes = recent_nodes.len();
+        let active_reconcilers = recent_nodes
+            .iter()
+            .filter(|node| node.active_reconciler)
+            .count();
+        let leader_claims = recent_nodes
+            .iter()
+            .filter(|node| {
+                node.role == "leader"
+                    && node.active_reconciler
+                    && (current_epoch == 0 || node.lease_epoch_seen == current_epoch)
+            })
+            .count();
+        let mut distinct_epochs = recent_nodes
+            .iter()
+            .filter_map(|node| (node.lease_epoch_seen > 0).then_some(node.lease_epoch_seen))
+            .collect::<Vec<_>>();
+        distinct_epochs.sort_unstable();
+        distinct_epochs.dedup();
+        let lease_epoch_divergence = distinct_epochs.len() > 1
+            || recent_nodes.iter().any(|node| {
+                current_epoch > 0
+                    && node.lease_epoch_seen > 0
+                    && node.lease_epoch_seen != current_epoch
+            });
+        let stale_reconciler = nodes.iter().any(|node| {
+            node.active_reconciler
+                && now_unix.saturating_sub(node.last_seen_unix) > HEARTBEAT_STALE_AFTER_SECONDS
+        });
+        let split_brain_suspected = leader_claims > 1 || stale_reconciler;
+        let local_node = nodes.iter().find(|node| node.node_id == self.node_id());
+        let heartbeat_age_ms = local_node
+            .map(|node| {
+                now_unix
+                    .saturating_sub(node.last_seen_unix)
+                    .saturating_mul(1_000)
+            })
+            .unwrap_or(0);
+        let multiple_active_reconcilers = active_reconcilers > 1;
+        let nodes = nodes
+            .into_iter()
+            .map(|node| ClusterNodeStatus {
+                node_id: node.node_id,
+                hostname: node.hostname,
+                advertised_addr: node.advertised_addr,
+                role: node.role,
+                last_seen_unix: node.last_seen_unix,
+                capabilities: node.capabilities,
+                lease_epoch_seen: node.lease_epoch_seen,
+                control_plane_version: node.control_plane_version,
+                reconciliation_enabled: node.reconciliation_enabled,
+                active_reconciler: node.active_reconciler,
+            })
+            .collect::<Vec<_>>();
+        let mut degraded_markers = Vec::new();
+        if split_brain_suspected {
+            degraded_markers.push("split_brain_suspected".into());
+        }
+        if multiple_active_reconcilers {
+            degraded_markers.push("multiple_active_reconcilers".into());
+        }
+        if lease_epoch_divergence {
+            degraded_markers.push("lease_epoch_divergence".into());
+        }
+        (
+            ClusterDiagnostics {
+                observed_nodes,
+                active_reconcilers,
+                lease_epoch_divergence,
+                split_brain_suspected,
+                cluster_size: nodes.len(),
+                local_role: self.local_role(now_unix),
+                heartbeat_age_ms,
+                multiple_active_reconcilers,
+                checkpoint_owner_mismatch: false,
+                snapshot_owner_mismatch: false,
+                stale_reconciler,
+                reconciliation_blocked: !self.reconciliation_enabled(now_unix),
+                degraded_markers,
+                nodes,
+            },
+            ClusterSignalState {
+                split_brain_suspected,
+                multiple_active_reconcilers,
+                checkpoint_owner_mismatch: false,
+                snapshot_owner_mismatch: false,
+                lease_epoch_divergence,
+                stale_reconciler,
+            },
+        )
     }
 
     fn refresh_leadership(&mut self, now_unix: u64) {
@@ -1152,6 +1322,56 @@ where
                 self.leadership.ownership_lost = was_leader;
                 self.leadership.last_error = Some(err.to_string());
             }
+        }
+        let is_leader = self.reconciliation_enabled(now_unix);
+        if !was_leader && is_leader {
+            let _ = OperationalJournalStore::new(&self.config.storage_root).append(
+                &OperationalJournalEntry {
+                    schema_version: 1,
+                    timestamp_unix: now_unix,
+                    event_type: "leader_acquired".into(),
+                    project_id: None,
+                    environment: None,
+                    generation: None,
+                    payload: serde_json::json!({
+                        "node_id": self.node_id(),
+                        "lease_epoch": self.leadership.lease_epoch(),
+                    }),
+                },
+            );
+        }
+        if was_leader && !is_leader {
+            let _ = OperationalJournalStore::new(&self.config.storage_root).append(
+                &OperationalJournalEntry {
+                    schema_version: 1,
+                    timestamp_unix: now_unix,
+                    event_type: "leader_lost".into(),
+                    project_id: None,
+                    environment: None,
+                    generation: None,
+                    payload: serde_json::json!({
+                        "node_id": self.node_id(),
+                        "lease_epoch": self.leadership.lease_epoch(),
+                    }),
+                },
+            );
+        }
+        if !is_leader && self.local_role(now_unix) == "follower" {
+            let _ = OperationalJournalStore::new(&self.config.storage_root).append(
+                &OperationalJournalEntry {
+                    schema_version: 1,
+                    timestamp_unix: now_unix,
+                    event_type: "follower_transition".into(),
+                    project_id: None,
+                    environment: None,
+                    generation: None,
+                    payload: serde_json::json!({
+                        "node_id": self.node_id(),
+                        "leader_node_id": self.leadership.convergence_owner(),
+                        "lease_epoch": self.leadership.lease_epoch(),
+                    }),
+                },
+            );
         }
     }
 
@@ -1305,10 +1525,13 @@ where
         ) {
             self.refresh_leadership(now_unix);
         }
+        let previous_cluster_signals = self.cluster_signals.clone();
+        let (mut cluster_diagnostics, mut cluster_signals) =
+            self.load_cluster_diagnostics(now_unix);
         let queue_depth = self.queue_depth().unwrap_or_default();
         self.convergence_domains.clear();
         let dependency_started = Instant::now();
-        let mut reasons = self.compute_readyz_reasons(now_unix);
+        let mut reasons = self.compute_readyz_reasons(now_unix, &cluster_diagnostics);
         self.convergence_domains.push(ConvergenceDomainSummary {
             domain: "dependency_probing".into(),
             status: if reasons
@@ -1323,7 +1546,11 @@ where
             detail: None,
         });
         let runtime_started = Instant::now();
-        reasons.extend(self.cached_environment_readyz_reasons_with_budget(now_unix));
+        reasons.extend(self.cached_environment_readyz_reasons_with_budget(
+            now_unix,
+            &mut cluster_signals,
+            &mut cluster_diagnostics,
+        ));
         self.convergence_domains.push(ConvergenceDomainSummary {
             domain: "runtime_container_reconciliation".into(),
             status: if reasons
@@ -1397,6 +1624,11 @@ where
                 "convergence stalled".into(),
             ));
         }
+        self.record_cluster_events(now_unix, &previous_cluster_signals, &cluster_signals);
+        self.cluster_signals = cluster_signals;
+        cluster_diagnostics.reconciliation_blocked =
+            !self.reconciliation_enabled(now_unix) || cluster_diagnostics.split_brain_suspected;
+        self.cluster_diagnostics = cluster_diagnostics.clone();
         annotate_readyz_reasons(&mut reasons, 0);
         let degraded = !reasons.is_empty();
         let loop_duration_ms = started.elapsed().as_millis() as u64;
@@ -1446,7 +1678,11 @@ where
         }
     }
 
-    fn compute_readyz_reasons(&mut self, now_unix: u64) -> Vec<ReadyzReason> {
+    fn compute_readyz_reasons(
+        &mut self,
+        now_unix: u64,
+        cluster: &ClusterDiagnostics,
+    ) -> Vec<ReadyzReason> {
         if self.state() != &DaemonState::Ready {
             return Vec::new();
         }
@@ -1475,6 +1711,30 @@ where
                     "leader lease stale".into(),
                 ));
             }
+        }
+        if cluster.split_brain_suspected {
+            reasons.push(control_plane_reason(
+                "split_brain_suspected",
+                "split-brain suspected".into(),
+            ));
+        }
+        if cluster.multiple_active_reconcilers {
+            reasons.push(control_plane_reason(
+                "multiple_active_reconcilers",
+                "multiple active reconcilers observed".into(),
+            ));
+        }
+        if cluster.lease_epoch_divergence {
+            reasons.push(control_plane_reason(
+                "lease_epoch_divergence",
+                "lease epoch divergence observed".into(),
+            ));
+        }
+        if cluster.stale_reconciler {
+            reasons.push(control_plane_reason(
+                "stale_reconciler",
+                "stale leader with active reconciler observed".into(),
+            ));
         }
         if !self.reconciliation_enabled(now_unix) {
             return reasons;
@@ -1514,15 +1774,16 @@ where
     fn cached_environment_readyz_reasons_with_budget(
         &mut self,
         now_unix: u64,
+        cluster_signals: &mut ClusterSignalState,
+        cluster: &mut ClusterDiagnostics,
     ) -> Vec<ReadyzReason> {
-        if !self.reconciliation_enabled(now_unix) {
-            return Vec::new();
-        }
         let started = Instant::now();
         let projects_root = self.config.storage_root.join("projects");
         let Ok(projects) = fs::read_dir(projects_root) else {
             return Vec::new();
         };
+        let expected_owner = self.leadership.convergence_owner();
+        let expected_epoch = self.leadership.lease_epoch();
         let mut reasons = Vec::new();
         for project in projects.flatten() {
             if started.elapsed() >= Duration::from_millis(FILESYSTEM_SCAN_BUDGET_MS) {
@@ -1548,12 +1809,13 @@ where
                 let project_id = project.file_name().to_string_lossy().into_owned();
                 let env =
                     EnvironmentPaths::new(&self.config.storage_root, &project_id, &environment);
-                let Ok(runtime_state) = RuntimeStateStore::new(env.clone()).load() else {
-                    continue;
-                };
                 if let Ok(Some(checkpoint)) = ConvergenceCheckpointStore::new(env.clone()).load() {
-                    if checkpoint.lease_epoch != self.leadership.lease_epoch()
-                        || checkpoint.convergence_owner != self.leadership.convergence_owner()
+                    let cache_age_ms = now_unix
+                        .saturating_sub(checkpoint.checkpointed_at_unix)
+                        .saturating_mul(1_000);
+                    if (expected_epoch > 0 && checkpoint.lease_epoch != expected_epoch)
+                        || (!expected_owner.is_empty()
+                            && checkpoint.convergence_owner != expected_owner)
                     {
                         reasons.push(ReadyzReason {
                             project_id: project_id.clone(),
@@ -1565,11 +1827,74 @@ where
                             marker: "checkpoint_epoch_mismatch".into(),
                             message: "checkpoint epoch mismatch".into(),
                             last_checked_unix: Some(checkpoint.checkpointed_at_unix),
+                            cache_age_ms,
+                        });
+                    }
+                    if !checkpoint.convergence_owner.is_empty()
+                        && checkpoint.node_id != checkpoint.convergence_owner
+                    {
+                        cluster_signals.checkpoint_owner_mismatch = true;
+                        cluster.checkpoint_owner_mismatch = true;
+                        if !cluster
+                            .degraded_markers
+                            .iter()
+                            .any(|marker| marker == "checkpoint_owner_mismatch")
+                        {
+                            cluster
+                                .degraded_markers
+                                .push("checkpoint_owner_mismatch".into());
+                        }
+                        reasons.push(ReadyzReason {
+                            project_id: project_id.clone(),
+                            environment: environment.clone(),
+                            generation: checkpoint.active_generation,
+                            active: checkpoint.active_generation.is_some(),
+                            unresolved: true,
+                            source: "convergence_checkpoint".into(),
+                            marker: "checkpoint_owner_mismatch".into(),
+                            message: "checkpoint owner mismatch".into(),
+                            last_checked_unix: Some(checkpoint.checkpointed_at_unix),
+                            cache_age_ms,
+                        });
+                    }
+                }
+                if let Ok(Some(snapshot)) =
+                    ControlPlaneSnapshotStore::new(env.clone()).latest_by_kind("runtime_snapshot")
+                {
+                    let snapshot_owner = snapshot.convergence_owner.clone();
+                    if !snapshot_owner.is_empty() && snapshot.node_id != snapshot_owner {
+                        cluster_signals.snapshot_owner_mismatch = true;
+                        cluster.snapshot_owner_mismatch = true;
+                        if !cluster
+                            .degraded_markers
+                            .iter()
+                            .any(|marker| marker == "snapshot_owner_mismatch")
+                        {
+                            cluster
+                                .degraded_markers
+                                .push("snapshot_owner_mismatch".into());
+                        }
+                        reasons.push(ReadyzReason {
+                            project_id: project_id.clone(),
+                            environment: environment.clone(),
+                            generation: snapshot.generation,
+                            active: snapshot.generation.is_some(),
+                            unresolved: true,
+                            source: "control_plane_snapshot".into(),
+                            marker: "snapshot_owner_mismatch".into(),
+                            message: "snapshot owner mismatch".into(),
+                            last_checked_unix: Some(snapshot.created_at_unix),
                             cache_age_ms: now_unix
-                                .saturating_sub(checkpoint.checkpointed_at_unix)
+                                .saturating_sub(snapshot.created_at_unix)
                                 .saturating_mul(1_000),
                         });
                     }
+                }
+                let Ok(runtime_state) = RuntimeStateStore::new(env.clone()).load() else {
+                    continue;
+                };
+                if !self.reconciliation_enabled(now_unix) {
+                    continue;
                 }
                 let Some(generation) = runtime_state.active_generation else {
                     continue;
@@ -1874,6 +2199,60 @@ where
         );
     }
 
+    fn record_cluster_events(
+        &self,
+        now_unix: u64,
+        previous: &ClusterSignalState,
+        current: &ClusterSignalState,
+    ) {
+        let journal = OperationalJournalStore::new(&self.config.storage_root);
+        if !previous.split_brain_suspected && current.split_brain_suspected {
+            let _ = journal.append(&OperationalJournalEntry {
+                schema_version: 1,
+                timestamp_unix: now_unix,
+                event_type: "split_brain_suspected".into(),
+                project_id: None,
+                environment: None,
+                generation: None,
+                payload: serde_json::json!({
+                    "node_id": self.node_id(),
+                    "lease_epoch": self.leadership.lease_epoch(),
+                }),
+            });
+        }
+        if !previous.lease_epoch_divergence && current.lease_epoch_divergence {
+            let _ = journal.append(&OperationalJournalEntry {
+                schema_version: 1,
+                timestamp_unix: now_unix,
+                event_type: "lease_divergence_observed".into(),
+                project_id: None,
+                environment: None,
+                generation: None,
+                payload: serde_json::json!({
+                    "node_id": self.node_id(),
+                    "lease_epoch": self.leadership.lease_epoch(),
+                }),
+            });
+        }
+        if (!previous.multiple_active_reconcilers && current.multiple_active_reconcilers)
+            || (!previous.stale_reconciler && current.stale_reconciler)
+        {
+            let _ = journal.append(&OperationalJournalEntry {
+                schema_version: 1,
+                timestamp_unix: now_unix,
+                event_type: "reconciliation_blocked".into(),
+                project_id: None,
+                environment: None,
+                generation: None,
+                payload: serde_json::json!({
+                    "node_id": self.node_id(),
+                    "multiple_active_reconcilers": current.multiple_active_reconcilers,
+                    "stale_reconciler": current.stale_reconciler,
+                }),
+            });
+        }
+    }
+
     fn build_metrics_snapshot(
         &self,
         queue_depth: usize,
@@ -1913,6 +2292,7 @@ where
             follower_mode: !leader && !self.leadership.uncertain,
             docker: self.docker_breaker.metrics_snapshot(),
             caddy: self.caddy_breaker.metrics_snapshot(),
+            cluster: self.cluster_diagnostics.clone(),
             convergence_domains: self.convergence_domains.clone(),
             node: Some(self.node_info()),
         }
@@ -2115,6 +2495,20 @@ pub fn run_readyz_refresh_loop(
     loop {
         refresh_control_plane_snapshot(&daemon, &control_plane_cache);
         thread::sleep(Duration::from_millis(READYZ_REFRESH_INTERVAL_MS));
+    }
+}
+
+pub fn run_heartbeat_loop(
+    daemon: std::sync::Arc<std::sync::Mutex<Box<dyn crate::http::ControlPlane>>>,
+) -> ! {
+    loop {
+        let interval_ms = if let Ok(mut daemon) = daemon.lock() {
+            daemon.heartbeat_tick();
+            daemon.heartbeat_interval_ms()
+        } else {
+            1_000
+        };
+        thread::sleep(Duration::from_millis(interval_ms.max(100)));
     }
 }
 
@@ -2908,6 +3302,7 @@ fn config_with_root(root: PathBuf) -> DaemonConfig {
         storage_root: root,
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
+        heartbeat_interval_ms: 1_000,
         github_webhook_secret: None,
         repository_cache_root: None,
         sqlite_path: None,
@@ -4523,6 +4918,186 @@ mod daemon_control_plane_durability {
             .unwrap();
     }
 
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    enum ClusterSimulation {
+        DualWriterRace,
+        StaleLeaderTakeover,
+        NetworkPartition,
+        HeartbeatFreeze,
+        LeaseCorruption,
+        CheckpointDivergence,
+    }
+
+    fn cluster_node(
+        node_id: &str,
+        role: &str,
+        lease_epoch_seen: u64,
+        last_seen_unix: u64,
+        active_reconciler: bool,
+    ) -> PersistedClusterNode {
+        PersistedClusterNode {
+            schema_version: 1,
+            node_id: node_id.into(),
+            hostname: format!("{node_id}.local"),
+            advertised_addr: format!("{node_id}:8080"),
+            role: role.into(),
+            last_seen_unix,
+            capabilities: vec!["control_plane".into()],
+            lease_epoch_seen,
+            control_plane_version: env!("CARGO_PKG_VERSION").into(),
+            reconciliation_enabled: active_reconciler,
+            active_reconciler,
+        }
+    }
+
+    fn write_cluster_nodes(root: &std::path::Path, nodes: Vec<PersistedClusterNode>) {
+        ClusterTopologyStore::new(root)
+            .save(&crate::storage::PersistedClusterTopology {
+                schema_version: 1,
+                nodes,
+            })
+            .unwrap();
+    }
+
+    fn force_leader_lease(
+        root: &std::path::Path,
+        node_id: &str,
+        acquired_at_unix: u64,
+        ttl_seconds: u64,
+        lease_epoch: u64,
+    ) {
+        let lease = PersistedLeaderLease {
+            schema_version: 1,
+            leader_node_id: node_id.into(),
+            acquired_at_unix,
+            expires_at_unix: acquired_at_unix.saturating_add(ttl_seconds),
+            lease_epoch,
+            last_heartbeat_unix: acquired_at_unix,
+        };
+        let path = EnvironmentPaths::leader_lease_file(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&lease).unwrap()).unwrap();
+    }
+
+    #[allow(dead_code)]
+    fn write_runtime_snapshot(
+        root: &std::path::Path,
+        node_id: &str,
+        convergence_owner: &str,
+        lease_epoch: u64,
+    ) {
+        let env = EnvironmentPaths::new(root, "api", "production");
+        env.ensure_exists().unwrap();
+        ControlPlaneSnapshotStore::new(env)
+            .append(
+                &PersistedControlPlaneSnapshot {
+                    snapshot_version: 1,
+                    schema_version: 1,
+                    snapshot_kind: "runtime_snapshot".into(),
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    cycle_id: "test".into(),
+                    created_at_unix: current_unix_timestamp(),
+                    generation: Some(1),
+                    node_id: node_id.into(),
+                    lease_epoch,
+                    convergence_owner: convergence_owner.into(),
+                    payload: serde_json::json!({}),
+                },
+                CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT,
+            )
+            .unwrap();
+    }
+
+    fn apply_cluster_simulation(
+        root: &std::path::Path,
+        local_node: &str,
+        simulation: ClusterSimulation,
+    ) {
+        let now = current_unix_timestamp();
+        match simulation {
+            ClusterSimulation::DualWriterRace => {
+                force_leader_lease(root, local_node, now, LEADER_LEASE_TTL_SECONDS, 1);
+                write_cluster_nodes(
+                    root,
+                    vec![
+                        cluster_node(local_node, "leader", 1, now, true),
+                        cluster_node("peer-node", "leader", 1, now, true),
+                    ],
+                );
+            }
+            ClusterSimulation::StaleLeaderTakeover => {
+                force_leader_lease(root, "peer-node", now, LEADER_LEASE_TTL_SECONDS, 2);
+                write_cluster_nodes(
+                    root,
+                    vec![
+                        cluster_node(local_node, "leader", 1, now.saturating_sub(60), true),
+                        cluster_node("peer-node", "leader", 2, now, true),
+                    ],
+                );
+            }
+            ClusterSimulation::NetworkPartition => {
+                force_leader_lease(root, local_node, now, LEADER_LEASE_TTL_SECONDS, 3);
+                write_cluster_nodes(
+                    root,
+                    vec![
+                        cluster_node(local_node, "leader", 3, now, true),
+                        cluster_node("peer-node", "follower", 4, now, false),
+                    ],
+                );
+            }
+            ClusterSimulation::HeartbeatFreeze => {
+                force_leader_lease(root, "peer-node", now, LEADER_LEASE_TTL_SECONDS, 4);
+                write_cluster_nodes(
+                    root,
+                    vec![
+                        cluster_node(
+                            "peer-node",
+                            "leader",
+                            4,
+                            now.saturating_sub(HEARTBEAT_STALE_AFTER_SECONDS + 5),
+                            true,
+                        ),
+                        cluster_node(local_node, "follower", 4, now, false),
+                    ],
+                );
+            }
+            ClusterSimulation::LeaseCorruption => {
+                let path = EnvironmentPaths::leader_lease_file(root);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "{ invalid json").unwrap();
+            }
+            ClusterSimulation::CheckpointDivergence => {
+                let env = EnvironmentPaths::new(root, "api", "production");
+                env.ensure_exists().unwrap();
+                ConvergenceCheckpointStore::new(env)
+                    .save(&PersistedEnvironmentCheckpoint {
+                        snapshot_version: 1,
+                        schema_version: 1,
+                        project_id: "api".into(),
+                        environment: "production".into(),
+                        checkpointed_at_unix: now,
+                        last_successful_convergence_unix: Some(now),
+                        last_convergence_duration_ms: 1,
+                        last_convergence_generation: Some(1),
+                        last_convergence_error: None,
+                        active_generation: Some(1),
+                        health_state: RuntimeHealthState::Healthy,
+                        dependency_states: BTreeMap::new(),
+                        breaker_states: BTreeMap::new(),
+                        queue_depth_snapshot: 0,
+                        node_id: local_node.into(),
+                        lease_epoch: 1,
+                        convergence_owner: "peer-node".into(),
+                        readyz_reasons: Vec::new(),
+                        extra: BTreeMap::new(),
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn convergence_checkpoint_survives_restart() {
         let root = test_root("convergence-checkpoint-survives-restart");
@@ -5259,5 +5834,351 @@ mod daemon_control_plane_durability {
 
         let err = daemon.restore_backup("backup-1").unwrap_err();
         assert_eq!(err.code, "not_leader");
+    }
+
+    #[test]
+    fn split_brain_detection_triggers_degraded_readyz() {
+        let root = test_root("split-brain-detection-triggers-degraded-readyz");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        apply_cluster_simulation(&root, &local_node, ClusterSimulation::DualWriterRace);
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let readyz = daemon.readyz_response();
+        assert_eq!(readyz.status, "degraded");
+        assert!(
+            readyz
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "split_brain_suspected")
+        );
+        assert!(
+            readyz
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "multiple_active_reconcilers")
+        );
+    }
+
+    #[test]
+    fn follower_never_reconciles_after_leader_loss() {
+        let root = test_root("follower-never-reconciles-after-leader-loss");
+        let local_node = local_node_id(&root);
+        write_leader_lease(
+            &root,
+            &local_node,
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+        );
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        force_leader_lease(
+            &root,
+            "peer-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            2,
+        );
+
+        let did_work = execute_worker_iteration(
+            root.clone(),
+            &queue,
+            &mut NoopDockerRuntime,
+            &mut StaticProbeRuntime {
+                tcp_ok: true,
+                http_ok: true,
+            },
+            &mut NoopRoutingRuntime,
+            &DeploymentWorkerSettings::default(),
+            &WorkerLeadership {
+                node_id: local_node,
+            },
+        )
+        .unwrap();
+
+        assert!(!did_work);
+        assert_eq!(queue.queued_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn heartbeat_updates_without_reconciliation() {
+        let root = test_root("heartbeat-updates-without-reconciliation");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        force_leader_lease(
+            &root,
+            "peer-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            1,
+        );
+        daemon.heartbeat_tick();
+        let first = ClusterTopologyStore::new(&root)
+            .load()
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|node| node.node_id == daemon.node_id())
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        daemon.heartbeat_tick();
+        let second = ClusterTopologyStore::new(&root)
+            .load()
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|node| node.node_id == daemon.node_id())
+            .unwrap();
+
+        assert_eq!(first.role, "follower");
+        assert!(second.last_seen_unix > first.last_seen_unix);
+        assert!(!second.active_reconciler);
+    }
+
+    #[test]
+    fn checkpoint_owner_mismatch_detected() {
+        let root = test_root("checkpoint-owner-mismatch-detected");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        apply_cluster_simulation(&root, &local_node, ClusterSimulation::CheckpointDivergence);
+        force_leader_lease(
+            &root,
+            "peer-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            1,
+        );
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert!(
+            daemon
+                .readyz_response()
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "checkpoint_owner_mismatch")
+        );
+    }
+
+    #[test]
+    fn snapshot_owner_mismatch_detected() {
+        let root = test_root("snapshot-owner-mismatch-detected");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        force_leader_lease(
+            &root,
+            "peer-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            1,
+        );
+        write_runtime_snapshot(&root, &local_node, "peer-node", 1);
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert!(
+            daemon
+                .readyz_response()
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "snapshot_owner_mismatch")
+        );
+    }
+
+    #[test]
+    fn divergent_epoch_observation_detected() {
+        let root = test_root("divergent-epoch-observation-detected");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        apply_cluster_simulation(&root, &local_node, ClusterSimulation::NetworkPartition);
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert!(
+            daemon
+                .control_plane_snapshot()
+                .metrics
+                .cluster
+                .lease_epoch_divergence
+        );
+        assert!(
+            daemon
+                .readyz_response()
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "lease_epoch_divergence")
+        );
+    }
+
+    #[test]
+    fn stale_reconciler_marked_degraded() {
+        let root = test_root("stale-reconciler-marked-degraded");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        apply_cluster_simulation(&root, &local_node, ClusterSimulation::HeartbeatFreeze);
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert!(
+            daemon
+                .control_plane_snapshot()
+                .metrics
+                .cluster
+                .stale_reconciler
+        );
+        assert!(
+            daemon
+                .readyz_response()
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "stale_reconciler")
+        );
+    }
+
+    #[test]
+    fn diagnostics_expose_cluster_state() {
+        let root = test_root("diagnostics-expose-cluster-state");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        apply_cluster_simulation(&root, &local_node, ClusterSimulation::DualWriterRace);
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let diagnostics = daemon
+            .get_project_environment_diagnostics("api", "production")
+            .unwrap();
+        assert!(diagnostics.cluster.split_brain_suspected);
+        assert_eq!(diagnostics.cluster.active_reconcilers, 2);
+        assert_eq!(diagnostics.cluster.cluster_size, 2);
+    }
+
+    #[test]
+    fn request_paths_remain_constant_time_under_cluster_divergence() {
+        let root = test_root("request-paths-remain-constant-time-under-cluster-divergence");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        apply_cluster_simulation(&root, &local_node, ClusterSimulation::DualWriterRace);
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let started = Instant::now();
+        for _ in 0..256 {
+            let _ = daemon.cached_readyz_response();
+            let _ = daemon.control_plane_snapshot();
+        }
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn journal_records_leadership_transitions() {
+        let root = test_root("journal-records-leadership-transitions");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.heartbeat_tick();
+        force_leader_lease(
+            &root,
+            "peer-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            2,
+        );
+        daemon.heartbeat_tick();
+
+        let entries = OperationalJournalStore::new(&root).read_all().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.event_type == "leader_acquired")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.event_type == "leader_lost")
+        );
+    }
+
+    #[test]
+    fn only_single_reconciler_allowed_per_epoch() {
+        let root = test_root("only-single-reconciler-allowed-per-epoch");
+        seed_project(&root);
+        let local_node = local_node_id(&root);
+        apply_cluster_simulation(&root, &local_node, ClusterSimulation::DualWriterRace);
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let cluster = daemon.control_plane_snapshot().metrics.cluster;
+        assert_eq!(cluster.active_reconcilers, 2);
+        assert!(cluster.multiple_active_reconcilers);
+        assert!(cluster.split_brain_suspected);
     }
 }

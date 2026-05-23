@@ -184,7 +184,9 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 ### Convergence Model
 
 - A background convergence refresh loop computes cached control-plane truth.
+- A separate background heartbeat loop refreshes local node topology and lease observations even while reconciliation is disabled.
 - Request paths do not perform live Docker scans, live Caddy scans, or fleet-wide reconciliation.
+- Request paths do not depend on cross-node communication.
 - Every convergence cycle is time-bounded and records its duration, last success, last failure, and failure count.
 
 ### Cache-Backed APIs
@@ -207,6 +209,13 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 - `readyz_degraded_total`
 - `docker_probe_latency_ms`
 - `caddy_probe_latency_ms`
+- `cluster.observed_nodes`
+- `cluster.active_reconcilers`
+- `cluster.lease_epoch_divergence`
+- `cluster.split_brain_suspected`
+- `cluster.cluster_size`
+- `cluster.local_role`
+- `cluster.heartbeat_age_ms`
 - dependency breaker state, failure count, last success, next retry time, and last error
 
 ### Degraded Mode Semantics
@@ -215,12 +224,15 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 - When a dependency repeatedly fails, its circuit breaker opens and the loop backs off exponentially.
 - Readiness continues to serve cached degraded state while the loop waits for the next retry budget.
 - Recovery automatically closes the breaker after a successful probe.
+- Split-brain heuristics such as `split_brain_suspected`, `multiple_active_reconcilers`, `checkpoint_owner_mismatch`, and `lease_epoch_divergence` degrade `/readyz` without attempting automatic repair.
+- Followers remain read-only during divergence scenarios and continue serving cached `/readyz` and `/metrics` responses.
 
 ### Durable Control-Plane State
 
 - `convergence_checkpoint.json` is the warm-start artifact for per-environment readiness, dependency, breaker, and queue-depth state.
 - `control_plane_snapshots/` stores immutable per-cycle `runtime_snapshot`, `route_snapshot`, and `dependency_snapshot` artifacts with bounded retention.
 - `control_plane/node.json` stores stable node identity, boot time, and capability flags.
+- `control_plane/cluster_nodes.json` stores per-node topology and heartbeat observations including role, advertised address, lease epoch seen, and control-plane version.
 - `control_plane/operations.jsonl` is the append-only operational journal for deployments, breaker transitions, daemon restarts, and other bounded audit events.
 
 ### Recovery Model

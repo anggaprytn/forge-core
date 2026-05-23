@@ -299,6 +299,7 @@ mod tests {
             storage_root: root.to_path_buf(),
             api_bind: "127.0.0.1:8080".into(),
             bearer_token: "test-token".into(),
+            heartbeat_interval_ms: 1_000,
             github_webhook_secret: None,
             repository_cache_root: None,
             sqlite_path: None,

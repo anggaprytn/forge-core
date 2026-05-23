@@ -1327,6 +1327,7 @@ where
         convergence_checkpoint,
         domain_summaries,
         node,
+        cluster: Default::default(),
     })
 }
 
