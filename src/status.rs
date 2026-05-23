@@ -4811,6 +4811,7 @@ mod tests {
         ControlPlaneSnapshotStore::new(env.clone())
             .append(
                 &PersistedControlPlaneSnapshot {
+                    snapshot_version: 1,
                     schema_version: 1,
                     snapshot_kind: "runtime_snapshot".into(),
                     project_id: "api".into(),
@@ -4818,6 +4819,9 @@ mod tests {
                     cycle_id: "cycle-7".into(),
                     created_at_unix: 7,
                     generation: Some(7),
+                    node_id: "node-test".into(),
+                    lease_epoch: 1,
+                    convergence_owner: "node-test".into(),
                     payload: serde_json::json!({
                         "domains": [{
                             "domain": "metrics_refresh",
@@ -4873,6 +4877,7 @@ mod tests {
         let env = EnvironmentPaths::new(&root, "api", "staging");
         ConvergenceCheckpointStore::new(env.clone())
             .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
                 schema_version: 1,
                 project_id: "api".into(),
                 environment: "staging".into(),
@@ -4886,6 +4891,9 @@ mod tests {
                 dependency_states: BTreeMap::new(),
                 breaker_states: BTreeMap::new(),
                 queue_depth_snapshot: 0,
+                node_id: "node-test".into(),
+                lease_epoch: 1,
+                convergence_owner: "node-test".into(),
                 readyz_reasons: Vec::new(),
                 extra: BTreeMap::from([(
                     "convergence_domains".into(),

@@ -38,11 +38,12 @@ use crate::status::{
 };
 use crate::storage::{
     CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT, ControlPlaneSnapshotStore, ConvergenceCheckpointStore,
-    DiagnosticsStore, EnvironmentPaths, EventStore, NodeMetadataStore, OperationalJournalEntry,
-    OperationalJournalStore, PersistedActivationMode, PersistedBreakerState,
-    PersistedControlPlaneSnapshot, PersistedDependencyState, PersistedEnvironmentCheckpoint,
-    PersistedNodeMetadata, PersistedRuntimeInfo, PersistedServiceRuntimeInfo, RuntimeHealthState,
-    RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
+    DiagnosticsStore, EnvironmentPaths, EventStore, LeaderLeaseStore, LeaseAcquireOutcome,
+    NodeMetadataStore, OperationalJournalEntry, OperationalJournalStore, PersistedActivationMode,
+    PersistedBreakerState, PersistedControlPlaneSnapshot, PersistedDependencyState,
+    PersistedEnvironmentCheckpoint, PersistedLeaderLease, PersistedNodeMetadata,
+    PersistedRuntimeInfo, PersistedServiceRuntimeInfo, RuntimeHealthState, RuntimeStateStore,
+    current_unix_timestamp, load_generation_runtime_info,
 };
 use serde_json::Value;
 
@@ -54,6 +55,53 @@ const FILESYSTEM_SCAN_BUDGET_MS: u64 = 100;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_INITIAL_BACKOFF_MS: u64 = 250;
 const CIRCUIT_BREAKER_MAX_BACKOFF_MS: u64 = 5_000;
+const LEADER_LEASE_TTL_SECONDS: u64 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeadershipState {
+    lease: Option<PersistedLeaderLease>,
+    uncertain: bool,
+    ownership_lost: bool,
+    last_error: Option<String>,
+}
+
+impl Default for LeadershipState {
+    fn default() -> Self {
+        Self {
+            lease: None,
+            uncertain: false,
+            ownership_lost: false,
+            last_error: None,
+        }
+    }
+}
+
+impl LeadershipState {
+    fn is_leader(&self, node_id: &str, now_unix: u64) -> bool {
+        self.lease.as_ref().is_some_and(|lease| {
+            lease.leader_node_id == node_id && lease.expires_at_unix > now_unix
+        })
+    }
+
+    fn convergence_owner(&self) -> String {
+        self.lease
+            .as_ref()
+            .map(|lease| lease.leader_node_id.clone())
+            .unwrap_or_default()
+    }
+
+    fn lease_epoch(&self) -> u64 {
+        self.lease
+            .as_ref()
+            .map(|lease| lease.lease_epoch)
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerLeadership {
+    pub node_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonState {
@@ -366,6 +414,7 @@ pub struct Daemon<D, R, A> {
     docker_breaker: DependencyCircuitBreaker,
     caddy_breaker: DependencyCircuitBreaker,
     node_metadata: PersistedNodeMetadata,
+    leadership: LeadershipState,
     convergence_domains: Vec<ConvergenceDomainSummary>,
 }
 
@@ -408,6 +457,7 @@ where
             docker_breaker: DependencyCircuitBreaker::default(),
             caddy_breaker: DependencyCircuitBreaker::default(),
             node_metadata,
+            leadership: LeadershipState::default(),
             convergence_domains: Vec::new(),
         }
     }
@@ -473,6 +523,10 @@ where
                 code: "daemon_not_ready".into(),
                 message: "daemon is not ready to accept commands".into(),
             });
+        }
+        self.refresh_leadership(current_unix_timestamp());
+        if !self.reconciliation_enabled(current_unix_timestamp()) {
+            return Err(not_leader_error_response());
         }
 
         let queue = self.queue.as_ref().ok_or_else(|| ErrorResponse {
@@ -680,6 +734,10 @@ where
         project_id: &str,
         environment: &str,
     ) -> Result<BackupRecord, ErrorResponse> {
+        self.refresh_leadership(current_unix_timestamp());
+        if !self.reconciliation_enabled(current_unix_timestamp()) {
+            return Err(not_leader_error_response());
+        }
         create_backup(
             &self.config.storage_root,
             &mut self.docker_runtime,
@@ -716,6 +774,10 @@ where
         &mut self,
         backup_id: &str,
     ) -> Result<BackupRestoreResponse, ErrorResponse> {
+        self.refresh_leadership(current_unix_timestamp());
+        if !self.reconciliation_enabled(current_unix_timestamp()) {
+            return Err(not_leader_error_response());
+        }
         restore_backup(
             &self.config.storage_root,
             &mut self.docker_runtime,
@@ -1042,6 +1104,42 @@ where
         }
     }
 
+    pub fn node_id(&self) -> &str {
+        &self.node_metadata.node_id
+    }
+
+    fn reconciliation_enabled(&self, now_unix: u64) -> bool {
+        !self.leadership.uncertain && self.leadership.is_leader(self.node_id(), now_unix)
+    }
+
+    fn refresh_leadership(&mut self, now_unix: u64) {
+        let store = LeaderLeaseStore::new(&self.config.storage_root);
+        let was_leader = self.leadership.is_leader(self.node_id(), now_unix);
+        match store.try_acquire_or_renew(self.node_id(), now_unix, LEADER_LEASE_TTL_SECONDS) {
+            Ok(LeaseAcquireOutcome::Leader(lease)) => {
+                self.leadership = LeadershipState {
+                    lease: Some(lease),
+                    uncertain: false,
+                    ownership_lost: false,
+                    last_error: None,
+                };
+            }
+            Ok(LeaseAcquireOutcome::Follower(lease)) => {
+                self.leadership = LeadershipState {
+                    lease: Some(lease),
+                    uncertain: false,
+                    ownership_lost: was_leader,
+                    last_error: None,
+                };
+            }
+            Err(err) => {
+                self.leadership.uncertain = true;
+                self.leadership.ownership_lost = was_leader;
+                self.leadership.last_error = Some(err.to_string());
+            }
+        }
+    }
+
     fn persist_environment_checkpoint(
         &self,
         env: EnvironmentPaths,
@@ -1050,14 +1148,19 @@ where
         queue_depth: usize,
         reasons: &[ReadyzReason],
     ) {
+        let now_unix = current_unix_timestamp();
+        if !self.reconciliation_enabled(now_unix) {
+            return;
+        }
         let runtime_state = RuntimeStateStore::new(env.clone())
             .load()
             .unwrap_or_default();
         let checkpoint = PersistedEnvironmentCheckpoint {
+            snapshot_version: 1,
             schema_version: 1,
             project_id: project_id.into(),
             environment: environment.into(),
-            checkpointed_at_unix: current_unix_timestamp(),
+            checkpointed_at_unix: now_unix,
             last_successful_convergence_unix: self.convergence_last_success_unix,
             last_convergence_duration_ms: self.convergence_loop_duration_ms,
             last_convergence_generation: runtime_state.active_generation,
@@ -1087,6 +1190,9 @@ where
                 ("caddy".into(), breaker_state(&self.caddy_breaker)),
             ]),
             queue_depth_snapshot: queue_depth,
+            node_id: self.node_id().to_string(),
+            lease_epoch: self.leadership.lease_epoch(),
+            convergence_owner: self.leadership.convergence_owner(),
             readyz_reasons: reasons
                 .iter()
                 .filter(|reason| {
@@ -1118,6 +1224,7 @@ where
         let store = ControlPlaneSnapshotStore::new(env.clone());
         let generation = checkpoint.active_generation;
         let runtime_snapshot = PersistedControlPlaneSnapshot {
+            snapshot_version: 1,
             schema_version: 1,
             snapshot_kind: "runtime_snapshot".into(),
             project_id: checkpoint.project_id.clone(),
@@ -1125,6 +1232,9 @@ where
             cycle_id: cycle_id.clone(),
             created_at_unix: checkpoint.checkpointed_at_unix,
             generation,
+            node_id: checkpoint.node_id.clone(),
+            lease_epoch: checkpoint.lease_epoch,
+            convergence_owner: checkpoint.convergence_owner.clone(),
             payload: serde_json::json!({
                 "checkpoint": checkpoint,
                 "node": self.node_info(),
@@ -1132,6 +1242,7 @@ where
             }),
         };
         let route_snapshot = PersistedControlPlaneSnapshot {
+            snapshot_version: 1,
             schema_version: 1,
             snapshot_kind: "route_snapshot".into(),
             project_id: checkpoint.project_id.clone(),
@@ -1139,12 +1250,16 @@ where
             cycle_id: cycle_id.clone(),
             created_at_unix: checkpoint.checkpointed_at_unix,
             generation,
+            node_id: checkpoint.node_id.clone(),
+            lease_epoch: checkpoint.lease_epoch,
+            convergence_owner: checkpoint.convergence_owner.clone(),
             payload: serde_json::json!({
                 "active_generation": checkpoint.active_generation,
                 "health_state": checkpoint.health_state,
             }),
         };
         let dependency_snapshot = PersistedControlPlaneSnapshot {
+            snapshot_version: 1,
             schema_version: 1,
             snapshot_kind: "dependency_snapshot".into(),
             project_id: checkpoint.project_id.clone(),
@@ -1152,6 +1267,9 @@ where
             cycle_id,
             created_at_unix: checkpoint.checkpointed_at_unix,
             generation,
+            node_id: checkpoint.node_id.clone(),
+            lease_epoch: checkpoint.lease_epoch,
+            convergence_owner: checkpoint.convergence_owner.clone(),
             payload: serde_json::json!({
                 "dependencies": checkpoint.dependency_states,
                 "breakers": checkpoint.breaker_states,
@@ -1166,6 +1284,7 @@ where
         let started = Instant::now();
         let now_unix = current_unix_timestamp();
         let updated_at_unix_ms = now_unix_ms();
+        self.refresh_leadership(now_unix);
         let queue_depth = self.queue_depth().unwrap_or_default();
         self.convergence_domains.clear();
         let dependency_started = Instant::now();
@@ -1248,9 +1367,10 @@ where
                 ))
         });
         reasons.dedup();
-        let stalled = self.convergence_last_success_unix.is_some_and(|value| {
-            now_unix.saturating_sub(value) * 1_000 > CONVERGENCE_STALLED_AFTER_MS
-        });
+        let stalled = self.reconciliation_enabled(now_unix)
+            && self.convergence_last_success_unix.is_some_and(|value| {
+                now_unix.saturating_sub(value) * 1_000 > CONVERGENCE_STALLED_AFTER_MS
+            });
         if stalled {
             reasons.push(control_plane_reason(
                 "convergence_stalled",
@@ -1264,7 +1384,7 @@ where
         if degraded {
             self.convergence_last_failure_unix = Some(now_unix);
             self.convergence_failures_total = self.convergence_failures_total.saturating_add(1);
-        } else {
+        } else if self.reconciliation_enabled(now_unix) {
             self.convergence_last_success_unix = Some(now_unix);
         }
         let reason = reasons
@@ -1312,6 +1432,33 @@ where
         }
 
         let mut reasons = Vec::new();
+        if self.leadership.uncertain {
+            reasons.push(control_plane_reason(
+                "leadership_uncertain",
+                self.leadership
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "leadership uncertain".into()),
+            ));
+            return reasons;
+        }
+        if self.leadership.ownership_lost {
+            reasons.push(control_plane_reason(
+                "convergence_ownership_lost",
+                "convergence ownership lost".into(),
+            ));
+        }
+        if let Some(lease) = self.leadership.lease.as_ref() {
+            if lease.expires_at_unix <= now_unix {
+                reasons.push(control_plane_reason(
+                    "lease_stale",
+                    "leader lease stale".into(),
+                ));
+            }
+        }
+        if !self.reconciliation_enabled(now_unix) {
+            return reasons;
+        }
         if fs::metadata(&self.config.storage_root).is_err() {
             reasons.push(control_plane_reason(
                 "storage_unavailable",
@@ -1348,6 +1495,9 @@ where
         &mut self,
         now_unix: u64,
     ) -> Vec<ReadyzReason> {
+        if !self.reconciliation_enabled(now_unix) {
+            return Vec::new();
+        }
         let started = Instant::now();
         let projects_root = self.config.storage_root.join("projects");
         let Ok(projects) = fs::read_dir(projects_root) else {
@@ -1381,6 +1531,26 @@ where
                 let Ok(runtime_state) = RuntimeStateStore::new(env.clone()).load() else {
                     continue;
                 };
+                if let Ok(Some(checkpoint)) = ConvergenceCheckpointStore::new(env.clone()).load() {
+                    if checkpoint.lease_epoch != self.leadership.lease_epoch()
+                        || checkpoint.convergence_owner != self.leadership.convergence_owner()
+                    {
+                        reasons.push(ReadyzReason {
+                            project_id: project_id.clone(),
+                            environment: environment.clone(),
+                            generation: checkpoint.active_generation,
+                            active: checkpoint.active_generation.is_some(),
+                            unresolved: true,
+                            source: "convergence_checkpoint".into(),
+                            marker: "checkpoint_epoch_mismatch".into(),
+                            message: "checkpoint epoch mismatch".into(),
+                            last_checked_unix: Some(checkpoint.checkpointed_at_unix),
+                            cache_age_ms: now_unix
+                                .saturating_sub(checkpoint.checkpointed_at_unix)
+                                .saturating_mul(1_000),
+                        });
+                    }
+                }
                 let Some(generation) = runtime_state.active_generation else {
                     continue;
                 };
@@ -1691,6 +1861,8 @@ where
     ) -> MetricsResponse {
         let request_metrics = crate::metrics::registry().snapshot();
         let now = now_unix_ms();
+        let leader = self.reconciliation_enabled(current_unix_timestamp());
+        let lease = self.leadership.lease.as_ref();
         MetricsResponse {
             queue_depth,
             convergence_loop_duration_ms: self.convergence_loop_duration_ms,
@@ -1703,6 +1875,22 @@ where
             readyz_degraded_total: request_metrics.readyz_degraded_total,
             docker_probe_latency_ms: self.docker_breaker.last_latency_ms,
             caddy_probe_latency_ms: self.caddy_breaker.last_latency_ms,
+            leader,
+            lease_epoch: self.leadership.lease_epoch(),
+            lease_age_ms: lease
+                .map(|lease| now.saturating_sub(lease.last_heartbeat_unix.saturating_mul(1_000)))
+                .unwrap_or(0),
+            lease_expiry_ms: lease
+                .map(|lease| {
+                    lease
+                        .expires_at_unix
+                        .saturating_mul(1_000)
+                        .saturating_sub(now)
+                })
+                .unwrap_or(0),
+            convergence_owner: self.leadership.convergence_owner(),
+            reconciliation_enabled: leader,
+            follower_mode: !leader && !self.leadership.uncertain,
             docker: self.docker_breaker.metrics_snapshot(),
             caddy: self.caddy_breaker.metrics_snapshot(),
             convergence_domains: self.convergence_domains.clone(),
@@ -1985,6 +2173,7 @@ pub fn run_deployment_worker_loop<D, P, R>(
     mut probes: P,
     mut routing: R,
     settings: DeploymentWorkerSettings,
+    leadership: WorkerLeadership,
 ) -> !
 where
     D: DockerRuntime,
@@ -1993,16 +2182,16 @@ where
 {
     let storage_root = storage_root.into();
     loop {
-        let did_work = match execute_next_queued_deployment(
+        let did_work = match execute_worker_iteration(
             storage_root.clone(),
             &queue,
             &mut docker,
             &mut probes,
             &mut routing,
             &settings,
+            &leadership,
         ) {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(value) => value,
             Err(err) => {
                 eprintln!("forge daemon worker deployment failed: {err}");
                 true
@@ -2015,10 +2204,54 @@ where
     }
 }
 
+fn execute_worker_iteration<D, P, R>(
+    storage_root: PathBuf,
+    queue: &PersistentQueue,
+    docker: &mut D,
+    probes: &mut P,
+    routing: &mut R,
+    settings: &DeploymentWorkerSettings,
+    leadership: &WorkerLeadership,
+) -> Result<bool, DeploymentError>
+where
+    D: DockerRuntime,
+    P: ProbeRuntime,
+    R: RoutingRuntime,
+{
+    if !worker_reconciliation_enabled(&storage_root, leadership) {
+        return Ok(false);
+    }
+    Ok(
+        execute_next_queued_deployment(storage_root, queue, docker, probes, routing, settings)?
+            .is_some(),
+    )
+}
+
+fn worker_reconciliation_enabled(
+    storage_root: &std::path::Path,
+    leadership: &WorkerLeadership,
+) -> bool {
+    let now_unix = current_unix_timestamp();
+    LeaderLeaseStore::new(storage_root)
+        .load()
+        .ok()
+        .flatten()
+        .is_some_and(|lease| {
+            lease.leader_node_id == leadership.node_id && lease.expires_at_unix > now_unix
+        })
+}
+
 fn queue_error_to_response(error: QueueError) -> ErrorResponse {
     ErrorResponse {
         code: "queue_error".into(),
         message: error.to_string(),
+    }
+}
+
+fn not_leader_error_response() -> ErrorResponse {
+    ErrorResponse {
+        code: "not_leader".into(),
+        message: "node is not the active control-plane leader".into(),
     }
 }
 
@@ -2658,6 +2891,25 @@ fn config_with_root(root: PathBuf) -> DaemonConfig {
         github_webhook_secret: None,
         repository_cache_root: None,
         sqlite_path: None,
+    }
+}
+
+#[cfg(test)]
+fn local_node_id(root: &std::path::Path) -> String {
+    NodeMetadataStore::new(root)
+        .load_or_create()
+        .unwrap()
+        .node_id
+}
+
+#[cfg(test)]
+fn write_leader_lease(root: &std::path::Path, node_id: &str, now_unix: u64, ttl_seconds: u64) {
+    match LeaderLeaseStore::new(root)
+        .try_acquire_or_renew(node_id, now_unix, ttl_seconds)
+        .unwrap()
+    {
+        LeaseAcquireOutcome::Leader(_) => {}
+        LeaseAcquireOutcome::Follower(_) => panic!("expected local leader lease"),
     }
 }
 
@@ -4271,6 +4523,7 @@ mod daemon_control_plane_durability {
         env.ensure_exists().unwrap();
         ConvergenceCheckpointStore::new(env)
             .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
                 schema_version: 1,
                 project_id: "api".into(),
                 environment: "production".into(),
@@ -4284,6 +4537,9 @@ mod daemon_control_plane_durability {
                 dependency_states: BTreeMap::new(),
                 breaker_states: BTreeMap::new(),
                 queue_depth_snapshot: 0,
+                node_id: "node-test".into(),
+                lease_epoch: 1,
+                convergence_owner: "node-test".into(),
                 readyz_reasons: vec!["restored from checkpoint".into()],
                 extra: BTreeMap::new(),
             })
@@ -4309,6 +4565,7 @@ mod daemon_control_plane_durability {
         env.ensure_exists().unwrap();
         ConvergenceCheckpointStore::new(env)
             .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
                 schema_version: 1,
                 project_id: "api".into(),
                 environment: "production".into(),
@@ -4322,6 +4579,9 @@ mod daemon_control_plane_durability {
                 dependency_states: BTreeMap::new(),
                 breaker_states: BTreeMap::new(),
                 queue_depth_snapshot: 0,
+                node_id: "node-test".into(),
+                lease_epoch: 1,
+                convergence_owner: "node-test".into(),
                 readyz_reasons: Vec::new(),
                 extra: BTreeMap::new(),
             })
@@ -4713,5 +4973,182 @@ mod daemon_control_plane_durability {
 
         assert_eq!(daemon.state(), &DaemonState::Ready);
         assert_eq!(daemon.readyz_cache_snapshot().response.status, "degraded");
+    }
+
+    #[test]
+    fn readyz_degrades_when_lease_uncertain() {
+        let root = test_root("readyz-degrades-when-lease-uncertain");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
+        fs::create_dir_all(&lock_path).unwrap();
+        daemon.refresh_readyz_cache();
+        let readyz = daemon.readyz_response();
+        assert_eq!(readyz.status, "degraded");
+        assert!(
+            readyz
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "leadership_uncertain")
+        );
+    }
+
+    #[test]
+    fn checkpoint_epoch_mismatch_detected() {
+        let root = test_root("checkpoint-epoch-mismatch-detected");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        let local_node = daemon.node_id().to_string();
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: current_unix_timestamp(),
+                last_successful_convergence_unix: Some(current_unix_timestamp()),
+                last_convergence_duration_ms: 1,
+                last_convergence_generation: None,
+                last_convergence_error: None,
+                active_generation: None,
+                health_state: RuntimeHealthState::Healthy,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                node_id: local_node.clone(),
+                lease_epoch: 0,
+                convergence_owner: "stale-node".into(),
+                readyz_reasons: Vec::new(),
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+        daemon.refresh_readyz_cache();
+
+        assert!(daemon.readyz_response().reasons.iter().any(|reason| {
+            reason.marker == "checkpoint_epoch_mismatch" && reason.project_id == "api"
+        }));
+    }
+
+    #[test]
+    fn metrics_expose_leader_state() {
+        let root = test_root("metrics-expose-leader-state");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        let local_node = daemon.node_id().to_string();
+        write_leader_lease(
+            &root,
+            &local_node,
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+        );
+        daemon.refresh_readyz_cache();
+
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert!(metrics.leader);
+        assert_eq!(metrics.convergence_owner, local_node);
+        assert!(metrics.reconciliation_enabled);
+        assert!(!metrics.follower_mode);
+        assert!(metrics.lease_epoch >= 1);
+    }
+
+    #[test]
+    fn leadership_heartbeat_refreshes_lease() {
+        let root = test_root("leadership-heartbeat-refreshes-lease");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+        let first = LeaderLeaseStore::new(&root).load().unwrap().unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        daemon.refresh_readyz_cache();
+        let second = LeaderLeaseStore::new(&root).load().unwrap().unwrap();
+
+        assert_eq!(first.leader_node_id, second.leader_node_id);
+        assert!(second.last_heartbeat_unix > first.last_heartbeat_unix);
+        assert_eq!(second.lease_epoch, first.lease_epoch);
+    }
+
+    #[test]
+    fn convergence_disabled_when_not_leader() {
+        let root = test_root("convergence-disabled-when-not-leader");
+        let local_node = local_node_id(&root);
+        write_leader_lease(
+            &root,
+            "other-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+        );
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+
+        let did_work = execute_worker_iteration(
+            root.clone(),
+            &queue,
+            &mut NoopDockerRuntime,
+            &mut StaticProbeRuntime {
+                tcp_ok: true,
+                http_ok: true,
+            },
+            &mut NoopRoutingRuntime,
+            &DeploymentWorkerSettings::default(),
+            &WorkerLeadership {
+                node_id: local_node,
+            },
+        )
+        .unwrap();
+
+        assert!(!did_work);
+        assert_eq!(queue.queued_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn follower_node_does_not_reconcile() {
+        let root = test_root("follower-node-does-not-reconcile");
+        let local_node = local_node_id(&root);
+        write_leader_lease(
+            &root,
+            "leader-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+        );
+        assert!(!worker_reconciliation_enabled(
+            &root,
+            &WorkerLeadership {
+                node_id: local_node,
+            }
+        ));
     }
 }

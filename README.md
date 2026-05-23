@@ -155,6 +155,7 @@ Forge Alpha Core Loop v4 freezes the single-node stateful orchestration loop wit
 - **Termination Diagnostics:** `forge diagnose` and API diagnostics expose exit reason, exit code, signal, restart count, OOM state, and log tails when available.
 - **Runtime Usage Snapshots:** Status and diagnostics surface captured CPU and memory usage snapshots for active services.
 - **Cache-Backed Readiness:** The convergence loop computes readiness asynchronously and `/readyz` serves cached control-plane truth in bounded time.
+- **Single-Writer Lease Semantics:** Forge now persists a bounded filesystem lease under `control_plane/leader_lease.json` so only one node is allowed to reconcile shared control-plane state at a time.
 - **Cache-Backed Metrics:** `/metrics` exposes cached convergence timings, readiness counters, cache age, and Docker/Caddy breaker state without live scans on the request path.
 - **Dependency Circuit Breakers:** Docker and Caddy probing use bounded retries with automatic degraded-mode backoff and automatic recovery closure.
 - **Non-Fatal Route Repair Failures:** Startup route-repair failure degrades readiness reporting without failing basic liveness.
@@ -166,7 +167,10 @@ Operational benchmarking helpers are available through:
 
 ```bash
 forge --url http://127.0.0.1:18080 bench readyz
+forge --url http://127.0.0.1:18080 bench leader
 forge --url http://127.0.0.1:18080 bench convergence
+forge control-plane leader
+forge control-plane lease
 ```
 
 Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, which produced pathological latency in the 48s to 150s range. The current model keeps readiness off the fleet-inspection path and bounded under scale.
@@ -178,7 +182,17 @@ Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, w
 - restore does not mutate existing persistent volumes in-place
 - backups are crash-consistent unless hooks are configured
 - Forge is still single-node and Docker-volume only
+- current multi-node work is preparatory only: Forge remains single-writer with one active reconciler
 - no PITR, no distributed storage, no automatic quiescing
+
+### Leadership And Follower Mode
+
+Forge is still not a distributed orchestrator. The new lease layer is a guardrail that prepares future HA work while keeping the current model single-writer.
+
+- The active leader renews a bounded TTL lease and is the only node allowed to reconcile routing, retention, backup GC, and convergence checkpoints.
+- Follower nodes do not mutate shared control-plane state. They serve cached `/readyz` and `/metrics` responses, expose lease state, and stay ready when cached control-plane truth is still valid.
+- Lease takeover is allowed only after expiry and each successful acquisition advances a monotonic `lease_epoch`.
+- `/readyz` now degrades for leadership-specific uncertainty such as `leadership uncertain`, `convergence ownership lost`, `lease stale`, and `checkpoint epoch mismatch`.
 
 ---
 

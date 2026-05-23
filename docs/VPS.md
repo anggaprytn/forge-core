@@ -23,6 +23,7 @@ The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful 
 - **Termination Diagnostics**: Diagnose/status expose exit reason, signal, OOM state, restart count, and tails when available.
 - **Runtime Usage Snapshots**: Active services expose captured CPU and memory usage snapshots.
 - **Cache-Backed Readiness**: Convergence computes readiness asynchronously and `/readyz` serves cached control-plane truth.
+- **Single-Writer Leadership Lease**: Forge persists a bounded filesystem lease in `control_plane/leader_lease.json` and allows only one active reconciler at a time.
 - **Non-Fatal Route Repair Failures**: Route repair issues degrade readiness without falsely claiming full readiness.
 - **Readyz Active Degradation Semantics**: `/readyz` may return `degraded` with active repair reasons while `/healthz` remains live.
 - **Clean Diagnostics API Repair Fields**: Current unresolved runtime policy and volume repair events remain visible; healthy historical noise is suppressed.
@@ -269,6 +270,20 @@ Semantics:
 
 Readiness derives from cached control-plane inputs such as storage accessibility, queue health, Docker reachability, Caddy admin reachability, unresolved fatal markers, and convergence freshness. Environment-level health belongs to diagnostics, not readiness.
 
+Forge is still single-writer. The new multi-node work is preparatory only:
+
+- the active leader refreshes `control_plane/leader_lease.json`
+- only the lease owner may reconcile shared control-plane state
+- follower nodes serve cached reads and metrics without mutating shared control-plane state
+- lease takeover is allowed only after expiry and advances a monotonic `lease_epoch`
+
+Leadership-specific degraded readiness reasons now include:
+
+- `leadership uncertain`
+- `convergence ownership lost`
+- `lease stale`
+- `checkpoint epoch mismatch`
+
 Performance targets:
 
 - local `/readyz`: under 250ms
@@ -287,6 +302,9 @@ Example degraded response:
 Observed validation:
 
 ```bash
+forge control-plane leader
+forge control-plane lease
+forge --url http://127.0.0.1:18080 bench leader
 time curl -s http://127.0.0.1:18080/readyz >/dev/null
 # ~13ms
 

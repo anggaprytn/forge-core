@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use forge_core::api::{
     BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
@@ -21,7 +21,8 @@ use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
 use forge_core::convergence::garbage_collect;
 use forge_core::daemon::{
-    Daemon, DeploymentWorkerSettings, run_deployment_worker_loop, run_readyz_refresh_loop,
+    Daemon, DeploymentWorkerSettings, WorkerLeadership, run_deployment_worker_loop,
+    run_readyz_refresh_loop,
 };
 use forge_core::deployments::{
     ActivationMode, ExecutionConfig, FORGE_MANAGED_DOCKER_NETWORK, ValidationPolicy,
@@ -39,6 +40,7 @@ use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
+use forge_core::storage::{LeaderLeaseStore, NodeMetadataStore, PersistedLeaderLease};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
@@ -99,6 +101,8 @@ where
         Command::Login { server_url } => run_login(server_url)?,
         Command::Logout => run_logout()?,
         Command::WhoAmI => run_whoami(&parsed)?,
+        Command::ControlPlaneLeader { config_path } => run_control_plane_leader(config_path)?,
+        Command::ControlPlaneLease { config_path } => run_control_plane_lease(config_path)?,
         Command::Deploy {
             project_id,
             environment,
@@ -661,10 +665,11 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
         .map_err(|err| CliError::Http(err.to_string()))?;
     let path = match target {
         "readyz" => "/readyz",
-        "convergence" | "diagnostics" | "snapshots" => "/metrics",
+        "leader" | "convergence" | "diagnostics" | "snapshots" => "/metrics",
         _ => {
             return Err(CliError::Usage(
-                "bench target must be readyz, convergence, diagnostics, or snapshots".into(),
+                "bench target must be readyz, leader, convergence, diagnostics, or snapshots"
+                    .into(),
             ));
         }
     };
@@ -686,7 +691,7 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
             "readyz" => {
                 last_readyz = Some(decode_raw_json::<ReadyzResponse>(response)?);
             }
-            "convergence" | "diagnostics" | "snapshots" => {
+            "leader" | "convergence" | "diagnostics" | "snapshots" => {
                 last_metrics = Some(decode_raw_json::<MetricsResponse>(response)?);
             }
             _ => {}
@@ -726,7 +731,7 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
                 metrics.convergence_loop_duration_ms
             );
         }
-        "convergence" | "diagnostics" | "snapshots" => {
+        "leader" | "convergence" | "diagnostics" | "snapshots" => {
             let metrics = last_metrics.expect("metrics benchmark should decode response");
             println!("cache_age_ms: {}", metrics.readiness_cache_age_ms);
             println!("lock_wait_ms: n/a (cache-backed endpoint)");
@@ -734,6 +739,13 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
                 "convergence_duration_ms: {}",
                 metrics.convergence_loop_duration_ms
             );
+            println!("leader: {}", metrics.leader);
+            println!("convergence_owner: {}", metrics.convergence_owner);
+            println!("lease_epoch: {}", metrics.lease_epoch);
+            println!("lease_age_ms: {}", metrics.lease_age_ms);
+            println!("lease_expiry_ms: {}", metrics.lease_expiry_ms);
+            println!("reconciliation_enabled: {}", metrics.reconciliation_enabled);
+            println!("follower_mode: {}", metrics.follower_mode);
             println!(
                 "docker_probe_latency_ms: {}",
                 metrics.docker_probe_latency_ms
@@ -838,6 +850,12 @@ enum Command {
     },
     Logout,
     WhoAmI,
+    ControlPlaneLeader {
+        config_path: PathBuf,
+    },
+    ControlPlaneLease {
+        config_path: PathBuf,
+    },
     Deploy {
         project_id: String,
         environment: String,
@@ -1100,6 +1118,12 @@ fn parse_command(
         }),
         [cmd] if cmd == "logout" => Ok(Command::Logout),
         [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
+        [group, action] if group == "control-plane" && action == "leader" => {
+            Ok(Command::ControlPlaneLeader { config_path })
+        }
+        [group, action] if group == "control-plane" && action == "lease" => {
+            Ok(Command::ControlPlaneLease { config_path })
+        }
         [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
         [cmd, rest @ ..] if cmd == "bench" => parse_bench_command(rest),
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
@@ -1170,8 +1194,10 @@ fn usage() -> String {
         "  forge login <server_url>",
         "  forge logout",
         "  forge whoami",
+        "  forge [--config PATH] control-plane leader",
+        "  forge [--config PATH] control-plane lease",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
-        "  forge [--url URL] bench <readyz|convergence|diagnostics|snapshots> [--samples N]",
+        "  forge [--url URL] bench <readyz|leader|convergence|diagnostics|snapshots> [--samples N]",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] logs [--json] [--service SERVICE] <deployment_id>",
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
@@ -1337,6 +1363,7 @@ fn parse_bench_command(args: &[String]) -> Result<Command, CliError> {
     match positionals.as_slice() {
         [target]
             if target == "readyz"
+                || target == "leader"
                 || target == "convergence"
                 || target == "diagnostics"
                 || target == "snapshots" =>
@@ -2794,6 +2821,7 @@ fn run_gc_command(
 ) -> Result<(), CliError> {
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
+    require_local_leader(&config.storage_root)?;
     let queue = PersistentQueue::new(config.storage_root.join("queue"))
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
@@ -2812,6 +2840,72 @@ fn run_gc_command(
         print!("{}", render_gc_report(&report, dry_run));
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ControlPlaneLeaderView {
+    local_node_id: String,
+    leader_node_id: Option<String>,
+    leader: bool,
+    lease_epoch: u64,
+    acquired_at_unix: Option<u64>,
+    expires_at_unix: Option<u64>,
+    last_heartbeat_unix: Option<u64>,
+}
+
+fn run_control_plane_leader(config_path: PathBuf) -> Result<(), CliError> {
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let local_node = NodeMetadataStore::new(&config.storage_root)
+        .load()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .ok_or_else(|| CliError::Usage("node metadata unavailable".into()))?;
+    let lease = LeaderLeaseStore::new(&config.storage_root)
+        .load()
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let view = ControlPlaneLeaderView {
+        local_node_id: local_node.node_id.clone(),
+        leader_node_id: lease.as_ref().map(|value| value.leader_node_id.clone()),
+        leader: lease
+            .as_ref()
+            .is_some_and(|value| value.leader_node_id == local_node.node_id),
+        lease_epoch: lease.as_ref().map(|value| value.lease_epoch).unwrap_or(0),
+        acquired_at_unix: lease.as_ref().map(|value| value.acquired_at_unix),
+        expires_at_unix: lease.as_ref().map(|value| value.expires_at_unix),
+        last_heartbeat_unix: lease.as_ref().map(|value| value.last_heartbeat_unix),
+    };
+    print_json(&view)
+}
+
+fn run_control_plane_lease(config_path: PathBuf) -> Result<(), CliError> {
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let lease = LeaderLeaseStore::new(&config.storage_root)
+        .load()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .unwrap_or_default();
+    print_json(&lease)
+}
+
+fn require_local_leader(storage_root: &Path) -> Result<PersistedLeaderLease, CliError> {
+    let local_node = NodeMetadataStore::new(storage_root)
+        .load()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .ok_or_else(|| CliError::Usage("node metadata unavailable".into()))?;
+    let lease = LeaderLeaseStore::new(storage_root)
+        .load()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .ok_or_else(|| CliError::Usage("leader lease unavailable".into()))?;
+    let now_unix = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if lease.leader_node_id != local_node.node_id || lease.expires_at_unix <= now_unix {
+        return Err(CliError::Usage(
+            "local node is not the active control-plane leader".into(),
+        ));
+    }
+    Ok(lease)
 }
 
 fn load_saved_cli_config() -> Result<SavedCliConfig, CliError> {
@@ -2978,6 +3072,14 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
     daemon
         .start()
         .map_err(|err| CliError::Usage(err.to_string()))?;
+    let worker_leadership = WorkerLeadership {
+        node_id: daemon.node_id().to_string(),
+    };
+    let control_plane_cache = Arc::new(RwLock::new(daemon.control_plane_snapshot()));
+    let daemon = Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>));
+    let readyz_daemon = daemon.clone();
+    let control_plane_cache_loop = control_plane_cache.clone();
+    thread::spawn(move || run_readyz_refresh_loop(readyz_daemon, control_plane_cache_loop));
     let worker_queue = PersistentQueue::new(config.storage_root.join("queue"))
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let worker_settings = DeploymentWorkerSettings {
@@ -3005,14 +3107,9 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
             DockerNetworkProbeRuntime::new(FORGE_MANAGED_DOCKER_NETWORK, 3000),
             CaddyApiRuntime::new(worker_caddy_admin_url, worker_caddy_public_url),
             worker_settings,
+            worker_leadership,
         )
     });
-
-    let control_plane_cache = Arc::new(RwLock::new(daemon.control_plane_snapshot()));
-    let daemon = Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>));
-    let readyz_daemon = daemon.clone();
-    let control_plane_cache_loop = control_plane_cache.clone();
-    thread::spawn(move || run_readyz_refresh_loop(readyz_daemon, control_plane_cache_loop));
 
     let github_webhooks = build_github_webhook_state(&config)?;
     let state = HttpState::new(
@@ -3165,6 +3262,42 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_leader_command_parses() {
+        let parsed = ParsedArgs::parse(vec![
+            "--config".into(),
+            "/tmp/forge.conf".into(),
+            "control-plane".into(),
+            "leader".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::ControlPlaneLeader {
+                config_path: PathBuf::from("/tmp/forge.conf"),
+            }
+        );
+    }
+
+    #[test]
+    fn control_plane_lease_command_parses() {
+        let parsed = ParsedArgs::parse(vec![
+            "--config".into(),
+            "/tmp/forge.conf".into(),
+            "control-plane".into(),
+            "lease".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::ControlPlaneLease {
+                config_path: PathBuf::from("/tmp/forge.conf"),
+            }
+        );
+    }
+
+    #[test]
     fn deploy_command_accepts_from_before_positionals() {
         let parsed = ParsedArgs::parse(vec![
             "--url".into(),
@@ -3284,6 +3417,27 @@ mod tests {
                 caddy_public_url: "http://127.0.0.1".into(),
                 dry_run: true,
                 json: true,
+            }
+        );
+    }
+
+    #[test]
+    fn bench_leader_command_parses() {
+        let parsed = ParsedArgs::parse(vec![
+            "--url".into(),
+            "http://127.0.0.1:8080".into(),
+            "bench".into(),
+            "leader".into(),
+            "--samples".into(),
+            "5".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::Bench {
+                target: "leader".into(),
+                samples: 5,
             }
         );
     }

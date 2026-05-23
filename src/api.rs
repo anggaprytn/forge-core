@@ -667,6 +667,20 @@ pub struct MetricsResponse {
     pub readyz_degraded_total: u64,
     pub docker_probe_latency_ms: u64,
     pub caddy_probe_latency_ms: u64,
+    #[serde(default)]
+    pub leader: bool,
+    #[serde(default)]
+    pub lease_epoch: u64,
+    #[serde(default)]
+    pub lease_age_ms: u64,
+    #[serde(default)]
+    pub lease_expiry_ms: u64,
+    #[serde(default)]
+    pub convergence_owner: String,
+    #[serde(default)]
+    pub reconciliation_enabled: bool,
+    #[serde(default)]
+    pub follower_mode: bool,
     pub docker: MetricsDependencySnapshot,
     pub caddy: MetricsDependencySnapshot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

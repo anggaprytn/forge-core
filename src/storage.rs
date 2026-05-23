@@ -95,6 +95,8 @@ pub struct PersistedBreakerState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PersistedEnvironmentCheckpoint {
+    #[serde(default = "default_snapshot_version")]
+    pub snapshot_version: u64,
     #[serde(default = "default_control_plane_schema_version")]
     pub schema_version: u64,
     #[serde(default)]
@@ -122,6 +124,12 @@ pub struct PersistedEnvironmentCheckpoint {
     #[serde(default)]
     pub queue_depth_snapshot: usize,
     #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub lease_epoch: u64,
+    #[serde(default)]
+    pub convergence_owner: String,
+    #[serde(default)]
     pub readyz_reasons: Vec<String>,
     #[serde(default)]
     pub extra: BTreeMap<String, Value>,
@@ -129,6 +137,8 @@ pub struct PersistedEnvironmentCheckpoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PersistedControlPlaneSnapshot {
+    #[serde(default = "default_snapshot_version")]
+    pub snapshot_version: u64,
     #[serde(default = "default_control_plane_schema_version")]
     pub schema_version: u64,
     #[serde(default)]
@@ -144,7 +154,29 @@ pub struct PersistedControlPlaneSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub lease_epoch: u64,
+    #[serde(default)]
+    pub convergence_owner: String,
+    #[serde(default)]
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedLeaderLease {
+    #[serde(default = "default_control_plane_schema_version")]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub leader_node_id: String,
+    #[serde(default)]
+    pub acquired_at_unix: u64,
+    #[serde(default)]
+    pub expires_at_unix: u64,
+    #[serde(default)]
+    pub lease_epoch: u64,
+    #[serde(default)]
+    pub last_heartbeat_unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1012,6 +1044,13 @@ impl EnvironmentPaths {
         self.root.join("control_plane_snapshots")
     }
 
+    pub fn leader_lease_file(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root
+            .as_ref()
+            .join("control_plane")
+            .join("leader_lease.json")
+    }
+
     pub fn backups_root(storage_root: impl AsRef<Path>) -> PathBuf {
         storage_root.as_ref().join("backups")
     }
@@ -1152,6 +1191,10 @@ pub struct ConvergenceCheckpointStore {
 
 pub struct ControlPlaneSnapshotStore {
     env: EnvironmentPaths,
+}
+
+pub struct LeaderLeaseStore {
+    storage_root: PathBuf,
 }
 
 pub struct NodeMetadataStore {
@@ -1706,6 +1749,64 @@ impl ControlPlaneSnapshotStore {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseAcquireOutcome {
+    Leader(PersistedLeaderLease),
+    Follower(PersistedLeaderLease),
+}
+
+impl LeaderLeaseStore {
+    pub fn new(storage_root: impl AsRef<Path>) -> Self {
+        Self {
+            storage_root: storage_root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn load(&self) -> StorageResult<Option<PersistedLeaderLease>> {
+        load_json_file(EnvironmentPaths::leader_lease_file(&self.storage_root))
+    }
+
+    pub fn try_acquire_or_renew(
+        &self,
+        node_id: &str,
+        now_unix: u64,
+        ttl_seconds: u64,
+    ) -> StorageResult<LeaseAcquireOutcome> {
+        let path = EnvironmentPaths::leader_lease_file(&self.storage_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _guard = FileLock::acquire(path.with_extension("lock"))?;
+        let current = load_json_file::<PersistedLeaderLease>(&path)?.unwrap_or_default();
+        let is_active = !current.leader_node_id.is_empty() && current.expires_at_unix > now_unix;
+        if is_active && current.leader_node_id != node_id {
+            return Ok(LeaseAcquireOutcome::Follower(current));
+        }
+
+        let next = if is_active {
+            PersistedLeaderLease {
+                schema_version: CONTROL_PLANE_SCHEMA_VERSION,
+                leader_node_id: node_id.to_string(),
+                acquired_at_unix: current.acquired_at_unix.max(1),
+                expires_at_unix: now_unix.saturating_add(ttl_seconds),
+                lease_epoch: current.lease_epoch.max(1),
+                last_heartbeat_unix: now_unix,
+            }
+        } else {
+            PersistedLeaderLease {
+                schema_version: CONTROL_PLANE_SCHEMA_VERSION,
+                leader_node_id: node_id.to_string(),
+                acquired_at_unix: now_unix,
+                expires_at_unix: now_unix.saturating_add(ttl_seconds),
+                lease_epoch: current.lease_epoch.saturating_add(1).max(1),
+                last_heartbeat_unix: now_unix,
+            }
+        };
+        write_pretty_json(&path, &next)?;
+        Ok(LeaseAcquireOutcome::Leader(next))
+    }
+}
+
 impl NodeMetadataStore {
     pub fn new(storage_root: impl AsRef<Path>) -> Self {
         Self {
@@ -2134,6 +2235,10 @@ fn default_control_plane_schema_version() -> u64 {
     CONTROL_PLANE_SCHEMA_VERSION
 }
 
+fn default_snapshot_version() -> u64 {
+    1
+}
+
 fn default_runtime_health_state() -> RuntimeHealthState {
     RuntimeHealthState::Healthy
 }
@@ -2295,6 +2400,7 @@ pub mod control_plane_persistence_semantics {
         store
             .append(
                 &PersistedControlPlaneSnapshot {
+                    snapshot_version: 1,
                     schema_version: 1,
                     snapshot_kind: "runtime_snapshot".into(),
                     project_id: "api".into(),
@@ -2302,6 +2408,9 @@ pub mod control_plane_persistence_semantics {
                     cycle_id: "cycle-1".into(),
                     created_at_unix: 1,
                     generation: Some(1),
+                    node_id: "node-test".into(),
+                    lease_epoch: 1,
+                    convergence_owner: "node-test".into(),
                     payload: serde_json::json!({"ok": true}),
                 },
                 12,
@@ -2335,6 +2444,7 @@ pub mod control_plane_persistence_semantics {
         store
             .append(
                 &PersistedControlPlaneSnapshot {
+                    snapshot_version: 1,
                     schema_version: 1,
                     snapshot_kind: "runtime_snapshot".into(),
                     project_id: "api".into(),
@@ -2342,6 +2452,9 @@ pub mod control_plane_persistence_semantics {
                     cycle_id: "cycle-2".into(),
                     created_at_unix: 2,
                     generation: Some(2),
+                    node_id: "node-test".into(),
+                    lease_epoch: 2,
+                    convergence_owner: "node-test".into(),
                     payload: serde_json::json!({"rebuilt": true}),
                 },
                 12,
@@ -2361,6 +2474,7 @@ pub mod control_plane_persistence_semantics {
             store
                 .append(
                     &PersistedControlPlaneSnapshot {
+                        snapshot_version: 1,
                         schema_version: 1,
                         snapshot_kind: "runtime_snapshot".into(),
                         project_id: "api".into(),
@@ -2368,6 +2482,9 @@ pub mod control_plane_persistence_semantics {
                         cycle_id: format!("cycle-{created_at_unix}"),
                         created_at_unix,
                         generation: Some(created_at_unix),
+                        node_id: "node-test".into(),
+                        lease_epoch: created_at_unix,
+                        convergence_owner: "node-test".into(),
                         payload: serde_json::json!({ "generation": created_at_unix }),
                     },
                     2,
@@ -2426,6 +2543,77 @@ pub mod control_plane_persistence_semantics {
 
         let entries = journal.read_all().unwrap();
         assert!(entries.iter().any(|entry| entry.payload["index"] == 1999));
+    }
+}
+
+#[cfg(test)]
+pub mod leader_lease_semantics {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn leader_lease_survives_restart() {
+        let root = test_root("leader-lease-survives-restart");
+        let store = LeaderLeaseStore::new(&root);
+        match store.try_acquire_or_renew("node-a", 100, 5).unwrap() {
+            LeaseAcquireOutcome::Leader(lease) => {
+                assert_eq!(lease.leader_node_id, "node-a");
+            }
+            LeaseAcquireOutcome::Follower(_) => panic!("expected leader lease"),
+        }
+
+        let persisted = LeaderLeaseStore::new(&root).load().unwrap().unwrap();
+        assert_eq!(persisted.leader_node_id, "node-a");
+        assert_eq!(persisted.lease_epoch, 1);
+    }
+
+    #[test]
+    fn stale_leader_lease_can_be_taken_over() {
+        let root = test_root("stale-leader-lease-can-be-taken-over");
+        let store = LeaderLeaseStore::new(&root);
+        store.try_acquire_or_renew("node-a", 100, 5).unwrap();
+
+        match store.try_acquire_or_renew("node-b", 106, 5).unwrap() {
+            LeaseAcquireOutcome::Leader(lease) => {
+                assert_eq!(lease.leader_node_id, "node-b");
+                assert_eq!(lease.lease_epoch, 2);
+            }
+            LeaseAcquireOutcome::Follower(_) => panic!("expected takeover"),
+        }
+    }
+
+    #[test]
+    fn concurrent_leader_acquisition_single_winner() {
+        let root = test_root("concurrent-leader-acquisition-single-winner");
+        let barrier = Arc::new(Barrier::new(2));
+        let left_root = root.clone();
+        let right_root = root.clone();
+        let left_barrier = barrier.clone();
+        let right_barrier = barrier.clone();
+        let left = std::thread::spawn(move || {
+            left_barrier.wait();
+            LeaderLeaseStore::new(left_root)
+                .try_acquire_or_renew("node-a", 100, 5)
+                .unwrap()
+        });
+        let right = std::thread::spawn(move || {
+            right_barrier.wait();
+            LeaderLeaseStore::new(right_root)
+                .try_acquire_or_renew("node-b", 100, 5)
+                .unwrap()
+        });
+
+        let outcomes = vec![left.join().unwrap(), right.join().unwrap()];
+        let leaders = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, LeaseAcquireOutcome::Leader(_)))
+            .count();
+        let followers = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, LeaseAcquireOutcome::Follower(_)))
+            .count();
+        assert_eq!(leaders, 1);
+        assert_eq!(followers, 1);
     }
 }
 

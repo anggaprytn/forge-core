@@ -4102,6 +4102,7 @@ pub mod http_readyz_false_before_daemon_ready {
 #[cfg(test)]
 pub mod http_readyz_cache_latency {
     use super::*;
+    use crate::api::MetricsResponse;
     use crate::daemon::READYZ_HANDLER_TIMEOUT_MS;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -4201,6 +4202,59 @@ pub mod http_readyz_cache_latency {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_paths_constant_time_in_follower_mode() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                leader: false,
+                lease_epoch: 3,
+                convergence_owner: "leader-node".into(),
+                reconciliation_enabled: false,
+                follower_mode: true,
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+        let readyz_started = Instant::now();
+        let readyz_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let readyz_elapsed = readyz_started.elapsed();
+        let metrics_started = Instant::now();
+        let metrics_response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_elapsed = metrics_started.elapsed();
+
+        assert_eq!(readyz_response.status(), StatusCode::OK);
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        assert!(readyz_elapsed < Duration::from_millis(250));
+        assert!(metrics_elapsed < Duration::from_millis(250));
     }
 
     #[tokio::test]
