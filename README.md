@@ -1,4 +1,4 @@
-![Forge Cover](https://testing-1355450658.cos.ap-jakarta.myqcloud.com/forge-cover.webp)
+![Forge Cover](https://testing-1355450658.cos.ap-jakarta.myqcloud.com/forge-cover3.webp)
 
 # Forge
 
@@ -11,6 +11,7 @@ Forge is the safety layer. It ensures that AI-generated applications don't just 
 ---
 
 ## The Vision
+
 Forge treats deployment as a continuous state machine, not a one-time event. It provides the rigorous, fail-closed infrastructure needed for AI agents to deploy, validate, and self-correct their own software autonomously.
 
 - **Deterministic Correctness:** A running container is not a successful deployment. Forge only promotes traffic once internal reachability and health invariants are strictly met.
@@ -22,6 +23,7 @@ Forge treats deployment as a continuous state machine, not a one-time event. It 
 ## Technical Grounding
 
 ### 1. Simple Configuration (`forge.yml`)
+
 Forge Alpha Core Loop v4 extends the single-node multi-service model with per-service runtime policy persistence, Docker restart policy mapping, warmup crash gating, and basic runtime isolation signals.
 
 ```yaml
@@ -58,7 +60,8 @@ services:
 ```
 
 ### 2. AI-Native Diagnostic Primitive
-Forge captures failure context into a structured JSON payload. This allows AI agents to understand exactly *why* a deployment failed without human intervention.
+
+Forge captures failure context into a structured JSON payload. This allows AI agents to understand exactly _why_ a deployment failed without human intervention.
 
 ```json
 {
@@ -79,6 +82,7 @@ Forge captures failure context into a structured JSON payload. This allows AI ag
 ---
 
 ## How it Works
+
 Forge follows a rigid lifecycle: `Candidate → Validated → Finalized → Activated → Promoted`.
 
 1. **Build:** Forge packages the AI-generated code into an optimized image.
@@ -91,17 +95,21 @@ Forge follows a rigid lifecycle: `Candidate → Validated → Finalized → Acti
 ## Quick Start
 
 ### Installation
+
 For quick evaluation:
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/anggaprytn/forge-core/main/install.sh | bash
 ```
 
 For deterministic production builds:
+
 ```bash
 cargo install forge-core
 ```
 
 ### Initializing & Deploying
+
 ```bash
 forge init
 forge deploy <project_id> production --from ./
@@ -110,9 +118,11 @@ forge deploy <project_id> production --from ./
 ---
 
 ## Operational Reality
+
 Forge is intentionally narrow to remain bulletproof. It is a single-node orchestrator designed for vertical scale on VPS or bare metal. It optimizes for **operational calm** over feature breadth.
 
 Isolation and tenancy notes:
+
 - Forge relies on Docker cgroups and namespace isolation on a single node. This is an operational isolation boundary, not a security-grade multi-tenant sandbox.
 - CPU and memory limits are enforced through Docker `HostConfig` and are persisted per generation so rollback and convergence restore the exact historical policy.
 - Promotion now blocks when warmup detects OOM kills, restart storms, unstable health behavior, or unstable required dependencies.
@@ -149,6 +159,7 @@ Forge Alpha Core Loop v3 freezes the stateful single-node orchestration mileston
 ---
 
 ## Status
+
 Forge is in **Alpha**. Alpha Core Loop v3 is the current frozen orchestration milestone for single-node stateful deployments.
 
 [Roadmap](./ROADMAP.md) | [Architecture](./ARCHITECTURE.md) | [Invariants](./INVARIANTS.md)
@@ -156,4 +167,5 @@ Forge is in **Alpha**. Alpha Core Loop v3 is the current frozen orchestration mi
 ---
 
 ## License
+
 MIT License. Built for the era of agentic software.
