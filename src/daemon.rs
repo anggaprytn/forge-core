@@ -729,8 +729,9 @@ where
                 let Ok(runtime_state) = RuntimeStateStore::new(env).load() else {
                     continue;
                 };
-                if runtime_state.last_error_code.as_deref()
-                    == Some("route_activation_verification_failed")
+                if runtime_state.health_state == RuntimeHealthState::Degraded
+                    && runtime_state.last_error_code.as_deref()
+                        == Some("route_activation_verification_failed")
                 {
                     return true;
                 }
@@ -1433,6 +1434,83 @@ pub mod daemon_refuses_api_commands_before_ready {
                 message: "daemon is not ready to accept commands".into(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+pub mod daemon_readyz_route_repair_resolution {
+    use super::*;
+    use crate::storage::{
+        PointerStore, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
+    };
+    use std::path::Path;
+
+    fn seed_runtime_state(
+        root: &Path,
+        health_state: RuntimeHealthState,
+        last_transition: &str,
+        last_error_code: Option<&str>,
+    ) {
+        let env = EnvironmentPaths::new(root, "api", "production");
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .finalize("api", "production", SnapshotState::Healthy)
+            .unwrap();
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(1),
+                health_state,
+                failed_probe_count: 0,
+                successful_probe_count: 2,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: last_transition.into(),
+                last_error_code: last_error_code.map(str::to_string),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn readyz_clears_after_route_repair_success() {
+        let root = test_root("readyz-clears-after-route-repair-success");
+        seed_runtime_state(
+            &root,
+            RuntimeHealthState::Healthy,
+            "healthy",
+            Some("route_activation_verification_failed"),
+        );
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_status(), "ready");
+    }
+
+    #[test]
+    fn stale_route_repair_failure_does_not_keep_readyz_degraded() {
+        let root = test_root("stale-route-repair-failure-does-not-keep-readyz-degraded");
+        seed_runtime_state(
+            &root,
+            RuntimeHealthState::Healthy,
+            "healthy",
+            Some("route_activation_verification_failed"),
+        );
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_status(), "ready");
     }
 }
 

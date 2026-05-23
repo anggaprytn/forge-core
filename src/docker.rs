@@ -634,8 +634,11 @@ fn parse_inspection_output(output: &str) -> Result<ContainerInspection, DockerRu
         labels,
         network_ips,
         volume_mounts,
-        restart_policy: restart_policy
-            .ok_or_else(|| DockerRuntimeError::InvalidResponse("missing restart policy".into()))?,
+        restart_policy: crate::storage::normalize_restart_policy_name(
+            &restart_policy.ok_or_else(|| {
+                DockerRuntimeError::InvalidResponse("missing restart policy".into())
+            })?,
+        ),
         restart_max_retries,
         cpu_limit,
         memory_limit_mb,

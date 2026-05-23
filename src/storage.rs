@@ -348,7 +348,10 @@ pub struct PersistedRuntimePolicy {
     pub cpu_limit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_mb: Option<u64>,
-    #[serde(default = "default_restart_policy")]
+    #[serde(
+        default = "default_restart_policy",
+        deserialize_with = "deserialize_restart_policy"
+    )]
     pub restart_policy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u64>,
@@ -1650,6 +1653,23 @@ fn default_restart_policy() -> String {
     "no".into()
 }
 
+pub fn normalize_restart_policy_name(policy: &str) -> String {
+    let policy = policy.trim();
+    if policy.is_empty() {
+        "no".into()
+    } else {
+        policy.into()
+    }
+}
+
+fn deserialize_restart_policy<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?.unwrap_or_else(default_restart_policy);
+    Ok(normalize_restart_policy_name(&value))
+}
+
 fn truncate_to_recent_bytes(input: &str, max_bytes: usize) -> String {
     if input.len() <= max_bytes {
         return input.to_string();
@@ -1739,5 +1759,20 @@ pub mod generation_allocator {
         let third = allocator.allocate().unwrap();
 
         assert_eq!((first, second, third), (1, 2, 3));
+    }
+}
+
+#[cfg(test)]
+pub mod runtime_policy_normalization {
+    use super::*;
+
+    #[test]
+    fn empty_restart_policy_normalizes_to_no() {
+        let policy: PersistedRuntimePolicy = serde_json::from_str(
+            "{\n  \"cpu_limit\": null,\n  \"memory_limit_mb\": null,\n  \"restart_policy\": \"\"\n}\n",
+        )
+        .unwrap();
+
+        assert_eq!(policy.restart_policy, "no");
     }
 }

@@ -63,12 +63,16 @@ fn runtime_policy_matches(
     expected: &PersistedRuntimePolicy,
     inspection: &ContainerInspection,
 ) -> bool {
+    let expected_restart_policy =
+        crate::storage::normalize_restart_policy_name(&expected.restart_policy);
+    let actual_restart_policy =
+        crate::storage::normalize_restart_policy_name(&inspection.restart_policy);
     expected.cpu_limit == inspection.cpu_limit
         && expected.memory_limit_mb == inspection.memory_limit_mb
-        && expected.restart_policy == inspection.restart_policy
+        && expected_restart_policy == actual_restart_policy
         && expected.max_retries
             == crate::deployments::normalize_restart_max_retries(
-                &inspection.restart_policy,
+                &actual_restart_policy,
                 inspection.restart_max_retries,
             )
 }
@@ -77,11 +81,7 @@ fn runtime_policy_as_container(expected: &PersistedRuntimePolicy) -> ContainerRu
     ContainerRuntimePolicy {
         cpu_limit: expected.cpu_limit.clone(),
         memory_limit_mb: expected.memory_limit_mb,
-        restart_policy: if expected.restart_policy.trim().is_empty() {
-            "no".into()
-        } else {
-            expected.restart_policy.clone()
-        },
+        restart_policy: crate::storage::normalize_restart_policy_name(&expected.restart_policy),
         max_retries: expected.max_retries,
     }
 }
@@ -133,6 +133,25 @@ fn append_probe_history_entry(
         },
         MAX_PROBE_HISTORY_ENTRIES,
     )?;
+    Ok(())
+}
+
+fn clear_resolved_route_repair_state(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> Result<(), ConvergenceError> {
+    let runtime_store = RuntimeStateStore::new(env.clone());
+    let mut runtime_state = runtime_store.load()?;
+    if runtime_state.active_generation != Some(generation)
+        || runtime_state.last_error_code.as_deref() != Some("route_activation_verification_failed")
+    {
+        return Ok(());
+    }
+    runtime_state.last_error_code = None;
+    runtime_state.health_state = RuntimeHealthState::Healthy;
+    runtime_state.degraded_since_unix = None;
+    runtime_state.last_transition = "healthy".into();
+    runtime_store.save(&runtime_state)?;
     Ok(())
 }
 
@@ -1161,6 +1180,9 @@ where
                     false,
                 )?;
             }
+        }
+        if !route_repair_failed {
+            clear_resolved_route_repair_state(env, current_generation)?;
         }
         Ok((Some(current_generation), route_repair_failed))
     }
@@ -3507,51 +3529,46 @@ fn ensure_generation_service_running<RtD: DockerRuntime>(
 ) -> Result<ContainerInspection, ConvergenceError> {
     let expected_mounts = expected_volume_mounts(runtime);
     match docker.inspect_container(&runtime.container_name) {
-        Ok(inspection)
-            if inspection.running
-                && runtime_policy_matches(&runtime.runtime_policy, &inspection)
-                && volume_mounts_match(&expected_mounts, &inspection.volume_mounts) =>
-        {
-            return Ok(inspection);
-        }
         Ok(_) => {
-            if volume_mounts_match(
-                &expected_mounts,
-                &docker
-                    .inspect_container(&runtime.container_name)?
-                    .volume_mounts,
-            ) && runtime_policy_matches(
-                &runtime.runtime_policy,
-                &docker.inspect_container(&runtime.container_name)?,
-            ) {
+            let inspection = docker.inspect_container(&runtime.container_name)?;
+            let policy_drift = !runtime_policy_matches(&runtime.runtime_policy, &inspection);
+            let volume_drift = !volume_mounts_match(&expected_mounts, &inspection.volume_mounts);
+            if inspection.running && !policy_drift && !volume_drift {
+                return Ok(inspection);
+            }
+            if !policy_drift && !volume_drift {
                 docker.start_container(&runtime.container_name)?;
                 return Ok(docker.inspect_container(&runtime.container_name)?);
             }
             docker.remove_container(&runtime.container_name)?;
-            append_cleanup_event(
-                &EnvironmentPaths::new(storage_root, project_id, environment),
-                project_id,
-                environment,
-                generation,
-                Some(deployment_id.to_string()),
-                "RUNTIME_POLICY_DRIFT_REPAIRED",
-                Some(format!(
-                    "recreated container {} to restore runtime policy {:?}",
-                    runtime.container_name, runtime.runtime_policy
-                )),
-            )?;
-            append_cleanup_event(
-                &EnvironmentPaths::new(storage_root, project_id, environment),
-                project_id,
-                environment,
-                generation,
-                Some(deployment_id.to_string()),
-                "VOLUME_ATTACHMENT_REPAIRED",
-                Some(format!(
-                    "recreated container {} due to stale volume attachment state",
-                    runtime.container_name
-                )),
-            )?;
+            if policy_drift {
+                append_cleanup_event(
+                    &EnvironmentPaths::new(storage_root, project_id, environment),
+                    project_id,
+                    environment,
+                    generation,
+                    Some(deployment_id.to_string()),
+                    "RUNTIME_POLICY_DRIFT_REPAIRED",
+                    Some(format!(
+                        "recreated container {} to restore runtime policy {:?}",
+                        runtime.container_name, runtime.runtime_policy
+                    )),
+                )?;
+            }
+            if volume_drift {
+                append_cleanup_event(
+                    &EnvironmentPaths::new(storage_root, project_id, environment),
+                    project_id,
+                    environment,
+                    generation,
+                    Some(deployment_id.to_string()),
+                    "VOLUME_ATTACHMENT_REPAIRED",
+                    Some(format!(
+                        "recreated container {} due to stale volume attachment state",
+                        runtime.container_name
+                    )),
+                )?;
+            }
         }
         Err(_) => {}
     }
@@ -6957,5 +6974,140 @@ pub mod multi_service_convergence_and_gc {
                 && action.subject.as_deref() == Some(volume_name.as_str())
                 && action.outcome == "protected"
         }));
+    }
+}
+
+#[cfg(test)]
+pub mod drift_normalization {
+    use super::*;
+
+    fn volume_less_runtime(restart_policy: &str) -> PersistedServiceRuntimeInfo {
+        PersistedServiceRuntimeInfo {
+            service_id: "api".into(),
+            container_name: "prod-api-gen-1".into(),
+            image_ref: "forge/api:prod-gen-1".into(),
+            running: true,
+            state: crate::storage::PersistedServiceState::Healthy,
+            network_name: Some("forge-test".into()),
+            probe_path: Some("/health".into()),
+            activation: Some(PersistedActivationMode::Http {
+                internal_port: 3000,
+                route_subtree_id: Some("forge:api:production".into()),
+                target_source: PersistedRouteTargetSource::ContainerIp,
+            }),
+            command: None,
+            runtime_policy: PersistedRuntimePolicy {
+                restart_policy: restart_policy.into(),
+                ..PersistedRuntimePolicy::default()
+            },
+            runtime_usage: None,
+            termination: None,
+            depends_on: Vec::new(),
+            required_for_promotion: true,
+            externally_exposed: true,
+            environment_variables: BTreeMap::new(),
+            state_config: None,
+            volume_mounts: Vec::new(),
+            source_ref: None,
+            repo_url: None,
+            commit_sha: None,
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn empty_volume_mounts_compare_equal() {
+        assert!(volume_mounts_match(&[], &[]));
+    }
+
+    #[test]
+    fn convergence_does_not_recreate_for_empty_restart_policy() {
+        let root = test_root("convergence-does-not-recreate-for-empty-restart-policy");
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+
+        ensure_generation_service_running(
+            &root,
+            "api",
+            "production",
+            1,
+            "dep-1",
+            &volume_less_runtime(""),
+            &mut docker,
+        )
+        .unwrap();
+
+        assert!(docker.remove_calls.is_empty());
+        assert!(docker.create_calls.is_empty());
+    }
+
+    #[test]
+    fn no_volume_service_does_not_trigger_volume_repair() {
+        let root = test_root("no-volume-service-does-not-trigger-volume-repair");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+
+        ensure_generation_service_running(
+            &root,
+            "api",
+            "production",
+            1,
+            "dep-1",
+            &volume_less_runtime("no"),
+            &mut docker,
+        )
+        .unwrap();
+
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        assert!(!env.generation_dir(1).join("events.jsonl").exists());
+    }
+
+    #[test]
+    fn convergence_does_not_recreate_volume_less_services() {
+        let root = test_root("convergence-does-not-recreate-volume-less-services");
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), false);
+
+        ensure_generation_service_running(
+            &root,
+            "api",
+            "production",
+            1,
+            "dep-1",
+            &volume_less_runtime("no"),
+            &mut docker,
+        )
+        .unwrap();
+
+        assert_eq!(docker.start_calls, vec!["prod-api-gen-1".to_string()]);
+        assert!(docker.remove_calls.is_empty());
+        assert!(docker.create_calls.is_empty());
+    }
+
+    #[test]
+    fn healthy_environment_clears_startup_route_failure_marker() {
+        let root = test_root("healthy-environment-clears-startup-route-failure-marker");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        RuntimeStateStore::new(env.clone())
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Degraded,
+                failed_probe_count: 0,
+                successful_probe_count: 0,
+                restart_attempted: false,
+                degraded_since_unix: Some(1),
+                last_transition: "startup_route_repair_failed".into(),
+                last_error_code: Some("route_activation_verification_failed".into()),
+            })
+            .unwrap();
+
+        clear_resolved_route_repair_state(&env, 1).unwrap();
+
+        let runtime_state = RuntimeStateStore::new(env).load().unwrap();
+        assert_eq!(runtime_state.health_state, RuntimeHealthState::Healthy);
+        assert_eq!(runtime_state.last_transition, "healthy");
+        assert_eq!(runtime_state.last_error_code, None);
     }
 }

@@ -1525,9 +1525,11 @@ where
         .map(|inspection| PersistedRuntimePolicy {
             cpu_limit: inspection.cpu_limit.clone(),
             memory_limit_mb: inspection.memory_limit_mb,
-            restart_policy: inspection.restart_policy.clone(),
-            max_retries: crate::deployments::normalize_restart_max_retries(
+            restart_policy: crate::storage::normalize_restart_policy_name(
                 &inspection.restart_policy,
+            ),
+            max_retries: crate::deployments::normalize_restart_max_retries(
+                &crate::storage::normalize_restart_policy_name(&inspection.restart_policy),
                 inspection.restart_max_retries,
             ),
         })
@@ -1735,9 +1737,11 @@ fn collect_service_runtime_truth<D: DockerRuntime, R: RoutingRuntime>(
                     .map(|value| PersistedRuntimePolicy {
                         cpu_limit: value.cpu_limit.clone(),
                         memory_limit_mb: value.memory_limit_mb,
-                        restart_policy: value.restart_policy.clone(),
-                        max_retries: crate::deployments::normalize_restart_max_retries(
+                        restart_policy: crate::storage::normalize_restart_policy_name(
                             &value.restart_policy,
+                        ),
+                        max_retries: crate::deployments::normalize_restart_max_retries(
+                            &crate::storage::normalize_restart_policy_name(&value.restart_policy),
                             value.restart_max_retries,
                         ),
                     })
@@ -2070,6 +2074,7 @@ fn recent_volume_repair_events(
     generations: &[u64],
 ) -> Result<Vec<String>, ProjectStatusError> {
     let mut events = Vec::new();
+    let mut seen = BTreeSet::new();
     for generation in generations {
         let path = env.generation_dir(*generation).join("events.jsonl");
         if !path.exists() {
@@ -2087,9 +2092,16 @@ fn recent_volume_repair_events(
                 )))
             })?;
             if event.event_type == "VOLUME_ATTACHMENT_REPAIRED" {
-                events.push(event.reason.unwrap_or_else(|| {
-                    format!("generation {} volume attachment repaired", generation)
-                }));
+                let rendered = format!(
+                    "historical gen-{}: {}",
+                    generation,
+                    event.reason.unwrap_or_else(|| {
+                        format!("generation {} volume attachment repaired", generation)
+                    })
+                );
+                if seen.insert(rendered.clone()) {
+                    events.push(rendered);
+                }
             }
         }
     }
@@ -2137,6 +2149,7 @@ fn recent_policy_drift_repairs(
     generations: &[u64],
 ) -> Result<Vec<String>, ProjectStatusError> {
     let mut events = Vec::new();
+    let mut seen = BTreeSet::new();
     for generation in generations {
         let path = env.generation_dir(*generation).join("events.jsonl");
         if !path.exists() {
@@ -2154,9 +2167,16 @@ fn recent_policy_drift_repairs(
                 )))
             })?;
             if event.event_type == "RUNTIME_POLICY_DRIFT_REPAIRED" {
-                events.push(event.reason.unwrap_or_else(|| {
-                    format!("generation {} runtime policy drift repaired", generation)
-                }));
+                let rendered = format!(
+                    "historical gen-{}: {}",
+                    generation,
+                    event.reason.unwrap_or_else(|| {
+                        format!("generation {} runtime policy drift repaired", generation)
+                    })
+                );
+                if seen.insert(rendered.clone()) {
+                    events.push(rendered);
+                }
             }
         }
     }
@@ -2868,11 +2888,11 @@ mod tests {
         BuildImageRequest, CreateContainerRequest, ManagedImage, RouteUpdateRequest,
     };
     use crate::storage::{
-        DiagnosticSummary, LifecycleStore, PersistedProbeHistory, PersistedProbeHistoryEntry,
-        PersistedProbeType, PersistedRouteTargetSource, PersistedRuntimeInfo,
-        PersistedServiceRuntimeInfo, PersistedServiceState, PointerStore, ProbeHistoryStore,
-        RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
-        atomic_write,
+        DiagnosticSummary, EventStore, LifecycleStore, PersistedProbeHistory,
+        PersistedProbeHistoryEntry, PersistedProbeType, PersistedRouteTargetSource,
+        PersistedRuntimeInfo, PersistedServiceRuntimeInfo, PersistedServiceState, PointerStore,
+        ProbeHistoryStore, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
+        SnapshotWriter, atomic_write,
     };
 
     #[derive(Default)]
@@ -5977,5 +5997,46 @@ mod tests {
         assert_eq!(db.volumes[0].retention, "persistent");
         assert!(db.volumes[0].attached);
         assert!(diagnostics.orphaned_state_warnings.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_label_repair_events_as_historical_and_deduplicate_volume_lines() {
+        let root = test_root("diagnostics-label-repair-events-as-historical-and-deduplicate");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        let events = EventStore::new(env.clone(), 7);
+        for event_type in [
+            "VOLUME_ATTACHMENT_REPAIRED",
+            "VOLUME_ATTACHMENT_REPAIRED",
+            "RUNTIME_POLICY_DRIFT_REPAIRED",
+        ] {
+            events
+                .append(&EventRecord {
+                    timestamp_unix: 1,
+                    project_id: "api".into(),
+                    environment: "staging".into(),
+                    generation: Some(7),
+                    deployment_id: Some("dep-7".into()),
+                    event_type: event_type.into(),
+                    reason: Some("recreated container staging-api-gen-7".into()),
+                })
+                .unwrap();
+        }
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert_eq!(diagnostics.volume_repair_events.len(), 1);
+        assert!(diagnostics.volume_repair_events[0].starts_with("historical gen-7:"));
+        assert_eq!(diagnostics.policy_drift_repairs.len(), 1);
+        assert!(diagnostics.policy_drift_repairs[0].starts_with("historical gen-7:"));
     }
 }

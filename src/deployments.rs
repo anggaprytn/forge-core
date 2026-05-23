@@ -54,6 +54,47 @@ pub enum DeploymentError {
     RollbackUnavailable,
 }
 
+#[cfg(test)]
+pub mod runtime_policy_drift_normalization {
+    use super::*;
+
+    #[test]
+    fn default_restart_policy_does_not_trigger_drift() {
+        let inspection = ContainerInspection {
+            container_name: "prod-api-gen-1".into(),
+            running: true,
+            state_status: "running".into(),
+            exit_code: None,
+            restart_count: 0,
+            started_at: None,
+            image_ref: "forge/api:prod-gen-1".into(),
+            labels: BTreeMap::new(),
+            network_ips: BTreeMap::new(),
+            volume_mounts: Vec::new(),
+            restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            oom_killed: false,
+            finished_at: None,
+            error: None,
+            exit_signal: None,
+            termination_reason: None,
+        };
+
+        let result = validate_inspection(
+            &inspection,
+            "prod-api-gen-1",
+            &PersistedRuntimePolicy {
+                restart_policy: String::new(),
+                ..PersistedRuntimePolicy::default()
+            },
+        );
+
+        assert!(result.is_ok());
+    }
+}
+
 impl Display for DeploymentError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3992,7 +4033,13 @@ fn validate_inspection(
         ));
     }
     let actual_policy = inspection_runtime_policy(inspection);
-    if actual_policy != *expected_policy {
+    let expected_policy = PersistedRuntimePolicy {
+        restart_policy: crate::storage::normalize_restart_policy_name(
+            &expected_policy.restart_policy,
+        ),
+        ..expected_policy.clone()
+    };
+    if actual_policy != expected_policy {
         return Err(DeploymentError::InvalidInspection(format!(
             "runtime policy mismatch: expected {:?}, got {:?}",
             expected_policy, actual_policy
@@ -4351,11 +4398,7 @@ fn container_runtime_policy(policy: &ForgeRuntimePolicy) -> ContainerRuntimePoli
     ContainerRuntimePolicy {
         cpu_limit: policy.cpu_limit.clone(),
         memory_limit_mb: policy.memory_limit_mb,
-        restart_policy: if policy.restart_policy.trim().is_empty() {
-            "no".into()
-        } else {
-            policy.restart_policy.clone()
-        },
+        restart_policy: crate::storage::normalize_restart_policy_name(&policy.restart_policy),
         max_retries: policy.max_retries,
     }
 }
@@ -4364,11 +4407,7 @@ fn persisted_runtime_policy(policy: &ForgeRuntimePolicy) -> PersistedRuntimePoli
     PersistedRuntimePolicy {
         cpu_limit: policy.cpu_limit.clone(),
         memory_limit_mb: policy.memory_limit_mb,
-        restart_policy: if policy.restart_policy.trim().is_empty() {
-            "no".into()
-        } else {
-            policy.restart_policy.clone()
-        },
+        restart_policy: crate::storage::normalize_restart_policy_name(&policy.restart_policy),
         max_retries: policy.max_retries,
     }
 }
@@ -4377,9 +4416,9 @@ fn inspection_runtime_policy(inspection: &ContainerInspection) -> PersistedRunti
     PersistedRuntimePolicy {
         cpu_limit: inspection.cpu_limit.clone(),
         memory_limit_mb: inspection.memory_limit_mb,
-        restart_policy: inspection.restart_policy.clone(),
+        restart_policy: crate::storage::normalize_restart_policy_name(&inspection.restart_policy),
         max_retries: normalize_restart_max_retries(
-            &inspection.restart_policy,
+            &crate::storage::normalize_restart_policy_name(&inspection.restart_policy),
             inspection.restart_max_retries,
         ),
     }
@@ -4389,7 +4428,7 @@ pub(crate) fn normalize_restart_max_retries(
     restart_policy: &str,
     max_retries: Option<u64>,
 ) -> Option<u64> {
-    if restart_policy == "no" {
+    if crate::storage::normalize_restart_policy_name(restart_policy) == "no" {
         None
     } else {
         max_retries

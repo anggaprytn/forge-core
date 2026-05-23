@@ -1495,7 +1495,9 @@ fn render_services_section(services: &[ServiceRuntimeStatus], include_logs: bool
         ));
         output.push_str(&format!(
             "    restart: {}{}\n",
-            service.runtime_policy.restart_policy,
+            forge_core::storage::normalize_restart_policy_name(
+                &service.runtime_policy.restart_policy,
+            ),
             service
                 .runtime_policy
                 .max_retries
@@ -1608,7 +1610,7 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
             .memory_limit_mb
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unlimited".into()),
-        status.runtime_policy.restart_policy,
+        forge_core::storage::normalize_restart_policy_name(&status.runtime_policy.restart_policy),
         status
             .runtime_policy
             .max_retries
@@ -1822,7 +1824,7 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
                 .memory_limit_mb
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unlimited".into()),
-            policy.restart_policy,
+            forge_core::storage::normalize_restart_policy_name(&policy.restart_policy),
             policy
                 .max_retries
                 .map(|value| format!(" (max_retries={value})"))

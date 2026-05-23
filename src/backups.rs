@@ -1440,9 +1440,10 @@ fn validate_inspection(
             "restored container is not running".into(),
         ));
     }
-    if inspection.restart_policy != expected_policy.restart_policy
+    if crate::storage::normalize_restart_policy_name(&inspection.restart_policy)
+        != crate::storage::normalize_restart_policy_name(&expected_policy.restart_policy)
         || crate::deployments::normalize_restart_max_retries(
-            &inspection.restart_policy,
+            &crate::storage::normalize_restart_policy_name(&inspection.restart_policy),
             inspection.restart_max_retries,
         ) != expected_policy.max_retries
         || inspection.cpu_limit != expected_policy.cpu_limit
