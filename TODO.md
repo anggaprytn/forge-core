@@ -386,3 +386,5 @@ candidate
 ```
 
 Never break this.
+- keep tightening release artifact determinism and operator-facing upgrade diagnostics
+- document hosted artifact publishing/distribution once a canonical release channel is chosen

@@ -138,7 +138,7 @@ Restart Caddy: `systemctl restart caddy`.
 For Linux hosts with systemd, use the provided conservative installer:
 
 ```bash
-./install.sh
+./install.sh --artifact dist/forge-<version>-linux-amd64.tar.gz
 ```
 
 The installer is **idempotent** and safe:
@@ -432,5 +432,9 @@ Probe guidance:
 
 ## Upgrade Preflight
 
-- Use `forge version` to capture runtime build identity and schema versions.
+- Use `forge version` to capture runtime build identity, target triple, and schema/storage compatibility versions.
 - Use `forge doctor upgrade` before upgrades. It is read-only and checks storage readability, schema compatibility, Docker, Caddy, write access, and Linux `systemd` sanity.
+- Use `forge upgrade plan --artifact dist/forge-<version>-linux-amd64.tar.gz` before swapping binaries.
+- Use `forge upgrade apply --artifact dist/forge-<version>-linux-amd64.tar.gz` for the actual upgrade.
+- Use `forge upgrade rollback` for emergency binary restore from `/usr/local/bin/forge.previous`.
+- Treat `syncforge` as development-only; release artifacts are the preferred production path.

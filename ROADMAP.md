@@ -145,6 +145,7 @@ Forge Alpha Core Loop v1 proves that git-backed immutable deployments can achiev
 - [x] AI-generated application deployment proofs
 - **VPS Alpha Milestone (Manual Validation)**:
   - conservative and idempotent `install.sh`
+  - versioned release artifacts with checksums and operator rollback
   - systemd-managed daemon lifecycle
   - host reboot / daemon restart recovery
   - routing repair after Caddy/Docker restart

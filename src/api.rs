@@ -283,10 +283,9 @@ pub struct TokenRevokeResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgeVersionOutput {
     pub version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_commit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_timestamp: Option<String>,
+    pub git_commit: String,
+    pub build_timestamp: String,
+    pub target_triple: String,
     pub schema_versions: ForgeSchemaVersions,
 }
 
@@ -296,6 +295,7 @@ pub struct ForgeSchemaVersions {
     pub snapshot_schema: u64,
     pub checkpoint_schema: u64,
     pub reconciliation_log_schema: u64,
+    pub storage_compatibility: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +433,8 @@ pub struct EnvironmentDiagnostics {
     pub state_restore_warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backup_restore_events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_upgrade_events: Vec<crate::upgrade::UpgradeEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_drift_repairs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

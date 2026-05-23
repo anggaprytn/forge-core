@@ -243,13 +243,14 @@ Minimum runtime requirements:
 For Linux hosts with systemd, use the provided conservative installer:
 
 ```bash
-./install.sh
+./install.sh --artifact dist/forge-<version>-linux-amd64.tar.gz
 ```
 
 The installer is **idempotent** and performs the following:
 - Installs the `forge` binary to `/usr/local/bin`.
-- Creates `/etc/forge/forge.conf` and `/etc/forge/forge.env` if they do not exist.
+- Creates `/etc/forge/forge.conf` and `/etc/forge/forge.env` if they do not exist, and preserves them unless `--force` is used.
 - Prepares the storage root at `/var/lib/forge`.
+- Preserves the previous binary at `/usr/local/bin/forge.previous`.
 - Installs the systemd unit `forge.service` (does not enable or start it automatically).
 
 **What the installer does NOT do:**
@@ -1163,7 +1164,14 @@ forge token revoke tok-1234abcd
 ```bash
 forge version
 forge doctor upgrade
+forge upgrade plan --artifact dist/forge-<version>-linux-amd64.tar.gz
+forge upgrade apply --artifact dist/forge-<version>-linux-amd64.tar.gz
+forge upgrade rollback
 ```
 
-- `forge version` prints the runtime version plus embedded git/build metadata when available.
+- `forge version` prints the runtime version, git commit, build timestamp, target triple, schema versions, and storage compatibility version. Missing git/build metadata is rendered as `unknown`.
 - `forge doctor upgrade` is read-only and checks storage readability, checkpoint compatibility, reconciliation log compatibility, backup metadata compatibility, Docker, Caddy, write permissions, and Linux `systemd` unit sanity.
+- `forge upgrade plan` validates the current binary version, target artifact version, config/env readability, Docker, Caddy, systemd presence, schema compatibility, checksum availability, artifact permissions, and disk space without touching the running binary.
+- `forge upgrade apply` stops the service, saves `/usr/local/bin/forge.previous`, swaps the binary atomically, waits for `/readyz`, and auto-rolls back unless `--no-auto-rollback` is set.
+- `forge upgrade rollback` restores `/usr/local/bin/forge.previous` and restarts the service.
+- `scripts/package-release.sh` produces release tarballs and `checksums.txt`.

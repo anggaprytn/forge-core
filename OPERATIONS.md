@@ -424,9 +424,20 @@ The `install.sh` script is designed to be safe and non-destructive:
 - It installs the binary and systemd unit.
 - It prepares the storage root at `/var/lib/forge`.
 - It creates default config/env files if they are missing.
+- It preserves existing config/env unless `--force` is used.
+- It keeps `/usr/local/bin/forge.previous` as the rollback candidate.
 - It **does not** install Docker or Caddy.
 - It **does not** modify firewall or Nginx rules.
 - It **does not** expose the API publicly.
+
+## Release Upgrades
+
+- Package releases with `scripts/package-release.sh`.
+- Verify artifacts with `dist/checksums.txt`.
+- Prefer `forge upgrade plan --artifact ...` before every operator upgrade.
+- Use `forge upgrade apply --artifact ...` for the actual swap; the binary replacement is atomic and gated on `/readyz`.
+- Use `forge upgrade rollback` for emergency recovery from the preserved `forge.previous` binary.
+- `syncforge` remains a development-only workflow and should not be the production upgrade path.
 
 ## Required Environment & Config
 

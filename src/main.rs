@@ -49,6 +49,10 @@ use forge_core::storage::{
     CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, LeaderLeaseStore, NodeMetadataStore,
     PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
 };
+use forge_core::upgrade::{
+    MANIFEST_SCHEMA_VERSION, STORAGE_COMPATIBILITY_VERSION, UpgradeOptions, apply as apply_upgrade,
+    plan as plan_upgrade, rollback as rollback_upgrade,
+};
 use forge_core::{
     reconciliation::RECONCILIATION_LOG_SCHEMA_VERSION, storage::CONTROL_PLANE_SCHEMA_VERSION,
 };
@@ -87,6 +91,9 @@ where
             | Command::Logout
             | Command::WhoAmI
             | Command::Version
+            | Command::UpgradePlan { .. }
+            | Command::UpgradeApply { .. }
+            | Command::UpgradeRollback { .. }
             | Command::ControlPlaneLeader { .. }
             | Command::ControlPlaneLease { .. }
             | Command::ControlPlaneReplayStatus { .. }
@@ -123,6 +130,36 @@ where
         Command::Logout => run_logout()?,
         Command::WhoAmI => run_whoami(&parsed)?,
         Command::Version => print_json(&forge_version_output())?,
+        Command::UpgradePlan {
+            config_path,
+            caddy_admin_url,
+            artifact_path,
+        } => print_json(
+            &plan_upgrade(&UpgradeOptions {
+                config_path,
+                caddy_admin_url,
+                artifact_path,
+                auto_rollback: true,
+            })
+            .map_err(|err| CliError::Usage(err.to_string()))?,
+        )?,
+        Command::UpgradeApply {
+            config_path,
+            caddy_admin_url,
+            artifact_path,
+            no_auto_rollback,
+        } => print_json(
+            &apply_upgrade(&UpgradeOptions {
+                config_path,
+                caddy_admin_url,
+                artifact_path,
+                auto_rollback: !no_auto_rollback,
+            })
+            .map_err(|err| CliError::Usage(err.to_string()))?,
+        )?,
+        Command::UpgradeRollback { config_path } => print_json(
+            &rollback_upgrade(&config_path).map_err(|err| CliError::Usage(err.to_string()))?,
+        )?,
         Command::TokenList => {
             let (base_url, token) = api_credentials.unwrap();
             let client = ForgeClient::new(base_url, token);
@@ -948,6 +985,20 @@ enum Command {
     Logout,
     WhoAmI,
     Version,
+    UpgradePlan {
+        config_path: PathBuf,
+        caddy_admin_url: String,
+        artifact_path: PathBuf,
+    },
+    UpgradeApply {
+        config_path: PathBuf,
+        caddy_admin_url: String,
+        artifact_path: PathBuf,
+        no_auto_rollback: bool,
+    },
+    UpgradeRollback {
+        config_path: PathBuf,
+    },
     TokenList,
     TokenCreate {
         name: String,
@@ -1241,6 +1292,31 @@ fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) 
             metrics_url,
             upgrade: true,
         },
+        Command::UpgradePlan {
+            config_path: _,
+            caddy_admin_url,
+            artifact_path,
+        } if !config_path_explicit => Command::UpgradePlan {
+            config_path: default_server_config_path(),
+            caddy_admin_url,
+            artifact_path,
+        },
+        Command::UpgradeApply {
+            config_path: _,
+            caddy_admin_url,
+            artifact_path,
+            no_auto_rollback,
+        } if !config_path_explicit => Command::UpgradeApply {
+            config_path: default_server_config_path(),
+            caddy_admin_url,
+            artifact_path,
+            no_auto_rollback,
+        },
+        Command::UpgradeRollback { config_path: _ } if !config_path_explicit => {
+            Command::UpgradeRollback {
+                config_path: default_server_config_path(),
+            }
+        }
         other => other,
     }
 }
@@ -1289,6 +1365,41 @@ fn parse_command(
         [cmd] if cmd == "logout" => Ok(Command::Logout),
         [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
         [cmd] if cmd == "version" => Ok(Command::Version),
+        [group, action, flag, artifact]
+            if group == "upgrade" && action == "plan" && flag == "--artifact" =>
+        {
+            Ok(Command::UpgradePlan {
+                config_path,
+                caddy_admin_url,
+                artifact_path: PathBuf::from(artifact),
+            })
+        }
+        [group, action, flag, artifact]
+            if group == "upgrade" && action == "apply" && flag == "--artifact" =>
+        {
+            Ok(Command::UpgradeApply {
+                config_path,
+                caddy_admin_url,
+                artifact_path: PathBuf::from(artifact),
+                no_auto_rollback: false,
+            })
+        }
+        [group, action, flag, artifact, extra]
+            if group == "upgrade"
+                && action == "apply"
+                && flag == "--artifact"
+                && extra == "--no-auto-rollback" =>
+        {
+            Ok(Command::UpgradeApply {
+                config_path,
+                caddy_admin_url,
+                artifact_path: PathBuf::from(artifact),
+                no_auto_rollback: true,
+            })
+        }
+        [group, action] if group == "upgrade" && action == "rollback" => {
+            Ok(Command::UpgradeRollback { config_path })
+        }
         [group, action] if group == "token" && action == "list" => Ok(Command::TokenList),
         [group, action, flag, name]
             if group == "token" && action == "create" && flag == "--name" =>
@@ -1406,6 +1517,9 @@ fn usage() -> String {
         "  forge logout",
         "  forge whoami",
         "  forge version",
+        "  forge [--config PATH] [--caddy-admin-url URL] upgrade plan --artifact <path>",
+        "  forge [--config PATH] [--caddy-admin-url URL] upgrade apply --artifact <path> [--no-auto-rollback]",
+        "  forge [--config PATH] upgrade rollback",
         "  forge [--url URL] [--token TOKEN] token list",
         "  forge [--url URL] [--token TOKEN] token create --name <name>",
         "  forge [--url URL] [--token TOKEN] token revoke <token_id>",
@@ -2564,6 +2678,22 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
         }
     }
     output.push('\n');
+    output.push_str("Recent Upgrades:\n");
+    if diagnostics.recent_upgrade_events.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for event in &diagnostics.recent_upgrade_events {
+            output.push_str(&format!(
+                "  {} {} {} -> {} ({})\n",
+                event.timestamp_unix,
+                event.action,
+                event.from_version,
+                event.to_version,
+                event.result
+            ));
+        }
+    }
+    output.push('\n');
     output.push_str("Recent GC Actions:\n");
     if diagnostics.recent_gc_actions.is_empty() {
         output.push_str("  none\n");
@@ -3069,15 +3199,25 @@ fn run_whoami(parsed: &ParsedArgs) -> Result<(), CliError> {
 fn forge_version_output() -> ForgeVersionOutput {
     ForgeVersionOutput {
         version: env!("CARGO_PKG_VERSION").into(),
-        git_commit: option_env!("FORGE_GIT_COMMIT").map(str::to_string),
-        build_timestamp: option_env!("FORGE_BUILD_TIMESTAMP").map(str::to_string),
+        git_commit: build_metadata_value(option_env!("FORGE_GIT_COMMIT")),
+        build_timestamp: build_metadata_value(option_env!("FORGE_BUILD_TIMESTAMP")),
+        target_triple: build_metadata_value(option_env!("FORGE_TARGET_TRIPLE")),
         schema_versions: ForgeSchemaVersions {
-            manifest_schema: 1,
+            manifest_schema: MANIFEST_SCHEMA_VERSION,
             snapshot_schema: SNAPSHOT_SCHEMA_VERSION,
             checkpoint_schema: CHECKPOINT_SCHEMA_VERSION.max(CONTROL_PLANE_SCHEMA_VERSION),
             reconciliation_log_schema: RECONCILIATION_LOG_SCHEMA_VERSION,
+            storage_compatibility: STORAGE_COMPATIBILITY_VERSION,
         },
     }
+}
+
+fn build_metadata_value(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn run_gc_command(
@@ -3855,6 +3995,7 @@ mod tests {
             active_restore: None,
             state_restore_warnings: Vec::new(),
             backup_restore_events: Vec::new(),
+            recent_upgrade_events: Vec::new(),
             policy_drift_repairs: Vec::new(),
             current_policy_drift_repairs: Vec::new(),
             historical_policy_drift_repairs: Vec::new(),
@@ -3863,6 +4004,13 @@ mod tests {
             node: None,
             cluster: ClusterDiagnostics::default(),
         }
+    }
+
+    #[test]
+    fn version_handles_missing_git_metadata() {
+        assert_eq!(build_metadata_value(None), "unknown");
+        assert_eq!(build_metadata_value(Some("")), "unknown");
+        assert_eq!(build_metadata_value(Some("abc123")), "abc123");
     }
 
     #[test]

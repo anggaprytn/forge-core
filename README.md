@@ -111,7 +111,7 @@ Architectural principle: `Convergence computes truth. APIs serve cached truth.`
 For quick evaluation:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/anggaprytn/forge-core/main/install.sh | bash
+./install.sh --artifact dist/forge-<version>-linux-amd64.tar.gz
 ```
 
 For deterministic production builds:
@@ -246,8 +246,10 @@ MIT License. Built for the era of agentic software.
 
 - `bearer_token` in `forge.conf` remains the bootstrap/admin credential. Prefer CLI tokens for routine remote operation.
 - Do not paste the bootstrap bearer token into shell history; use env injection or a protected config file.
-- `forge version` reports the runtime version, embedded git commit and build timestamp when available, and the manifest/snapshot/checkpoint/reconciliation schema versions.
+- `forge version` reports the runtime version, git commit, build timestamp, target triple, manifest/snapshot/checkpoint/reconciliation schema versions, and storage compatibility version. Missing build metadata is rendered as `unknown`.
 - `forge doctor upgrade` is read-only and checks storage readability, checkpoint compatibility, reconciliation log compatibility, backup metadata compatibility, Docker, Caddy, write access, and Linux `systemd` sanity.
+- Release artifacts live under `dist/` with `forge-<version>-<platform>.tar.gz` plus `checksums.txt`.
+- Prefer `forge upgrade plan --artifact ...` and `forge upgrade apply --artifact ...` for production/self-hosted operators. `syncforge` remains development-only.
 
 ## Backup Safety
 

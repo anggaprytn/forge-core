@@ -758,16 +758,19 @@ fn token_create_shows_token_once() {
 }
 
 #[test]
-fn forge_version_outputs_runtime_version() {
+fn version_outputs_build_metadata() {
     let output = run_cli_in_dir(Path::new("."), &["version"]);
     assert!(output.status.success());
     let body = String::from_utf8_lossy(&output.stdout);
     assert!(body.contains("\"version\":"));
     assert!(body.contains(env!("CARGO_PKG_VERSION")));
+    assert!(body.contains("\"git_commit\":"));
+    assert!(body.contains("\"build_timestamp\":"));
+    assert!(body.contains("\"target_triple\":"));
 }
 
 #[test]
-fn version_includes_schema_versions() {
+fn version_outputs_schema_versions() {
     let output = run_cli_in_dir(Path::new("."), &["version"]);
     assert!(output.status.success());
     let body = String::from_utf8_lossy(&output.stdout);
@@ -776,6 +779,7 @@ fn version_includes_schema_versions() {
     assert!(body.contains("\"snapshot_schema\""));
     assert!(body.contains("\"checkpoint_schema\""));
     assert!(body.contains("\"reconciliation_log_schema\""));
+    assert!(body.contains("\"storage_compatibility\""));
 }
 
 #[test]

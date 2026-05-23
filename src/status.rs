@@ -43,6 +43,7 @@ use crate::storage::{
     load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 use crate::topology::runtime_with_primary_service;
+use crate::upgrade::read_recent_events;
 
 const HEALTHY_FINALIZED_RETENTION_LIMIT: usize = 2;
 const FAILED_GENERATION_RETENTION_LIMIT: usize = 2;
@@ -1321,6 +1322,7 @@ where
         active_restore,
         state_restore_warnings: orphaned_state_warnings.clone(),
         backup_restore_events,
+        recent_upgrade_events: read_recent_events(storage_root, 5),
         policy_drift_repairs: policy_drift_repairs.current.clone(),
         current_policy_drift_repairs: policy_drift_repairs.current,
         historical_policy_drift_repairs: policy_drift_repairs.historical,
