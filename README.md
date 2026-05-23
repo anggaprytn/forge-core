@@ -96,6 +96,7 @@ Forge exposes four distinct operator surfaces:
 
 - **`/healthz`**: process liveness only. Verifies the daemon is running and responding. Keep it lightweight.
 - **`/readyz`**: control-plane readiness only. Serves cached readiness state derived from asynchronous convergence. It is not fleet health inspection.
+- **`/metrics`**: cache-backed control-plane metrics and dependency breaker diagnostics in lightweight JSON.
 - **`forge status`**: lightweight runtime and environment summary for operators.
 - **`forge diagnose`**: deep runtime truth inspection for debugging and incident response.
 
@@ -154,10 +155,19 @@ Forge Alpha Core Loop v4 freezes the single-node stateful orchestration loop wit
 - **Termination Diagnostics:** `forge diagnose` and API diagnostics expose exit reason, exit code, signal, restart count, OOM state, and log tails when available.
 - **Runtime Usage Snapshots:** Status and diagnostics surface captured CPU and memory usage snapshots for active services.
 - **Cache-Backed Readiness:** The convergence loop computes readiness asynchronously and `/readyz` serves cached control-plane truth in bounded time.
+- **Cache-Backed Metrics:** `/metrics` exposes cached convergence timings, readiness counters, cache age, and Docker/Caddy breaker state without live scans on the request path.
+- **Dependency Circuit Breakers:** Docker and Caddy probing use bounded retries with automatic degraded-mode backoff and automatic recovery closure.
 - **Non-Fatal Route Repair Failures:** Startup route-repair failure degrades readiness reporting without failing basic liveness.
 - **Readyz Active Degradation Semantics:** `/readyz` returns `degraded` with concrete reasons while the daemon remains operational enough to serve requests.
 - **Clean Repair Diagnostics:** Diagnostics separate current repair signals from historical repair noise for runtime policy and volume repair fields.
 - **Stateful Multi-Service Baseline:** Multi-service topology, internal DNS, stateful volumes, backup/restore, restore lineage, and GC safety remain part of the validated core.
+
+Operational benchmarking helpers are available through:
+
+```bash
+forge --url http://127.0.0.1:18080 bench readyz
+forge --url http://127.0.0.1:18080 bench convergence
+```
 
 Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, which produced pathological latency in the 48s to 150s range. The current model keeps readiness off the fleet-inspection path and bounded under scale.
 

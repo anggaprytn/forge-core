@@ -4,7 +4,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -12,9 +12,9 @@ use forge_core::api::{
     BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
-    EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectRecord, ProjectUpsertRequest, RestoreLineage, RetentionRole, SecretListResponse,
-    SecretUnsetResponse, ServiceRuntimeStatus,
+    EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, MetricsResponse,
+    ProjectList, ProjectRecord, ProjectUpsertRequest, ReadyzResponse, RestoreLineage,
+    RetentionRole, SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -65,6 +65,7 @@ where
         parsed.command,
         Command::Doctor { .. }
             | Command::Daemon(_)
+            | Command::Bench { .. }
             | Command::Gc { .. }
             | Command::Init { .. }
             | Command::Login { .. }
@@ -149,6 +150,10 @@ where
                 print!("{}", render_project_environment_status(&status));
             }
         }
+        Command::Bench {
+            ref target,
+            samples,
+        } => run_bench(&parsed, target, samples)?,
         Command::Diagnose {
             project_id,
             environment,
@@ -646,6 +651,134 @@ impl ForgeClient {
     }
 }
 
+fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), CliError> {
+    let base_url = parsed
+        .resolved_server_url()?
+        .ok_or_else(|| CliError::Usage("missing Forge URL: use --url or FORGE_URL".into()))?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|err| CliError::Http(err.to_string()))?;
+    let path = match target {
+        "readyz" => "/readyz",
+        "convergence" => "/metrics",
+        _ => {
+            return Err(CliError::Usage(
+                "bench target must be readyz or convergence".into(),
+            ));
+        }
+    };
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let throughput_started = std::time::Instant::now();
+    let mut latencies_ms = Vec::with_capacity(samples);
+    let mut last_readyz = None;
+    let mut last_metrics = None;
+
+    for _ in 0..samples {
+        let started = std::time::Instant::now();
+        let response = client
+            .get(&url)
+            .send()
+            .map_err(|err| CliError::Http(err.to_string()))?;
+        let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        latencies_ms.push(latency_ms);
+        match target {
+            "readyz" => {
+                last_readyz = Some(decode_public_json::<ReadyzResponse>(response)?);
+            }
+            "convergence" => {
+                last_metrics = Some(decode_public_json::<MetricsResponse>(response)?);
+            }
+            _ => {}
+        }
+    }
+
+    let elapsed_secs = throughput_started.elapsed().as_secs_f64();
+    let throughput = if elapsed_secs > 0.0 {
+        samples as f64 / elapsed_secs
+    } else {
+        samples as f64
+    };
+    latencies_ms.sort_by(|left, right| left.total_cmp(right));
+    let min = *latencies_ms.first().unwrap_or(&0.0);
+    let p50 = percentile(&latencies_ms, 0.50);
+    let p95 = percentile(&latencies_ms, 0.95);
+    let max = *latencies_ms.last().unwrap_or(&0.0);
+
+    println!("target: {target}");
+    println!("samples: {samples}");
+    println!("latency_ms: min={min:.2} p50={p50:.2} p95={p95:.2} max={max:.2}");
+    println!("throughput_rps: {:.2}", throughput);
+    match target {
+        "readyz" => {
+            let readyz = last_readyz.expect("readyz benchmark should decode response");
+            let metrics = decode_public_json::<MetricsResponse>(
+                client
+                    .get(format!("{}/metrics", base_url.trim_end_matches('/')))
+                    .send()
+                    .map_err(|err| CliError::Http(err.to_string()))?,
+            )?;
+            println!("status: {}", readyz.status);
+            println!("cache_age_ms: {}", metrics.readiness_cache_age_ms);
+            println!("lock_wait_ms: n/a (cache-backed endpoint)");
+            println!(
+                "convergence_duration_ms: {}",
+                metrics.convergence_loop_duration_ms
+            );
+        }
+        "convergence" => {
+            let metrics = last_metrics.expect("metrics benchmark should decode response");
+            println!("cache_age_ms: {}", metrics.readiness_cache_age_ms);
+            println!("lock_wait_ms: n/a (cache-backed endpoint)");
+            println!(
+                "convergence_duration_ms: {}",
+                metrics.convergence_loop_duration_ms
+            );
+            println!(
+                "docker_probe_latency_ms: {}",
+                metrics.docker_probe_latency_ms
+            );
+            println!("caddy_probe_latency_ms: {}", metrics.caddy_probe_latency_ms);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn decode_public_json<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T, CliError> {
+    let status = response.status();
+    let body = response
+        .bytes()
+        .map_err(|err| CliError::Http(err.to_string()))?;
+    let body_text = String::from_utf8_lossy(&body).into_owned();
+    if status.is_success() {
+        let envelope = serde_json::from_slice::<SuccessEnvelope<T>>(&body).map_err(|err| {
+            CliError::Http(format!(
+                "error decoding response body: {err}; status: {}; body: {}",
+                status.as_u16(),
+                summarize_response_body(&body_text)
+            ))
+        })?;
+        Ok(envelope.data)
+    } else {
+        Err(CliError::Http(format!(
+            "bench request failed with status {}: {}",
+            status.as_u16(),
+            summarize_response_body(&body_text)
+        )))
+    }
+}
+
+fn percentile(values: &[f64], quantile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let index = ((values.len() - 1) as f64 * quantile).round() as usize;
+    values[index]
+}
+
 fn summarize_response_body(body: &str) -> String {
     const MAX_LEN: usize = 600;
     let compact = body.trim().replace('\n', "\\n");
@@ -718,6 +851,10 @@ enum Command {
         project_id: String,
         environment: String,
         json: bool,
+    },
+    Bench {
+        target: String,
+        samples: usize,
     },
     Diagnose {
         project_id: String,
@@ -959,6 +1096,7 @@ fn parse_command(
         [cmd] if cmd == "logout" => Ok(Command::Logout),
         [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
         [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
+        [cmd, rest @ ..] if cmd == "bench" => parse_bench_command(rest),
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
         [cmd, rest @ ..] if cmd == "logs" => parse_logs_command(rest),
         [cmd, rest @ ..] if cmd == "diagnose" => parse_diagnose_command(rest),
@@ -1028,6 +1166,7 @@ fn usage() -> String {
         "  forge logout",
         "  forge whoami",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
+        "  forge [--url URL] bench <readyz|convergence> [--samples N]",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] logs [--json] [--service SERVICE] <deployment_id>",
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
@@ -1158,6 +1297,42 @@ fn parse_status_command(args: &[String]) -> Result<Command, CliError> {
             project_id: project_id.clone(),
             environment: environment.clone(),
             json,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_bench_command(args: &[String]) -> Result<Command, CliError> {
+    let mut samples = 50usize;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--samples" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage("bench requires --samples <count>".into()));
+                };
+                samples = value.parse::<usize>().map_err(|_| {
+                    CliError::Usage("bench samples must be a positive integer".into())
+                })?;
+                if samples == 0 {
+                    return Err(CliError::Usage(
+                        "bench samples must be greater than zero".into(),
+                    ));
+                }
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+        index += 1;
+    }
+
+    match positionals.as_slice() {
+        [target] if target == "readyz" || target == "convergence" => Ok(Command::Bench {
+            target: target.clone(),
+            samples,
         }),
         _ => Err(CliError::Usage(usage())),
     }
@@ -2821,16 +2996,16 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
         )
     });
 
-    let readyz_cache = Arc::new(Mutex::new(daemon.readyz_cache_snapshot()));
+    let control_plane_cache = Arc::new(RwLock::new(daemon.control_plane_snapshot()));
     let daemon = Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>));
     let readyz_daemon = daemon.clone();
-    let readyz_cache_loop = readyz_cache.clone();
-    thread::spawn(move || run_readyz_refresh_loop(readyz_daemon, readyz_cache_loop));
+    let control_plane_cache_loop = control_plane_cache.clone();
+    thread::spawn(move || run_readyz_refresh_loop(readyz_daemon, control_plane_cache_loop));
 
     let github_webhooks = build_github_webhook_state(&config)?;
     let state = HttpState::new(
         daemon,
-        readyz_cache,
+        control_plane_cache,
         config.bearer_token.clone(),
         IdempotencyStore::new(config.storage_root.join("idempotency"))
             .map_err(|err| CliError::Usage(err.to_string()))?,

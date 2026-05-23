@@ -600,6 +600,43 @@ pub struct ReadyzResponse {
     pub reasons: Vec<ReadyzReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DependencyBreakerDiagnostics {
+    pub state: String,
+    pub failure_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MetricsDependencySnapshot {
+    pub probe_latency_ms: u64,
+    pub breaker: DependencyBreakerDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MetricsResponse {
+    pub queue_depth: usize,
+    pub convergence_loop_duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_last_success_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_last_failure_unix: Option<u64>,
+    pub convergence_failures_total: u64,
+    pub readiness_cache_age_ms: u64,
+    pub readyz_requests_total: u64,
+    pub readyz_latency_ms: u64,
+    pub readyz_degraded_total: u64,
+    pub docker_probe_latency_ms: u64,
+    pub caddy_probe_latency_ms: u64,
+    pub docker: MetricsDependencySnapshot,
+    pub caddy: MetricsDependencySnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreLineage {
     pub backup_id: String,

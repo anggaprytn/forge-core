@@ -3,14 +3,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    BackupListResponse, BackupRecord, BackupRestoreResponse, DeploymentAccepted,
-    DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
-    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, ReadyzReason, ReadyzResponse, ServiceLogGroup, validate_deployment_request,
+    BackupListResponse, BackupRecord, BackupRestoreResponse, DependencyBreakerDiagnostics,
+    DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest,
+    DeploymentStatus, EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport,
+    ErrorResponse, EventList, MetricsDependencySnapshot, MetricsResponse, ReadyzReason,
+    ReadyzResponse, ServiceLogGroup, validate_deployment_request,
 };
 use crate::backups::{create_backup, inspect_backup, list_backups, restore_backup};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
@@ -33,12 +34,17 @@ use crate::status::{
 };
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, PersistedActivationMode, PersistedRuntimeInfo,
-    RuntimeHealthState, RuntimeStateStore, load_generation_runtime_info,
+    RuntimeHealthState, RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
 };
 
 pub const READYZ_CACHE_STALE_AFTER_MS: u64 = 5_000;
 pub const READYZ_HANDLER_TIMEOUT_MS: u64 = 500;
 const READYZ_REFRESH_INTERVAL_MS: u64 = 250;
+const CONVERGENCE_STALLED_AFTER_MS: u64 = 15_000;
+const FILESYSTEM_SCAN_BUDGET_MS: u64 = 100;
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+const CIRCUIT_BREAKER_INITIAL_BACKOFF_MS: u64 = 250;
+const CIRCUIT_BREAKER_MAX_BACKOFF_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonState {
@@ -205,6 +211,113 @@ struct DependencyReadinessState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum CircuitBreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl CircuitBreakerState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half_open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependencyCircuitBreaker {
+    state: CircuitBreakerState,
+    failure_count: u32,
+    last_success_unix: Option<u64>,
+    next_retry_unix: Option<u64>,
+    last_error: Option<String>,
+    last_latency_ms: u64,
+}
+
+impl Default for DependencyCircuitBreaker {
+    fn default() -> Self {
+        Self {
+            state: CircuitBreakerState::Closed,
+            failure_count: 0,
+            last_success_unix: None,
+            next_retry_unix: None,
+            last_error: None,
+            last_latency_ms: 0,
+        }
+    }
+}
+
+impl DependencyCircuitBreaker {
+    fn allow_request(&mut self, now_unix: u64) -> bool {
+        match self.state {
+            CircuitBreakerState::Closed | CircuitBreakerState::HalfOpen => true,
+            CircuitBreakerState::Open => {
+                if self.next_retry_unix.is_some_and(|value| now_unix >= value) {
+                    self.state = CircuitBreakerState::HalfOpen;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn record_success(&mut self, now_unix: u64, latency_ms: u64) {
+        self.state = CircuitBreakerState::Closed;
+        self.failure_count = 0;
+        self.last_success_unix = Some(now_unix);
+        self.next_retry_unix = None;
+        self.last_error = None;
+        self.last_latency_ms = latency_ms;
+    }
+
+    fn record_failure(&mut self, now_unix: u64, latency_ms: u64, error: String) {
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.last_error = Some(error);
+        self.last_latency_ms = latency_ms;
+        if self.failure_count >= CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            let exponent = self
+                .failure_count
+                .saturating_sub(CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+                .min(5);
+            let backoff_ms = (CIRCUIT_BREAKER_INITIAL_BACKOFF_MS << exponent)
+                .min(CIRCUIT_BREAKER_MAX_BACKOFF_MS);
+            self.state = CircuitBreakerState::Open;
+            self.next_retry_unix = Some(now_unix.saturating_add(backoff_ms.div_ceil(1_000)));
+        } else {
+            self.state = CircuitBreakerState::Closed;
+            self.next_retry_unix = None;
+        }
+    }
+
+    fn diagnostics(&self) -> DependencyBreakerDiagnostics {
+        DependencyBreakerDiagnostics {
+            state: self.state.as_str().into(),
+            failure_count: self.failure_count as u64,
+            last_success_unix: self.last_success_unix,
+            next_retry_unix: self.next_retry_unix,
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    fn metrics_snapshot(&self) -> MetricsDependencySnapshot {
+        MetricsDependencySnapshot {
+            probe_latency_ms: self.last_latency_ms,
+            breaker: self.diagnostics(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ControlPlaneSnapshot {
+    pub readyz: DaemonReadyzCache,
+    pub metrics: MetricsResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonReadyzCache {
     pub response: ReadyzResponse,
     pub updated_at_unix_ms: u64,
@@ -236,6 +349,13 @@ pub struct Daemon<D, R, A> {
     readyz_cache: DaemonReadyzCache,
     docker_readiness: DependencyReadinessState,
     caddy_readiness: DependencyReadinessState,
+    control_plane_snapshot: ControlPlaneSnapshot,
+    convergence_loop_duration_ms: u64,
+    convergence_last_success_unix: Option<u64>,
+    convergence_last_failure_unix: Option<u64>,
+    convergence_failures_total: u64,
+    docker_breaker: DependencyCircuitBreaker,
+    caddy_breaker: DependencyCircuitBreaker,
 }
 
 impl<D, R, A> Daemon<D, R, A>
@@ -264,6 +384,13 @@ where
             readyz_cache: DaemonReadyzCache::default(),
             docker_readiness: DependencyReadinessState::default(),
             caddy_readiness: DependencyReadinessState::default(),
+            control_plane_snapshot: ControlPlaneSnapshot::default(),
+            convergence_loop_duration_ms: 0,
+            convergence_last_success_unix: None,
+            convergence_last_failure_unix: None,
+            convergence_failures_total: 0,
+            docker_breaker: DependencyCircuitBreaker::default(),
+            caddy_breaker: DependencyCircuitBreaker::default(),
         }
     }
 
@@ -749,35 +876,104 @@ where
     }
 
     pub fn readyz_cache_snapshot(&self) -> DaemonReadyzCache {
-        self.readyz_cache.clone()
+        self.control_plane_snapshot.readyz.clone()
+    }
+
+    pub fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {
+        self.control_plane_snapshot.clone()
     }
 
     pub fn cached_readyz_response(&self) -> ReadyzResponse {
         let now = now_unix_ms();
-        if now.saturating_sub(self.readyz_cache.updated_at_unix_ms) > READYZ_CACHE_STALE_AFTER_MS {
+        if now.saturating_sub(self.control_plane_snapshot.readyz.updated_at_unix_ms)
+            > READYZ_CACHE_STALE_AFTER_MS
+        {
             return ReadyzResponse {
                 status: "degraded".into(),
                 reason: Some("readiness cache stale".into()),
                 reasons: Vec::new(),
             };
         }
-        self.readyz_cache.response.clone()
+        self.control_plane_snapshot.readyz.response.clone()
     }
 
     pub fn refresh_readyz_cache(&mut self) {
-        self.readyz_cache = DaemonReadyzCache {
-            response: self.compute_readyz_response(),
-            updated_at_unix_ms: now_unix_ms(),
+        let started = Instant::now();
+        let now_unix = current_unix_timestamp();
+        let updated_at_unix_ms = now_unix_ms();
+        let queue_depth = self.queue_depth().unwrap_or_default();
+        let mut reasons = self.compute_readyz_reasons(now_unix);
+        reasons.extend(self.cached_environment_readyz_reasons_with_budget());
+        reasons.sort_by(|left, right| {
+            (
+                left.project_id.as_str(),
+                left.environment.as_str(),
+                left.generation.unwrap_or(0),
+                left.source.as_str(),
+                left.marker.as_str(),
+                left.message.as_str(),
+            )
+                .cmp(&(
+                    right.project_id.as_str(),
+                    right.environment.as_str(),
+                    right.generation.unwrap_or(0),
+                    right.source.as_str(),
+                    right.marker.as_str(),
+                    right.message.as_str(),
+                ))
+        });
+        reasons.dedup();
+        let stalled = self.convergence_last_success_unix.is_some_and(|value| {
+            now_unix.saturating_sub(value) * 1_000 > CONVERGENCE_STALLED_AFTER_MS
+        });
+        if stalled {
+            reasons.push(control_plane_reason(
+                "convergence_stalled",
+                "convergence stalled".into(),
+            ));
+        }
+        let degraded = !reasons.is_empty();
+        let loop_duration_ms = started.elapsed().as_millis() as u64;
+        self.convergence_loop_duration_ms = loop_duration_ms;
+        if degraded {
+            self.convergence_last_failure_unix = Some(now_unix);
+            self.convergence_failures_total = self.convergence_failures_total.saturating_add(1);
+        } else {
+            self.convergence_last_success_unix = Some(now_unix);
+        }
+        let reason = reasons
+            .iter()
+            .find(|reason| reason.marker == "convergence_stalled")
+            .map(|_| "convergence stalled".to_string())
+            .or_else(|| {
+                reasons.first().and_then(|value| {
+                    (value.project_id == "_control_plane").then(|| value.message.clone())
+                })
+            });
+        let readyz = DaemonReadyzCache {
+            response: ReadyzResponse {
+                status: if self.state() != &DaemonState::Ready {
+                    "not_ready".into()
+                } else if degraded {
+                    "degraded".into()
+                } else {
+                    "ready".into()
+                },
+                reason,
+                reasons,
+            },
+            updated_at_unix_ms,
+        };
+        self.readyz_cache = readyz.clone();
+        self.control_plane_snapshot = ControlPlaneSnapshot {
+            readyz: readyz.clone(),
+            metrics: self.build_metrics_snapshot(queue_depth, &readyz),
         };
     }
 
-    fn compute_readyz_response(&mut self) -> ReadyzResponse {
+    fn compute_readyz_reasons(&mut self, now_unix: u64) -> Vec<ReadyzReason> {
         if self.state() != &DaemonState::Ready {
-            return ReadyzResponse {
-                status: "not_ready".into(),
-                reason: None,
-                reasons: Vec::new(),
-            };
+            return Vec::new();
         }
 
         let mut reasons = Vec::new();
@@ -803,92 +999,43 @@ where
             ));
         }
 
-        let docker_reachable = match self.docker_runtime.list_managed_containers() {
-            Ok(_) => {
-                self.docker_readiness.last_known_reachable = Some(true);
-                self.docker_readiness.last_error = None;
-                true
-            }
-            Err(err) => {
-                self.docker_readiness.last_error = Some(err.to_string());
-                self.docker_readiness.last_known_reachable.unwrap_or(false)
-            }
-        };
-        if !docker_reachable {
-            reasons.push(control_plane_reason(
-                "docker_unreachable",
-                self.docker_readiness
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "docker daemon unavailable".into()),
-            ));
+        if let Some(reason) = self.probe_docker_dependency(now_unix) {
+            reasons.push(reason);
+        }
+        if let Some(reason) = self.probe_caddy_dependency(now_unix) {
+            reasons.push(reason);
         }
 
-        let caddy_reachable = match self.routing_runtime.list_managed_routes() {
-            Ok(_) => {
-                self.caddy_readiness.last_known_reachable = Some(true);
-                self.caddy_readiness.last_error = None;
-                true
-            }
-            Err(err) => {
-                self.caddy_readiness.last_error = Some(err.to_string());
-                self.caddy_readiness.last_known_reachable.unwrap_or(false)
-            }
-        };
-        if !caddy_reachable {
-            reasons.push(control_plane_reason(
-                "caddy_admin_unreachable",
-                self.caddy_readiness
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "caddy admin API unavailable".into()),
-            ));
-        }
-
-        reasons.extend(self.cached_environment_readyz_reasons());
-        reasons.sort_by(|left, right| {
-            (
-                left.project_id.as_str(),
-                left.environment.as_str(),
-                left.generation.unwrap_or(0),
-                left.source.as_str(),
-                left.marker.as_str(),
-                left.message.as_str(),
-            )
-                .cmp(&(
-                    right.project_id.as_str(),
-                    right.environment.as_str(),
-                    right.generation.unwrap_or(0),
-                    right.source.as_str(),
-                    right.marker.as_str(),
-                    right.message.as_str(),
-                ))
-        });
-        reasons.dedup();
-
-        ReadyzResponse {
-            status: if reasons.is_empty() {
-                "ready".into()
-            } else {
-                "degraded".into()
-            },
-            reason: None,
-            reasons,
-        }
+        reasons
     }
 
-    fn cached_environment_readyz_reasons(&self) -> Vec<ReadyzReason> {
+    fn cached_environment_readyz_reasons_with_budget(&self) -> Vec<ReadyzReason> {
+        let started = Instant::now();
         let projects_root = self.config.storage_root.join("projects");
         let Ok(projects) = fs::read_dir(projects_root) else {
             return Vec::new();
         };
         let mut reasons = Vec::new();
         for project in projects.flatten() {
+            if started.elapsed() >= Duration::from_millis(FILESYSTEM_SCAN_BUDGET_MS) {
+                reasons.push(control_plane_reason(
+                    "filesystem_scan_timeout",
+                    "filesystem scan budget exceeded".into(),
+                ));
+                break;
+            }
             let envs_dir = project.path().join("environments");
             let Ok(envs) = fs::read_dir(envs_dir) else {
                 continue;
             };
             for env_entry in envs.flatten() {
+                if started.elapsed() >= Duration::from_millis(FILESYSTEM_SCAN_BUDGET_MS) {
+                    reasons.push(control_plane_reason(
+                        "filesystem_scan_timeout",
+                        "filesystem scan budget exceeded".into(),
+                    ));
+                    return reasons;
+                }
                 let environment = env_entry.file_name().to_string_lossy().into_owned();
                 let project_id = project.file_name().to_string_lossy().into_owned();
                 let env =
@@ -910,6 +1057,111 @@ where
             }
         }
         reasons
+    }
+}
+
+impl<D, R, A> Daemon<D, R, A>
+where
+    D: DockerRuntime,
+    R: RoutingRuntime,
+    A: ActiveDeploymentDecider,
+{
+    fn probe_docker_dependency(&mut self, now_unix: u64) -> Option<ReadyzReason> {
+        if !self.docker_breaker.allow_request(now_unix) {
+            self.docker_readiness.last_error = Some("docker circuit breaker open".into());
+            self.docker_readiness.last_known_reachable = Some(false);
+            return Some(control_plane_reason(
+                "docker_unreachable",
+                "docker circuit breaker open".into(),
+            ));
+        }
+        let started = Instant::now();
+        match self.docker_runtime.probe_control_plane() {
+            Ok(_) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                self.docker_breaker.record_success(now_unix, latency_ms);
+                self.docker_readiness.last_known_reachable = Some(true);
+                self.docker_readiness.last_error = None;
+                None
+            }
+            Err(err) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let message = err.to_string();
+                self.docker_breaker
+                    .record_failure(now_unix, latency_ms, message.clone());
+                self.docker_readiness.last_known_reachable = Some(false);
+                self.docker_readiness.last_error = Some(message.clone());
+                Some(control_plane_reason(
+                    "docker_unreachable",
+                    if self.docker_breaker.state == CircuitBreakerState::Open {
+                        "docker daemon unavailable; breaker open".into()
+                    } else {
+                        message
+                    },
+                ))
+            }
+        }
+    }
+
+    fn probe_caddy_dependency(&mut self, now_unix: u64) -> Option<ReadyzReason> {
+        if !self.caddy_breaker.allow_request(now_unix) {
+            self.caddy_readiness.last_error = Some("caddy circuit breaker open".into());
+            self.caddy_readiness.last_known_reachable = Some(false);
+            return Some(control_plane_reason(
+                "caddy_admin_unreachable",
+                "caddy circuit breaker open".into(),
+            ));
+        }
+        let started = Instant::now();
+        match self.routing_runtime.probe_control_plane() {
+            Ok(_) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                self.caddy_breaker.record_success(now_unix, latency_ms);
+                self.caddy_readiness.last_known_reachable = Some(true);
+                self.caddy_readiness.last_error = None;
+                None
+            }
+            Err(err) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let message = err.to_string();
+                self.caddy_breaker
+                    .record_failure(now_unix, latency_ms, message.clone());
+                self.caddy_readiness.last_known_reachable = Some(false);
+                self.caddy_readiness.last_error = Some(message.clone());
+                Some(control_plane_reason(
+                    "caddy_admin_unreachable",
+                    if self.caddy_breaker.state == CircuitBreakerState::Open {
+                        "caddy admin API unavailable; breaker open".into()
+                    } else {
+                        message
+                    },
+                ))
+            }
+        }
+    }
+
+    fn build_metrics_snapshot(
+        &self,
+        queue_depth: usize,
+        readyz: &DaemonReadyzCache,
+    ) -> MetricsResponse {
+        let request_metrics = crate::metrics::registry().snapshot();
+        let now = now_unix_ms();
+        MetricsResponse {
+            queue_depth,
+            convergence_loop_duration_ms: self.convergence_loop_duration_ms,
+            convergence_last_success_unix: self.convergence_last_success_unix,
+            convergence_last_failure_unix: self.convergence_last_failure_unix,
+            convergence_failures_total: self.convergence_failures_total,
+            readiness_cache_age_ms: now.saturating_sub(readyz.updated_at_unix_ms),
+            readyz_requests_total: request_metrics.readyz_requests_total,
+            readyz_latency_ms: request_metrics.readyz_latency_ms,
+            readyz_degraded_total: request_metrics.readyz_degraded_total,
+            docker_probe_latency_ms: self.docker_breaker.last_latency_ms,
+            caddy_probe_latency_ms: self.caddy_breaker.last_latency_ms,
+            docker: self.docker_breaker.metrics_snapshot(),
+            caddy: self.caddy_breaker.metrics_snapshot(),
+        }
     }
 }
 
@@ -972,13 +1224,13 @@ fn now_unix_ms() -> u64 {
 
 pub fn run_readyz_refresh_loop(
     daemon: std::sync::Arc<std::sync::Mutex<Box<dyn crate::http::ControlPlane>>>,
-    readyz_cache: std::sync::Arc<std::sync::Mutex<DaemonReadyzCache>>,
+    control_plane_cache: std::sync::Arc<std::sync::RwLock<ControlPlaneSnapshot>>,
 ) -> ! {
     loop {
         if let Ok(mut daemon) = daemon.lock() {
             daemon.refresh_readyz_cache();
-            if let Ok(mut cache) = readyz_cache.lock() {
-                *cache = daemon.readyz_cache_snapshot();
+            if let Ok(mut cache) = control_plane_cache.write() {
+                *cache = daemon.control_plane_snapshot();
             }
         }
         thread::sleep(Duration::from_millis(READYZ_REFRESH_INTERVAL_MS));
@@ -1383,6 +1635,131 @@ impl DockerRuntime for NoopDockerRuntime {
         _volume_name: &str,
     ) -> Result<(), crate::runtime::DockerRuntimeError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+struct SwitchableDockerRuntime {
+    fail_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl DockerRuntime for SwitchableDockerRuntime {
+    fn probe_control_plane(&mut self) -> Result<(), crate::runtime::DockerRuntimeError> {
+        if self.fail_probe.load(Ordering::Relaxed) {
+            Err(crate::runtime::DockerRuntimeError::CommandFailed(
+                "docker unavailable".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn build_image(
+        &mut self,
+        request: crate::runtime::BuildImageRequest,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.build_image(request)
+    }
+
+    fn ensure_network(
+        &mut self,
+        network_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.ensure_network(network_name)
+    }
+
+    fn ensure_volume(
+        &mut self,
+        request: crate::runtime::CreateVolumeRequest,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.ensure_volume(request)
+    }
+
+    fn create_container(
+        &mut self,
+        request: crate::runtime::CreateContainerRequest,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.create_container(request)
+    }
+
+    fn start_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.start_container(container_name)
+    }
+
+    fn inspect_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<crate::runtime::ContainerInspection, crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.inspect_container(container_name)
+    }
+
+    fn container_logs(
+        &mut self,
+        container_name: &str,
+        tail_lines: usize,
+    ) -> Result<String, crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.container_logs(container_name, tail_lines)
+    }
+
+    fn list_managed_containers(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::ContainerInspection>, crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.list_managed_containers()
+    }
+
+    fn list_managed_images(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::ManagedImage>, crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.list_managed_images()
+    }
+
+    fn list_managed_volumes(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::ManagedVolume>, crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.list_managed_volumes()
+    }
+
+    fn stop_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.stop_container(container_name)
+    }
+
+    fn remove_container(
+        &mut self,
+        container_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.remove_container(container_name)
+    }
+
+    fn remove_image(&mut self, image_ref: &str) -> Result<(), crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.remove_image(image_ref)
+    }
+
+    fn remove_volume(
+        &mut self,
+        volume_name: &str,
+    ) -> Result<(), crate::runtime::DockerRuntimeError> {
+        let mut inner = NoopDockerRuntime;
+        inner.remove_volume(volume_name)
     }
 }
 
@@ -2083,6 +2460,84 @@ pub mod daemon_readyz_cache_behavior {
         assert_eq!(daemon.readyz_response().status, "degraded");
         daemon.refresh_readyz_cache();
         assert_eq!(daemon.readyz_response().status, "ready");
+    }
+}
+
+#[cfg(test)]
+pub mod daemon_operational_hardening {
+    use super::*;
+
+    #[test]
+    fn stale_convergence_marks_readyz_degraded() {
+        let root = test_root("stale-convergence-marks-readyz-degraded");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.convergence_last_success_unix = Some(current_unix_timestamp().saturating_sub(60));
+
+        daemon.refresh_readyz_cache();
+        let readiness = daemon.readyz_response();
+        assert_eq!(readiness.status, "degraded");
+        assert_eq!(readiness.reason.as_deref(), Some("convergence stalled"));
+    }
+
+    #[test]
+    fn breaker_opens_after_repeated_dependency_failures() {
+        let root = test_root("breaker-opens-after-repeated-dependency-failures");
+        let fail_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            SwitchableDockerRuntime {
+                fail_probe: fail_probe.clone(),
+            },
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            daemon.refresh_readyz_cache();
+        }
+
+        assert_eq!(daemon.docker_breaker.state, CircuitBreakerState::Open);
+        assert_eq!(
+            daemon.control_plane_snapshot.metrics.docker.breaker.state,
+            "open"
+        );
+    }
+
+    #[test]
+    fn breaker_recovers_after_dependency_restored() {
+        let root = test_root("breaker-recovers-after-dependency-restored");
+        let fail_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            SwitchableDockerRuntime {
+                fail_probe: fail_probe.clone(),
+            },
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            daemon.refresh_readyz_cache();
+        }
+        assert_eq!(daemon.docker_breaker.state, CircuitBreakerState::Open);
+
+        fail_probe.store(false, Ordering::Relaxed);
+        daemon.docker_breaker.next_retry_unix = Some(current_unix_timestamp());
+        daemon.refresh_readyz_cache();
+
+        assert_eq!(daemon.docker_breaker.state, CircuitBreakerState::Closed);
+        assert_eq!(
+            daemon.control_plane_snapshot.metrics.docker.breaker.state,
+            "closed"
+        );
     }
 }
 

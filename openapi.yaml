@@ -40,15 +40,16 @@ paths:
                 $ref: '#/components/schemas/ReadinessEnvelope'
   /metrics:
     get:
-      summary: Prometheus metrics
+      summary: Cached control-plane metrics
+      description: Cache-backed convergence and dependency metrics. Request handling is bounded-time and does not trigger live Docker or Caddy scans.
       security: []
       responses:
         '200':
-          description: Prometheus text exposition
+          description: Metrics JSON snapshot
           content:
-            text/plain; version=0.0.4:
+            application/json:
               schema:
-                type: string
+                type: object
   /api/projects:
     post:
       summary: Create or update a project registry entry

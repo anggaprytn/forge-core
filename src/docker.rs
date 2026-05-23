@@ -51,10 +51,21 @@ impl CommandRunner for ProcessCommandRunner {
 }
 
 fn docker_command_timeout(args: &[String]) -> Duration {
-    match args.first().map(String::as_str) {
-        Some("build") => Duration::from_secs(600),
-        Some("logs") => Duration::from_secs(20),
-        _ => Duration::from_secs(60),
+    match (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    ) {
+        (Some("build"), _) => Duration::from_secs(600),
+        (Some("logs"), _) => Duration::from_secs(5),
+        (Some("volume"), Some("inspect")) => Duration::from_secs(10),
+        (Some("inspect"), _) => Duration::from_secs(10),
+        (Some("stats"), _) => Duration::from_secs(5),
+        (Some("ps"), _) => Duration::from_secs(10),
+        (Some("image"), Some("inspect")) => Duration::from_secs(10),
+        (Some("image"), Some("ls")) => Duration::from_secs(10),
+        (Some("volume"), Some("ls")) => Duration::from_secs(10),
+        (Some("network"), Some("inspect")) => Duration::from_secs(10),
+        _ => Duration::from_secs(30),
     }
 }
 
@@ -69,6 +80,15 @@ impl<R> DockerCliRuntime<R> {
 }
 
 impl<R: CommandRunner> DockerRuntime for DockerCliRuntime<R> {
+    fn probe_control_plane(&mut self) -> Result<(), DockerRuntimeError> {
+        let args = vec![
+            "version".to_string(),
+            "--format".to_string(),
+            "{{.Server.Version}}".to_string(),
+        ];
+        self.runner.run("docker", &args).map(|_| ())
+    }
+
     fn build_image(&mut self, request: BuildImageRequest) -> Result<String, DockerRuntimeError> {
         let mut args = vec![
             "build".to_string(),

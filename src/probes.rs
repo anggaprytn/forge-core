@@ -1,6 +1,8 @@
 use std::fmt::{Display, Formatter};
 use std::process::Command;
+use std::time::Duration;
 
+use crate::process::run_command_with_timeout;
 use crate::runtime::{ProbeError, ProbeRuntime};
 
 #[derive(Debug)]
@@ -24,6 +26,8 @@ pub struct DockerNetworkProbeRuntime {
 }
 
 impl DockerNetworkProbeRuntime {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub fn new(network_name: impl Into<String>, _internal_port: u16) -> Self {
         Self {
             network_name: network_name.into(),
@@ -32,8 +36,8 @@ impl DockerNetworkProbeRuntime {
     }
 
     fn run_probe(&self, command: &str) -> Result<bool, ProbeError> {
-        let output = Command::new("docker")
-            .args([
+        let output = run_command_with_timeout(
+            Command::new("docker").args([
                 "run",
                 "--rm",
                 "--network",
@@ -42,9 +46,10 @@ impl DockerNetworkProbeRuntime {
                 "sh",
                 "-lc",
                 command,
-            ])
-            .output()
-            .map_err(|err| ProbeError::Failed(err.to_string()))?;
+            ]),
+            Self::PROBE_TIMEOUT,
+        )
+        .map_err(|err| ProbeError::Failed(err.to_string()))?;
 
         Ok(output.status.success())
     }

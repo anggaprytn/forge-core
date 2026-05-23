@@ -1,8 +1,8 @@
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -27,12 +27,11 @@ use crate::api::{
     ProjectUpsertRequest, ReadyzResponse, SecretListResponse, SecretUnsetResponse,
 };
 use crate::daemon::{
-    Daemon, DaemonReadyzCache, DaemonState, READYZ_CACHE_STALE_AFTER_MS, READYZ_HANDLER_TIMEOUT_MS,
+    ControlPlaneSnapshot, Daemon, DaemonReadyzCache, DaemonState, READYZ_CACHE_STALE_AFTER_MS,
 };
 use crate::github::{
     GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
 };
-use crate::metrics::render_prometheus;
 use crate::projects::{ProjectRegistryStore, project_registry_error_response};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
@@ -94,6 +93,12 @@ pub trait ControlPlane: Send {
                 reasons: Vec::new(),
             },
             updated_at_unix_ms: unix_now_ms(),
+        }
+    }
+    fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {
+        ControlPlaneSnapshot {
+            readyz: self.readyz_cache_snapshot(),
+            ..ControlPlaneSnapshot::default()
         }
     }
     fn handle_post_deployments(
@@ -176,6 +181,10 @@ where
 
     fn readyz_cache_snapshot(&self) -> DaemonReadyzCache {
         Daemon::readyz_cache_snapshot(self)
+    }
+
+    fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {
+        Daemon::control_plane_snapshot(self)
     }
 
     fn handle_post_deployments(
@@ -284,7 +293,7 @@ where
 #[derive(Clone)]
 pub struct HttpState {
     daemon: Arc<Mutex<Box<dyn ControlPlane>>>,
-    readyz_cache: Arc<Mutex<DaemonReadyzCache>>,
+    control_plane_cache: Arc<RwLock<ControlPlaneSnapshot>>,
     bearer_token: String,
     idempotency: IdempotencyStore,
     github_webhooks: Option<GitHubWebhookState>,
@@ -297,7 +306,7 @@ pub struct HttpState {
 impl HttpState {
     pub fn new(
         daemon: Arc<Mutex<Box<dyn ControlPlane>>>,
-        readyz_cache: Arc<Mutex<DaemonReadyzCache>>,
+        control_plane_cache: Arc<RwLock<ControlPlaneSnapshot>>,
         bearer_token: String,
         idempotency: IdempotencyStore,
         github_webhooks: Option<GitHubWebhookState>,
@@ -308,7 +317,7 @@ impl HttpState {
     ) -> Self {
         Self {
             daemon,
-            readyz_cache,
+            control_plane_cache,
             bearer_token,
             idempotency,
             github_webhooks,
@@ -1381,41 +1390,31 @@ async fn post_cli_login_poll(
 
 async fn get_readyz(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
-    let readyz_cache = state.readyz_cache.clone();
-    let readiness = match tokio::time::timeout(
-        Duration::from_millis(READYZ_HANDLER_TIMEOUT_MS),
-        tokio::task::spawn_blocking(move || {
-            readyz_cache
-                .lock()
-                .map(|cache| {
-                    if unix_now_ms().saturating_sub(cache.updated_at_unix_ms)
-                        > READYZ_CACHE_STALE_AFTER_MS
-                    {
-                        ReadyzResponse {
-                            status: "degraded".into(),
-                            reason: Some("readiness cache stale".into()),
-                            reasons: Vec::new(),
-                        }
-                    } else {
-                        cache.response.clone()
-                    }
-                })
-                .unwrap_or(ReadyzResponse {
+    let started = Instant::now();
+    let readiness = match state.control_plane_cache.read() {
+        Ok(cache) => {
+            if unix_now_ms().saturating_sub(cache.readyz.updated_at_unix_ms)
+                > READYZ_CACHE_STALE_AFTER_MS
+            {
+                ReadyzResponse {
                     status: "degraded".into(),
-                    reason: Some("readiness cache unavailable".into()),
+                    reason: Some("readiness cache stale".into()),
                     reasons: Vec::new(),
-                })
-        }),
-    )
-    .await
-    {
-        Ok(Ok(status)) => status,
-        _ => ReadyzResponse {
+                }
+            } else {
+                cache.readyz.response.clone()
+            }
+        }
+        Err(_) => ReadyzResponse {
             status: "degraded".into(),
-            reason: Some("readiness cache stale".into()),
+            reason: Some("readiness cache unavailable".into()),
             reasons: Vec::new(),
         },
     };
+    crate::metrics::registry().record_readyz_request(
+        started.elapsed().as_millis() as u64,
+        readiness.status == "degraded",
+    );
     let status = if readiness.status == "not_ready" {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -1427,37 +1426,17 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
 
 async fn get_metrics(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
-    let queue_depth = match state.daemon.lock() {
-        Ok(daemon) => match daemon.queue_depth() {
-            Ok(queue_depth) => queue_depth,
-            Err(err) => return error_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, err),
-        },
-        Err(_) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &request_id,
-                ErrorResponse {
-                    code: "daemon_lock_error".into(),
-                    message: "daemon lock poisoned".into(),
-                },
-            );
-        }
-    };
-
-    let mut response = (StatusCode::OK, render_prometheus(queue_depth)).into_response();
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; version=0.0.4"),
-    );
-    response.headers_mut().insert(
-        REQUEST_ID_HEADER,
-        HeaderValue::from_str(&request_id).unwrap(),
-    );
-    response.headers_mut().insert(
-        CORRELATION_ID_HEADER,
-        HeaderValue::from_str(&request_id).unwrap(),
-    );
-    response
+    match state.control_plane_cache.read() {
+        Ok(cache) => json_response(StatusCode::OK, &request_id, Json(cache.metrics.clone())),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "metrics_cache_unavailable".into(),
+                message: "metrics cache unavailable".into(),
+            },
+        ),
+    }
 }
 
 async fn post_deployments(
@@ -3012,11 +2991,11 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
         daemon.start().unwrap();
         seed_test_project(&root);
     }
-    let readyz_cache = Arc::new(Mutex::new(daemon.readyz_cache_snapshot()));
+    let control_plane_cache = Arc::new(RwLock::new(daemon.control_plane_snapshot()));
     (
         HttpState::new(
             Arc::new(Mutex::new(Box::new(daemon))),
-            readyz_cache,
+            control_plane_cache,
             config.bearer_token,
             IdempotencyStore::new(root.join("idempotency")).unwrap(),
             None,
@@ -3068,8 +3047,8 @@ fn build_state_with_route_repair_failure() -> HttpState {
         .unwrap();
     if let Ok(mut daemon) = state.daemon.lock() {
         daemon.refresh_readyz_cache();
-        if let Ok(mut readyz_cache) = state.readyz_cache.lock() {
-            *readyz_cache = daemon.readyz_cache_snapshot();
+        if let Ok(mut control_plane_cache) = state.control_plane_cache.write() {
+            *control_plane_cache = daemon.control_plane_snapshot();
         }
     }
     state
@@ -3991,16 +3970,18 @@ pub mod http_readyz_false_before_daemon_ready {
 #[cfg(test)]
 pub mod http_readyz_cache_latency {
     use super::*;
+    use crate::daemon::READYZ_HANDLER_TIMEOUT_MS;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use std::time::Duration;
     use std::time::Instant;
     use tower::util::ServiceExt;
 
     fn sync_readyz_cache(state: &HttpState) {
         if let Ok(mut daemon) = state.daemon.lock() {
             daemon.refresh_readyz_cache();
-            if let Ok(mut readyz_cache) = state.readyz_cache.lock() {
-                *readyz_cache = daemon.readyz_cache_snapshot();
+            if let Ok(mut control_plane_cache) = state.control_plane_cache.write() {
+                *control_plane_cache = daemon.control_plane_snapshot();
             }
         }
     }
@@ -4008,8 +3989,8 @@ pub mod http_readyz_cache_latency {
     #[tokio::test]
     async fn readyz_reports_cache_stale_without_blocking() {
         let state = build_state(true);
-        if let Ok(mut readyz_cache) = state.readyz_cache.lock() {
-            readyz_cache.updated_at_unix_ms = 0;
+        if let Ok(mut control_plane_cache) = state.control_plane_cache.write() {
+            control_plane_cache.readyz.updated_at_unix_ms = 0;
         }
         let app = router(state);
         let start = Instant::now();
@@ -4172,14 +4153,15 @@ pub mod http_error_response_is_machine_readable {
 }
 
 #[cfg(test)]
-pub mod metrics_endpoint_exposes_prometheus_text {
+pub mod metrics_endpoint_exposes_cached_json {
     use super::*;
+    use crate::api::MetricsResponse;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
     #[tokio::test]
-    async fn metrics_endpoint_exposes_prometheus_text() {
+    async fn metrics_endpoint_exposes_cached_json() {
         let app = router(build_state(true));
         let request = Request::builder()
             .method(axum::http::Method::GET)
@@ -4194,28 +4176,29 @@ pub mod metrics_endpoint_exposes_prometheus_text {
                 .headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .unwrap(),
-            "text/plain; version=0.0.4"
+            "application/json"
         );
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("forge_deployments_total "));
-        assert!(body.contains("forge_deployments_failed_total "));
-        assert!(body.contains("forge_deployments_rollback_total "));
-        assert!(body.contains("forge_queue_depth 0"));
+        let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.queue_depth, 0);
+        assert_eq!(metrics.readyz_requests_total, 0);
+        assert!(metrics.readiness_cache_age_ms <= READYZ_CACHE_STALE_AFTER_MS);
     }
 }
 
 #[cfg(test)]
 pub mod metrics_report_queue_depth {
     use super::*;
+    use crate::api::MetricsResponse;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
     #[tokio::test]
     async fn metrics_report_queue_depth() {
-        let app = router(build_state(true));
+        let state = build_state(true);
+        let app = router(state.clone());
         let deploy_request = Request::builder()
             .method(axum::http::Method::POST)
             .uri("/deployments")
@@ -4227,6 +4210,12 @@ pub mod metrics_report_queue_depth {
             .unwrap();
         let deploy_response = app.clone().oneshot(deploy_request).await.unwrap();
         assert_eq!(deploy_response.status(), StatusCode::ACCEPTED);
+        if let Ok(mut daemon) = state.daemon.lock() {
+            daemon.refresh_readyz_cache();
+            if let Ok(mut control_plane_cache) = state.control_plane_cache.write() {
+                *control_plane_cache = daemon.control_plane_snapshot();
+            }
+        }
 
         let metrics_request = Request::builder()
             .method(axum::http::Method::GET)
@@ -4237,8 +4226,44 @@ pub mod metrics_report_queue_depth {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("forge_queue_depth 1"));
+        let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.queue_depth, 1);
+    }
+}
+
+#[cfg(test)]
+pub mod metrics_endpoint_constant_time {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::time::{Duration, Instant};
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn metrics_endpoint_constant_time() {
+        let state = build_state(true);
+        let daemon = state.daemon.clone();
+        let blocker = std::thread::spawn(move || {
+            let _guard = daemon.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(750));
+        });
+        let app = router(state);
+        let start = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        blocker.join().unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(elapsed < Duration::from_millis(250));
     }
 }
 

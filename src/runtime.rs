@@ -181,6 +181,9 @@ impl std::error::Error for ProbeError {}
 
 pub trait DockerRuntime {
     fn build_image(&mut self, request: BuildImageRequest) -> Result<String, DockerRuntimeError>;
+    fn probe_control_plane(&mut self) -> Result<(), DockerRuntimeError> {
+        self.list_managed_containers().map(|_| ())
+    }
     fn ensure_network(&mut self, network_name: &str) -> Result<(), DockerRuntimeError>;
     fn ensure_volume(&mut self, request: CreateVolumeRequest) -> Result<(), DockerRuntimeError>;
     fn create_container(
@@ -296,6 +299,9 @@ impl std::error::Error for RoutingRuntimeError {}
 
 pub trait RoutingRuntime {
     fn update_route(&mut self, request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError>;
+    fn probe_control_plane(&mut self) -> Result<(), RoutingRuntimeError> {
+        self.list_managed_routes().map(|_| ())
+    }
     fn inspect_route(&mut self, subtree_id: &str) -> Result<RouteInspection, RoutingRuntimeError>;
     fn list_managed_routes(&mut self) -> Result<Vec<RouteInspection>, RoutingRuntimeError>;
     fn remove_route(&mut self, subtree_id: &str) -> Result<(), RoutingRuntimeError>;

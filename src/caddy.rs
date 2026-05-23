@@ -24,8 +24,10 @@ pub struct CaddyApiRuntime {
 }
 
 impl CaddyApiRuntime {
-    const REQUEST_RETRY_ATTEMPTS: usize = 40;
-    const REQUEST_RETRY_DELAY: Duration = Duration::from_millis(250);
+    const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+    const ACTIVATION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    const REQUEST_RETRY_ATTEMPTS: usize = 3;
+    const REQUEST_RETRY_DELAY: Duration = Duration::from_millis(100);
 
     fn ready_subtree_id() -> &'static str {
         "forge:ready"
@@ -36,8 +38,12 @@ impl CaddyApiRuntime {
             admin_base_url: admin_base_url.into().trim_end_matches('/').to_string(),
             public_base_url: public_base_url.into().trim_end_matches('/').to_string(),
             probe_paths: BTreeMap::new(),
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(Self::ADMIN_REQUEST_TIMEOUT)
+                .build()
+                .expect("reqwest blocking client should build"),
             insecure_client: reqwest::blocking::Client::builder()
+                .timeout(Self::ACTIVATION_PROBE_TIMEOUT)
                 .danger_accept_invalid_certs(true)
                 .build()
                 .expect("reqwest blocking client should build"),
@@ -332,6 +338,10 @@ impl RecordingRoutingRuntime {
 }
 
 impl RoutingRuntime for RecordingRoutingRuntime {
+    fn probe_control_plane(&mut self) -> Result<(), RoutingRuntimeError> {
+        Ok(())
+    }
+
     fn update_route(&mut self, request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError> {
         self.updates.push(RecordedRouteUpdate { request });
         Ok(())
@@ -361,6 +371,19 @@ impl RoutingRuntime for RecordingRoutingRuntime {
 }
 
 impl RoutingRuntime for CaddyApiRuntime {
+    fn probe_control_plane(&mut self) -> Result<(), RoutingRuntimeError> {
+        let response =
+            self.retry_client_request(|| self.client.get(self.routes_url()).send(), false)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(RoutingRuntimeError::InspectionFailed(format!(
+                "caddy admin probe failed with status {}",
+                response.status()
+            )))
+        }
+    }
+
     fn update_route(&mut self, request: RouteUpdateRequest) -> Result<(), RoutingRuntimeError> {
         Self::ensure_owned_subtree(&request.subtree_id)?;
         let mut routes = self.read_routes()?;

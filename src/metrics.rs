@@ -6,6 +6,9 @@ pub struct MetricsRegistry {
     deployments_total: AtomicU64,
     deployments_failed_total: AtomicU64,
     deployments_rollback_total: AtomicU64,
+    readyz_requests_total: AtomicU64,
+    readyz_latency_ms: AtomicU64,
+    readyz_degraded_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +16,9 @@ pub struct MetricsSnapshot {
     pub deployments_total: u64,
     pub deployments_failed_total: u64,
     pub deployments_rollback_total: u64,
+    pub readyz_requests_total: u64,
+    pub readyz_latency_ms: u64,
+    pub readyz_degraded_total: u64,
 }
 
 static REGISTRY: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -36,24 +42,24 @@ impl MetricsRegistry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_readyz_request(&self, latency_ms: u64, degraded: bool) {
+        self.readyz_requests_total.fetch_add(1, Ordering::Relaxed);
+        self.readyz_latency_ms.store(latency_ms, Ordering::Relaxed);
+        if degraded {
+            self.readyz_degraded_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             deployments_total: self.deployments_total.load(Ordering::Relaxed),
             deployments_failed_total: self.deployments_failed_total.load(Ordering::Relaxed),
             deployments_rollback_total: self.deployments_rollback_total.load(Ordering::Relaxed),
+            readyz_requests_total: self.readyz_requests_total.load(Ordering::Relaxed),
+            readyz_latency_ms: self.readyz_latency_ms.load(Ordering::Relaxed),
+            readyz_degraded_total: self.readyz_degraded_total.load(Ordering::Relaxed),
         }
     }
-}
-
-pub fn render_prometheus(queue_depth: usize) -> String {
-    let snapshot = registry().snapshot();
-    format!(
-        "# TYPE forge_deployments_total counter\nforge_deployments_total {}\n# TYPE forge_deployments_failed_total counter\nforge_deployments_failed_total {}\n# TYPE forge_deployments_rollback_total counter\nforge_deployments_rollback_total {}\n# TYPE forge_queue_depth gauge\nforge_queue_depth {}\n",
-        snapshot.deployments_total,
-        snapshot.deployments_failed_total,
-        snapshot.deployments_rollback_total,
-        queue_depth
-    )
 }
 
 #[cfg(test)]
@@ -66,4 +72,7 @@ pub fn reset_for_tests() {
     registry
         .deployments_rollback_total
         .store(0, Ordering::Relaxed);
+    registry.readyz_requests_total.store(0, Ordering::Relaxed);
+    registry.readyz_latency_ms.store(0, Ordering::Relaxed);
+    registry.readyz_degraded_total.store(0, Ordering::Relaxed);
 }

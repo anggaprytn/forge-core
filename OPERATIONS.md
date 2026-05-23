@@ -177,6 +177,102 @@ Environment-level health belongs to diagnostics, not readiness.
 
 ---
 
+# Operational Observability
+
+Forge now exposes cache-backed control-plane observability through `/readyz`, `/metrics`, and `forge bench`.
+
+### Convergence Model
+
+- A background convergence refresh loop computes cached control-plane truth.
+- Request paths do not perform live Docker scans, live Caddy scans, or fleet-wide reconciliation.
+- Every convergence cycle is time-bounded and records its duration, last success, last failure, and failure count.
+
+### Cache-Backed APIs
+
+- `/readyz` returns cached control-plane readiness only.
+- `/metrics` returns cached JSON diagnostics and counters in constant time.
+- Request handlers read cached state only; Docker and Caddy probing happens in the background loop.
+
+### Metrics and Diagnostics
+
+`/metrics` includes:
+
+- `convergence_loop_duration_ms`
+- `convergence_last_success_unix`
+- `convergence_last_failure_unix`
+- `convergence_failures_total`
+- `readiness_cache_age_ms`
+- `readyz_requests_total`
+- `readyz_latency_ms`
+- `readyz_degraded_total`
+- `docker_probe_latency_ms`
+- `caddy_probe_latency_ms`
+- dependency breaker state, failure count, last success, next retry time, and last error
+
+### Degraded Mode Semantics
+
+- Docker or Caddy outages degrade readiness but do not block API responses.
+- When a dependency repeatedly fails, its circuit breaker opens and the loop backs off exponentially.
+- Readiness continues to serve cached degraded state while the loop waits for the next retry budget.
+- Recovery automatically closes the breaker after a successful probe.
+
+### Readiness Cache Staleness
+
+- If the readiness cache ages past the freshness threshold, `/readyz` returns `degraded` immediately.
+- If convergence has not completed successfully within the stall threshold, readiness reports `convergence stalled`.
+- APIs remain responsive even when convergence is stale or dependencies are unhealthy.
+
+Example:
+
+```json
+{
+  "status": "degraded",
+  "reason": "convergence stalled",
+  "last_success_unix": 1779522000
+}
+```
+
+### Troubleshooting Flow
+
+To identify stalled convergence:
+
+1. Check `/readyz` for `reason: "convergence stalled"` or `reason: "readiness cache stale"`.
+2. Check `/metrics` for `convergence_last_success_unix`, `convergence_last_failure_unix`, and `convergence_failures_total`.
+3. If cache age keeps rising, inspect the daemon process and background refresh loop.
+
+To identify Docker degradation:
+
+1. Check `/metrics.docker.breaker.state`.
+2. Check `/metrics.docker.breaker.last_error`.
+3. Confirm `docker_probe_latency_ms` and whether `next_retry_unix` is in the future.
+
+To identify Caddy degradation:
+
+1. Check `/metrics.caddy.breaker.state`.
+2. Check `/metrics.caddy.breaker.last_error`.
+3. Confirm `caddy_probe_latency_ms` and whether `next_retry_unix` is in the future.
+
+Expected behavior during dependency outages:
+
+- deployments may stall or degrade
+- readiness becomes `degraded`
+- `/metrics` continues to respond quickly from cache
+- operator diagnostics remain available
+- recovery happens automatically once the dependency is restored
+
+### Bench Utilities
+
+Use the local benchmark helpers to catch regressions:
+
+```bash
+forge --url http://127.0.0.1:18080 bench readyz
+forge --url http://127.0.0.1:18080 bench convergence
+```
+
+These report latency, throughput, cache age, and cached convergence duration. `lock_wait_ms` is reported as `n/a` because the benchmarked endpoints are intentionally cache-backed and do not wait on live reconciliation work.
+
+---
+
 # Deployment Lifecycle States
 
 Forge generations move through these authoritative states:

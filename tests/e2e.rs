@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -881,11 +881,11 @@ impl E2eHarness {
             decider,
         );
         daemon.start().unwrap();
-        let readyz_cache = Arc::new(Mutex::new(daemon.readyz_cache_snapshot()));
+        let control_plane_cache = Arc::new(RwLock::new(daemon.control_plane_snapshot()));
 
         let state = HttpState::new(
             Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>)),
-            readyz_cache,
+            control_plane_cache,
             self.token.clone(),
             IdempotencyStore::new(self.runtime_root.join("idempotency")).unwrap(),
             self.github_webhook_state(),
