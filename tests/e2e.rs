@@ -881,9 +881,11 @@ impl E2eHarness {
             decider,
         );
         daemon.start().unwrap();
+        let readyz_cache = Arc::new(Mutex::new(daemon.readyz_cache_snapshot()));
 
         let state = HttpState::new(
             Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>)),
+            readyz_cache,
             self.token.clone(),
             IdempotencyStore::new(self.runtime_root.join("idempotency")).unwrap(),
             self.github_webhook_state(),

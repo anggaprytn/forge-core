@@ -36,6 +36,10 @@ use crate::storage::{
     RuntimeHealthState, RuntimeStateStore, load_generation_runtime_info,
 };
 
+pub const READYZ_CACHE_STALE_AFTER_MS: u64 = 5_000;
+pub const READYZ_HANDLER_TIMEOUT_MS: u64 = 500;
+const READYZ_REFRESH_INTERVAL_MS: u64 = 250;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonState {
     Created,
@@ -194,6 +198,31 @@ impl From<ConvergenceError> for DaemonError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DependencyReadinessState {
+    last_known_reachable: Option<bool>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonReadyzCache {
+    pub response: ReadyzResponse,
+    pub updated_at_unix_ms: u64,
+}
+
+impl Default for DaemonReadyzCache {
+    fn default() -> Self {
+        Self {
+            response: ReadyzResponse {
+                status: "not_ready".into(),
+                reason: None,
+                reasons: Vec::new(),
+            },
+            updated_at_unix_ms: now_unix_ms(),
+        }
+    }
+}
+
 pub struct Daemon<D, R, A> {
     config: DaemonConfig,
     docker_runtime: D,
@@ -204,6 +233,9 @@ pub struct Daemon<D, R, A> {
     queue: Option<PersistentQueue>,
     health_loops_started: bool,
     last_recovery_outcome: Option<RecoveryOutcome>,
+    readyz_cache: DaemonReadyzCache,
+    docker_readiness: DependencyReadinessState,
+    caddy_readiness: DependencyReadinessState,
 }
 
 impl<D, R, A> Daemon<D, R, A>
@@ -229,6 +261,9 @@ where
             queue: None,
             health_loops_started: false,
             last_recovery_outcome: None,
+            readyz_cache: DaemonReadyzCache::default(),
+            docker_readiness: DependencyReadinessState::default(),
+            caddy_readiness: DependencyReadinessState::default(),
         }
     }
 
@@ -238,6 +273,7 @@ where
             BootstrapState::WaitingForStorage(path) => {
                 self.state = DaemonState::WaitingForBootstrap(path);
                 self.health_loops_started = false;
+                self.refresh_readyz_cache();
                 Ok(())
             }
             BootstrapState::Ready => {
@@ -261,6 +297,7 @@ where
                 self.health_loops_started = true;
                 self.startup_steps.push(StartupStep::HealthLoopsStarted);
                 self.state = DaemonState::Ready;
+                self.refresh_readyz_cache();
                 Ok(())
             }
         }
@@ -672,6 +709,7 @@ where
         self.state = DaemonState::ShuttingDown;
         self.health_loops_started = false;
         self.state = DaemonState::Stopped;
+        self.refresh_readyz_cache();
     }
 
     pub fn state(&self) -> &DaemonState {
@@ -691,32 +729,15 @@ where
     }
 
     pub fn readyz_status(&mut self) -> &'static str {
-        if self.state() != &DaemonState::Ready {
-            return "not_ready";
-        }
-        if !self.readyz_degraded_reasons().is_empty() {
-            "degraded"
-        } else {
-            "ready"
+        match self.readyz_response().status.as_str() {
+            "ready" => "ready",
+            "degraded" => "degraded",
+            _ => "not_ready",
         }
     }
 
     pub fn readyz_response(&mut self) -> ReadyzResponse {
-        if self.state() != &DaemonState::Ready {
-            return ReadyzResponse {
-                status: "not_ready".into(),
-                reasons: Vec::new(),
-            };
-        }
-        let reasons = self.readyz_degraded_reasons();
-        ReadyzResponse {
-            status: if reasons.is_empty() {
-                "ready".into()
-            } else {
-                "degraded".into()
-            },
-            reasons,
-        }
+        self.cached_readyz_response()
     }
 
     pub fn queue(&self) -> Option<&PersistentQueue> {
@@ -727,33 +748,104 @@ where
         (&self.docker_runtime, &self.routing_runtime)
     }
 
-    fn readyz_degraded_reasons(&mut self) -> Vec<ReadyzReason> {
-        let projects_root = self.config.storage_root.join("projects");
-        let Ok(projects) = fs::read_dir(projects_root) else {
-            return Vec::new();
-        };
-        let mut reasons = Vec::new();
-        for project in projects.flatten() {
-            let envs_dir = project.path().join("environments");
-            let Ok(envs) = fs::read_dir(envs_dir) else {
-                continue;
+    pub fn readyz_cache_snapshot(&self) -> DaemonReadyzCache {
+        self.readyz_cache.clone()
+    }
+
+    pub fn cached_readyz_response(&self) -> ReadyzResponse {
+        let now = now_unix_ms();
+        if now.saturating_sub(self.readyz_cache.updated_at_unix_ms) > READYZ_CACHE_STALE_AFTER_MS {
+            return ReadyzResponse {
+                status: "degraded".into(),
+                reason: Some("readiness cache stale".into()),
+                reasons: Vec::new(),
             };
-            for env_entry in envs.flatten() {
-                let environment = env_entry.file_name().to_string_lossy().into_owned();
-                let project_id = project.file_name().to_string_lossy().into_owned();
-                let Ok(diagnostics) = load_environment_diagnostics(
-                    &self.config.storage_root,
-                    self.queue.as_ref(),
-                    &mut self.docker_runtime,
-                    &mut self.routing_runtime,
-                    &project_id,
-                    &environment,
-                ) else {
-                    continue;
-                };
-                reasons.extend(readyz_reasons_for_environment(&diagnostics));
-            }
         }
+        self.readyz_cache.response.clone()
+    }
+
+    pub fn refresh_readyz_cache(&mut self) {
+        self.readyz_cache = DaemonReadyzCache {
+            response: self.compute_readyz_response(),
+            updated_at_unix_ms: now_unix_ms(),
+        };
+    }
+
+    fn compute_readyz_response(&mut self) -> ReadyzResponse {
+        if self.state() != &DaemonState::Ready {
+            return ReadyzResponse {
+                status: "not_ready".into(),
+                reason: None,
+                reasons: Vec::new(),
+            };
+        }
+
+        let mut reasons = Vec::new();
+        if fs::metadata(&self.config.storage_root).is_err() {
+            reasons.push(control_plane_reason(
+                "storage_unavailable",
+                format!(
+                    "storage root inaccessible: {}",
+                    self.config.storage_root.display()
+                ),
+            ));
+        }
+
+        let queue_alive = self
+            .queue
+            .as_ref()
+            .and_then(|queue| queue.queued_len().ok())
+            .is_some();
+        if !queue_alive {
+            reasons.push(control_plane_reason(
+                "queue_unavailable",
+                "deployment queue unavailable".into(),
+            ));
+        }
+
+        let docker_reachable = match self.docker_runtime.list_managed_containers() {
+            Ok(_) => {
+                self.docker_readiness.last_known_reachable = Some(true);
+                self.docker_readiness.last_error = None;
+                true
+            }
+            Err(err) => {
+                self.docker_readiness.last_error = Some(err.to_string());
+                self.docker_readiness.last_known_reachable.unwrap_or(false)
+            }
+        };
+        if !docker_reachable {
+            reasons.push(control_plane_reason(
+                "docker_unreachable",
+                self.docker_readiness
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "docker daemon unavailable".into()),
+            ));
+        }
+
+        let caddy_reachable = match self.routing_runtime.list_managed_routes() {
+            Ok(_) => {
+                self.caddy_readiness.last_known_reachable = Some(true);
+                self.caddy_readiness.last_error = None;
+                true
+            }
+            Err(err) => {
+                self.caddy_readiness.last_error = Some(err.to_string());
+                self.caddy_readiness.last_known_reachable.unwrap_or(false)
+            }
+        };
+        if !caddy_reachable {
+            reasons.push(control_plane_reason(
+                "caddy_admin_unreachable",
+                self.caddy_readiness
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "caddy admin API unavailable".into()),
+            ));
+        }
+
+        reasons.extend(self.cached_environment_readyz_reasons());
         reasons.sort_by(|left, right| {
             (
                 left.project_id.as_str(),
@@ -773,114 +865,124 @@ where
                 ))
         });
         reasons.dedup();
+
+        ReadyzResponse {
+            status: if reasons.is_empty() {
+                "ready".into()
+            } else {
+                "degraded".into()
+            },
+            reason: None,
+            reasons,
+        }
+    }
+
+    fn cached_environment_readyz_reasons(&self) -> Vec<ReadyzReason> {
+        let projects_root = self.config.storage_root.join("projects");
+        let Ok(projects) = fs::read_dir(projects_root) else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        for project in projects.flatten() {
+            let envs_dir = project.path().join("environments");
+            let Ok(envs) = fs::read_dir(envs_dir) else {
+                continue;
+            };
+            for env_entry in envs.flatten() {
+                let environment = env_entry.file_name().to_string_lossy().into_owned();
+                let project_id = project.file_name().to_string_lossy().into_owned();
+                let env =
+                    EnvironmentPaths::new(&self.config.storage_root, &project_id, &environment);
+                let Ok(runtime_state) = RuntimeStateStore::new(env.clone()).load() else {
+                    continue;
+                };
+                if runtime_state.active_generation.is_none()
+                    || runtime_state.health_state == RuntimeHealthState::Healthy
+                {
+                    continue;
+                }
+                reasons.extend(readyz_reasons_for_runtime_state(
+                    &env,
+                    &project_id,
+                    &environment,
+                    &runtime_state,
+                ));
+            }
+        }
         reasons
     }
 }
 
-fn readyz_reasons_for_environment(diagnostics: &EnvironmentDiagnostics) -> Vec<ReadyzReason> {
-    let Some(active_generation) = diagnostics.active_generation else {
-        return Vec::new();
-    };
-
-    let mut reasons = Vec::new();
-    let default_source = diagnostics
-        .diagnostics_source
-        .clone()
-        .unwrap_or_else(|| "runtime".into());
-
-    if diagnostics.route.route_required
-        && (!diagnostics.route.route_active || !diagnostics.route.matches_expected)
-    {
-        reasons.push(ReadyzReason {
-            project_id: diagnostics.project_id.clone(),
-            environment: diagnostics.environment.clone(),
-            generation: Some(active_generation),
-            source: diagnostics
-                .diagnostics_source
-                .clone()
-                .unwrap_or_else(|| "route_runtime".into()),
-            marker: "route_repair".into(),
-            message: diagnostics
-                .route
-                .mismatch_reason
-                .clone()
-                .unwrap_or_else(|| "route target is not active".into()),
-        });
-    }
-
-    if !diagnostics.container.running {
-        reasons.push(ReadyzReason {
-            project_id: diagnostics.project_id.clone(),
-            environment: diagnostics.environment.clone(),
-            generation: Some(active_generation),
-            source: "runtime_container".into(),
-            marker: "container".into(),
-            message: diagnostics
-                .container
-                .state_status
-                .clone()
-                .map(|status| format!("container not running ({status})"))
-                .unwrap_or_else(|| "container not running".into()),
-        });
-    }
-
-    for service in diagnostics.services.iter().filter(|service| {
-        service.failure_reason.is_some()
-            && matches!(
-                service.health.as_str(),
-                "failed" | "degraded" | "crash_loop" | "oom_killed" | "stopped"
-            )
-    }) {
-        reasons.push(ReadyzReason {
-            project_id: diagnostics.project_id.clone(),
-            environment: diagnostics.environment.clone(),
-            generation: Some(active_generation),
-            source: default_source.clone(),
-            marker: format!("service:{}", service.service_id),
-            message: service.failure_reason.clone().unwrap_or_default(),
-        });
-    }
-
-    for failure in diagnostics
-        .recent_failures
-        .iter()
-        .filter(|failure| !failure.historical && failure.generation == active_generation)
-    {
-        reasons.push(ReadyzReason {
-            project_id: diagnostics.project_id.clone(),
-            environment: diagnostics.environment.clone(),
-            generation: Some(active_generation),
-            source: failure.diagnostics_source.clone(),
-            marker: failure.failure_stage.clone(),
-            message: failure.failure_reason.clone(),
-        });
-    }
-
-    if reasons.is_empty() && diagnostics.status == "degraded" {
-        let has_current_signal = diagnostics.last_failed_transition.is_some()
-            || diagnostics.restart_instability
-            || diagnostics.probe_flapping
-            || diagnostics.promotion_gate_reason.is_some();
-        if has_current_signal {
-            reasons.push(ReadyzReason {
-                project_id: diagnostics.project_id.clone(),
-                environment: diagnostics.environment.clone(),
-                generation: Some(active_generation),
-                source: default_source,
-                marker: diagnostics
-                    .likely_failure_stage
-                    .clone()
-                    .unwrap_or_else(|| "runtime".into()),
-                message: diagnostics
-                    .promotion_gate_reason
-                    .clone()
-                    .or_else(|| diagnostics.last_failed_transition.clone())
-                    .unwrap_or_else(|| "active environment is degraded".into()),
+fn readyz_reasons_for_runtime_state(
+    env: &EnvironmentPaths,
+    project_id: &str,
+    environment: &str,
+    runtime_state: &crate::storage::RuntimeState,
+) -> Vec<ReadyzReason> {
+    let generation = runtime_state.active_generation;
+    let marker =
+        runtime_state
+            .last_error_code
+            .clone()
+            .unwrap_or_else(|| match runtime_state.health_state {
+                RuntimeHealthState::Healthy => "healthy".into(),
+                RuntimeHealthState::Degraded => "runtime_degraded".into(),
+                RuntimeHealthState::Unavailable => "runtime_unavailable".into(),
             });
-        }
-    }
+    let message = generation
+        .and_then(|generation| {
+            DiagnosticsStore::new(env.clone(), generation)
+                .read_summary()
+                .ok()
+                .flatten()
+        })
+        .map(|summary| summary.blocking_reason.unwrap_or(summary.failure_reason))
+        .unwrap_or_else(|| match runtime_state.health_state {
+            RuntimeHealthState::Healthy => "runtime healthy".into(),
+            RuntimeHealthState::Degraded => format!("active generation degraded: {marker}"),
+            RuntimeHealthState::Unavailable => format!("active generation unavailable: {marker}"),
+        });
+    vec![ReadyzReason {
+        project_id: project_id.into(),
+        environment: environment.into(),
+        generation,
+        source: "runtime_state_cache".into(),
+        marker,
+        message,
+    }]
+}
 
-    reasons
+fn control_plane_reason(marker: &str, message: String) -> ReadyzReason {
+    ReadyzReason {
+        project_id: "_control_plane".into(),
+        environment: "daemon".into(),
+        generation: None,
+        source: "daemon_readiness_cache".into(),
+        marker: marker.into(),
+        message,
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub fn run_readyz_refresh_loop(
+    daemon: std::sync::Arc<std::sync::Mutex<Box<dyn crate::http::ControlPlane>>>,
+    readyz_cache: std::sync::Arc<std::sync::Mutex<DaemonReadyzCache>>,
+) -> ! {
+    loop {
+        if let Ok(mut daemon) = daemon.lock() {
+            daemon.refresh_readyz_cache();
+            if let Ok(mut cache) = readyz_cache.lock() {
+                *cache = daemon.readyz_cache_snapshot();
+            }
+        }
+        thread::sleep(Duration::from_millis(READYZ_REFRESH_INTERVAL_MS));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1753,6 +1855,234 @@ pub mod daemon_readyz_route_repair_resolution {
 
         assert_eq!(daemon.readyz_status(), "ready");
         assert!(daemon.readyz_response().reasons.is_empty());
+    }
+}
+
+#[cfg(test)]
+pub mod daemon_readyz_cache_behavior {
+    use super::*;
+    use crate::storage::{DiagnosticsStore, RuntimeState, SnapshotState, SnapshotWriter};
+
+    #[derive(Default)]
+    struct PanicPerEnvironmentDockerRuntime;
+
+    impl DockerRuntime for PanicPerEnvironmentDockerRuntime {
+        fn build_image(
+            &mut self,
+            request: crate::runtime::BuildImageRequest,
+        ) -> Result<String, crate::runtime::DockerRuntimeError> {
+            Ok(request.image_tag)
+        }
+
+        fn ensure_network(
+            &mut self,
+            _network_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn ensure_volume(
+            &mut self,
+            _request: crate::runtime::CreateVolumeRequest,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn create_container(
+            &mut self,
+            request: crate::runtime::CreateContainerRequest,
+        ) -> Result<String, crate::runtime::DockerRuntimeError> {
+            Ok(request.container_name)
+        }
+
+        fn start_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn inspect_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<crate::runtime::ContainerInspection, crate::runtime::DockerRuntimeError>
+        {
+            panic!("readyz must not inspect containers per environment")
+        }
+
+        fn container_logs(
+            &mut self,
+            _container_name: &str,
+            _tail_lines: usize,
+        ) -> Result<String, crate::runtime::DockerRuntimeError> {
+            panic!("readyz must not read container logs per environment")
+        }
+
+        fn list_managed_containers(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ContainerInspection>, crate::runtime::DockerRuntimeError>
+        {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_images(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedImage>, crate::runtime::DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_volumes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedVolume>, crate::runtime::DockerRuntimeError>
+        {
+            Ok(Vec::new())
+        }
+
+        fn stop_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_image(
+            &mut self,
+            _image_ref: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_volume(
+            &mut self,
+            _volume_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn seed_cached_runtime(
+        root: &std::path::Path,
+        project_id: &str,
+        environment: &str,
+        generation: u64,
+        health_state: RuntimeHealthState,
+        error_code: Option<&str>,
+    ) {
+        let env = EnvironmentPaths::new(root, project_id, environment);
+        SnapshotWriter::new(env.clone(), generation)
+            .unwrap()
+            .finalize(project_id, environment, SnapshotState::Healthy)
+            .unwrap();
+        RuntimeStateStore::new(env.clone())
+            .save(&RuntimeState {
+                active_generation: Some(generation),
+                health_state,
+                failed_probe_count: 0,
+                successful_probe_count: 0,
+                restart_attempted: false,
+                degraded_since_unix: Some(1),
+                last_transition: "degraded".into(),
+                last_error_code: error_code.map(str::to_string),
+            })
+            .unwrap();
+        DiagnosticsStore::new(env, generation)
+            .write_summary(&crate::storage::DiagnosticSummary {
+                deployment_id: Some(format!("dep-{generation}")),
+                failure_stage: "warming".into(),
+                failure_reason: format!("{project_id}/{environment} degraded"),
+                blocking_reason: None,
+                container_name: format!("{environment}-{project_id}-gen-{generation}"),
+                failed_service_name: None,
+                blocking_service_name: None,
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn readyz_does_not_scan_all_environments() {
+        let root = test_root("readyz-does-not-scan-all-environments");
+        for index in 0..64 {
+            seed_cached_runtime(
+                &root,
+                &format!("api-{index}"),
+                "production",
+                index + 1,
+                RuntimeHealthState::Degraded,
+                Some("tcp_unreachable"),
+            );
+        }
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            PanicPerEnvironmentDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let readiness = daemon.readyz_response();
+        assert_eq!(readiness.status, "degraded");
+        assert_eq!(readiness.reasons.len(), 64);
+    }
+
+    #[test]
+    fn readyz_uses_cached_convergence_state() {
+        let root = test_root("readyz-uses-cached-convergence-state");
+        seed_cached_runtime(
+            &root,
+            "api",
+            "production",
+            1,
+            RuntimeHealthState::Degraded,
+            Some("tcp_unreachable"),
+        );
+
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        assert_eq!(daemon.readyz_response().status, "degraded");
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 4,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        assert_eq!(daemon.readyz_response().status, "degraded");
+        daemon.refresh_readyz_cache();
+        assert_eq!(daemon.readyz_response().status, "ready");
     }
 }
 

@@ -20,7 +20,9 @@ use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
 use forge_core::convergence::garbage_collect;
-use forge_core::daemon::{Daemon, DeploymentWorkerSettings, run_deployment_worker_loop};
+use forge_core::daemon::{
+    Daemon, DeploymentWorkerSettings, run_deployment_worker_loop, run_readyz_refresh_loop,
+};
 use forge_core::deployments::{
     ActivationMode, ExecutionConfig, FORGE_MANAGED_DOCKER_NETWORK, ValidationPolicy,
 };
@@ -2819,9 +2821,16 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
         )
     });
 
+    let readyz_cache = Arc::new(Mutex::new(daemon.readyz_cache_snapshot()));
+    let daemon = Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>));
+    let readyz_daemon = daemon.clone();
+    let readyz_cache_loop = readyz_cache.clone();
+    thread::spawn(move || run_readyz_refresh_loop(readyz_daemon, readyz_cache_loop));
+
     let github_webhooks = build_github_webhook_state(&config)?;
     let state = HttpState::new(
-        Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>)),
+        daemon,
+        readyz_cache,
         config.bearer_token.clone(),
         IdempotencyStore::new(config.storage_root.join("idempotency"))
             .map_err(|err| CliError::Usage(err.to_string()))?,

@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -25,7 +26,9 @@ use crate::api::{
     EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
     ProjectUpsertRequest, ReadyzResponse, SecretListResponse, SecretUnsetResponse,
 };
-use crate::daemon::{Daemon, DaemonState};
+use crate::daemon::{
+    Daemon, DaemonReadyzCache, DaemonState, READYZ_CACHE_STALE_AFTER_MS, READYZ_HANDLER_TIMEOUT_MS,
+};
 use crate::github::{
     GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
 };
@@ -74,7 +77,23 @@ pub trait ControlPlane: Send {
     fn readyz_response(&mut self) -> ReadyzResponse {
         ReadyzResponse {
             status: self.readyz_status().into(),
+            reason: None,
             reasons: Vec::new(),
+        }
+    }
+    fn refresh_readyz_cache(&mut self) {}
+    fn readyz_cache_snapshot(&self) -> DaemonReadyzCache {
+        DaemonReadyzCache {
+            response: ReadyzResponse {
+                status: if self.is_ready() {
+                    "ready".into()
+                } else {
+                    "not_ready".into()
+                },
+                reason: None,
+                reasons: Vec::new(),
+            },
+            updated_at_unix_ms: unix_now_ms(),
         }
     }
     fn handle_post_deployments(
@@ -149,6 +168,14 @@ where
 
     fn readyz_response(&mut self) -> ReadyzResponse {
         Daemon::readyz_response(self)
+    }
+
+    fn refresh_readyz_cache(&mut self) {
+        Daemon::refresh_readyz_cache(self)
+    }
+
+    fn readyz_cache_snapshot(&self) -> DaemonReadyzCache {
+        Daemon::readyz_cache_snapshot(self)
     }
 
     fn handle_post_deployments(
@@ -257,6 +284,7 @@ where
 #[derive(Clone)]
 pub struct HttpState {
     daemon: Arc<Mutex<Box<dyn ControlPlane>>>,
+    readyz_cache: Arc<Mutex<DaemonReadyzCache>>,
     bearer_token: String,
     idempotency: IdempotencyStore,
     github_webhooks: Option<GitHubWebhookState>,
@@ -269,6 +297,7 @@ pub struct HttpState {
 impl HttpState {
     pub fn new(
         daemon: Arc<Mutex<Box<dyn ControlPlane>>>,
+        readyz_cache: Arc<Mutex<DaemonReadyzCache>>,
         bearer_token: String,
         idempotency: IdempotencyStore,
         github_webhooks: Option<GitHubWebhookState>,
@@ -279,6 +308,7 @@ impl HttpState {
     ) -> Self {
         Self {
             daemon,
+            readyz_cache,
             bearer_token,
             idempotency,
             github_webhooks,
@@ -1231,6 +1261,7 @@ async fn get_healthz() -> impl IntoResponse {
         StatusCode::OK,
         Json(ReadyzResponse {
             status: "ok".into(),
+            reason: None,
             reasons: Vec::new(),
         }),
     )
@@ -1350,21 +1381,38 @@ async fn post_cli_login_poll(
 
 async fn get_readyz(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
-    let daemon = state.daemon.clone();
-    let readiness = match tokio::task::spawn_blocking(move || {
-        daemon
-            .lock()
-            .map(|mut daemon| daemon.readyz_response())
-            .unwrap_or(ReadyzResponse {
-                status: "not_ready".into(),
-                reasons: Vec::new(),
-            })
-    })
+    let readyz_cache = state.readyz_cache.clone();
+    let readiness = match tokio::time::timeout(
+        Duration::from_millis(READYZ_HANDLER_TIMEOUT_MS),
+        tokio::task::spawn_blocking(move || {
+            readyz_cache
+                .lock()
+                .map(|cache| {
+                    if unix_now_ms().saturating_sub(cache.updated_at_unix_ms)
+                        > READYZ_CACHE_STALE_AFTER_MS
+                    {
+                        ReadyzResponse {
+                            status: "degraded".into(),
+                            reason: Some("readiness cache stale".into()),
+                            reasons: Vec::new(),
+                        }
+                    } else {
+                        cache.response.clone()
+                    }
+                })
+                .unwrap_or(ReadyzResponse {
+                    status: "degraded".into(),
+                    reason: Some("readiness cache unavailable".into()),
+                    reasons: Vec::new(),
+                })
+        }),
+    )
     .await
     {
-        Ok(status) => status,
-        Err(_) => ReadyzResponse {
-            status: "not_ready".into(),
+        Ok(Ok(status)) => status,
+        _ => ReadyzResponse {
+            status: "degraded".into(),
+            reason: Some("readiness cache stale".into()),
             reasons: Vec::new(),
         },
     };
@@ -2683,6 +2731,13 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2957,9 +3012,11 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
         daemon.start().unwrap();
         seed_test_project(&root);
     }
+    let readyz_cache = Arc::new(Mutex::new(daemon.readyz_cache_snapshot()));
     (
         HttpState::new(
             Arc::new(Mutex::new(Box::new(daemon))),
+            readyz_cache,
             config.bearer_token,
             IdempotencyStore::new(root.join("idempotency")).unwrap(),
             None,
@@ -3009,6 +3066,12 @@ fn build_state_with_route_repair_failure() -> HttpState {
             last_error_code: Some("route_activation_verification_failed".into()),
         })
         .unwrap();
+    if let Ok(mut daemon) = state.daemon.lock() {
+        daemon.refresh_readyz_cache();
+        if let Ok(mut readyz_cache) = state.readyz_cache.lock() {
+            *readyz_cache = daemon.readyz_cache_snapshot();
+        }
+    }
     state
 }
 
@@ -3922,6 +3985,135 @@ pub mod http_readyz_false_before_daemon_ready {
         assert!(reason["source"].as_str().is_some());
         assert!(reason["marker"].as_str().is_some());
         assert!(reason["message"].as_str().is_some());
+    }
+}
+
+#[cfg(test)]
+pub mod http_readyz_cache_latency {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use std::time::Instant;
+    use tower::util::ServiceExt;
+
+    fn sync_readyz_cache(state: &HttpState) {
+        if let Ok(mut daemon) = state.daemon.lock() {
+            daemon.refresh_readyz_cache();
+            if let Ok(mut readyz_cache) = state.readyz_cache.lock() {
+                *readyz_cache = daemon.readyz_cache_snapshot();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_cache_stale_without_blocking() {
+        let state = build_state(true);
+        if let Ok(mut readyz_cache) = state.readyz_cache.lock() {
+            readyz_cache.updated_at_unix_ms = 0;
+        }
+        let app = router(state);
+        let start = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(1));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["reason"], "readiness cache stale");
+    }
+
+    #[tokio::test]
+    async fn readyz_returns_under_timeout_with_slow_docker() {
+        let state = build_state(true);
+        let daemon = state.daemon.clone();
+        let blocker = std::thread::spawn(move || {
+            let _guard = daemon.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(750));
+        });
+        let app = router(state);
+        let start = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        blocker.join().unwrap();
+        assert!(elapsed < Duration::from_millis(READYZ_HANDLER_TIMEOUT_MS));
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_and_readyz_fast_under_many_projects() {
+        let (state, root) = build_state_with_root(true);
+        for index in 0..200 {
+            let env = crate::storage::EnvironmentPaths::new(
+                &root,
+                &format!("proj-{index}"),
+                "production",
+            );
+            crate::storage::RuntimeStateStore::new(env)
+                .save(&crate::storage::RuntimeState {
+                    active_generation: Some(index + 1),
+                    health_state: crate::storage::RuntimeHealthState::Healthy,
+                    failed_probe_count: 0,
+                    successful_probe_count: 1,
+                    restart_attempted: false,
+                    degraded_since_unix: None,
+                    last_transition: "healthy".into(),
+                    last_error_code: None,
+                })
+                .unwrap();
+        }
+        sync_readyz_cache(&state);
+        let app = router(state);
+
+        let health_start = Instant::now();
+        let health_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let health_elapsed = health_start.elapsed();
+
+        let ready_start = Instant::now();
+        let ready_response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ready_elapsed = ready_start.elapsed();
+
+        assert_eq!(health_response.status(), StatusCode::OK);
+        assert_eq!(ready_response.status(), StatusCode::OK);
+        assert!(health_elapsed < Duration::from_millis(250));
+        assert!(ready_elapsed < Duration::from_secs(1));
     }
 }
 
