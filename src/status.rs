@@ -529,6 +529,44 @@ fn compute_history_references(
     })
 }
 
+fn active_restore_lineage(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    last_deployment_id: Option<&str>,
+    history_entry: Option<&DeploymentHistoryEntry>,
+) -> Option<crate::api::RestoreLineage> {
+    let mut record = GenerationHistoryRecord {
+        generation,
+        deployment_id: last_deployment_id.map(str::to_string),
+        ..GenerationHistoryRecord::default()
+    };
+    if let Some(entry) = history_entry {
+        if record.deployment_id.is_none() {
+            record.deployment_id = entry.deployment_id.clone();
+        }
+        record.commit_sha = entry.commit_sha.clone();
+        record.source_ref = entry.source_ref.clone();
+        record.image_ref = entry.image_ref.clone();
+        record.created_at_unix = entry.created_at_unix;
+        record.finalized_at_unix = entry.finalized_at_unix;
+        record.promoted_at_unix = entry.promoted_at_unix;
+        record.finalized_state = entry.finalized_state.clone();
+        record.restored_by_rollback = entry.restored_by_rollback;
+        record.rollback_target = entry.rollback_target;
+        record.retained = entry.retained;
+        record.eligible_for_gc = entry.eligible_for_gc;
+        record.missing_artifacts = entry.missing_artifacts;
+        record.retained_reasons = entry.retained_reasons.clone();
+        record.restored_from_backup_id = entry.restored_from_backup_id.clone();
+        record.restored_from_generation = entry.restored_from_generation;
+        record.restored_from_deployment_id = entry.restored_from_deployment_id.clone();
+        record.restored_at_unix = entry.restored_at_unix;
+    }
+    load_backup_restore_lineage(storage_root, project_id, environment, &record)
+}
+
 fn retained_healthy_generations(
     records: &[GenerationHistoryRecord],
     references: &HistoryReferences,
@@ -1145,40 +1183,17 @@ where
         })
     });
     let active_restore = truth.active_generation.and_then(|generation| {
-        history
-            .entries
-            .iter()
-            .find(|entry| entry.generation == generation)
-            .and_then(|entry| {
-                load_backup_restore_lineage(
-                    storage_root,
-                    project_id,
-                    environment,
-                    &GenerationHistoryRecord {
-                        generation: entry.generation,
-                        deployment_id: entry.deployment_id.clone(),
-                        commit_sha: entry.commit_sha.clone(),
-                        source_ref: entry.source_ref.clone(),
-                        image_ref: entry.image_ref.clone(),
-                        source_path: None,
-                        created_at_unix: entry.created_at_unix,
-                        finalized_at_unix: entry.finalized_at_unix,
-                        promoted_at_unix: entry.promoted_at_unix,
-                        finalized_state: entry.finalized_state.clone(),
-                        restored_by_rollback: entry.restored_by_rollback,
-                        rollback_target: entry.rollback_target,
-                        retained: entry.retained,
-                        eligible_for_gc: entry.eligible_for_gc,
-                        missing_artifacts: entry.missing_artifacts,
-                        retained_reasons: entry.retained_reasons.clone(),
-                        archived_at_unix: None,
-                        restored_from_backup_id: entry.restored_from_backup_id.clone(),
-                        restored_from_generation: entry.restored_from_generation,
-                        restored_from_deployment_id: entry.restored_from_deployment_id.clone(),
-                        restored_at_unix: entry.restored_at_unix,
-                    },
-                )
-            })
+        active_restore_lineage(
+            storage_root,
+            project_id,
+            environment,
+            generation,
+            status.last_deployment_id.as_deref(),
+            history
+                .entries
+                .iter()
+                .find(|entry| entry.generation == generation),
+        )
     });
     let backup_restore_events = recent_backup_restore_events(
         &env,
@@ -5984,6 +5999,92 @@ mod tests {
         assert_eq!(active_restore.backup_id, "backup-1");
         assert_eq!(active_restore.source_generation, 3);
         assert_eq!(active_restore.restored_at_unix, 20);
+    }
+
+    #[test]
+    fn active_restore_detected_from_restore_deployment_id() {
+        let root = test_root("active-restore-detected-from-restore-deployment-id");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 9);
+        write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(9)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let active_restore = diagnostics.active_restore.expect("restore lineage");
+        assert_eq!(active_restore.backup_id, "backup-1");
+        assert_eq!(active_restore.source_generation, 3);
+        assert_eq!(active_restore.restored_at_unix, 20);
+    }
+
+    #[test]
+    fn active_restore_detected_from_generation_metadata() {
+        let root = test_root("active-restore-detected-from-generation-metadata");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 9);
+        write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        RetentionStore::new(env.clone())
+            .write(&RetentionMetadata {
+                updated_at_unix: Some(20),
+                generations: vec![GenerationHistoryRecord {
+                    generation: 9,
+                    deployment_id: Some("dep-9".into()),
+                    restored_from_backup_id: Some("backup-1".into()),
+                    restored_from_generation: Some(3),
+                    restored_from_deployment_id: Some("dep-3".into()),
+                    restored_at_unix: Some(20),
+                    retained: true,
+                    ..GenerationHistoryRecord::default()
+                }],
+            })
+            .unwrap();
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(9)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        let active_restore = diagnostics.active_restore.expect("restore lineage");
+        assert_eq!(active_restore.backup_id, "backup-1");
+        assert_eq!(active_restore.source_generation, 3);
+        assert_eq!(
+            active_restore.source_deployment_id.as_deref(),
+            Some("dep-3")
+        );
+    }
+
+    #[test]
+    fn active_restore_not_none_for_restored_active_generation() {
+        let root = test_root("active-restore-not-none-for-restored-active-generation");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 9);
+        write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
+
+        let mut docker = StubDockerRuntime {
+            inspection: Some(healthy_container(9)),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+
+        assert!(diagnostics.active_restore.is_some());
     }
 
     #[test]

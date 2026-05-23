@@ -739,6 +739,20 @@ pub fn load_backup_restore_lineage(
                 })
                 .cloned();
             (backup_id, metadata, restore_record)
+        } else if let Some(backup_id) =
+            backup_id_from_restore_deployment_id(record.deployment_id.as_deref())
+        {
+            let metadata = find_backup_metadata(storage_root, &backup_id).ok()?;
+            let restore_record = metadata
+                .restores
+                .iter()
+                .find(|restore| {
+                    restore.restored_generation == record.generation
+                        || Some(restore.restored_deployment_id.as_str())
+                            == record.deployment_id.as_deref()
+                })
+                .cloned();
+            (backup_id, metadata, restore_record)
         } else {
             find_backup_restore_metadata(storage_root, project_id, environment, record)?
         };
@@ -802,6 +816,13 @@ pub fn load_backup_restore_lineage(
             .then(|| metadata.hooks.iter().all(|hook| hook.exit_code == 0)),
         restored_volumes,
     })
+}
+
+fn backup_id_from_restore_deployment_id(deployment_id: Option<&str>) -> Option<String> {
+    let deployment_id = deployment_id?;
+    let suffix = deployment_id.strip_prefix("restore-")?;
+    let backup_suffix = suffix.rsplit_once("-gen-")?.0;
+    (!backup_suffix.is_empty()).then(|| backup_suffix.to_string())
 }
 
 fn find_backup_restore_metadata(

@@ -10,7 +10,7 @@ use crate::api::{
     BackupListResponse, BackupRecord, BackupRestoreResponse, DeploymentAccepted,
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, ServiceLogGroup, validate_deployment_request,
+    EventList, ReadyzReason, ReadyzResponse, ServiceLogGroup, validate_deployment_request,
 };
 use crate::backups::{create_backup, inspect_backup, list_backups, restore_backup};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
@@ -694,10 +694,28 @@ where
         if self.state() != &DaemonState::Ready {
             return "not_ready";
         }
-        if self.has_route_repair_failures() {
+        if !self.readyz_degraded_reasons().is_empty() {
             "degraded"
         } else {
             "ready"
+        }
+    }
+
+    pub fn readyz_response(&mut self) -> ReadyzResponse {
+        if self.state() != &DaemonState::Ready {
+            return ReadyzResponse {
+                status: "not_ready".into(),
+                reasons: Vec::new(),
+            };
+        }
+        let reasons = self.readyz_degraded_reasons();
+        ReadyzResponse {
+            status: if reasons.is_empty() {
+                "ready".into()
+            } else {
+                "degraded".into()
+            },
+            reasons,
         }
     }
 
@@ -709,11 +727,12 @@ where
         (&self.docker_runtime, &self.routing_runtime)
     }
 
-    fn has_route_repair_failures(&mut self) -> bool {
+    fn readyz_degraded_reasons(&mut self) -> Vec<ReadyzReason> {
         let projects_root = self.config.storage_root.join("projects");
         let Ok(projects) = fs::read_dir(projects_root) else {
-            return false;
+            return Vec::new();
         };
+        let mut reasons = Vec::new();
         for project in projects.flatten() {
             let envs_dir = project.path().join("environments");
             let Ok(envs) = fs::read_dir(envs_dir) else {
@@ -722,7 +741,7 @@ where
             for env_entry in envs.flatten() {
                 let environment = env_entry.file_name().to_string_lossy().into_owned();
                 let project_id = project.file_name().to_string_lossy().into_owned();
-                let Ok(status) = load_project_environment_status(
+                let Ok(diagnostics) = load_environment_diagnostics(
                     &self.config.storage_root,
                     self.queue.as_ref(),
                     &mut self.docker_runtime,
@@ -732,13 +751,136 @@ where
                 ) else {
                     continue;
                 };
-                if status.status == "degraded" && status.active_generation.is_some() {
-                    return true;
-                }
+                reasons.extend(readyz_reasons_for_environment(&diagnostics));
             }
         }
-        false
+        reasons.sort_by(|left, right| {
+            (
+                left.project_id.as_str(),
+                left.environment.as_str(),
+                left.generation.unwrap_or(0),
+                left.source.as_str(),
+                left.marker.as_str(),
+                left.message.as_str(),
+            )
+                .cmp(&(
+                    right.project_id.as_str(),
+                    right.environment.as_str(),
+                    right.generation.unwrap_or(0),
+                    right.source.as_str(),
+                    right.marker.as_str(),
+                    right.message.as_str(),
+                ))
+        });
+        reasons.dedup();
+        reasons
     }
+}
+
+fn readyz_reasons_for_environment(diagnostics: &EnvironmentDiagnostics) -> Vec<ReadyzReason> {
+    let Some(active_generation) = diagnostics.active_generation else {
+        return Vec::new();
+    };
+
+    let mut reasons = Vec::new();
+    let default_source = diagnostics
+        .diagnostics_source
+        .clone()
+        .unwrap_or_else(|| "runtime".into());
+
+    if diagnostics.route.route_required
+        && (!diagnostics.route.route_active || !diagnostics.route.matches_expected)
+    {
+        reasons.push(ReadyzReason {
+            project_id: diagnostics.project_id.clone(),
+            environment: diagnostics.environment.clone(),
+            generation: Some(active_generation),
+            source: diagnostics
+                .diagnostics_source
+                .clone()
+                .unwrap_or_else(|| "route_runtime".into()),
+            marker: "route_repair".into(),
+            message: diagnostics
+                .route
+                .mismatch_reason
+                .clone()
+                .unwrap_or_else(|| "route target is not active".into()),
+        });
+    }
+
+    if !diagnostics.container.running {
+        reasons.push(ReadyzReason {
+            project_id: diagnostics.project_id.clone(),
+            environment: diagnostics.environment.clone(),
+            generation: Some(active_generation),
+            source: "runtime_container".into(),
+            marker: "container".into(),
+            message: diagnostics
+                .container
+                .state_status
+                .clone()
+                .map(|status| format!("container not running ({status})"))
+                .unwrap_or_else(|| "container not running".into()),
+        });
+    }
+
+    for service in diagnostics.services.iter().filter(|service| {
+        service.failure_reason.is_some()
+            && matches!(
+                service.health.as_str(),
+                "failed" | "degraded" | "crash_loop" | "oom_killed" | "stopped"
+            )
+    }) {
+        reasons.push(ReadyzReason {
+            project_id: diagnostics.project_id.clone(),
+            environment: diagnostics.environment.clone(),
+            generation: Some(active_generation),
+            source: default_source.clone(),
+            marker: format!("service:{}", service.service_id),
+            message: service.failure_reason.clone().unwrap_or_default(),
+        });
+    }
+
+    for failure in diagnostics
+        .recent_failures
+        .iter()
+        .filter(|failure| !failure.historical && failure.generation == active_generation)
+    {
+        reasons.push(ReadyzReason {
+            project_id: diagnostics.project_id.clone(),
+            environment: diagnostics.environment.clone(),
+            generation: Some(active_generation),
+            source: failure.diagnostics_source.clone(),
+            marker: failure.failure_stage.clone(),
+            message: failure.failure_reason.clone(),
+        });
+    }
+
+    if reasons.is_empty() && diagnostics.status == "degraded" {
+        let has_current_signal = diagnostics.last_failed_transition.is_some()
+            || diagnostics.restart_instability
+            || diagnostics.probe_flapping
+            || diagnostics.promotion_gate_reason.is_some();
+        if has_current_signal {
+            reasons.push(ReadyzReason {
+                project_id: diagnostics.project_id.clone(),
+                environment: diagnostics.environment.clone(),
+                generation: Some(active_generation),
+                source: default_source,
+                marker: diagnostics
+                    .likely_failure_stage
+                    .clone()
+                    .unwrap_or_else(|| "runtime".into()),
+                message: diagnostics
+                    .promotion_gate_reason
+                    .clone()
+                    .or_else(|| diagnostics.last_failed_transition.clone())
+                    .unwrap_or_else(|| "active environment is degraded".into()),
+            });
+        }
+    }
+
+    reasons
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1441,7 +1583,8 @@ pub mod daemon_refuses_api_commands_before_ready {
 pub mod daemon_readyz_route_repair_resolution {
     use super::*;
     use crate::storage::{
-        PointerStore, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
+        DiagnosticSummary, DiagnosticsStore, PointerStore, RuntimeState, RuntimeStateStore,
+        SnapshotState, SnapshotWriter,
     };
     use std::path::Path;
 
@@ -1514,6 +1657,47 @@ pub mod daemon_readyz_route_repair_resolution {
     }
 
     #[test]
+    fn readyz_ignores_historical_startup_recovery_route_failure() {
+        let root = test_root("readyz-ignores-historical-startup-recovery-route-failure");
+        seed_runtime_state(&root, RuntimeHealthState::Healthy, "healthy", None);
+        DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1)
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some("dep-1".into()),
+                failure_stage: "startup_recovery".into(),
+                failure_reason: "route activation verification failed".into(),
+                blocking_reason: Some("route activation verification failed".into()),
+                container_name: "production-api-gen-1".into(),
+                failed_service_name: Some("default".into()),
+                blocking_service_name: Some("default".into()),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_status(), "ready");
+        assert!(daemon.readyz_response().reasons.is_empty());
+    }
+
+    #[test]
     fn readyz_ok_when_all_active_environments_healthy() {
         let root = test_root("readyz-ok-when-all-active-environments-healthy");
         seed_runtime_state(&root, RuntimeHealthState::Healthy, "healthy", None);
@@ -1527,6 +1711,48 @@ pub mod daemon_readyz_route_repair_resolution {
         daemon.start().unwrap();
 
         assert_eq!(daemon.readyz_status(), "ready");
+    }
+
+    #[test]
+    fn readyz_ok_when_all_active_statuses_healthy_even_with_historical_failures() {
+        let root =
+            test_root("readyz-ok-when-all-active-statuses-healthy-even-with-historical-failures");
+        seed_runtime_state(&root, RuntimeHealthState::Healthy, "healthy", None);
+        DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1)
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some("dep-1".into()),
+                failure_stage: "warming".into(),
+                failure_reason: "route activation verification failed".into(),
+                blocking_reason: Some("route activation verification failed".into()),
+                container_name: "production-api-gen-1".into(),
+                failed_service_name: Some("default".into()),
+                blocking_service_name: Some("default".into()),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_status(), "ready");
+        assert!(daemon.readyz_response().reasons.is_empty());
     }
 }
 

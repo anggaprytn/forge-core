@@ -23,7 +23,7 @@ use crate::api::{
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
     EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectUpsertRequest, SecretListResponse, SecretUnsetResponse,
+    ProjectUpsertRequest, ReadyzResponse, SecretListResponse, SecretUnsetResponse,
 };
 use crate::daemon::{Daemon, DaemonState};
 use crate::github::{
@@ -69,6 +69,12 @@ pub trait ControlPlane: Send {
             "ready"
         } else {
             "not_ready"
+        }
+    }
+    fn readyz_response(&mut self) -> ReadyzResponse {
+        ReadyzResponse {
+            status: self.readyz_status().into(),
+            reasons: Vec::new(),
         }
     }
     fn handle_post_deployments(
@@ -139,6 +145,10 @@ where
 
     fn readyz_status(&mut self) -> &'static str {
         Daemon::readyz_status(self)
+    }
+
+    fn readyz_response(&mut self) -> ReadyzResponse {
+        Daemon::readyz_response(self)
     }
 
     fn handle_post_deployments(
@@ -596,11 +606,6 @@ struct ErrorEnvelope {
     correlation_id: String,
     code: String,
     message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct HealthEnvelope {
-    status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1224,8 +1229,9 @@ async fn post_logout(State(state): State<HttpState>) -> Response {
 async fn get_healthz() -> impl IntoResponse {
     (
         StatusCode::OK,
-        Json(HealthEnvelope {
+        Json(ReadyzResponse {
             status: "ok".into(),
+            reasons: Vec::new(),
         }),
     )
 }
@@ -1345,31 +1351,30 @@ async fn post_cli_login_poll(
 async fn get_readyz(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
     let daemon = state.daemon.clone();
-    let (ready, readiness_status) =
-        match tokio::task::spawn_blocking(move || {
-            daemon
-                .lock()
-                .map(|mut daemon| (daemon.is_ready(), daemon.readyz_status()))
-                .unwrap_or((false, "not_ready"))
-        })
-        .await
-        {
-            Ok(status) => status,
-            Err(_) => (false, "not_ready"),
-        };
-    let status = if ready {
-        StatusCode::OK
-    } else {
+    let readiness = match tokio::task::spawn_blocking(move || {
+        daemon
+            .lock()
+            .map(|mut daemon| daemon.readyz_response())
+            .unwrap_or(ReadyzResponse {
+                status: "not_ready".into(),
+                reasons: Vec::new(),
+            })
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(_) => ReadyzResponse {
+            status: "not_ready".into(),
+            reasons: Vec::new(),
+        },
+    };
+    let status = if readiness.status == "not_ready" {
         StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
     };
 
-    json_response(
-        status,
-        &request_id,
-        Json(HealthEnvelope {
-            status: readiness_status.into(),
-        }),
-    )
+    json_response(status, &request_id, Json(readiness))
 }
 
 async fn get_metrics(State(state): State<HttpState>) -> Response {
@@ -3891,6 +3896,32 @@ pub mod http_readyz_false_before_daemon_ready {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "degraded");
+        assert!(!json["reasons"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_degraded_reasons() {
+        let app = router(build_state_with_route_repair_failure());
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "degraded");
+        let reasons = json["reasons"].as_array().unwrap();
+        assert!(!reasons.is_empty());
+        let reason = &reasons[0];
+        assert_eq!(reason["project_id"], "api");
+        assert_eq!(reason["environment"], "production");
+        assert!(reason["generation"].as_u64().is_some());
+        assert!(reason["source"].as_str().is_some());
+        assert!(reason["marker"].as_str().is_some());
+        assert!(reason["message"].as_str().is_some());
     }
 }
 
