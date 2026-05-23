@@ -157,6 +157,8 @@ Forge Alpha Core Loop v4 freezes the single-node stateful orchestration loop wit
 - **Cache-Backed Readiness:** The convergence loop computes readiness asynchronously and `/readyz` serves cached control-plane truth in bounded time.
 - **Single-Writer Lease Semantics:** Forge now persists a bounded filesystem lease under `control_plane/leader_lease.json` so only one node is allowed to reconcile shared control-plane state at a time.
 - **Distributed-Reconciliation Preparation:** Forge now persists `control_plane/cluster_nodes.json`, runs a separate heartbeat loop, and exposes heuristic split-brain signals without adding cross-node dependencies to request paths.
+- **Reconciliation Intent Journaling:** Every replayable reconciliation mutation now records a durable intent in `control_plane/reconciliation_log.jsonl` before mutating runtime state.
+- **Deterministic Replay Cursor:** Forge tracks bounded replay progress in `control_plane/reconciliation_cursor.json` so crash recovery stays resumable and request paths remain cache-backed.
 - **Cache-Backed Metrics:** `/metrics` exposes cached convergence timings, readiness counters, cache age, and Docker/Caddy breaker state without live scans on the request path.
 - **Dependency Circuit Breakers:** Docker and Caddy probing use bounded retries with automatic degraded-mode backoff and automatic recovery closure.
 - **Non-Fatal Route Repair Failures:** Startup route-repair failure degrades readiness reporting without failing basic liveness.
@@ -198,7 +200,15 @@ Forge is still not a distributed orchestrator. The new lease layer is a safety p
 - `control_plane/cluster_nodes.json` is topology and heartbeat state only. It is not consensus membership, not a lock service, and not an authority for automatic repair.
 - Split-brain handling is heuristic detection and degraded signaling only. Forge does not attempt automatic multi-node repair.
 - `/readyz` now degrades for leadership-specific uncertainty such as `leadership uncertain`, `convergence ownership lost`, `lease stale`, `checkpoint epoch mismatch`, `split_brain_suspected`, `multiple_active_reconcilers`, `checkpoint_owner_mismatch`, and `lease_epoch_divergence`.
+- `/readyz` also degrades for replay-specific states such as `reconciliation_replay_incomplete`, `unrecoverable_pending_intents`, `destructive_replay_blocked`, `replay_cursor_corrupted`, and `reconciliation_log_corrupted`.
 - Request paths remain isolated from reconciliation and cross-node communication. Followers stay read-only during divergence and continue serving cache-backed reads in bounded time.
+
+### Reconciliation Replay
+
+- Forge writes intent records before deployment promotion, rollback, route activation, snapshot persistence, backup restore, and other control-plane mutations.
+- Startup recovery replays only intents marked replay-safe or idempotent. Destructive or operator-sensitive intents are left pending and surfaced as degraded readiness.
+- `forge control-plane replay-status` shows the replay cursor, `forge control-plane intents` lists current intents, `forge control-plane replay --dry-run` is side-effect free, and `forge control-plane replay --resume` requires the active leader.
+- Forge uses intent journaling instead of synchronous fleet reconstruction so crash recovery stays deterministic, bounded, and independent from request-path ordering.
 
 ---
 

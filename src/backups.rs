@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::api::{
@@ -16,6 +17,9 @@ use crate::api::{
 use crate::events::EventRecord;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::DeploymentRecord;
+use crate::reconciliation::{
+    ReconciliationIntentStatus, ReconciliationStore, intent_request_for_storage_root,
+};
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
     ContainerInspection, CreateContainerRequest, CreateVolumeRequest, DockerRuntime,
@@ -518,10 +522,26 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
             serde_json::to_string_pretty(&restored_runtime_env_snapshot).unwrap()
         ),
     )?;
+    let reconciliation = ReconciliationStore::new(storage_root);
+    let snapshot_intent = reconciliation.append_pending(intent_request_for_storage_root(
+        storage_root,
+        "snapshot_persistence",
+        &metadata.project_id,
+        &metadata.environment,
+        Some(generation),
+        "healthy",
+        "backup_reconciliation",
+        BTreeMap::new(),
+    ))?;
     writer.finalize(
         &metadata.project_id,
         &metadata.environment,
         SnapshotState::Healthy,
+    )?;
+    let _ = reconciliation.append_status(
+        &snapshot_intent,
+        ReconciliationIntentStatus::Applied,
+        BTreeMap::new(),
     )?;
     atomic_write(
         env.generation_dir(generation).join("snapshot.json"),
@@ -561,6 +581,31 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
         let subtree_id = route_subtree_id
             .clone()
             .unwrap_or_else(|| route_subtree_id_for_service(&record, service_id, service_count));
+        let route_intent = reconciliation.append_pending(intent_request_for_storage_root(
+            storage_root,
+            "route_activation",
+            &record.project_id,
+            &record.environment,
+            Some(generation),
+            "healthy",
+            "routing_reconciliation",
+            BTreeMap::from([
+                ("subtree_id".into(), Value::String(subtree_id.clone())),
+                ("target".into(), Value::String(target.clone())),
+                (
+                    "domain".into(),
+                    Value::String(domain.clone().unwrap_or_default()),
+                ),
+                (
+                    "probe_path".into(),
+                    service
+                        .probe_path
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                ),
+            ]),
+        ))?;
         routing.update_route(RouteUpdateRequest {
             subtree_id: subtree_id.clone(),
             target: target.clone(),
@@ -568,11 +613,31 @@ pub fn restore_backup<D: DockerRuntime, R: RoutingRuntime>(
             health_checks_enabled: false,
             probe_path: service.probe_path.clone(),
         })?;
+        let _ = reconciliation.append_status(
+            &route_intent,
+            ReconciliationIntentStatus::Applied,
+            BTreeMap::new(),
+        )?;
         let route = routing.inspect_route(&subtree_id)?;
         validate_route_activation(&route, &target)?;
     }
 
+    let restore_intent = reconciliation.append_pending(intent_request_for_storage_root(
+        storage_root,
+        "backup_restore",
+        &record.project_id,
+        &record.environment,
+        Some(generation),
+        "healthy",
+        "backup_reconciliation",
+        BTreeMap::new(),
+    ))?;
     PointerStore::new(env.clone()).swap_current(generation)?;
+    let _ = reconciliation.append_status(
+        &restore_intent,
+        ReconciliationIntentStatus::Applied,
+        BTreeMap::new(),
+    )?;
     RuntimeStateStore::new(env.clone()).save(&RuntimeState {
         active_generation: Some(generation),
         health_state: RuntimeHealthState::Healthy,

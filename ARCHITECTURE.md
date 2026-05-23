@@ -117,6 +117,8 @@ Durability model:
 - `control_plane/cluster_nodes.json` persists observed node topology, heartbeat state, lease epochs, and capability hints for future distributed reconciliation work.
 - The cluster topology document is advisory coordination state, not consensus membership and not distributed locking.
 - An append-only operational journal records durable control-plane events without adding writes to the request path.
+- `control_plane/reconciliation_log.jsonl` is the append-only reconciliation intent journal. Intent durability is the boundary before route, promotion, rollback, restore, snapshot, and repair mutations.
+- `control_plane/reconciliation_cursor.json` stores bounded replay state including last applied intent, replay position, replay status, and recovered/skipped operations.
 
 Single-writer coordination model:
 
@@ -124,6 +126,14 @@ Single-writer coordination model:
 - The filesystem lease is advisory coordination, not Raft, not quorum, and not automatic failover consensus.
 - Heartbeats and split-brain signals are used for detection and degraded readiness only.
 - Request paths remain cache-backed and must never depend on live cross-node communication.
+- Followers never replay intents. Replay is leader-only and correctness-biased: unsafe or destructive intents degrade readiness instead of running automatically.
+
+Replay model:
+
+- Recovery starts from durable intent order, not implicit runtime inspection order.
+- Replay resumes only operations classified `replay_safe` or `idempotent`.
+- Operations classified `requires_operator_intervention` or `destructive` are surfaced through readiness, metrics, and CLI diagnostics and remain pending until explicitly handled.
+- Replay is resumable and bounded by cursor progress. Forge prefers degraded recovery over aggressive automatic mutation.
 
 Convergence domains:
 

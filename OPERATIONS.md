@@ -234,13 +234,24 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 - `control_plane/node.json` stores stable node identity, boot time, and capability flags.
 - `control_plane/cluster_nodes.json` stores per-node topology and heartbeat observations including role, advertised address, lease epoch seen, and control-plane version.
 - `control_plane/operations.jsonl` is the append-only operational journal for deployments, breaker transitions, daemon restarts, and other bounded audit events.
+- `control_plane/reconciliation_log.jsonl` stores reconciliation intents with replay safety markers and mutable status transitions.
+- `control_plane/reconciliation_cursor.json` stores replay position, replay status, recovered operations, and skipped operations.
 
 ### Recovery Model
 
 - On daemon restart, Forge restores cached operational truth from checkpoints before live probing catches up.
 - If a checkpoint or snapshot is stale, readiness degrades until the next bounded convergence refresh.
 - If a checkpoint or snapshot is corrupted, Forge skips it, keeps the API up, and rebuilds truth from surviving durable state plus the next live convergence cycle.
+- If the reconciliation log or replay cursor is corrupted, `/readyz` degrades immediately from cached control-plane state and operators should inspect `forge control-plane replay-status` and `forge control-plane intents`.
 - Diagnostics should prefer durable snapshots when live dependencies are unavailable, so status remains usable during Docker or Caddy outages.
+
+Operator replay workflow:
+
+- Use `forge control-plane replay-status` to inspect cursor state after a crash or restart.
+- Use `forge control-plane intents` to inspect pending, failed, or blocked intents.
+- Use `forge control-plane replay --dry-run` first when the system reports pending intents; it must not mutate runtime state.
+- Use `forge control-plane replay --resume` only on the active leader. Followers remain read-only and never replay.
+- Destructive intents such as GC-style deletion remain blocked for operator handling; Forge does not auto-replay them on startup.
 
 ### Readiness Cache Staleness
 

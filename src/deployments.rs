@@ -1,3 +1,4 @@
+use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -16,6 +17,9 @@ use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
+use crate::reconciliation::{
+    ReconciliationIntentStatus, ReconciliationStore, intent_request_for_storage_root,
+};
 use crate::route_truth::resolve_route_target;
 use crate::runtime::{
     BuildImageRequest, ContainerInspection, ContainerRuntimePolicy, CreateContainerRequest,
@@ -1073,10 +1077,26 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             &secret_values,
         )?;
 
+        let reconciliation = ReconciliationStore::new(&self.storage_root);
+        let snapshot_intent = reconciliation.append_pending(intent_request_for_storage_root(
+            &self.storage_root,
+            "snapshot_persistence",
+            &record.project_id,
+            &record.environment,
+            Some(generation),
+            "healthy",
+            "runtime_container_reconciliation",
+            BTreeMap::new(),
+        ))?;
         writer.finalize(
             &record.project_id,
             &record.environment,
             SnapshotState::Healthy,
+        )?;
+        let _ = reconciliation.append_status(
+            &snapshot_intent,
+            ReconciliationIntentStatus::Applied,
+            BTreeMap::new(),
         )?;
         let referenced_secret_keys = runtime_env
             .snapshot
@@ -1186,6 +1206,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let runtime = load_generation_runtime_info(&env, target)?
             .ok_or(DeploymentError::RollbackUnavailable)?;
         let service_runtime = runtime_services(&runtime);
+        let reconciliation = ReconciliationStore::new(&self.storage_root);
         let mut inspections = BTreeMap::new();
         for (service_id, service) in &service_runtime {
             let inspection = self
@@ -1232,6 +1253,31 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             let subtree_id = persisted_subtree_id.clone().unwrap_or_else(|| {
                 route_subtree_id_for_service(record, service_id, service_runtime.len())
             });
+            let route_intent = reconciliation.append_pending(intent_request_for_storage_root(
+                &self.storage_root,
+                "route_activation",
+                &record.project_id,
+                &record.environment,
+                Some(target),
+                "healthy",
+                "routing_reconciliation",
+                BTreeMap::from([
+                    ("subtree_id".into(), Value::String(subtree_id.clone())),
+                    ("target".into(), Value::String(upstream_target.clone())),
+                    (
+                        "domain".into(),
+                        Value::String(domain.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "probe_path".into(),
+                        service
+                            .probe_path
+                            .clone()
+                            .map(Value::String)
+                            .unwrap_or(Value::Null),
+                    ),
+                ]),
+            ))?;
             self.routing.update_route(RouteUpdateRequest {
                 subtree_id: subtree_id.clone(),
                 target: upstream_target.clone(),
@@ -1239,6 +1285,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 health_checks_enabled: false,
                 probe_path: service.probe_path.clone(),
             })?;
+            let _ = reconciliation.append_status(
+                &route_intent,
+                ReconciliationIntentStatus::Applied,
+                BTreeMap::new(),
+            )?;
             let route_inspection = self.routing.inspect_route(&subtree_id)?;
             validate_route_activation(
                 &route_inspection,
@@ -1268,7 +1319,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 ..PersistedPromotionSummary::default()
             }),
         )?;
+        let rollback_intent = reconciliation.append_pending(intent_request_for_storage_root(
+            &self.storage_root,
+            "rollback",
+            &record.project_id,
+            &record.environment,
+            Some(target),
+            "healthy",
+            "runtime_container_reconciliation",
+            BTreeMap::new(),
+        ))?;
         pointers.swap_current(target)?;
+        let _ = reconciliation.append_status(
+            &rollback_intent,
+            ReconciliationIntentStatus::Applied,
+            BTreeMap::new(),
+        )?;
         update_generation_history(&env, target, |history| {
             history.restored_by_rollback = true;
             history.promoted_at_unix = Some(current_unix_timestamp());
@@ -1849,6 +1915,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             }),
         )?;
 
+        let reconciliation = ReconciliationStore::new(&self.storage_root);
         for (service_id, runtime) in &service_runtime {
             if !runtime.externally_exposed {
                 continue;
@@ -1880,6 +1947,31 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             let subtree_id = route_subtree_id.unwrap_or_else(|| {
                 route_subtree_id_for_service(record, service_id, config.services().len())
             });
+            let route_intent = reconciliation.append_pending(intent_request_for_storage_root(
+                &self.storage_root,
+                "route_activation",
+                &record.project_id,
+                &record.environment,
+                Some(generation),
+                "healthy",
+                "routing_reconciliation",
+                BTreeMap::from([
+                    ("subtree_id".into(), Value::String(subtree_id.clone())),
+                    ("target".into(), Value::String(target.clone())),
+                    (
+                        "domain".into(),
+                        Value::String(domain.clone().unwrap_or_default()),
+                    ),
+                    (
+                        "probe_path".into(),
+                        runtime
+                            .probe_path
+                            .clone()
+                            .map(Value::String)
+                            .unwrap_or(Value::Null),
+                    ),
+                ]),
+            ))?;
             self.routing.update_route(RouteUpdateRequest {
                 subtree_id: subtree_id.clone(),
                 target: target.clone(),
@@ -1887,6 +1979,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 health_checks_enabled: false,
                 probe_path: runtime.probe_path.clone(),
             })?;
+            let _ = reconciliation.append_status(
+                &route_intent,
+                ReconciliationIntentStatus::Applied,
+                BTreeMap::new(),
+            )?;
             let route_inspection = self.routing.inspect_route(&subtree_id)?;
             validate_route_activation(
                 &route_inspection,
@@ -1919,7 +2016,22 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             generation,
             &referenced_secret_keys,
         )?;
+        let promotion_intent = reconciliation.append_pending(intent_request_for_storage_root(
+            &self.storage_root,
+            "deployment_promotion",
+            &record.project_id,
+            &record.environment,
+            Some(generation),
+            "healthy",
+            "runtime_container_reconciliation",
+            BTreeMap::new(),
+        ))?;
         PointerStore::new(env.clone()).swap_current(generation)?;
+        let _ = reconciliation.append_status(
+            &promotion_intent,
+            ReconciliationIntentStatus::Applied,
+            BTreeMap::new(),
+        )?;
         RuntimeStateStore::new(env.clone()).save(&RuntimeState {
             active_generation: Some(generation),
             health_state: RuntimeHealthState::Healthy,
@@ -3811,10 +3923,27 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let pointers = PointerStore::new(env.clone());
         let previous_authoritative = pointers.read_authoritative_pointer()?;
         let mut promotion_summary = warmup.promotion_summary.clone();
+        let reconciliation = ReconciliationStore::new(&self.storage_root);
 
         match validation.activation {
             ActivationMode::Direct => {
+                let promotion_intent =
+                    reconciliation.append_pending(intent_request_for_storage_root(
+                        &self.storage_root,
+                        "deployment_promotion",
+                        &record.project_id,
+                        &record.environment,
+                        Some(generation),
+                        "healthy",
+                        "runtime_container_reconciliation",
+                        BTreeMap::new(),
+                    ))?;
                 pointers.swap_current(generation)?;
+                let _ = reconciliation.append_status(
+                    &promotion_intent,
+                    ReconciliationIntentStatus::Applied,
+                    BTreeMap::new(),
+                )?;
                 promotion_summary.route_verification_succeeded = true;
             }
             ActivationMode::Http { internal_port } => {
@@ -3840,6 +3969,32 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     &record.project_id,
                     &record.environment,
                 )?;
+                let route_intent =
+                    reconciliation.append_pending(intent_request_for_storage_root(
+                        &self.storage_root,
+                        "route_activation",
+                        &record.project_id,
+                        &record.environment,
+                        Some(generation),
+                        "healthy",
+                        "routing_reconciliation",
+                        BTreeMap::from([
+                            ("subtree_id".into(), Value::String(subtree_id.clone())),
+                            ("target".into(), Value::String(target.clone())),
+                            (
+                                "domain".into(),
+                                Value::String(domain.clone().unwrap_or_default()),
+                            ),
+                            (
+                                "probe_path".into(),
+                                validation
+                                    .http_health_path
+                                    .clone()
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Null),
+                            ),
+                        ]),
+                    ))?;
                 self.routing.update_route(RouteUpdateRequest {
                     subtree_id: subtree_id.clone(),
                     target: target.clone(),
@@ -3847,6 +4002,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     health_checks_enabled: false,
                     probe_path: validation.http_health_path.clone(),
                 })?;
+                let _ = reconciliation.append_status(
+                    &route_intent,
+                    ReconciliationIntentStatus::Applied,
+                    BTreeMap::new(),
+                )?;
                 let inspection = self.routing.inspect_route(&subtree_id)?;
                 let context = RouteActivationContext {
                     route_id: subtree_id,
@@ -3880,7 +4040,23 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     return Err(err);
                 }
                 promotion_summary.route_verification_succeeded = true;
+                let promotion_intent =
+                    reconciliation.append_pending(intent_request_for_storage_root(
+                        &self.storage_root,
+                        "deployment_promotion",
+                        &record.project_id,
+                        &record.environment,
+                        Some(generation),
+                        "healthy",
+                        "runtime_container_reconciliation",
+                        BTreeMap::new(),
+                    ))?;
                 pointers.swap_current(generation)?;
+                let _ = reconciliation.append_status(
+                    &promotion_intent,
+                    ReconciliationIntentStatus::Applied,
+                    BTreeMap::new(),
+                )?;
             }
         }
 
@@ -3967,7 +4143,23 @@ impl RollbackExecutor {
         if !snapshot.exists() {
             return Err(DeploymentError::RollbackUnavailable);
         }
+        let reconciliation = ReconciliationStore::new(&self.storage_root);
+        let rollback_intent = reconciliation.append_pending(intent_request_for_storage_root(
+            &self.storage_root,
+            "rollback",
+            project_id,
+            environment,
+            Some(target),
+            "healthy",
+            "runtime_container_reconciliation",
+            BTreeMap::new(),
+        ))?;
         pointers.swap_current(target)?;
+        let _ = reconciliation.append_status(
+            &rollback_intent,
+            ReconciliationIntentStatus::Applied,
+            BTreeMap::new(),
+        )?;
         append_simple_event(
             &EventStore::new(env.clone(), target),
             project_id,

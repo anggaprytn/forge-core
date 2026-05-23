@@ -28,6 +28,7 @@ use crate::deployments::{
 use crate::events::EventRecord;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
+use crate::reconciliation::{ReconciliationDiagnostics, ReconciliationStore, ReplayOptions};
 use crate::route_truth::expected_route_for_runtime;
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
@@ -230,6 +231,7 @@ pub enum DaemonError {
     Bootstrap(crate::bootstrap::BootstrapError),
     Convergence(ConvergenceError),
     Queue(QueueError),
+    Storage(crate::storage::StorageError),
 }
 
 impl Display for DaemonError {
@@ -238,6 +240,7 @@ impl Display for DaemonError {
             Self::Bootstrap(err) => write!(f, "{err}"),
             Self::Convergence(err) => write!(f, "{err}"),
             Self::Queue(err) => write!(f, "{err}"),
+            Self::Storage(err) => write!(f, "{err}"),
         }
     }
 }
@@ -259,6 +262,12 @@ impl From<QueueError> for DaemonError {
 impl From<ConvergenceError> for DaemonError {
     fn from(value: ConvergenceError) -> Self {
         Self::Convergence(value)
+    }
+}
+
+impl From<crate::storage::StorageError> for DaemonError {
+    fn from(value: crate::storage::StorageError) -> Self {
+        Self::Storage(value)
     }
 }
 
@@ -429,6 +438,7 @@ pub struct Daemon<D, R, A> {
     convergence_domains: Vec<ConvergenceDomainSummary>,
     cluster_diagnostics: ClusterDiagnostics,
     cluster_signals: ClusterSignalState,
+    reconciliation: ReconciliationDiagnostics,
 }
 
 impl<D, R, A> Drop for Daemon<D, R, A> {
@@ -481,6 +491,7 @@ where
             convergence_domains: Vec::new(),
             cluster_diagnostics: ClusterDiagnostics::default(),
             cluster_signals: ClusterSignalState::default(),
+            reconciliation: ReconciliationDiagnostics::default(),
         }
     }
 
@@ -499,6 +510,24 @@ where
                     .unwrap_or_default();
                 self.state = DaemonState::Recovering;
                 self.startup_steps.push(StartupStep::BootstrapReady);
+                self.refresh_leadership(current_unix_timestamp());
+                self.reconciliation =
+                    ReconciliationStore::new(&self.config.storage_root).diagnostics();
+                if self.reconciliation_enabled(current_unix_timestamp()) {
+                    let node_id = self.node_id().to_string();
+                    let lease_epoch = self.leadership.lease_epoch();
+                    self.reconciliation = ReconciliationStore::new(&self.config.storage_root)
+                        .replay(
+                            &mut self.routing_runtime,
+                            &node_id,
+                            lease_epoch,
+                            ReplayOptions {
+                                dry_run: false,
+                                resume: true,
+                            },
+                        )?
+                        .diagnostics;
+                }
                 let _ = OperationalJournalStore::new(&self.config.storage_root).append(
                     &OperationalJournalEntry {
                         schema_version: 1,
@@ -1528,6 +1557,7 @@ where
         let previous_cluster_signals = self.cluster_signals.clone();
         let (mut cluster_diagnostics, mut cluster_signals) =
             self.load_cluster_diagnostics(now_unix);
+        self.reconciliation = ReconciliationStore::new(&self.config.storage_root).diagnostics();
         let queue_depth = self.queue_depth().unwrap_or_default();
         self.convergence_domains.clear();
         let dependency_started = Instant::now();
@@ -1702,6 +1732,36 @@ where
             reasons.push(control_plane_reason(
                 "convergence_ownership_lost",
                 "convergence ownership lost".into(),
+            ));
+        }
+        if self.reconciliation.replay_incomplete {
+            reasons.push(control_plane_reason(
+                "reconciliation_replay_incomplete",
+                "reconciliation replay incomplete".into(),
+            ));
+        }
+        if self.reconciliation.unrecoverable_pending_intents {
+            reasons.push(control_plane_reason(
+                "unrecoverable_pending_intents",
+                "unrecoverable pending intents require operator intervention".into(),
+            ));
+        }
+        if self.reconciliation.destructive_replay_blocked {
+            reasons.push(control_plane_reason(
+                "destructive_replay_blocked",
+                "destructive replay blocked".into(),
+            ));
+        }
+        if self.reconciliation.replay_cursor_corrupted {
+            reasons.push(control_plane_reason(
+                "replay_cursor_corrupted",
+                "replay cursor corrupted".into(),
+            ));
+        }
+        if self.reconciliation.reconciliation_log_corrupted {
+            reasons.push(control_plane_reason(
+                "reconciliation_log_corrupted",
+                "reconciliation log corrupted".into(),
             ));
         }
         if let Some(lease) = self.leadership.lease.as_ref() {
@@ -2262,6 +2322,7 @@ where
         let now = now_unix_ms();
         let leader = self.reconciliation_enabled(current_unix_timestamp());
         let lease = self.leadership.lease.as_ref();
+        let replay = &self.reconciliation;
         MetricsResponse {
             queue_depth,
             convergence_loop_duration_ms: self.convergence_loop_duration_ms,
@@ -2290,6 +2351,14 @@ where
             convergence_owner: self.leadership.convergence_owner(),
             reconciliation_enabled: leader,
             follower_mode: !leader && !self.leadership.uncertain,
+            pending_intents: replay.pending_intents,
+            replay_queue_depth: replay.replay_queue_depth,
+            replay_in_progress: replay.replay_in_progress,
+            replay_duration_ms: replay.replay_duration_ms,
+            replay_failures_total: replay.replay_failures_total,
+            unrecoverable_operations: replay.unrecoverable_operations,
+            last_replayed_intent: replay.last_replayed_intent.clone(),
+            reconciliation_log_size_bytes: replay.reconciliation_log_size_bytes,
             docker: self.docker_breaker.metrics_snapshot(),
             caddy: self.caddy_breaker.metrics_snapshot(),
             cluster: self.cluster_diagnostics.clone(),
@@ -4900,8 +4969,10 @@ pub mod deployment_status_reflects_runtime_state {
 mod daemon_control_plane_durability {
     use super::*;
     use crate::api::{DeploymentRequest, ProjectUpsertRequest};
+    use crate::reconciliation::{ReconciliationStore, intent_request_for_storage_root};
     use crate::storage::{
-        ControlPlaneSnapshotStore, ConvergenceCheckpointStore, OperationalJournalStore,
+        ControlPlaneSnapshotStore, ConvergenceCheckpointStore, EnvironmentPaths,
+        OperationalJournalStore,
     };
 
     fn seed_project(root: &std::path::Path) {
@@ -6180,5 +6251,58 @@ mod daemon_control_plane_durability {
         assert_eq!(cluster.active_reconcilers, 2);
         assert!(cluster.multiple_active_reconcilers);
         assert!(cluster.split_brain_suspected);
+    }
+
+    #[test]
+    fn reconciliation_log_corruption_degrades_readyz() {
+        let root = test_root("reconciliation-log-corruption-degrades-readyz");
+        let path = EnvironmentPaths::reconciliation_log_file(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{not-json\n").unwrap();
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+        let readyz = daemon.readyz_response();
+        assert_eq!(readyz.status, "degraded");
+        assert!(
+            readyz
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "reconciliation_log_corrupted")
+        );
+    }
+
+    #[test]
+    fn replay_metrics_exposed() {
+        let root = test_root("replay-metrics-exposed");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        ReconciliationStore::new(&root)
+            .append_pending(intent_request_for_storage_root(
+                &root,
+                "gc_action",
+                "api",
+                "production",
+                Some(3),
+                "deleted",
+                "retention_reconciliation",
+                BTreeMap::new(),
+            ))
+            .unwrap();
+        daemon.refresh_readyz_cache();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert!(metrics.pending_intents >= 1);
+        assert!(metrics.replay_queue_depth >= 1);
+        assert!(metrics.reconciliation_log_size_bytes > 0);
     }
 }

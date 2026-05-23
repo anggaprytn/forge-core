@@ -738,6 +738,22 @@ pub struct MetricsResponse {
     pub reconciliation_enabled: bool,
     #[serde(default)]
     pub follower_mode: bool,
+    #[serde(default)]
+    pub pending_intents: usize,
+    #[serde(default)]
+    pub replay_queue_depth: usize,
+    #[serde(default)]
+    pub replay_in_progress: bool,
+    #[serde(default)]
+    pub replay_duration_ms: u64,
+    #[serde(default)]
+    pub replay_failures_total: u64,
+    #[serde(default)]
+    pub unrecoverable_operations: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replayed_intent: Option<String>,
+    #[serde(default)]
+    pub reconciliation_log_size_bytes: u64,
     pub docker: MetricsDependencySnapshot,
     pub caddy: MetricsDependencySnapshot,
     #[serde(default)]

@@ -38,6 +38,9 @@ use forge_core::http::{
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
+use forge_core::reconciliation::{
+    ReconciliationIntentStatus, ReconciliationStore, ReplayOptions, intent_request_for_storage_root,
+};
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
 use forge_core::storage::{
@@ -79,6 +82,9 @@ where
             | Command::WhoAmI
             | Command::ControlPlaneLeader { .. }
             | Command::ControlPlaneLease { .. }
+            | Command::ControlPlaneReplayStatus { .. }
+            | Command::ControlPlaneIntents { .. }
+            | Command::ControlPlaneReplay { .. }
     ) {
         None
     } else {
@@ -116,6 +122,23 @@ where
             control_plane_remote_client,
             config_path,
             config_path_explicit,
+        )?,
+        Command::ControlPlaneReplayStatus { config_path } => {
+            run_control_plane_replay_status(config_path)?
+        }
+        Command::ControlPlaneIntents { config_path } => run_control_plane_intents(config_path)?,
+        Command::ControlPlaneReplay {
+            config_path,
+            caddy_admin_url,
+            caddy_public_url,
+            dry_run,
+            resume,
+        } => run_control_plane_replay(
+            config_path,
+            caddy_admin_url,
+            caddy_public_url,
+            dry_run,
+            resume,
         )?,
         Command::Deploy {
             project_id,
@@ -885,6 +908,19 @@ enum Command {
     ControlPlaneLease {
         config_path: PathBuf,
     },
+    ControlPlaneReplayStatus {
+        config_path: PathBuf,
+    },
+    ControlPlaneIntents {
+        config_path: PathBuf,
+    },
+    ControlPlaneReplay {
+        config_path: PathBuf,
+        caddy_admin_url: String,
+        caddy_public_url: String,
+        dry_run: bool,
+        resume: bool,
+    },
     Deploy {
         project_id: String,
         environment: String,
@@ -1167,6 +1203,34 @@ fn parse_command(
         [group, action] if group == "control-plane" && action == "lease" => {
             Ok(Command::ControlPlaneLease { config_path })
         }
+        [group, action] if group == "control-plane" && action == "replay-status" => {
+            Ok(Command::ControlPlaneReplayStatus { config_path })
+        }
+        [group, action] if group == "control-plane" && action == "intents" => {
+            Ok(Command::ControlPlaneIntents { config_path })
+        }
+        [group, action, flag]
+            if group == "control-plane" && action == "replay" && flag == "--dry-run" =>
+        {
+            Ok(Command::ControlPlaneReplay {
+                config_path,
+                caddy_admin_url,
+                caddy_public_url,
+                dry_run: true,
+                resume: false,
+            })
+        }
+        [group, action, flag]
+            if group == "control-plane" && action == "replay" && flag == "--resume" =>
+        {
+            Ok(Command::ControlPlaneReplay {
+                config_path,
+                caddy_admin_url,
+                caddy_public_url,
+                dry_run: false,
+                resume: true,
+            })
+        }
         [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
         [cmd, rest @ ..] if cmd == "bench" => parse_bench_command(rest),
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
@@ -1239,6 +1303,10 @@ fn usage() -> String {
         "  forge whoami",
         "  forge [--config PATH] control-plane leader",
         "  forge [--config PATH] control-plane lease",
+        "  forge [--config PATH] control-plane replay-status",
+        "  forge [--config PATH] control-plane intents",
+        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] control-plane replay --dry-run",
+        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] control-plane replay --resume",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
         "  forge [--url URL] bench <readyz|leader|convergence|diagnostics|snapshots> [--samples N]",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
@@ -2904,6 +2972,22 @@ fn run_gc_command(
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let mut docker = DockerCliRuntime::new(ProcessCommandRunner);
     let mut routing = CaddyApiRuntime::new(caddy_admin_url, caddy_public_url);
+    let reconciliation = ReconciliationStore::new(&config.storage_root);
+    let gc_intent = (!dry_run)
+        .then(|| {
+            reconciliation.append_pending(intent_request_for_storage_root(
+                &config.storage_root,
+                "gc_action",
+                "*",
+                "*",
+                None,
+                "gc",
+                "retention_reconciliation",
+                std::collections::BTreeMap::new(),
+            ))
+        })
+        .transpose()
+        .map_err(|err| CliError::Usage(err.to_string()))?;
     let report = garbage_collect(
         &config.storage_root,
         &queue,
@@ -2912,6 +2996,15 @@ fn run_gc_command(
         dry_run,
     )
     .map_err(|err| CliError::Usage(err.to_string()))?;
+    if let Some(intent) = gc_intent.as_ref() {
+        let _ = reconciliation
+            .append_status(
+                intent,
+                ReconciliationIntentStatus::Applied,
+                std::collections::BTreeMap::new(),
+            )
+            .map_err(|err| CliError::Usage(err.to_string()))?;
+    }
     if json {
         print_json(&report)?;
     } else {
@@ -2978,6 +3071,53 @@ fn run_control_plane_lease(
     };
     print!("{}", render_control_plane_lease(&view));
     Ok(())
+}
+
+fn run_control_plane_replay_status(config_path: PathBuf) -> Result<(), CliError> {
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let store = ReconciliationStore::new(&config.storage_root);
+    let cursor = store
+        .load_cursor()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .unwrap_or_default();
+    print_json(&cursor)
+}
+
+fn run_control_plane_intents(config_path: PathBuf) -> Result<(), CliError> {
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let intents = ReconciliationStore::new(&config.storage_root)
+        .read_all()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .intents;
+    print_json(&intents)
+}
+
+fn run_control_plane_replay(
+    config_path: PathBuf,
+    caddy_admin_url: String,
+    caddy_public_url: String,
+    dry_run: bool,
+    resume: bool,
+) -> Result<(), CliError> {
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let lease = require_local_leader(&config.storage_root)?;
+    let local_node = NodeMetadataStore::new(&config.storage_root)
+        .load()
+        .map_err(|err| CliError::Usage(err.to_string()))?
+        .ok_or_else(|| CliError::Usage("node metadata unavailable".into()))?;
+    let mut routing = CaddyApiRuntime::new(caddy_admin_url, caddy_public_url);
+    let replay = ReconciliationStore::new(&config.storage_root)
+        .replay(
+            &mut routing,
+            &local_node.node_id,
+            lease.lease_epoch,
+            ReplayOptions { dry_run, resume },
+        )
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    print_json(&replay.cursor)
 }
 
 fn control_plane_leader_view_from_metrics(metrics: &MetricsResponse) -> ControlPlaneLeaderView {

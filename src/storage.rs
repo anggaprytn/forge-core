@@ -1103,6 +1103,20 @@ impl EnvironmentPaths {
             .join("operations.jsonl")
     }
 
+    pub fn reconciliation_log_file(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root
+            .as_ref()
+            .join("control_plane")
+            .join("reconciliation_log.jsonl")
+    }
+
+    pub fn reconciliation_cursor_file(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root
+            .as_ref()
+            .join("control_plane")
+            .join("reconciliation_cursor.json")
+    }
+
     pub fn cluster_nodes_file(storage_root: impl AsRef<Path>) -> PathBuf {
         storage_root
             .as_ref()

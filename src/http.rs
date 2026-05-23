@@ -4116,7 +4116,7 @@ pub mod http_readyz_false_before_daemon_ready {
 #[cfg(test)]
 pub mod http_readyz_cache_latency {
     use super::*;
-    use crate::api::MetricsResponse;
+    use crate::api::{MetricsResponse, ReadyzReason};
     use crate::daemon::READYZ_HANDLER_TIMEOUT_MS;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
@@ -4278,6 +4278,68 @@ pub mod http_readyz_cache_latency {
     #[tokio::test]
     async fn follower_request_paths_do_not_wait_for_leader() {
         assert_follower_request_paths_constant_time().await;
+    }
+
+    #[tokio::test]
+    async fn request_paths_constant_time_during_replay() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "degraded".into(),
+                    reason: Some("reconciliation replay incomplete".into()),
+                    reasons: vec![ReadyzReason {
+                        project_id: "_control_plane".into(),
+                        environment: "_control_plane".into(),
+                        generation: None,
+                        active: true,
+                        unresolved: true,
+                        source: "reconciliation".into(),
+                        marker: "reconciliation_replay_incomplete".into(),
+                        message: "reconciliation replay incomplete".into(),
+                        last_checked_unix: None,
+                        cache_age_ms: 0,
+                    }],
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                replay_in_progress: true,
+                pending_intents: 3,
+                replay_queue_depth: 3,
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+        let readyz_started = Instant::now();
+        let readyz = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let readyz_elapsed = readyz_started.elapsed();
+        let metrics_started = Instant::now();
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_elapsed = metrics_started.elapsed();
+
+        assert_eq!(readyz.status(), StatusCode::OK);
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert!(readyz_elapsed < Duration::from_millis(250));
+        assert!(metrics_elapsed < Duration::from_millis(250));
     }
 
     #[tokio::test]
