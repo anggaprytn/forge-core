@@ -2116,11 +2116,19 @@ fn render_environment_diagnostics(diagnostics: &EnvironmentDiagnostics) -> Strin
 
 fn render_restore_lineage(lineage: &RestoreLineage) -> String {
     let mut output = format!(
-        "backup={} source_generation={} restored_at={}",
-        lineage.backup_id, lineage.source_generation, lineage.restored_at_unix
+        "backup={} restored_generation={}",
+        lineage.backup_id, lineage.restored_generation
     );
+    if let Some(source_generation) = lineage.source_generation {
+        output.push_str(&format!(" source_generation={source_generation}"));
+    } else {
+        output.push_str(" source=unknown");
+    }
     if let Some(deployment_id) = lineage.source_deployment_id.as_deref() {
         output.push_str(&format!(" source_deployment={deployment_id}"));
+    }
+    if let Some(restored_at_unix) = lineage.restored_at_unix {
+        output.push_str(&format!(" restored_at={restored_at_unix}"));
     }
     if let Some(hook_succeeded) = lineage.hook_succeeded {
         output.push_str(&format!(" hook_succeeded={hook_succeeded}"));

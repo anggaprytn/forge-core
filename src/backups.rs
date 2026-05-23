@@ -728,92 +728,51 @@ pub fn load_backup_restore_lineage(
 ) -> Option<crate::api::RestoreLineage> {
     let (backup_id, metadata, restore_record) =
         if let Some(backup_id) = record.restored_from_backup_id.clone() {
-            let metadata = find_backup_metadata(storage_root, &backup_id).ok()?;
+            let metadata = find_backup_metadata(storage_root, &backup_id).ok();
             let restore_record = metadata
-                .restores
-                .iter()
-                .find(|restore| {
-                    restore.restored_generation == record.generation
-                        || Some(restore.restored_deployment_id.as_str())
-                            == record.deployment_id.as_deref()
-                })
-                .cloned();
+                .as_ref()
+                .and_then(|metadata| matching_restore_record(metadata, record));
             (backup_id, metadata, restore_record)
         } else if let Some(backup_id) =
             backup_id_from_restore_deployment_id(record.deployment_id.as_deref())
         {
-            let metadata = find_backup_metadata(storage_root, &backup_id).ok()?;
+            let metadata = find_backup_metadata(storage_root, &backup_id).ok();
             let restore_record = metadata
-                .restores
-                .iter()
-                .find(|restore| {
-                    restore.restored_generation == record.generation
-                        || Some(restore.restored_deployment_id.as_str())
-                            == record.deployment_id.as_deref()
-                })
-                .cloned();
+                .as_ref()
+                .and_then(|metadata| matching_restore_record(metadata, record));
             (backup_id, metadata, restore_record)
         } else {
-            find_backup_restore_metadata(storage_root, project_id, environment, record)?
+            let (backup_id, metadata, restore_record) =
+                find_backup_restore_metadata(storage_root, project_id, environment, record)?;
+            (backup_id, Some(metadata), restore_record)
         };
-    let restored_runtime = load_generation_runtime_info(
-        &EnvironmentPaths::new(storage_root, project_id, environment),
-        record.generation,
-    )
-    .ok()
-    .flatten();
-    let restored_mounts = restored_runtime
-        .as_ref()
-        .map(runtime_services)
-        .unwrap_or_default()
-        .into_values()
-        .flat_map(|service| service.volume_mounts.into_iter())
-        .map(|mount| {
-            (
-                (mount.service_id.clone(), mount.volume_id.clone()),
-                mount.docker_volume_name,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+
     let restored_volumes = metadata
-        .volumes
-        .iter()
-        .map(|volume| BackupVolumeRecord {
-            volume_id: volume.volume_id.clone(),
-            docker_volume_name: volume.docker_volume_name.clone(),
-            service_id: volume.service_id.clone(),
-            mount_path: volume.mount_path.clone(),
-            archive_file: volume.archive_file.clone(),
-            archive_size_bytes: volume.archive_size_bytes,
-            archive_sha256: volume.archive_sha256.clone(),
-            archive_files: volume
-                .archive_files
-                .iter()
-                .map(|file| BackupArchiveFileRecord {
-                    path: file.path.clone(),
-                    size_bytes: file.size_bytes,
-                    sha256: file.sha256.clone(),
-                })
-                .collect(),
-            restored_docker_volume_name: restored_mounts
-                .get(&(volume.service_id.clone(), volume.volume_id.clone()))
-                .cloned(),
+        .as_ref()
+        .map(|metadata| {
+            restored_backup_volumes(storage_root, project_id, environment, record, metadata)
         })
-        .collect();
+        .unwrap_or_default();
+
     Some(crate::api::RestoreLineage {
         backup_id,
-        source_generation: record
-            .restored_from_generation
-            .unwrap_or(metadata.source_generation),
-        source_deployment_id: record
-            .restored_from_deployment_id
-            .clone()
-            .or(metadata.source_deployment_id.clone()),
-        restored_at_unix: record.restored_at_unix.or(restore_record
+        restored_generation: record.generation,
+        source_generation: metadata
             .as_ref()
-            .map(|restore| restore.restored_at_unix))?,
-        hook_succeeded: (!metadata.hooks.is_empty())
-            .then(|| metadata.hooks.iter().all(|hook| hook.exit_code == 0)),
+            .map(|metadata| metadata.source_generation)
+            .or(record.restored_from_generation),
+        source_deployment_id: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_deployment_id.clone())
+            .or_else(|| record.restored_from_deployment_id.clone()),
+        restored_at_unix: restore_record
+            .as_ref()
+            .map(|restore| restore.restored_at_unix)
+            .or(record.restored_at_unix),
+        hook_succeeded: metadata.as_ref().and_then(|metadata| {
+            (!metadata.hooks.is_empty())
+                .then(|| metadata.hooks.iter().all(|hook| hook.exit_code == 0))
+        }),
         restored_volumes,
     })
 }
@@ -853,6 +812,74 @@ fn find_backup_restore_metadata(
         }
     }
     None
+}
+
+fn matching_restore_record(
+    metadata: &PersistedBackupMetadata,
+    record: &GenerationHistoryRecord,
+) -> Option<PersistedBackupRestoreRecord> {
+    metadata
+        .restores
+        .iter()
+        .find(|restore| {
+            restore.restored_generation == record.generation
+                || Some(restore.restored_deployment_id.as_str()) == record.deployment_id.as_deref()
+        })
+        .cloned()
+}
+
+fn restored_backup_volumes(
+    storage_root: &Path,
+    project_id: &str,
+    environment: &str,
+    record: &GenerationHistoryRecord,
+    metadata: &PersistedBackupMetadata,
+) -> Vec<BackupVolumeRecord> {
+    let restored_runtime = load_generation_runtime_info(
+        &EnvironmentPaths::new(storage_root, project_id, environment),
+        record.generation,
+    )
+    .ok()
+    .flatten();
+    let restored_mounts = restored_runtime
+        .as_ref()
+        .map(runtime_services)
+        .unwrap_or_default()
+        .into_values()
+        .flat_map(|service| service.volume_mounts.into_iter())
+        .map(|mount| {
+            (
+                (mount.service_id.clone(), mount.volume_id.clone()),
+                mount.docker_volume_name,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    metadata
+        .volumes
+        .iter()
+        .map(|volume| BackupVolumeRecord {
+            volume_id: volume.volume_id.clone(),
+            docker_volume_name: volume.docker_volume_name.clone(),
+            service_id: volume.service_id.clone(),
+            mount_path: volume.mount_path.clone(),
+            archive_file: volume.archive_file.clone(),
+            archive_size_bytes: volume.archive_size_bytes,
+            archive_sha256: volume.archive_sha256.clone(),
+            archive_files: volume
+                .archive_files
+                .iter()
+                .map(|file| BackupArchiveFileRecord {
+                    path: file.path.clone(),
+                    size_bytes: file.size_bytes,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+            restored_docker_volume_name: restored_mounts
+                .get(&(volume.service_id.clone(), volume.volume_id.clone()))
+                .cloned(),
+        })
+        .collect()
 }
 
 fn inspect_archive_files(
@@ -3036,7 +3063,8 @@ mod tests {
             .active_restore
             .expect("restore lineage should exist");
         assert_eq!(lineage.backup_id, backup.backup_id);
-        assert_eq!(lineage.source_generation, 1);
+        assert_eq!(lineage.restored_generation, 2);
+        assert_eq!(lineage.source_generation, Some(1));
         assert_eq!(lineage.source_deployment_id.as_deref(), Some("dep-1"));
         assert_eq!(lineage.hook_succeeded, None);
         assert_eq!(lineage.restored_volumes.len(), 1);

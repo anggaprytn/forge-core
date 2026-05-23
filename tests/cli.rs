@@ -542,13 +542,15 @@ fn diagnose_reports_restore_lineage() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"data":{"project_id":"api","environment":"production","status":"healthy","active_generation":4,"container":{"running":true},"route":{"route_required":false,"route_active":false,"matches_expected":true},"retained_generations":[],"recent_gc_actions":[],"missing_required_secrets":[],"recent_secret_mutations":[],"startup_order":[],"services":[],"recent_failures":[],"active_restore":{"backup_id":"backup-1","source_generation":3,"source_deployment_id":"dep-3","restored_at_unix":20,"hook_succeeded":true,"restored_volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc","archive_files":[{"path":"dump.rdb","size_bytes":4,"sha256":"def"}],"restored_docker_volume_name":"forge-api-production-restore-gen-4-vol-redis"}]},"backup_restore_events":["restored backup backup-1 into gen-4"]}}"#,
+        r#"{"data":{"project_id":"api","environment":"production","status":"healthy","active_generation":4,"container":{"running":true},"route":{"route_required":false,"route_active":false,"matches_expected":true},"retained_generations":[],"recent_gc_actions":[],"missing_required_secrets":[],"recent_secret_mutations":[],"startup_order":[],"services":[],"recent_failures":[],"active_restore":{"backup_id":"backup-1","restored_generation":4,"source_generation":3,"source_deployment_id":"dep-3","restored_at_unix":20,"hook_succeeded":true,"restored_volumes":[{"volume_id":"redis","docker_volume_name":"forge-api-production-vol-redis","service_id":"api","mount_path":"/data","archive_file":"api-redis.tar.gz","archive_size_bytes":12,"archive_sha256":"abc","archive_files":[{"path":"dump.rdb","size_bytes":4,"sha256":"def"}],"restored_docker_volume_name":"forge-api-production-restore-gen-4-vol-redis"}]},"backup_restore_events":["restored backup backup-1 into gen-4"]}}"#,
     );
 
     let output = run_cli(&url, &["diagnose", "api", "production"]);
     assert!(output.status.success());
     let body = String::from_utf8_lossy(&output.stdout);
-    assert!(body.contains("Active Restore: backup=backup-1 source_generation=3"));
+    assert!(
+        body.contains("Active Restore: backup=backup-1 restored_generation=4 source_generation=3")
+    );
     assert!(body.contains("hook_succeeded=true"));
     assert!(body.contains("restored_volume=forge-api-production-restore-gen-4-vol-redis"));
     assert!(body.contains("Backup Restore Events:"));
@@ -558,6 +560,24 @@ fn diagnose_reports_restore_lineage() {
     assert_eq!(
         request.path,
         "/api/projects/api/environments/production/diagnostics"
+    );
+}
+
+#[test]
+fn diagnose_reports_partial_restore_lineage() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"project_id":"api","environment":"production","status":"healthy","active_generation":9,"last_deployment_id":"restore-backup-1779481391-gen-9","container":{"running":true},"route":{"route_required":false,"route_active":false,"matches_expected":true},"retained_generations":[],"recent_gc_actions":[],"missing_required_secrets":[],"recent_secret_mutations":[],"startup_order":[],"services":[],"recent_failures":[],"active_restore":{"backup_id":"backup-1779481391","restored_generation":9},"backup_restore_events":[]}}"#,
+    );
+
+    let output = run_cli(&url, &["diagnose", "api", "production"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        body.contains(
+            "Active Restore: backup=backup-1779481391 restored_generation=9 source=unknown"
+        )
     );
 }
 

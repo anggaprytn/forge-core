@@ -3176,6 +3176,28 @@ mod tests {
             .unwrap();
     }
 
+    fn write_generation_with_deployment_id(root: &Path, generation: u64, deployment_id: &str) {
+        write_generation(root, generation);
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        let generation_dir = env.generation_dir(generation);
+        fs::write(
+            generation_dir.join("build.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"deployment_id\": \"{deployment_id}\",\n",
+                    "  \"image_ref\": \"forge/api:staging-gen-{generation}\",\n",
+                    "  \"source_ref\": \"main\",\n",
+                    "  \"commit_sha\": \"340ac8108006d84dbf951d8c0bb04ecfaf0eccac\"\n",
+                    "}}\n"
+                ),
+                deployment_id = deployment_id,
+                generation = generation,
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_backup_metadata_fixture(
         root: &Path,
         backup_id: &str,
@@ -5966,24 +5988,17 @@ mod tests {
     }
 
     #[test]
-    fn active_restored_generation_reports_active_restore_lineage() {
-        let root = test_root("active-restored-generation-reports-active-restore-lineage");
+    fn active_restore_detected_from_last_deployment_restore_id() {
+        let root = test_root("active-restore-detected-from-last-deployment-restore-id");
         register_project(&root, "api", "api.example.com");
-        write_generation(&root, 9);
-        write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
-
-        let env = EnvironmentPaths::new(&root, "api", "staging");
-        RetentionStore::new(env.clone())
-            .write(&RetentionMetadata {
-                updated_at_unix: Some(20),
-                generations: vec![GenerationHistoryRecord {
-                    generation: 9,
-                    deployment_id: Some("restore-backup-1-gen-9".into()),
-                    retained: true,
-                    ..GenerationHistoryRecord::default()
-                }],
-            })
-            .unwrap();
+        write_generation_with_deployment_id(&root, 9, "restore-backup-1779481391-gen-9");
+        write_backup_metadata_fixture(
+            &root,
+            "backup-1779481391",
+            9,
+            "restore-backup-1779481391-gen-9",
+            20,
+        );
 
         let mut docker = StubDockerRuntime {
             inspection: Some(healthy_container(9)),
@@ -5996,17 +6011,17 @@ mod tests {
                 .unwrap();
 
         let active_restore = diagnostics.active_restore.unwrap();
-        assert_eq!(active_restore.backup_id, "backup-1");
-        assert_eq!(active_restore.source_generation, 3);
-        assert_eq!(active_restore.restored_at_unix, 20);
+        assert_eq!(active_restore.backup_id, "backup-1779481391");
+        assert_eq!(active_restore.restored_generation, 9);
+        assert_eq!(active_restore.source_generation, Some(3));
+        assert_eq!(active_restore.restored_at_unix, Some(20));
     }
 
     #[test]
-    fn active_restore_detected_from_restore_deployment_id() {
-        let root = test_root("active-restore-detected-from-restore-deployment-id");
+    fn active_restore_renders_with_partial_backup_metadata() {
+        let root = test_root("active-restore-renders-with-partial-backup-metadata");
         register_project(&root, "api", "api.example.com");
-        write_generation(&root, 9);
-        write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
+        write_generation_with_deployment_id(&root, 9, "restore-backup-1779481391-gen-9");
 
         let mut docker = StubDockerRuntime {
             inspection: Some(healthy_container(9)),
@@ -6019,16 +6034,18 @@ mod tests {
                 .unwrap();
 
         let active_restore = diagnostics.active_restore.expect("restore lineage");
-        assert_eq!(active_restore.backup_id, "backup-1");
-        assert_eq!(active_restore.source_generation, 3);
-        assert_eq!(active_restore.restored_at_unix, 20);
+        assert_eq!(active_restore.backup_id, "backup-1779481391");
+        assert_eq!(active_restore.restored_generation, 9);
+        assert_eq!(active_restore.source_generation, None);
+        assert_eq!(active_restore.source_deployment_id, None);
+        assert_eq!(active_restore.restored_at_unix, None);
     }
 
     #[test]
-    fn active_restore_detected_from_generation_metadata() {
-        let root = test_root("active-restore-detected-from-generation-metadata");
+    fn active_restore_prefers_backup_metadata_when_available() {
+        let root = test_root("active-restore-prefers-backup-metadata-when-available");
         register_project(&root, "api", "api.example.com");
-        write_generation(&root, 9);
+        write_generation_with_deployment_id(&root, 9, "restore-backup-1-gen-9");
         write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
 
         let env = EnvironmentPaths::new(&root, "api", "staging");
@@ -6039,9 +6056,9 @@ mod tests {
                     generation: 9,
                     deployment_id: Some("dep-9".into()),
                     restored_from_backup_id: Some("backup-1".into()),
-                    restored_from_generation: Some(3),
-                    restored_from_deployment_id: Some("dep-3".into()),
-                    restored_at_unix: Some(20),
+                    restored_from_generation: Some(99),
+                    restored_from_deployment_id: Some("dep-99".into()),
+                    restored_at_unix: Some(999),
                     retained: true,
                     ..GenerationHistoryRecord::default()
                 }],
@@ -6060,36 +6077,18 @@ mod tests {
 
         let active_restore = diagnostics.active_restore.expect("restore lineage");
         assert_eq!(active_restore.backup_id, "backup-1");
-        assert_eq!(active_restore.source_generation, 3);
+        assert_eq!(active_restore.restored_generation, 9);
+        assert_eq!(active_restore.source_generation, Some(3));
         assert_eq!(
             active_restore.source_deployment_id.as_deref(),
             Some("dep-3")
         );
+        assert_eq!(active_restore.restored_at_unix, Some(20));
     }
 
     #[test]
-    fn active_restore_not_none_for_restored_active_generation() {
-        let root = test_root("active-restore-not-none-for-restored-active-generation");
-        register_project(&root, "api", "api.example.com");
-        write_generation(&root, 9);
-        write_backup_metadata_fixture(&root, "backup-1", 9, "restore-backup-1-gen-9", 20);
-
-        let mut docker = StubDockerRuntime {
-            inspection: Some(healthy_container(9)),
-        };
-        let mut routing = StubRoutingRuntime {
-            inspection: Some(healthy_route()),
-        };
-        let diagnostics =
-            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
-                .unwrap();
-
-        assert!(diagnostics.active_restore.is_some());
-    }
-
-    #[test]
-    fn non_restored_generation_reports_active_restore_none() {
-        let root = test_root("non-restored-generation-reports-active-restore-none");
+    fn active_restore_none_only_for_non_restore_generation() {
+        let root = test_root("active-restore-none-only-for-non-restore-generation");
         register_project(&root, "api", "api.example.com");
         write_generation(&root, 9);
 

@@ -593,10 +593,13 @@ pub struct ReadyzResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreLineage {
     pub backup_id: String,
-    pub source_generation: u64,
+    pub restored_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_deployment_id: Option<String>,
-    pub restored_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_succeeded: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
