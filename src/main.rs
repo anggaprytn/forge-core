@@ -3114,7 +3114,12 @@ fn run_control_plane_replay(
             &mut routing,
             &local_node.node_id,
             lease.lease_epoch,
-            ReplayOptions { dry_run, resume },
+            ReplayOptions {
+                dry_run,
+                resume,
+                max_duration_ms: Some(config.startup_replay_max_duration_ms),
+                max_entries: Some(config.startup_replay_max_entries),
+            },
         )
         .map_err(|err| CliError::Usage(err.to_string()))?;
     print_json(&replay.cursor)

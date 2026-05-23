@@ -1,8 +1,8 @@
 use crate::runtime::{RouteUpdateRequest, RoutingRuntime};
 use crate::storage::{
-    EnvironmentPaths, LeaderLeaseStore, NodeMetadataStore, PointerStore, RuntimeHealthState,
-    RuntimeState, RuntimeStateStore, StorageError, StorageResult, atomic_write,
-    current_unix_timestamp,
+    EnvironmentPaths, LeaderLeaseStore, NodeMetadataStore, OperationalJournalEntry,
+    OperationalJournalStore, PointerStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
+    StorageError, StorageResult, atomic_write, current_unix_timestamp,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const RECONCILIATION_LOG_MAX_METADATA_KEYS: usize = 16;
 const RECONCILIATION_LOG_MAX_METADATA_STRING_BYTES: usize = 256;
@@ -44,6 +44,7 @@ pub enum ReplayStatus {
     InProgress,
     Completed,
     DryRun,
+    Paused,
     Blocked,
     Corrupted,
     AbortedLeaderLoss,
@@ -61,6 +62,16 @@ pub struct ReconciliationCursor {
     pub replay_finished_at: Option<u64>,
     #[serde(default)]
     pub replay_status: Option<ReplayStatus>,
+    #[serde(default)]
+    pub replay_sequence: u64,
+    #[serde(default)]
+    pub replay_paused: bool,
+    #[serde(default)]
+    pub replay_quarantined_total: u64,
+    #[serde(default)]
+    pub replay_aborted_total: u64,
+    #[serde(default)]
+    pub lease_fencing_failures: u64,
     #[serde(default)]
     pub recovered_operations: Vec<String>,
     #[serde(default)]
@@ -113,8 +124,12 @@ pub struct ReconciliationDiagnostics {
     pub pending_intents: usize,
     pub replay_queue_depth: usize,
     pub replay_in_progress: bool,
+    pub replay_paused: bool,
     pub replay_duration_ms: u64,
     pub replay_failures_total: u64,
+    pub replay_quarantined_total: u64,
+    pub replay_aborted_total: u64,
+    pub lease_fencing_failures: u64,
     pub unrecoverable_operations: usize,
     pub last_replayed_intent: Option<String>,
     pub reconciliation_log_size_bytes: u64,
@@ -136,6 +151,8 @@ pub struct ReplayOutcome {
 pub struct ReplayOptions {
     pub dry_run: bool,
     pub resume: bool,
+    pub max_duration_ms: Option<u64>,
+    pub max_entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -143,6 +160,16 @@ pub struct ReadReconciliationLog {
     pub intents: Vec<ReconciliationIntentEntry>,
     pub corrupted: bool,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuarantinedIntentRecord {
+    quarantined_at_unix: u64,
+    reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<ReconciliationIntentEntry>,
 }
 
 pub struct ReconciliationStore {
@@ -299,9 +326,25 @@ impl ReconciliationStore {
     }
 
     pub fn save_cursor(&self, cursor: &ReconciliationCursor) -> StorageResult<()> {
+        let path = EnvironmentPaths::reconciliation_cursor_file(&self.storage_root);
+        let mut next = cursor.clone();
+        if let Ok(Some(current)) = self.load_cursor() {
+            if current.replay_sequence > next.replay_sequence {
+                next.replay_sequence = current.replay_sequence;
+                next.replay_position = current.replay_position;
+                next.last_applied_intent = current.last_applied_intent;
+            }
+            next.replay_quarantined_total = next
+                .replay_quarantined_total
+                .max(current.replay_quarantined_total);
+            next.replay_aborted_total = next.replay_aborted_total.max(current.replay_aborted_total);
+            next.lease_fencing_failures = next
+                .lease_fencing_failures
+                .max(current.lease_fencing_failures);
+        }
         atomic_write(
-            EnvironmentPaths::reconciliation_cursor_file(&self.storage_root),
-            serde_json::to_string_pretty(cursor)
+            path,
+            serde_json::to_string_pretty(&next)
                 .map_err(invalid_data)?
                 .as_bytes(),
         )
@@ -314,6 +357,7 @@ impl ReconciliationStore {
         lease_epoch: u64,
         options: ReplayOptions,
     ) -> StorageResult<ReplayOutcome> {
+        self.sanitize_log_and_quarantine_corruption()?;
         let log = self.read_all()?;
         let cursor_result = self.load_cursor();
         let cursor_corrupted = cursor_result.is_err();
@@ -326,6 +370,7 @@ impl ReconciliationStore {
         } else {
             ReplayStatus::InProgress
         });
+        cursor.replay_paused = false;
         self.save_cursor(&cursor)?;
 
         let mut recovered = Vec::new();
@@ -333,6 +378,30 @@ impl ReconciliationStore {
         let mut replay_failures_total = 0_u64;
         let mut destructive_replay_blocked = false;
         let mut unrecoverable_operations = 0_usize;
+        let replay_started = Instant::now();
+        let replay_budget_entries = options
+            .max_entries
+            .unwrap_or(RECONCILIATION_REPLAY_BATCH_LIMIT)
+            .min(RECONCILIATION_REPLAY_BATCH_LIMIT);
+        let replay_budget_duration_ms = options.max_duration_ms.unwrap_or(u64::MAX);
+
+        if !self.ensure_fence(node_id, lease_epoch, lease_epoch, None, &mut cursor)? {
+            cursor.replay_status = Some(ReplayStatus::AbortedLeaderLoss);
+            cursor.replay_finished_at = Some(current_unix_timestamp());
+            cursor.replay_aborted_total = cursor.replay_aborted_total.saturating_add(1);
+            self.save_cursor(&cursor)?;
+            return Ok(ReplayOutcome {
+                diagnostics: build_diagnostics(
+                    &log,
+                    &cursor,
+                    replay_failures_total,
+                    unrecoverable_operations,
+                    cursor_corrupted || log.corrupted,
+                ),
+                cursor,
+                intents: log.intents,
+            });
+        }
 
         let mut pending = log
             .intents
@@ -344,16 +413,41 @@ impl ReconciliationStore {
             (left.timestamp_unix, left.intent_id.as_str())
                 .cmp(&(right.timestamp_unix, right.intent_id.as_str()))
         });
-        if pending.len() > RECONCILIATION_REPLAY_BATCH_LIMIT {
-            pending.truncate(RECONCILIATION_REPLAY_BATCH_LIMIT);
+        if pending.len() > replay_budget_entries {
+            pending.truncate(replay_budget_entries);
         }
 
         for entry in &pending {
+            if replay_started.elapsed().as_millis() as u64 >= replay_budget_duration_ms {
+                cursor.replay_paused = true;
+                cursor.replay_status = Some(ReplayStatus::Paused);
+                cursor.replay_finished_at = Some(current_unix_timestamp());
+                self.save_cursor(&cursor)?;
+                return Ok(ReplayOutcome {
+                    diagnostics: build_diagnostics(
+                        &log,
+                        &cursor,
+                        replay_failures_total,
+                        unrecoverable_operations,
+                        cursor_corrupted || log.corrupted,
+                    ),
+                    cursor,
+                    intents: self.read_all()?.intents,
+                });
+            }
+            cursor.replay_sequence = cursor.replay_sequence.saturating_add(1);
             cursor.replay_position = Some(entry.intent_id.clone());
             self.save_cursor(&cursor)?;
-            if !current_node_is_active_leader(&self.storage_root, node_id, lease_epoch) {
+            if !self.ensure_fence(
+                node_id,
+                lease_epoch,
+                entry.lease_epoch,
+                Some(entry),
+                &mut cursor,
+            )? {
                 cursor.replay_status = Some(ReplayStatus::AbortedLeaderLoss);
                 cursor.replay_finished_at = Some(current_unix_timestamp());
+                cursor.replay_aborted_total = cursor.replay_aborted_total.saturating_add(1);
                 cursor.skipped_operations.extend(skipped.clone());
                 self.save_cursor(&cursor)?;
                 return Ok(ReplayOutcome {
@@ -377,6 +471,30 @@ impl ReconciliationStore {
                     }
                     match replay_intent(routing, entry) {
                         Ok(()) => {
+                            if !self.ensure_fence(
+                                node_id,
+                                lease_epoch,
+                                entry.lease_epoch,
+                                Some(entry),
+                                &mut cursor,
+                            )? {
+                                cursor.replay_status = Some(ReplayStatus::AbortedLeaderLoss);
+                                cursor.replay_finished_at = Some(current_unix_timestamp());
+                                cursor.replay_aborted_total =
+                                    cursor.replay_aborted_total.saturating_add(1);
+                                self.save_cursor(&cursor)?;
+                                return Ok(ReplayOutcome {
+                                    diagnostics: build_diagnostics(
+                                        &log,
+                                        &cursor,
+                                        replay_failures_total,
+                                        unrecoverable_operations,
+                                        cursor_corrupted || log.corrupted,
+                                    ),
+                                    cursor,
+                                    intents: self.read_all()?.intents,
+                                });
+                            }
                             let applied = self.append_status(
                                 entry,
                                 ReconciliationIntentStatus::Applied,
@@ -388,6 +506,12 @@ impl ReconciliationStore {
                         Err(err) => {
                             replay_failures_total = replay_failures_total.saturating_add(1);
                             unrecoverable_operations = unrecoverable_operations.saturating_add(1);
+                            self.quarantine_intent(
+                                entry,
+                                &format!("replay_failed: {err}"),
+                                None,
+                                &mut cursor,
+                            )?;
                             let mut metadata = BTreeMap::new();
                             metadata.insert("replay_error".into(), Value::String(err.to_string()));
                             let _ = self.append_status(
@@ -401,11 +525,34 @@ impl ReconciliationStore {
                 }
                 ReplaySafety::RequiresOperatorIntervention => {
                     unrecoverable_operations = unrecoverable_operations.saturating_add(1);
+                    self.quarantine_intent(
+                        entry,
+                        "requires_operator_intervention",
+                        None,
+                        &mut cursor,
+                    )?;
+                    let _ = self.append_status(
+                        entry,
+                        ReconciliationIntentStatus::Failed,
+                        BTreeMap::from([(
+                            "quarantined".into(),
+                            Value::String("requires_operator_intervention".into()),
+                        )]),
+                    );
                     skipped.push(describe_operation(entry));
                 }
                 ReplaySafety::Destructive => {
                     destructive_replay_blocked = true;
                     unrecoverable_operations = unrecoverable_operations.saturating_add(1);
+                    self.quarantine_intent(entry, "destructive_replay_blocked", None, &mut cursor)?;
+                    let _ = self.append_status(
+                        entry,
+                        ReconciliationIntentStatus::Failed,
+                        BTreeMap::from([(
+                            "quarantined".into(),
+                            Value::String("destructive_replay_blocked".into()),
+                        )]),
+                    );
                     skipped.push(describe_operation(entry));
                 }
             }
@@ -414,8 +561,11 @@ impl ReconciliationStore {
         cursor.recovered_operations = recovered.clone();
         cursor.skipped_operations = skipped.clone();
         cursor.replay_finished_at = Some(current_unix_timestamp());
+        cursor.replay_paused = false;
         cursor.replay_status = Some(if options.dry_run {
             ReplayStatus::DryRun
+        } else if cursor.replay_paused {
+            ReplayStatus::Paused
         } else if destructive_replay_blocked || unrecoverable_operations > 0 {
             ReplayStatus::Blocked
         } else {
@@ -441,6 +591,133 @@ impl ReconciliationStore {
         let log = self.read_all().unwrap_or_default();
         let cursor = self.load_cursor().ok().flatten().unwrap_or_default();
         build_diagnostics(&log, &cursor, 0, 0, false)
+    }
+
+    fn ensure_fence(
+        &self,
+        node_id: &str,
+        lease_epoch: u64,
+        intent_epoch: u64,
+        entry: Option<&ReconciliationIntentEntry>,
+        cursor: &mut ReconciliationCursor,
+    ) -> StorageResult<bool> {
+        let owns_lease = current_node_is_active_leader(&self.storage_root, node_id, lease_epoch);
+        let epoch_matches = lease_epoch > 0 && intent_epoch == lease_epoch;
+        if owns_lease && epoch_matches {
+            return Ok(true);
+        }
+        cursor.lease_fencing_failures = cursor.lease_fencing_failures.saturating_add(1);
+        let journal = OperationalJournalStore::new(&self.storage_root);
+        let _ = journal.append(&OperationalJournalEntry {
+            schema_version: 1,
+            timestamp_unix: current_unix_timestamp(),
+            event_type: "lease_fencing_failed".into(),
+            project_id: entry.map(|value| value.project_id.clone()),
+            environment: entry.map(|value| value.environment.clone()),
+            generation: entry.and_then(|value| value.target_generation),
+            payload: serde_json::json!({
+                "node_id": node_id,
+                "expected_lease_epoch": lease_epoch,
+                "intent_lease_epoch": intent_epoch,
+                "current_owner_ok": owns_lease,
+            }),
+        });
+        if let Some(entry) = entry {
+            self.quarantine_intent(entry, "lease_fencing_failed", None, cursor)?;
+        }
+        Ok(false)
+    }
+
+    fn sanitize_log_and_quarantine_corruption(&self) -> StorageResult<()> {
+        let path = EnvironmentPaths::reconciliation_log_file(&self.storage_root);
+        if !path.exists() {
+            return Ok(());
+        }
+        let raw = fs::read_to_string(&path)?;
+        let mut valid_lines = Vec::new();
+        let mut corrupted = false;
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<ReconciliationIntentEntry>(line).is_ok() {
+                valid_lines.push(line.to_string());
+            } else {
+                corrupted = true;
+                self.quarantine_raw_line("corrupted_reconciliation_log_entry", line)?;
+            }
+        }
+        if corrupted {
+            let rewritten = if valid_lines.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n", valid_lines.join("\n"))
+            };
+            atomic_write(path, rewritten.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn quarantine_raw_line(&self, reason: &str, raw_line: &str) -> StorageResult<()> {
+        let dir = EnvironmentPaths::reconciliation_quarantine_dir(&self.storage_root);
+        fs::create_dir_all(&dir)?;
+        let record = QuarantinedIntentRecord {
+            quarantined_at_unix: current_unix_timestamp(),
+            reason: reason.into(),
+            raw_line: Some(raw_line.to_string()),
+            intent: None,
+        };
+        let name = format!("{}-{}.json", record.quarantined_at_unix, next_intent_id());
+        atomic_write(
+            dir.join(name),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&record).map_err(invalid_data)?
+            )
+            .as_bytes(),
+        )?;
+        Ok(())
+    }
+
+    fn quarantine_intent(
+        &self,
+        entry: &ReconciliationIntentEntry,
+        reason: &str,
+        raw_line: Option<&str>,
+        cursor: &mut ReconciliationCursor,
+    ) -> StorageResult<()> {
+        let dir = EnvironmentPaths::reconciliation_quarantine_dir(&self.storage_root);
+        fs::create_dir_all(&dir)?;
+        let record = QuarantinedIntentRecord {
+            quarantined_at_unix: current_unix_timestamp(),
+            reason: reason.into(),
+            raw_line: raw_line.map(|value| value.to_string()),
+            intent: Some(entry.clone()),
+        };
+        let name = format!("{}-{}.json", record.quarantined_at_unix, entry.intent_id);
+        atomic_write(
+            dir.join(name),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&record).map_err(invalid_data)?
+            )
+            .as_bytes(),
+        )?;
+        cursor.replay_quarantined_total = cursor.replay_quarantined_total.saturating_add(1);
+        let _ = OperationalJournalStore::new(&self.storage_root).append(&OperationalJournalEntry {
+            schema_version: 1,
+            timestamp_unix: current_unix_timestamp(),
+            event_type: "intent_quarantined".into(),
+            project_id: Some(entry.project_id.clone()),
+            environment: Some(entry.environment.clone()),
+            generation: entry.target_generation,
+            payload: serde_json::json!({
+                "intent_id": entry.intent_id,
+                "reason": reason,
+                "lease_epoch": entry.lease_epoch,
+            }),
+        });
+        Ok(())
     }
 }
 
@@ -576,6 +853,7 @@ fn build_diagnostics(
         )
     });
     let replay_in_progress = cursor.replay_status == Some(ReplayStatus::InProgress);
+    let replay_paused = cursor.replay_status == Some(ReplayStatus::Paused) || cursor.replay_paused;
     let replay_duration_ms = cursor
         .replay_started_at
         .zip(cursor.replay_finished_at)
@@ -587,8 +865,12 @@ fn build_diagnostics(
         pending_intents: pending.len(),
         replay_queue_depth: pending.len().min(RECONCILIATION_REPLAY_BATCH_LIMIT),
         replay_in_progress,
+        replay_paused,
         replay_duration_ms,
         replay_failures_total,
+        replay_quarantined_total: cursor.replay_quarantined_total,
+        replay_aborted_total: cursor.replay_aborted_total,
+        lease_fencing_failures: cursor.lease_fencing_failures,
         unrecoverable_operations: unrecoverable_operations.max(unique_skipped.len()),
         last_replayed_intent: cursor.last_applied_intent.clone(),
         reconciliation_log_size_bytes: log.size_bytes,
@@ -724,7 +1006,10 @@ pub fn set_test_crash_after_intent(operation_type: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{RouteInspection, RoutingRuntime, RoutingRuntimeError};
+    use crate::runtime::{
+        RouteInspection, RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError,
+    };
+    use crate::storage::PersistedLeaderLease;
     use crate::storage::{EnvironmentPaths, SnapshotWriter};
     use std::collections::BTreeMap;
     use std::fs;
@@ -876,6 +1161,8 @@ mod tests {
                 ReplayOptions {
                     dry_run: false,
                     resume: true,
+                    max_duration_ms: None,
+                    max_entries: None,
                 },
             )
             .unwrap();
@@ -1074,6 +1361,8 @@ mod tests {
                 ReplayOptions {
                     dry_run: true,
                     resume: false,
+                    max_duration_ms: None,
+                    max_entries: None,
                 },
             )
             .unwrap();
@@ -1156,5 +1445,324 @@ mod tests {
             .replay(&mut routing, "node-a", 12, ReplayOptions::default())
             .unwrap();
         assert!(routing.saw_pending);
+    }
+
+    #[test]
+    fn replay_never_runs_without_valid_lease() {
+        let root = test_root("replay-never-runs-without-valid-lease");
+        seed_leader(&root, "leader-a", 4);
+        let store = ReconciliationStore::new(&root);
+        store
+            .append_pending(ReconciliationIntentRequest {
+                node_id: "leader-a".into(),
+                lease_epoch: 4,
+                operation_type: "route_activation".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                target_generation: Some(1),
+                target_state: "healthy".into(),
+                reconciliation_domain: "routing_reconciliation".into(),
+                triggered_by: None,
+                previous_intent_id: None,
+                recovery_of: None,
+                replay_safety: ReplaySafety::Idempotent,
+                metadata: BTreeMap::from([
+                    ("subtree_id".into(), Value::String("api-production".into())),
+                    (
+                        "target".into(),
+                        Value::String("http://127.0.0.1:3000".into()),
+                    ),
+                    ("domain".into(), Value::String("example.com".into())),
+                ]),
+            })
+            .unwrap();
+        let mut routing = TestRoutingRuntime::default();
+        let replay = store
+            .replay(&mut routing, "leader-a", 999, ReplayOptions::default())
+            .unwrap();
+        assert_eq!(
+            replay.cursor.replay_status,
+            Some(ReplayStatus::AbortedLeaderLoss)
+        );
+        assert!(routing.updates.is_empty());
+    }
+
+    #[derive(Default)]
+    struct LeaseFlippingRoutingRuntime {
+        root: PathBuf,
+        updates: usize,
+    }
+
+    impl RoutingRuntime for LeaseFlippingRoutingRuntime {
+        fn probe_control_plane(&mut self) -> Result<(), crate::runtime::RoutingRuntimeError> {
+            Ok(())
+        }
+
+        fn update_route(
+            &mut self,
+            request: RouteUpdateRequest,
+        ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+            self.updates = self.updates.saturating_add(1);
+            let _ = request;
+            let lease = PersistedLeaderLease {
+                schema_version: 1,
+                leader_node_id: "peer-node".into(),
+                acquired_at_unix: current_unix_timestamp(),
+                expires_at_unix: current_unix_timestamp().saturating_add(30),
+                lease_epoch: 99,
+                last_heartbeat_unix: current_unix_timestamp(),
+            };
+            atomic_write(
+                EnvironmentPaths::leader_lease_file(&self.root),
+                format!("{}\n", serde_json::to_string_pretty(&lease).unwrap()).as_bytes(),
+            )
+            .unwrap();
+            Ok(())
+        }
+
+        fn remove_route(
+            &mut self,
+            _subtree_id: &str,
+        ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+            Ok(())
+        }
+
+        fn inspect_route(
+            &mut self,
+            subtree_id: &str,
+        ) -> Result<crate::runtime::RouteInspection, crate::runtime::RoutingRuntimeError> {
+            Ok(crate::runtime::RouteInspection {
+                subtree_id: subtree_id.into(),
+                active_target: "http://127.0.0.1:3000".into(),
+                domain: Some("example.com".into()),
+                activation_verified: true,
+                health_checks_enabled: false,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+            })
+        }
+
+        fn list_managed_routes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::RouteInspection>, crate::runtime::RoutingRuntimeError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn replay_aborts_on_lease_loss() {
+        let root = test_root("replay-aborts-on-lease-loss");
+        seed_leader(&root, "node-a", 13);
+        let store = ReconciliationStore::new(&root);
+        for id in ["api-production-a", "api-production-b"] {
+            store
+                .append_pending(ReconciliationIntentRequest {
+                    node_id: "node-a".into(),
+                    lease_epoch: 13,
+                    operation_type: "route_activation".into(),
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    target_generation: Some(1),
+                    target_state: "healthy".into(),
+                    reconciliation_domain: "routing_reconciliation".into(),
+                    triggered_by: None,
+                    previous_intent_id: None,
+                    recovery_of: None,
+                    replay_safety: ReplaySafety::Idempotent,
+                    metadata: BTreeMap::from([
+                        ("subtree_id".into(), Value::String(id.into())),
+                        (
+                            "target".into(),
+                            Value::String("http://127.0.0.1:3000".into()),
+                        ),
+                        ("domain".into(), Value::String("example.com".into())),
+                    ]),
+                })
+                .unwrap();
+        }
+        let mut routing = LeaseFlippingRoutingRuntime {
+            root: root.clone(),
+            updates: 0,
+        };
+        let replay = store
+            .replay(&mut routing, "node-a", 13, ReplayOptions::default())
+            .unwrap();
+        assert_eq!(
+            replay.cursor.replay_status,
+            Some(ReplayStatus::AbortedLeaderLoss)
+        );
+        assert_eq!(routing.updates, 1);
+        assert!(replay.diagnostics.lease_fencing_failures >= 1);
+    }
+
+    #[test]
+    fn replay_cursor_monotonic_under_restart() {
+        let root = test_root("replay-cursor-monotonic-under-restart");
+        seed_leader(&root, "node-a", 21);
+        let store = ReconciliationStore::new(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .finalize("api", "production", crate::storage::SnapshotState::Healthy)
+            .unwrap();
+        SnapshotWriter::new(env.clone(), 2)
+            .unwrap()
+            .finalize("api", "production", crate::storage::SnapshotState::Healthy)
+            .unwrap();
+        for generation in [1, 2] {
+            store
+                .append_pending(ReconciliationIntentRequest {
+                    node_id: "node-a".into(),
+                    lease_epoch: 21,
+                    operation_type: "deployment_promotion".into(),
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    target_generation: Some(generation),
+                    target_state: "healthy".into(),
+                    reconciliation_domain: "runtime_container_reconciliation".into(),
+                    triggered_by: None,
+                    previous_intent_id: None,
+                    recovery_of: None,
+                    replay_safety: ReplaySafety::Idempotent,
+                    metadata: BTreeMap::from([(
+                        "storage_root".into(),
+                        Value::String(root.display().to_string()),
+                    )]),
+                })
+                .unwrap();
+        }
+
+        let mut routing = TestRoutingRuntime::default();
+        store
+            .replay(
+                &mut routing,
+                "node-a",
+                21,
+                ReplayOptions {
+                    max_entries: Some(1),
+                    ..ReplayOptions::default()
+                },
+            )
+            .unwrap();
+        let first = store.load_cursor().unwrap().unwrap();
+        store
+            .replay(&mut routing, "node-a", 21, ReplayOptions::default())
+            .unwrap();
+        let second = store.load_cursor().unwrap().unwrap();
+        assert!(second.replay_sequence >= first.replay_sequence);
+    }
+
+    #[test]
+    fn quarantined_intents_removed_from_active_replay() {
+        let root = test_root("quarantined-intents-removed-from-active-replay");
+        seed_leader(&root, "node-a", 3);
+        let store = ReconciliationStore::new(&root);
+        store
+            .append_pending(ReconciliationIntentRequest {
+                node_id: "node-a".into(),
+                lease_epoch: 3,
+                operation_type: "gc_action".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                target_generation: Some(4),
+                target_state: "deleted".into(),
+                reconciliation_domain: "retention_reconciliation".into(),
+                triggered_by: None,
+                previous_intent_id: None,
+                recovery_of: None,
+                replay_safety: ReplaySafety::Destructive,
+                metadata: BTreeMap::new(),
+            })
+            .unwrap();
+        let mut routing = TestRoutingRuntime::default();
+        store
+            .replay(&mut routing, "node-a", 3, ReplayOptions::default())
+            .unwrap();
+        let diagnostics = store.diagnostics();
+        assert_eq!(diagnostics.pending_intents, 0);
+        assert!(
+            EnvironmentPaths::reconciliation_quarantine_dir(&root)
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn replay_recovery_deterministic_under_scheduler_permutations() {
+        let root = test_root("replay-recovery-deterministic-under-scheduler-permutations");
+        seed_leader(&root, "node-a", 31);
+        let store = ReconciliationStore::new(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        for generation in [1, 2, 3] {
+            SnapshotWriter::new(env.clone(), generation)
+                .unwrap()
+                .finalize("api", "production", crate::storage::SnapshotState::Healthy)
+                .unwrap();
+            store
+                .append_pending(ReconciliationIntentRequest {
+                    node_id: "node-a".into(),
+                    lease_epoch: 31,
+                    operation_type: "deployment_promotion".into(),
+                    project_id: "api".into(),
+                    environment: "production".into(),
+                    target_generation: Some(generation),
+                    target_state: "healthy".into(),
+                    reconciliation_domain: "runtime_container_reconciliation".into(),
+                    triggered_by: None,
+                    previous_intent_id: None,
+                    recovery_of: None,
+                    replay_safety: ReplaySafety::Idempotent,
+                    metadata: BTreeMap::from([(
+                        "storage_root".into(),
+                        Value::String(root.display().to_string()),
+                    )]),
+                })
+                .unwrap();
+        }
+
+        let schedules = vec![vec![1, 1, 1], vec![2, 1], vec![3]];
+        let mut final_pending = Vec::new();
+        for schedule in schedules {
+            let case_root = test_root("replay-deterministic-case");
+            fs::create_dir_all(case_root.join("control_plane")).unwrap();
+            fs::copy(
+                EnvironmentPaths::reconciliation_log_file(&root),
+                EnvironmentPaths::reconciliation_log_file(&case_root),
+            )
+            .unwrap();
+            seed_leader(&case_root, "node-a", 31);
+            let case_env = EnvironmentPaths::new(&case_root, "api", "production");
+            for generation in [1, 2, 3] {
+                SnapshotWriter::new(case_env.clone(), generation)
+                    .unwrap()
+                    .finalize("api", "production", crate::storage::SnapshotState::Healthy)
+                    .unwrap();
+            }
+            let case_store = ReconciliationStore::new(&case_root);
+            let mut routing = TestRoutingRuntime::default();
+            for max_entries in schedule {
+                case_store
+                    .replay(
+                        &mut routing,
+                        "node-a",
+                        31,
+                        ReplayOptions {
+                            max_entries: Some(max_entries),
+                            ..ReplayOptions::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            case_store
+                .replay(&mut routing, "node-a", 31, ReplayOptions::default())
+                .unwrap();
+            final_pending.push(case_store.diagnostics().pending_intents);
+        }
+        assert!(final_pending.iter().all(|value| *value == 0));
     }
 }

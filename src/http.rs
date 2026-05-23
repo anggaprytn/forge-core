@@ -80,6 +80,11 @@ pub trait ControlPlane: Send {
     fn readyz_response(&mut self) -> ReadyzResponse {
         ReadyzResponse {
             status: self.readyz_status().into(),
+            startup_phase: if self.is_ready() {
+                "leader_active".into()
+            } else {
+                "booting".into()
+            },
             reason: None,
             reasons: Vec::new(),
         }
@@ -92,6 +97,11 @@ pub trait ControlPlane: Send {
                     "ready".into()
                 } else {
                     "not_ready".into()
+                },
+                startup_phase: if self.is_ready() {
+                    "leader_active".into()
+                } else {
+                    "booting".into()
                 },
                 reason: None,
                 reasons: Vec::new(),
@@ -1282,6 +1292,7 @@ async fn get_healthz() -> impl IntoResponse {
         StatusCode::OK,
         Json(ReadyzResponse {
             status: "ok".into(),
+            startup_phase: "leader_active".into(),
             reason: None,
             reasons: Vec::new(),
         }),
@@ -1410,6 +1421,7 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
             {
                 ReadyzResponse {
                     status: "degraded".into(),
+                    startup_phase: "degraded".into(),
                     reason: Some("readiness cache stale".into()),
                     reasons: Vec::new(),
                 }
@@ -1419,6 +1431,7 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
         }
         Err(_) => ReadyzResponse {
             status: "degraded".into(),
+            startup_phase: "degraded".into(),
             reason: Some("readiness cache unavailable".into()),
             reasons: Vec::new(),
         },
@@ -2990,6 +3003,8 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
         heartbeat_interval_ms: 1_000,
+        startup_replay_max_duration_ms: 5_000,
+        startup_replay_max_entries: 256,
         github_webhook_secret: None,
         repository_cache_root: None,
         sqlite_path: None,
@@ -3140,6 +3155,8 @@ fn build_cached_only_state(snapshot: ControlPlaneSnapshot) -> HttpState {
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
         heartbeat_interval_ms: 1_000,
+        startup_replay_max_duration_ms: 5_000,
+        startup_replay_max_entries: 256,
         github_webhook_secret: None,
         repository_cache_root: None,
         sqlite_path: None,
@@ -4166,6 +4183,7 @@ pub mod http_readyz_cache_latency {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "ready".into(),
+                    startup_phase: "leader_active".into(),
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -4195,6 +4213,7 @@ pub mod http_readyz_cache_latency {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "ready".into(),
+                    startup_phase: "leader_active".into(),
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -4223,6 +4242,7 @@ pub mod http_readyz_cache_latency {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "ready".into(),
+                    startup_phase: "follower".into(),
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -4286,6 +4306,7 @@ pub mod http_readyz_cache_latency {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "degraded".into(),
+                    startup_phase: "replaying".into(),
                     reason: Some("reconciliation replay incomplete".into()),
                     reasons: vec![ReadyzReason {
                         project_id: "_control_plane".into(),
@@ -4348,6 +4369,7 @@ pub mod http_readyz_cache_latency {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "ready".into(),
+                    startup_phase: "follower".into(),
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -4389,6 +4411,7 @@ pub mod http_readyz_cache_latency {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "ready".into(),
+                    startup_phase: "follower".into(),
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -4441,6 +4464,7 @@ pub mod http_readyz_cache_latency {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "degraded".into(),
+                    startup_phase: "degraded".into(),
                     reason: Some("convergence stalled".into()),
                     reasons: Vec::new(),
                 },
@@ -4649,6 +4673,7 @@ pub mod metrics_endpoint_exposes_cached_json {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "ready".into(),
+                    startup_phase: "leader_active".into(),
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -4684,6 +4709,7 @@ pub mod metrics_endpoint_exposes_cached_json {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
                     status: "ready".into(),
+                    startup_phase: "leader_active".into(),
                     reason: None,
                     reasons: Vec::new(),
                 },

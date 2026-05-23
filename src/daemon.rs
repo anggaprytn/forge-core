@@ -59,6 +59,56 @@ const CIRCUIT_BREAKER_MAX_BACKOFF_MS: u64 = 5_000;
 const LEADER_LEASE_TTL_SECONDS: u64 = 5;
 const HEARTBEAT_STALE_AFTER_SECONDS: u64 = LEADER_LEASE_TTL_SECONDS * 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupPhase {
+    Booting,
+    Replaying,
+    LeaderAcquiring,
+    Follower,
+    LeaderActive,
+    Degraded,
+}
+
+impl StartupPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Booting => "booting",
+            Self::Replaying => "replaying",
+            Self::LeaderAcquiring => "leader_acquiring",
+            Self::Follower => "follower",
+            Self::LeaderActive => "leader_active",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Booting, Self::Booting)
+                | (Self::Booting, Self::Replaying)
+                | (Self::Booting, Self::LeaderAcquiring)
+                | (Self::Booting, Self::Follower)
+                | (Self::Booting, Self::LeaderActive)
+                | (Self::Booting, Self::Degraded)
+                | (Self::Replaying, Self::LeaderAcquiring)
+                | (Self::Replaying, Self::Degraded)
+                | (Self::LeaderAcquiring, Self::Follower)
+                | (Self::LeaderAcquiring, Self::LeaderActive)
+                | (Self::LeaderAcquiring, Self::Degraded)
+                | (Self::Follower, Self::LeaderAcquiring)
+                | (Self::Follower, Self::LeaderActive)
+                | (Self::Follower, Self::Degraded)
+                | (Self::LeaderActive, Self::LeaderAcquiring)
+                | (Self::LeaderActive, Self::Follower)
+                | (Self::LeaderActive, Self::Degraded)
+                | (Self::Degraded, Self::LeaderAcquiring)
+                | (Self::Degraded, Self::Follower)
+                | (Self::Degraded, Self::LeaderActive)
+                | (Self::Degraded, Self::Degraded)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LeadershipState {
     lease: Option<PersistedLeaderLease>,
@@ -117,10 +167,16 @@ pub enum DaemonState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupStep {
-    ConfigLoaded,
-    BootstrapReady,
-    QueueRecovered,
-    HealthLoopsStarted,
+    StorageInit,
+    NodeIdentityLoad,
+    LeaseRecovery,
+    ReplayCursorLoad,
+    ReplayScan,
+    ReplayExecution,
+    LeadershipAcquisition,
+    HeartbeatStart,
+    ConvergenceEnable,
+    ReadinessPublish,
 }
 
 fn service_log_groups_from_runtime(runtime: &PersistedRuntimeInfo) -> Vec<ServiceLogGroup> {
@@ -405,6 +461,7 @@ impl Default for DaemonReadyzCache {
         Self {
             response: ReadyzResponse {
                 status: "not_ready".into(),
+                startup_phase: StartupPhase::Booting.as_str().into(),
                 reason: None,
                 reasons: Vec::new(),
             },
@@ -439,6 +496,9 @@ pub struct Daemon<D, R, A> {
     cluster_diagnostics: ClusterDiagnostics,
     cluster_signals: ClusterSignalState,
     reconciliation: ReconciliationDiagnostics,
+    startup_phase: StartupPhase,
+    startup_recovery_duration_ms: u64,
+    convergence_start_blocked: bool,
 }
 
 impl<D, R, A> Drop for Daemon<D, R, A> {
@@ -460,7 +520,7 @@ where
         routing_runtime: R,
         recovery_decider: A,
     ) -> Self {
-        let startup_steps = vec![StartupStep::ConfigLoaded];
+        let startup_steps = vec![StartupStep::StorageInit];
         let node_metadata = NodeMetadataStore::new(&config.storage_root)
             .load()
             .ok()
@@ -492,28 +552,39 @@ where
             cluster_diagnostics: ClusterDiagnostics::default(),
             cluster_signals: ClusterSignalState::default(),
             reconciliation: ReconciliationDiagnostics::default(),
+            startup_phase: StartupPhase::Booting,
+            startup_recovery_duration_ms: 0,
+            convergence_start_blocked: true,
         }
     }
 
     pub fn start(&mut self) -> Result<(), DaemonError> {
+        let startup_started = Instant::now();
         let bootstrap = BootstrapContext::new(self.config.clone());
         match bootstrap.initialize()? {
             BootstrapState::WaitingForStorage(path) => {
                 self.state = DaemonState::WaitingForBootstrap(path);
+                self.startup_phase = StartupPhase::Booting;
                 self.health_loops_started = false;
+                self.convergence_start_blocked = true;
                 self.refresh_readyz_cache();
                 Ok(())
             }
             BootstrapState::Ready => {
+                self.set_startup_phase(StartupPhase::Booting);
                 self.node_metadata = NodeMetadataStore::new(&self.config.storage_root)
                     .load_or_create()
                     .unwrap_or_default();
                 self.state = DaemonState::Recovering;
-                self.startup_steps.push(StartupStep::BootstrapReady);
+                self.record_startup_step(StartupStep::NodeIdentityLoad);
                 self.refresh_leadership(current_unix_timestamp());
+                self.record_startup_step(StartupStep::LeaseRecovery);
                 self.reconciliation =
                     ReconciliationStore::new(&self.config.storage_root).diagnostics();
+                self.record_startup_step(StartupStep::ReplayCursorLoad);
+                self.record_startup_step(StartupStep::ReplayScan);
                 if self.reconciliation_enabled(current_unix_timestamp()) {
+                    self.set_startup_phase(StartupPhase::Replaying);
                     let node_id = self.node_id().to_string();
                     let lease_epoch = self.leadership.lease_epoch();
                     self.reconciliation = ReconciliationStore::new(&self.config.storage_root)
@@ -524,10 +595,16 @@ where
                             ReplayOptions {
                                 dry_run: false,
                                 resume: true,
+                                max_duration_ms: Some(self.config.startup_replay_max_duration_ms),
+                                max_entries: Some(self.config.startup_replay_max_entries),
                             },
                         )?
                         .diagnostics;
                 }
+                self.record_startup_step(StartupStep::ReplayExecution);
+                self.set_startup_phase(StartupPhase::LeaderAcquiring);
+                self.refresh_leadership(current_unix_timestamp());
+                self.record_startup_step(StartupStep::LeadershipAcquisition);
                 let _ = OperationalJournalStore::new(&self.config.storage_root).append(
                     &OperationalJournalEntry {
                         schema_version: 1,
@@ -541,23 +618,41 @@ where
                 );
 
                 let queue = PersistentQueue::new(self.config.storage_root.join("queue"))?;
-                let convergence = StartupConvergence::new(
-                    self.config.storage_root.clone(),
-                    &queue,
-                    &self.recovery_decider,
-                );
-                let outcome = convergence.recover_active_deployment(
-                    &mut self.docker_runtime,
-                    &mut self.routing_runtime,
-                )?;
-                self.last_recovery_outcome = Some(outcome);
-                self.startup_steps.push(StartupStep::QueueRecovered);
-
                 self.queue = Some(queue);
                 self.health_loops_started = true;
-                self.startup_steps.push(StartupStep::HealthLoopsStarted);
+                self.record_startup_step(StartupStep::HeartbeatStart);
+                self.convergence_start_blocked = !self
+                    .reconciliation_enabled(current_unix_timestamp())
+                    || self.reconciliation.replay_in_progress
+                    || self.reconciliation.replay_paused
+                    || self.reconciliation.replay_incomplete
+                    || self.reconciliation.lease_fencing_failures > 0;
+                if !self.convergence_start_blocked {
+                    let convergence = StartupConvergence::new(
+                        self.config.storage_root.clone(),
+                        self.queue.as_ref().expect("queue initialized"),
+                        &self.recovery_decider,
+                    );
+                    let outcome = convergence.recover_active_deployment(
+                        &mut self.docker_runtime,
+                        &mut self.routing_runtime,
+                    )?;
+                    self.last_recovery_outcome = Some(outcome);
+                }
+                self.record_startup_step(StartupStep::ConvergenceEnable);
+                if self.reconciliation_enabled(current_unix_timestamp())
+                    && !self.convergence_start_blocked
+                {
+                    self.set_startup_phase(StartupPhase::LeaderActive);
+                } else if self.local_role(current_unix_timestamp()) == "follower" {
+                    self.set_startup_phase(StartupPhase::Follower);
+                } else if self.convergence_start_blocked {
+                    self.set_startup_phase(StartupPhase::Degraded);
+                }
                 self.state = DaemonState::Ready;
+                self.startup_recovery_duration_ms = startup_started.elapsed().as_millis() as u64;
                 self.restore_readyz_cache_from_checkpoints();
+                self.record_startup_step(StartupStep::ReadinessPublish);
                 self.refresh_readyz_cache();
                 Ok(())
             }
@@ -1021,12 +1116,31 @@ where
         &self.startup_steps
     }
 
+    pub fn startup_phase(&self) -> StartupPhase {
+        self.startup_phase
+    }
+
     pub fn health_loops_started(&self) -> bool {
         self.health_loops_started
     }
 
     pub fn last_recovery_outcome(&self) -> Option<&RecoveryOutcome> {
         self.last_recovery_outcome.as_ref()
+    }
+
+    fn record_startup_step(&mut self, step: StartupStep) {
+        if !self.startup_steps.contains(&step) {
+            self.startup_steps.push(step);
+        }
+    }
+
+    fn set_startup_phase(&mut self, next: StartupPhase) {
+        if self.startup_phase.can_transition_to(next) {
+            self.startup_phase = next;
+        } else {
+            self.startup_phase = StartupPhase::Degraded;
+            self.convergence_start_blocked = true;
+        }
     }
 
     pub fn readyz_status(&mut self) -> &'static str {
@@ -1064,6 +1178,7 @@ where
         {
             return ReadyzResponse {
                 status: "degraded".into(),
+                startup_phase: self.startup_phase.as_str().into(),
                 reason: Some("readiness cache stale".into()),
                 reasons: Vec::new(),
             };
@@ -1125,6 +1240,7 @@ where
                 } else {
                     "degraded".into()
                 },
+                startup_phase: self.startup_phase.as_str().into(),
                 reason: reasons.first().map(|value| value.message.clone()),
                 reasons,
             },
@@ -1464,10 +1580,17 @@ where
                 })
                 .map(|reason| reason.message.clone())
                 .collect(),
-            extra: BTreeMap::from([(
-                "convergence_domains".into(),
-                serde_json::to_value(&self.convergence_domains).unwrap_or(Value::Array(Vec::new())),
-            )]),
+            extra: BTreeMap::from([
+                (
+                    "convergence_domains".into(),
+                    serde_json::to_value(&self.convergence_domains)
+                        .unwrap_or(Value::Array(Vec::new())),
+                ),
+                (
+                    "startup_phase".into(),
+                    Value::String(self.startup_phase.as_str().into()),
+                ),
+            ]),
         };
         let _ = ConvergenceCheckpointStore::new(env.clone()).save(&checkpoint);
         self.persist_runtime_truth_snapshots(env, &checkpoint);
@@ -1687,6 +1810,7 @@ where
                 } else {
                     "ready".into()
                 },
+                startup_phase: self.startup_phase.as_str().into(),
                 reason,
                 reasons: reasons.clone(),
             },
@@ -1734,16 +1858,34 @@ where
                 "convergence ownership lost".into(),
             ));
         }
+        if self.convergence_start_blocked {
+            reasons.push(control_plane_reason(
+                "convergence_start_blocked",
+                "convergence start blocked pending stable startup".into(),
+            ));
+        }
         if self.reconciliation.replay_incomplete {
             reasons.push(control_plane_reason(
                 "reconciliation_replay_incomplete",
                 "reconciliation replay incomplete".into(),
             ));
         }
+        if self.reconciliation.replay_paused {
+            reasons.push(control_plane_reason(
+                "replay_paused",
+                "replay paused after bounded startup budget".into(),
+            ));
+        }
         if self.reconciliation.unrecoverable_pending_intents {
             reasons.push(control_plane_reason(
                 "unrecoverable_pending_intents",
                 "unrecoverable pending intents require operator intervention".into(),
+            ));
+        }
+        if self.reconciliation.lease_fencing_failures > 0 {
+            reasons.push(control_plane_reason(
+                "lease_fencing_failed",
+                "lease fencing failed during replay".into(),
             ));
         }
         if self.reconciliation.destructive_replay_blocked {
@@ -2325,6 +2467,8 @@ where
         let replay = &self.reconciliation;
         MetricsResponse {
             queue_depth,
+            startup_phase: self.startup_phase.as_str().into(),
+            startup_recovery_duration_ms: self.startup_recovery_duration_ms,
             convergence_loop_duration_ms: self.convergence_loop_duration_ms,
             convergence_last_success_unix: self.convergence_last_success_unix,
             convergence_last_failure_unix: self.convergence_last_failure_unix,
@@ -2354,11 +2498,16 @@ where
             pending_intents: replay.pending_intents,
             replay_queue_depth: replay.replay_queue_depth,
             replay_in_progress: replay.replay_in_progress,
+            replay_paused: replay.replay_paused,
             replay_duration_ms: replay.replay_duration_ms,
             replay_failures_total: replay.replay_failures_total,
+            replay_quarantined_total: replay.replay_quarantined_total,
+            replay_aborted_total: replay.replay_aborted_total,
+            lease_fencing_failures: replay.lease_fencing_failures,
             unrecoverable_operations: replay.unrecoverable_operations,
             last_replayed_intent: replay.last_replayed_intent.clone(),
             reconciliation_log_size_bytes: replay.reconciliation_log_size_bytes,
+            convergence_start_blocked: self.convergence_start_blocked,
             docker: self.docker_breaker.metrics_snapshot(),
             caddy: self.caddy_breaker.metrics_snapshot(),
             cluster: self.cluster_diagnostics.clone(),
@@ -3372,6 +3521,8 @@ fn config_with_root(root: PathBuf) -> DaemonConfig {
         api_bind: "127.0.0.1:8080".into(),
         bearer_token: "test-token".into(),
         heartbeat_interval_ms: 1_000,
+        startup_replay_max_duration_ms: 5_000,
+        startup_replay_max_entries: 256,
         github_webhook_secret: None,
         repository_cache_root: None,
         sqlite_path: None,
@@ -3471,10 +3622,16 @@ pub mod daemon_starts_only_after_bootstrap_succeeds {
         assert_eq!(
             daemon.startup_steps(),
             &[
-                StartupStep::ConfigLoaded,
-                StartupStep::BootstrapReady,
-                StartupStep::QueueRecovered,
-                StartupStep::HealthLoopsStarted
+                StartupStep::StorageInit,
+                StartupStep::NodeIdentityLoad,
+                StartupStep::LeaseRecovery,
+                StartupStep::ReplayCursorLoad,
+                StartupStep::ReplayScan,
+                StartupStep::ReplayExecution,
+                StartupStep::LeadershipAcquisition,
+                StartupStep::HeartbeatStart,
+                StartupStep::ConvergenceEnable,
+                StartupStep::ReadinessPublish,
             ]
         );
     }
@@ -4404,8 +4561,8 @@ pub mod daemon_recovers_queue_before_accepting_deploys {
                 commit_sha: None,
             }))
         );
-        assert_eq!(daemon.startup_steps()[1], StartupStep::BootstrapReady);
-        assert_eq!(daemon.startup_steps()[2], StartupStep::QueueRecovered);
+        assert_eq!(daemon.startup_steps()[1], StartupStep::NodeIdentityLoad);
+        assert_eq!(daemon.startup_steps()[2], StartupStep::LeaseRecovery);
         assert_eq!(daemon.state(), &DaemonState::Ready);
     }
 }
@@ -4506,10 +4663,16 @@ pub mod daemon_does_not_start_health_loops_before_convergence_completes {
         assert_eq!(
             daemon.startup_steps(),
             &[
-                StartupStep::ConfigLoaded,
-                StartupStep::BootstrapReady,
-                StartupStep::QueueRecovered,
-                StartupStep::HealthLoopsStarted
+                StartupStep::StorageInit,
+                StartupStep::NodeIdentityLoad,
+                StartupStep::LeaseRecovery,
+                StartupStep::ReplayCursorLoad,
+                StartupStep::ReplayScan,
+                StartupStep::ReplayExecution,
+                StartupStep::LeadershipAcquisition,
+                StartupStep::HeartbeatStart,
+                StartupStep::ConvergenceEnable,
+                StartupStep::ReadinessPublish,
             ]
         );
         assert!(daemon.health_loops_started());
@@ -4972,7 +5135,7 @@ mod daemon_control_plane_durability {
     use crate::reconciliation::{ReconciliationStore, intent_request_for_storage_root};
     use crate::storage::{
         ControlPlaneSnapshotStore, ConvergenceCheckpointStore, EnvironmentPaths,
-        OperationalJournalStore,
+        OperationalJournalStore, PointerStore,
     };
 
     fn seed_project(root: &std::path::Path) {
@@ -6304,5 +6467,253 @@ mod daemon_control_plane_durability {
         assert!(metrics.pending_intents >= 1);
         assert!(metrics.replay_queue_depth >= 1);
         assert!(metrics.reconciliation_log_size_bytes > 0);
+    }
+
+    fn seed_pending_promotion_intent(
+        root: &std::path::Path,
+        node_id: &str,
+        lease_epoch: u64,
+        generation: u64,
+    ) {
+        use crate::storage::SnapshotWriter;
+
+        let env = EnvironmentPaths::new(root, "api", "production");
+        SnapshotWriter::new(env.clone(), generation)
+            .unwrap()
+            .finalize("api", "production", crate::storage::SnapshotState::Healthy)
+            .unwrap();
+        ReconciliationStore::new(root)
+            .append_pending(crate::reconciliation::ReconciliationIntentRequest {
+                node_id: node_id.into(),
+                lease_epoch,
+                operation_type: "deployment_promotion".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                target_generation: Some(generation),
+                target_state: "healthy".into(),
+                reconciliation_domain: "runtime_container_reconciliation".into(),
+                triggered_by: Some("startup".into()),
+                previous_intent_id: None,
+                recovery_of: None,
+                replay_safety: crate::reconciliation::ReplaySafety::Idempotent,
+                metadata: BTreeMap::from([(
+                    "storage_root".into(),
+                    Value::String(root.display().to_string()),
+                )]),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn single_node_always_becomes_leader_after_restart() {
+        let root = test_root("single-node-always-becomes-leader-after-restart");
+        for _ in 0..5 {
+            let mut daemon = Daemon::new(
+                config_with_root(root.clone()),
+                NoopDockerRuntime,
+                NoopRoutingRuntime,
+                StaticDecider(true),
+            );
+            daemon.start().unwrap();
+            daemon.refresh_readyz_cache();
+            let metrics = daemon.control_plane_snapshot().metrics;
+            assert!(metrics.leader);
+            assert_eq!(metrics.startup_phase, "leader_active");
+            assert!(!metrics.convergence_start_blocked);
+        }
+    }
+
+    #[test]
+    fn stale_follower_never_replays() {
+        let root = test_root("stale-follower-never-replays");
+        let local_node = local_node_id(&root);
+        force_leader_lease(
+            &root,
+            "peer-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            9,
+        );
+        seed_pending_promotion_intent(&root, "peer-node", 9, 3);
+
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(daemon.startup_phase(), StartupPhase::Follower);
+        assert!(!metrics.leader);
+        assert!(metrics.follower_mode);
+        assert_eq!(
+            PointerStore::new(EnvironmentPaths::new(&root, "api", "production"))
+                .read_authoritative_pointer()
+                .unwrap(),
+            None
+        );
+        assert_ne!(local_node, "peer-node");
+    }
+
+    #[test]
+    fn convergence_never_starts_before_replay_complete() {
+        let root = test_root("convergence-never-starts-before-replay-complete");
+        let mut config = config_with_root(root.clone());
+        config.startup_replay_max_duration_ms = 0;
+        let node_id = local_node_id(&root);
+        force_leader_lease(
+            &root,
+            &node_id,
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            4,
+        );
+        seed_pending_promotion_intent(&root, &node_id, 4, 2);
+
+        let mut daemon = Daemon::new(
+            config,
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert!(daemon.last_recovery_outcome().is_none());
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert!(metrics.replay_paused);
+        assert!(metrics.convergence_start_blocked);
+    }
+
+    #[test]
+    fn startup_state_machine_transitions_valid() {
+        assert!(StartupPhase::Booting.can_transition_to(StartupPhase::Replaying));
+        assert!(StartupPhase::Replaying.can_transition_to(StartupPhase::LeaderAcquiring));
+        assert!(StartupPhase::LeaderAcquiring.can_transition_to(StartupPhase::Follower));
+        assert!(StartupPhase::LeaderAcquiring.can_transition_to(StartupPhase::LeaderActive));
+        assert!(!StartupPhase::LeaderActive.can_transition_to(StartupPhase::Replaying));
+    }
+
+    #[test]
+    fn readiness_not_published_before_stable() {
+        let root = test_root("readiness-not-published-before-stable");
+        let daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        let readyz = daemon.readyz_cache_snapshot().response;
+        assert_eq!(readyz.status, "not_ready");
+        assert_eq!(readyz.startup_phase, "booting");
+    }
+
+    #[test]
+    fn replay_timeout_degrades_without_blocking_requests() {
+        let root = test_root("replay-timeout-degrades-without-blocking-requests");
+        let mut config = config_with_root(root.clone());
+        config.startup_replay_max_duration_ms = 0;
+        let node_id = local_node_id(&root);
+        force_leader_lease(
+            &root,
+            &node_id,
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            7,
+        );
+        seed_pending_promotion_intent(&root, &node_id, 7, 5);
+
+        let mut daemon = Daemon::new(
+            config,
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        let started = Instant::now();
+        let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(readyz.status, "degraded");
+        assert_eq!(readyz.startup_phase, "degraded");
+        assert!(metrics.replay_paused);
+    }
+
+    #[test]
+    fn concurrent_restart_single_leader() {
+        let root = test_root("concurrent-restart-single-leader");
+        let now = current_unix_timestamp();
+        let handles = ["node-a", "node-b"]
+            .into_iter()
+            .map(|node_id| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    LeaderLeaseStore::new(&root).try_acquire_or_renew(
+                        node_id,
+                        now,
+                        LEADER_LEASE_TTL_SECONDS,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let leaders = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().ok())
+            .filter(|outcome| matches!(outcome, LeaseAcquireOutcome::Leader(_)))
+            .count();
+        assert_eq!(leaders, 1);
+    }
+
+    #[test]
+    fn repeated_restart_no_split_brain() {
+        let root = test_root("repeated-restart-no-split-brain");
+        for round in 0..25 {
+            let now = current_unix_timestamp().saturating_add(round);
+            let _ = LeaderLeaseStore::new(&root).release_if_owner("node-a", now);
+            let _ = LeaderLeaseStore::new(&root).release_if_owner("node-b", now);
+            let first = LeaderLeaseStore::new(&root)
+                .try_acquire_or_renew("node-a", now, LEADER_LEASE_TTL_SECONDS)
+                .unwrap();
+            let second = LeaderLeaseStore::new(&root)
+                .try_acquire_or_renew("node-b", now, LEADER_LEASE_TTL_SECONDS)
+                .unwrap();
+            let leaders = [first, second]
+                .into_iter()
+                .filter(|outcome| matches!(outcome, LeaseAcquireOutcome::Leader(_)))
+                .count();
+            assert_eq!(leaders, 1);
+        }
+    }
+
+    #[test]
+    fn control_plane_restart_stress() {
+        let root = test_root("control-plane-restart-stress");
+        let node_id = local_node_id(&root);
+        for cycle in 0..100 {
+            force_leader_lease(
+                &root,
+                &node_id,
+                current_unix_timestamp().saturating_add(cycle),
+                LEADER_LEASE_TTL_SECONDS,
+                cycle.saturating_add(1),
+            );
+            seed_pending_promotion_intent(&root, &node_id, cycle.saturating_add(1), cycle + 1);
+            let mut config = config_with_root(root.clone());
+            if cycle % 10 == 0 {
+                config.startup_replay_max_entries = 1;
+            }
+            let mut daemon = Daemon::new(
+                config,
+                NoopDockerRuntime,
+                NoopRoutingRuntime,
+                StaticDecider(true),
+            );
+            daemon.start().unwrap();
+            daemon.refresh_readyz_cache();
+            let metrics = daemon.control_plane_snapshot().metrics;
+            assert!(metrics.readiness_cache_age_ms <= READYZ_CACHE_STALE_AFTER_MS);
+            assert!(metrics.replay_queue_depth <= 256);
+        }
     }
 }

@@ -1117,6 +1117,13 @@ impl EnvironmentPaths {
             .join("reconciliation_cursor.json")
     }
 
+    pub fn reconciliation_quarantine_dir(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root
+            .as_ref()
+            .join("control_plane")
+            .join("quarantine")
+    }
+
     pub fn cluster_nodes_file(storage_root: impl AsRef<Path>) -> PathBuf {
         storage_root
             .as_ref()

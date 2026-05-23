@@ -240,6 +240,8 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 ### Recovery Model
 
 - On daemon restart, Forge restores cached operational truth from checkpoints before live probing catches up.
+- Restart recovery is deterministic and phase-ordered: `storage init -> node identity load -> lease recovery -> replay cursor load -> replay scan -> replay execution -> leadership acquisition -> heartbeat start -> convergence enable -> readiness publish`.
+- The cached startup phase is always one of `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, or `degraded`.
 - If a checkpoint or snapshot is stale, readiness degrades until the next bounded convergence refresh.
 - If a checkpoint or snapshot is corrupted, Forge skips it, keeps the API up, and rebuilds truth from surviving durable state plus the next live convergence cycle.
 - If the reconciliation log or replay cursor is corrupted, `/readyz` degrades immediately from cached control-plane state and operators should inspect `forge control-plane replay-status` and `forge control-plane intents`.
@@ -252,6 +254,27 @@ Operator replay workflow:
 - Use `forge control-plane replay --dry-run` first when the system reports pending intents; it must not mutate runtime state.
 - Use `forge control-plane replay --resume` only on the active leader. Followers remain read-only and never replay.
 - Destructive intents such as GC-style deletion remain blocked for operator handling; Forge does not auto-replay them on startup.
+
+Replay fencing and quarantine:
+
+- Every replay mutation verifies that the active lease owner is still the local node and that the active `lease_epoch` still matches the intent epoch.
+- If fencing fails, Forge aborts replay, writes a `lease_fencing_failed` journal event, increments fencing counters, and marks startup degraded.
+- Replay startup is bounded by a duration budget and an entry budget. If either budget is exceeded, replay pauses and request paths remain unaffected.
+- Quarantined intents and corrupted replay entries are moved under `control_plane/quarantine/` and removed from active replay.
+- `control_plane/reconciliation_cursor.json` is monotonic across restarts so paused recovery can resume without rewinding cursor progress.
+
+Operational expectations:
+
+- `/readyz` and `/metrics` remain cache-backed and bounded during replay stress.
+- Followers can remain available for cached reads while leader startup is replaying or degraded.
+- Startup recovery does not imply consensus, cluster failover, or distributed locking guarantees beyond the single filesystem lease.
+
+Known non-goals:
+
+- no consensus or Raft
+- no distributed database
+- no synchronous request-path replay
+- no multi-writer control plane
 
 ### Readiness Cache Staleness
 

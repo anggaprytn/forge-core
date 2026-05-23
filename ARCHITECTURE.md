@@ -131,9 +131,33 @@ Single-writer coordination model:
 Replay model:
 
 - Recovery starts from durable intent order, not implicit runtime inspection order.
+- Daemon startup is phase-ordered and deterministic: `storage init -> node identity load -> lease recovery -> replay cursor load -> replay scan -> replay execution -> leadership acquisition -> heartbeat start -> convergence enable -> readiness publish`.
+- Startup state is explicit and cached as one of `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, or `degraded`.
 - Replay resumes only operations classified `replay_safe` or `idempotent`.
+- Replay is lease-fenced. Every replay mutation verifies the current lease owner and `lease_epoch` still match the intent epoch before the mutation is allowed to stand.
 - Operations classified `requires_operator_intervention` or `destructive` are surfaced through readiness, metrics, and CLI diagnostics and remain pending until explicitly handled.
-- Replay is resumable and bounded by cursor progress. Forge prefers degraded recovery over aggressive automatic mutation.
+- Replay is resumable and bounded by cursor progress, a startup duration budget, and a startup entry budget. If the budget is exceeded, replay pauses, readiness degrades, and request paths stay cache-backed.
+- Followers never replay intents. A follower may serve cached reads and cached readiness, but convergence remains disabled until leadership is valid and replay is complete.
+- Corrupted or unrecoverable replay entries are quarantined under `control_plane/quarantine/` so they cannot poison future startup recovery.
+
+Lease fencing semantics:
+
+- Intents carry the `lease_epoch` observed when they were written.
+- Replay or convergence may mutate shared control-plane state only if the current node still owns the active lease and the active `lease_epoch` equals the intent epoch.
+- A fencing mismatch aborts the operation, increments fencing failure counters, writes an operational journal event, and drives startup into `degraded`.
+
+Deterministic recovery guarantees:
+
+- Startup recovery is bounded-time and does not make `/readyz` or `/metrics` synchronous on replay.
+- Replay cursor updates are monotonic across restarts so partial recovery can continue without rewinding progress.
+- Heartbeat and readiness publication start only after leadership and replay state have stabilized for the current startup cycle.
+
+Non-goals:
+
+- no consensus or Raft
+- no distributed database
+- no synchronous request-path replay
+- no multi-writer control plane
 
 Convergence domains:
 

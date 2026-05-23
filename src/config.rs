@@ -9,6 +9,8 @@ pub struct DaemonConfig {
     pub api_bind: String,
     pub bearer_token: String,
     pub heartbeat_interval_ms: u64,
+    pub startup_replay_max_duration_ms: u64,
+    pub startup_replay_max_entries: usize,
     pub github_webhook_secret: Option<String>,
     pub repository_cache_root: Option<PathBuf>,
     pub sqlite_path: Option<PathBuf>,
@@ -71,6 +73,14 @@ impl DaemonConfig {
             .get("heartbeat_interval_ms")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(1_000);
+        let startup_replay_max_duration_ms = values
+            .get("startup_replay_max_duration_ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5_000);
+        let startup_replay_max_entries = values
+            .get("startup_replay_max_entries")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(256);
         let github_webhook_secret = values.get("github_webhook_secret").cloned();
         let repository_cache_root = values.get("repository_cache_root").map(PathBuf::from);
         let sqlite_path = values.get("sqlite_path").map(PathBuf::from);
@@ -80,6 +90,8 @@ impl DaemonConfig {
             api_bind: api_bind.clone(),
             bearer_token: bearer_token.clone(),
             heartbeat_interval_ms,
+            startup_replay_max_duration_ms,
+            startup_replay_max_entries,
             github_webhook_secret,
             repository_cache_root,
             sqlite_path,
@@ -102,6 +114,8 @@ mod tests {
         assert_eq!(config.api_bind, "127.0.0.1:8080");
         assert_eq!(config.bearer_token, "test-token");
         assert_eq!(config.heartbeat_interval_ms, 1_000);
+        assert_eq!(config.startup_replay_max_duration_ms, 5_000);
+        assert_eq!(config.startup_replay_max_entries, 256);
         assert_eq!(config.github_webhook_secret, None);
         assert_eq!(config.repository_cache_root, None);
         assert_eq!(config.sqlite_path, None);
