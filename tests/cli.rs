@@ -843,6 +843,77 @@ fn cli_config_env_vars_override_saved_config() {
     assert_eq!(request.authorization, "Bearer env-token");
 }
 
+#[test]
+fn bench_readyz_decodes_raw_ready_response() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"status":"ready"}"#,
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":0,"convergence_failures_total":0,"docker_probe_latency_ms":0,"caddy_probe_latency_ms":0,"docker":{"probe_latency_ms":0,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":0,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["bench", "readyz", "--samples", "1"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("status: ready"));
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured[0].path, "/readyz");
+    assert_eq!(captured[1].path, "/metrics");
+}
+
+#[test]
+fn bench_readyz_decodes_raw_degraded_response() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests,
+        vec![
+            r#"{"status":"degraded","reasons":[{"project_id":"api","environment":"production","generation":9,"active":true,"unresolved":true,"source":"runtime_state_cache","marker":"route_activation_verification_failed","message":"route target mismatch: current=172.29.0.99:3000 expected=172.29.0.2:3000","last_checked_unix":1779320528,"cache_age_ms":21}]}"#,
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":1,"convergence_failures_total":1,"docker_probe_latency_ms":0,"caddy_probe_latency_ms":0,"docker":{"probe_latency_ms":0,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":0,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["bench", "readyz", "--samples", "1"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("status: degraded"));
+}
+
+#[test]
+fn bench_convergence_decodes_raw_metrics_response() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":0,"convergence_failures_total":0,"docker_probe_latency_ms":8,"caddy_probe_latency_ms":6,"docker":{"probe_latency_ms":8,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":6,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["bench", "convergence", "--samples", "1"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("convergence_duration_ms: 51"));
+    assert_eq!(requests.lock().unwrap()[0].path, "/metrics");
+}
+
+#[test]
+fn bench_does_not_expect_api_envelope_for_control_plane_endpoints() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests,
+        vec![
+            r#"{"status":"ready"}"#,
+            r#"{"queue_depth":0,"convergence_loop_duration_ms":51,"readiness_cache_age_ms":52,"readyz_requests_total":0,"readyz_latency_ms":0,"readyz_degraded_total":0,"convergence_failures_total":0,"docker_probe_latency_ms":0,"caddy_probe_latency_ms":0,"docker":{"probe_latency_ms":0,"breaker":{"state":"closed","failure_count":0}},"caddy":{"probe_latency_ms":0,"breaker":{"state":"closed","failure_count":0}}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["bench", "readyz", "--samples", "1"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("missing field data"));
+}
+
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)
@@ -864,56 +935,65 @@ fn spawn_server(
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     response_body: &'static str,
 ) -> (String, thread::JoinHandle<()>) {
+    spawn_server_sequence(requests, vec![response_body])
+}
+
+fn spawn_server_sequence(
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    response_bodies: Vec<&'static str>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = Vec::new();
-        let mut temp = [0u8; 4096];
-        loop {
-            let read = stream.read(&mut temp).unwrap();
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&temp[..read]);
-            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                let header_end = buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .unwrap()
-                    + 4;
-                let headers = String::from_utf8_lossy(&buffer[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        if name.eq_ignore_ascii_case("content-length") {
-                            Some(value.trim().parse::<usize>().unwrap())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                while buffer.len() < header_end + content_length {
-                    let read = stream.read(&mut temp).unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    buffer.extend_from_slice(&temp[..read]);
+        for response_body in response_bodies {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = Vec::new();
+            let mut temp = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut temp).unwrap();
+                if read == 0 {
+                    break;
                 }
-                break;
+                buffer.extend_from_slice(&temp[..read]);
+                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let header_end = buffer
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                Some(value.trim().parse::<usize>().unwrap())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while buffer.len() < header_end + content_length {
+                        let read = stream.read(&mut temp).unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        buffer.extend_from_slice(&temp[..read]);
+                    }
+                    break;
+                }
             }
+
+            let request = parse_request(&buffer);
+            requests.lock().unwrap().push(request);
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
         }
-
-        let request = parse_request(&buffer);
-        requests.lock().unwrap().push(request);
-
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            response_body.len(),
-            response_body
-        );
-        stream.write_all(response.as_bytes()).unwrap();
     });
     (url, handle)
 }

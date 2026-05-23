@@ -24,18 +24,20 @@ use crate::deployments::{
     DeploymentError, DeploymentExecution, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
 };
 use crate::events::EventRecord;
-#[cfg(test)]
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
+use crate::route_truth::expected_route_for_runtime;
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
 use crate::status::{
-    ProjectEnvironmentStatus, load_environment_diagnostics, load_environment_diff,
-    load_environment_history, load_project_environment_env_report, load_project_environment_status,
+    ProjectEnvironmentStatus, derive_environment_domain, load_environment_diagnostics,
+    load_environment_diff, load_environment_history, load_project_environment_env_report,
+    load_project_environment_status,
 };
 use crate::storage::{
     DiagnosticsStore, EnvironmentPaths, EventStore, PersistedActivationMode, PersistedRuntimeInfo,
-    RuntimeHealthState, RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
+    PersistedServiceRuntimeInfo, RuntimeHealthState, RuntimeStateStore, current_unix_timestamp,
+    load_generation_runtime_info,
 };
 
 pub const READYZ_CACHE_STALE_AFTER_MS: u64 = 5_000;
@@ -895,7 +897,11 @@ where
                 reasons: Vec::new(),
             };
         }
-        self.control_plane_snapshot.readyz.response.clone()
+        let mut response = self.control_plane_snapshot.readyz.response.clone();
+        let cache_age_ms =
+            now.saturating_sub(self.control_plane_snapshot.readyz.updated_at_unix_ms);
+        annotate_readyz_reasons(&mut response.reasons, cache_age_ms);
+        response
     }
 
     pub fn refresh_readyz_cache(&mut self) {
@@ -904,7 +910,7 @@ where
         let updated_at_unix_ms = now_unix_ms();
         let queue_depth = self.queue_depth().unwrap_or_default();
         let mut reasons = self.compute_readyz_reasons(now_unix);
-        reasons.extend(self.cached_environment_readyz_reasons_with_budget());
+        reasons.extend(self.cached_environment_readyz_reasons_with_budget(now_unix));
         reasons.sort_by(|left, right| {
             (
                 left.project_id.as_str(),
@@ -933,6 +939,7 @@ where
                 "convergence stalled".into(),
             ));
         }
+        annotate_readyz_reasons(&mut reasons, 0);
         let degraded = !reasons.is_empty();
         let loop_duration_ms = started.elapsed().as_millis() as u64;
         self.convergence_loop_duration_ms = loop_duration_ms;
@@ -1010,7 +1017,10 @@ where
         reasons
     }
 
-    fn cached_environment_readyz_reasons_with_budget(&self) -> Vec<ReadyzReason> {
+    fn cached_environment_readyz_reasons_with_budget(
+        &mut self,
+        now_unix: u64,
+    ) -> Vec<ReadyzReason> {
         let started = Instant::now();
         let projects_root = self.config.storage_root.join("projects");
         let Ok(projects) = fs::read_dir(projects_root) else {
@@ -1044,9 +1054,25 @@ where
                 let Ok(runtime_state) = RuntimeStateStore::new(env.clone()).load() else {
                     continue;
                 };
-                if runtime_state.active_generation.is_none()
-                    || runtime_state.health_state == RuntimeHealthState::Healthy
+                let Some(generation) = runtime_state.active_generation else {
+                    continue;
+                };
+                if runtime_state.last_error_code.as_deref()
+                    == Some("route_activation_verification_failed")
                 {
+                    if let Some(reason) = self.resolve_active_route_failure_readyz_reason(
+                        &env,
+                        &project_id,
+                        &environment,
+                        &runtime_state,
+                        generation,
+                        now_unix,
+                    ) {
+                        reasons.push(reason);
+                    }
+                    continue;
+                }
+                if runtime_state.health_state == RuntimeHealthState::Healthy {
                     continue;
                 }
                 reasons.extend(readyz_reasons_for_runtime_state(
@@ -1054,10 +1080,160 @@ where
                     &project_id,
                     &environment,
                     &runtime_state,
+                    now_unix,
                 ));
             }
         }
         reasons
+    }
+
+    fn resolve_active_route_failure_readyz_reason(
+        &mut self,
+        env: &EnvironmentPaths,
+        project_id: &str,
+        environment: &str,
+        runtime_state: &crate::storage::RuntimeState,
+        generation: u64,
+        now_unix: u64,
+    ) -> Option<ReadyzReason> {
+        let summary = DiagnosticsStore::new(env.clone(), generation)
+            .read_summary()
+            .ok()
+            .flatten();
+        let route_check = self.active_route_failure_state(env, project_id, environment, generation);
+        match route_check {
+            RouteFailureState::Resolved => {
+                let _ = clear_resolved_route_failure_marker(env, generation);
+                None
+            }
+            RouteFailureState::Unresolved(message) => Some(ReadyzReason {
+                project_id: project_id.into(),
+                environment: environment.into(),
+                generation: Some(generation),
+                active: true,
+                unresolved: true,
+                source: "runtime_state_cache".into(),
+                marker: "route_activation_verification_failed".into(),
+                message,
+                last_checked_unix: Some(now_unix),
+                cache_age_ms: 0,
+            }),
+            RouteFailureState::Unknown => {
+                let historical_startup_failure = summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.failure_stage == "startup_recovery");
+                if runtime_state.health_state == RuntimeHealthState::Healthy {
+                    let _ = clear_resolved_route_failure_marker(env, generation);
+                    return None;
+                }
+                if historical_startup_failure {
+                    let message = summary
+                        .as_ref()
+                        .and_then(|summary| summary.blocking_reason.clone())
+                        .unwrap_or_else(|| "route activation verification failed".into());
+                    return Some(ReadyzReason {
+                        project_id: project_id.into(),
+                        environment: environment.into(),
+                        generation: Some(generation),
+                        active: true,
+                        unresolved: true,
+                        source: "runtime_state_cache".into(),
+                        marker: "route_activation_verification_failed".into(),
+                        message,
+                        last_checked_unix: Some(now_unix),
+                        cache_age_ms: 0,
+                    });
+                }
+                let message = summary
+                    .as_ref()
+                    .and_then(|summary| summary.blocking_reason.clone())
+                    .unwrap_or_else(|| "route activation verification failed".into());
+                Some(ReadyzReason {
+                    project_id: project_id.into(),
+                    environment: environment.into(),
+                    generation: Some(generation),
+                    active: true,
+                    unresolved: true,
+                    source: "runtime_state_cache".into(),
+                    marker: "route_activation_verification_failed".into(),
+                    message,
+                    last_checked_unix: Some(now_unix),
+                    cache_age_ms: 0,
+                })
+            }
+        }
+    }
+
+    fn active_route_failure_state(
+        &mut self,
+        env: &EnvironmentPaths,
+        project_id: &str,
+        environment: &str,
+        generation: u64,
+    ) -> RouteFailureState {
+        let Some(runtime) = load_generation_runtime_info(env, generation).ok().flatten() else {
+            return RouteFailureState::Unknown;
+        };
+        let Some(domain) = ProjectRegistryStore::new(&self.config.storage_root)
+            .get(project_id)
+            .ok()
+            .flatten()
+            .map(|project| derive_environment_domain(&project.base_domain, environment))
+        else {
+            return RouteFailureState::Unknown;
+        };
+
+        let checks = collect_expected_route_checks(project_id, environment, &domain, &runtime);
+        if checks.is_empty() {
+            return RouteFailureState::Resolved;
+        }
+
+        for check in checks {
+            let Ok(container) = self.docker_runtime.inspect_container(&check.container_name) else {
+                return RouteFailureState::Unknown;
+            };
+            let Some(expected_route) = expected_route_for_runtime(
+                project_id,
+                environment,
+                Some(domain.clone()),
+                &check.runtime,
+                &container,
+                check.network_name.as_deref(),
+            ) else {
+                return RouteFailureState::Unknown;
+            };
+            let inspection = match self.routing_runtime.inspect_route(&check.subtree_id) {
+                Ok(inspection) => inspection,
+                Err(_) => return RouteFailureState::Unknown,
+            };
+            if !inspection.activation_verified {
+                return RouteFailureState::Unresolved(format!(
+                    "route activation not verified for {}",
+                    check.subtree_id
+                ));
+            }
+            if inspection.health_checks_enabled {
+                return RouteFailureState::Unresolved(format!(
+                    "route health checks still enabled for {}",
+                    check.subtree_id
+                ));
+            }
+            if inspection.active_target != expected_route.target {
+                return RouteFailureState::Unresolved(format!(
+                    "route target mismatch: current={} expected={}",
+                    inspection.active_target, expected_route.target
+                ));
+            }
+            if inspection.domain.as_deref() != Some(domain.as_str()) {
+                return RouteFailureState::Unresolved(format!(
+                    "route domain mismatch: current={} expected={}",
+                    inspection.domain.as_deref().unwrap_or("unknown"),
+                    domain
+                ));
+            }
+        }
+
+        RouteFailureState::Resolved
     }
 }
 
@@ -1171,6 +1347,7 @@ fn readyz_reasons_for_runtime_state(
     project_id: &str,
     environment: &str,
     runtime_state: &crate::storage::RuntimeState,
+    now_unix: u64,
 ) -> Vec<ReadyzReason> {
     let generation = runtime_state.active_generation;
     let marker =
@@ -1199,9 +1376,13 @@ fn readyz_reasons_for_runtime_state(
         project_id: project_id.into(),
         environment: environment.into(),
         generation,
+        active: true,
+        unresolved: true,
         source: "runtime_state_cache".into(),
         marker,
         message,
+        last_checked_unix: Some(now_unix),
+        cache_age_ms: 0,
     }]
 }
 
@@ -1210,9 +1391,125 @@ fn control_plane_reason(marker: &str, message: String) -> ReadyzReason {
         project_id: "_control_plane".into(),
         environment: "daemon".into(),
         generation: None,
+        active: true,
+        unresolved: true,
         source: "daemon_readiness_cache".into(),
         marker: marker.into(),
         message,
+        last_checked_unix: Some(current_unix_timestamp()),
+        cache_age_ms: 0,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedRouteCheck {
+    subtree_id: String,
+    runtime: PersistedRuntimeInfo,
+    container_name: String,
+    network_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteFailureState {
+    Resolved,
+    Unresolved(String),
+    Unknown,
+}
+
+fn annotate_readyz_reasons(reasons: &mut [ReadyzReason], cache_age_ms: u64) {
+    for reason in reasons {
+        reason.active = true;
+        reason.unresolved = true;
+        reason.cache_age_ms = cache_age_ms;
+    }
+}
+
+fn clear_resolved_route_failure_marker(
+    env: &EnvironmentPaths,
+    generation: u64,
+) -> Result<(), crate::storage::StorageError> {
+    let runtime_store = RuntimeStateStore::new(env.clone());
+    let mut runtime_state = runtime_store.load()?;
+    if runtime_state.active_generation != Some(generation)
+        || runtime_state.last_error_code.as_deref() != Some("route_activation_verification_failed")
+    {
+        return Ok(());
+    }
+    runtime_state.last_error_code = None;
+    runtime_state.health_state = RuntimeHealthState::Healthy;
+    runtime_state.degraded_since_unix = None;
+    runtime_state.last_transition = "healthy".into();
+    runtime_store.save(&runtime_state)
+}
+
+fn collect_expected_route_checks(
+    project_id: &str,
+    environment: &str,
+    _domain: &str,
+    runtime: &PersistedRuntimeInfo,
+) -> Vec<ExpectedRouteCheck> {
+    if runtime.services.is_empty() {
+        let Some(PersistedActivationMode::Http {
+            route_subtree_id, ..
+        }) = runtime.activation.as_ref()
+        else {
+            return Vec::new();
+        };
+        return vec![ExpectedRouteCheck {
+            subtree_id: route_subtree_id
+                .clone()
+                .unwrap_or_else(|| format!("forge:{project_id}:{environment}")),
+            runtime: runtime.clone(),
+            container_name: runtime.container_name.clone(),
+            network_name: runtime.network_name.clone(),
+        }];
+    }
+
+    let service_count = runtime.services.len();
+    runtime
+        .services
+        .values()
+        .filter_map(|service| {
+            let PersistedActivationMode::Http {
+                route_subtree_id, ..
+            } = service.activation.as_ref()?
+            else {
+                return None;
+            };
+            Some(ExpectedRouteCheck {
+                subtree_id: route_subtree_id.clone().unwrap_or_else(|| {
+                    if service_count <= 1 {
+                        format!("forge:{project_id}:{environment}")
+                    } else {
+                        format!("forge:{project_id}:{environment}:{}", service.service_id)
+                    }
+                }),
+                runtime: persisted_runtime_for_service(service),
+                container_name: service.container_name.clone(),
+                network_name: service.network_name.clone(),
+            })
+        })
+        .collect()
+}
+
+fn persisted_runtime_for_service(service: &PersistedServiceRuntimeInfo) -> PersistedRuntimeInfo {
+    PersistedRuntimeInfo {
+        container_name: service.container_name.clone(),
+        running: service.running,
+        network_name: service.network_name.clone(),
+        probe_path: service.probe_path.clone(),
+        activation: service.activation.clone(),
+        runtime_policy: service.runtime_policy.clone(),
+        runtime_usage: service.runtime_usage.clone(),
+        termination: service.termination.clone(),
+        environment_variables: service.environment_variables.clone(),
+        volume_mounts: service.volume_mounts.clone(),
+        source_ref: service.source_ref.clone(),
+        repo_url: service.repo_url.clone(),
+        commit_sha: service.commit_sha.clone(),
+        source_path: service.source_path.clone(),
+        services: Default::default(),
+        startup_order: Vec::new(),
     }
 }
 
@@ -2155,6 +2452,7 @@ pub mod daemon_refuses_api_commands_before_ready {
 #[cfg(test)]
 pub mod daemon_readyz_route_repair_resolution {
     use super::*;
+    use crate::api::ProjectUpsertRequest;
     use crate::storage::{
         DiagnosticSummary, DiagnosticsStore, PointerStore, RuntimeState, RuntimeStateStore,
         SnapshotState, SnapshotWriter,
@@ -2167,9 +2465,32 @@ pub mod daemon_readyz_route_repair_resolution {
         last_transition: &str,
         last_error_code: Option<&str>,
     ) {
+        ProjectRegistryStore::new(root)
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("api".into()),
+                    repo_url: "https://example.com/api.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
         let env = EnvironmentPaths::new(root, "api", "production");
-        SnapshotWriter::new(env.clone(), 1)
-            .unwrap()
+        let writer = SnapshotWriter::new(env.clone(), 1).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-1\",\n  \"image_ref\": \"forge/api:prod-gen-1\"\n}\n",
+            )
+            .unwrap();
+        writer
+            .write_artifact(
+                "runtime.json",
+                "{\n  \"container_name\": \"prod-api-gen-1\",\n  \"running\": true,\n  \"network_name\": \"forge-managed\",\n  \"probe_path\": \"/health\",\n  \"activation\": { \"Http\": { \"internal_port\": 3000, \"route_subtree_id\": \"forge:api:production\", \"target_source\": \"ContainerIp\" } },\n  \"environment_variables\": {}\n}\n",
+            )
+            .unwrap();
+        writer
             .finalize("api", "production", SnapshotState::Healthy)
             .unwrap();
         PointerStore::new(env.clone()).swap_current(1).unwrap();
@@ -2188,7 +2509,7 @@ pub mod daemon_readyz_route_repair_resolution {
     }
 
     #[test]
-    fn resolved_route_failure_clears_readyz_degraded_state() {
+    fn readiness_cache_ignores_resolved_route_failure_marker() {
         let root = test_root("readyz-clears-after-route-repair-success");
         seed_runtime_state(
             &root,
@@ -2209,8 +2530,29 @@ pub mod daemon_readyz_route_repair_resolution {
     }
 
     #[test]
-    fn historical_route_failure_does_not_degrade_readyz() {
+    fn readiness_cache_clears_route_failure_after_healthy_route_match() {
         let root = test_root("stale-route-repair-failure-does-not-keep-readyz-degraded");
+        seed_runtime_state(
+            &root,
+            RuntimeHealthState::Degraded,
+            "route_repair_failed",
+            Some("route_activation_verification_failed"),
+        );
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_status(), "ready");
+    }
+
+    #[test]
+    fn readyz_not_degraded_by_historical_route_failure_marker() {
+        let root = test_root("historical-route-failure-does-not-degrade-readyz");
         seed_runtime_state(
             &root,
             RuntimeHealthState::Healthy,

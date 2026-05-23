@@ -586,9 +586,17 @@ pub struct ReadyzReason {
     pub environment: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub unresolved: bool,
     pub source: String,
     pub marker: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_unix: Option<u64>,
+    #[serde(default)]
+    pub cache_age_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

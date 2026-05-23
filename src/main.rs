@@ -684,10 +684,10 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
         latencies_ms.push(latency_ms);
         match target {
             "readyz" => {
-                last_readyz = Some(decode_public_json::<ReadyzResponse>(response)?);
+                last_readyz = Some(decode_raw_json::<ReadyzResponse>(response)?);
             }
             "convergence" => {
-                last_metrics = Some(decode_public_json::<MetricsResponse>(response)?);
+                last_metrics = Some(decode_raw_json::<MetricsResponse>(response)?);
             }
             _ => {}
         }
@@ -712,7 +712,7 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
     match target {
         "readyz" => {
             let readyz = last_readyz.expect("readyz benchmark should decode response");
-            let metrics = decode_public_json::<MetricsResponse>(
+            let metrics = decode_raw_json::<MetricsResponse>(
                 client
                     .get(format!("{}/metrics", base_url.trim_end_matches('/')))
                     .send()
@@ -745,7 +745,7 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
     Ok(())
 }
 
-fn decode_public_json<T: DeserializeOwned>(
+fn decode_raw_json<T: DeserializeOwned>(
     response: reqwest::blocking::Response,
 ) -> Result<T, CliError> {
     let status = response.status();
@@ -754,14 +754,13 @@ fn decode_public_json<T: DeserializeOwned>(
         .map_err(|err| CliError::Http(err.to_string()))?;
     let body_text = String::from_utf8_lossy(&body).into_owned();
     if status.is_success() {
-        let envelope = serde_json::from_slice::<SuccessEnvelope<T>>(&body).map_err(|err| {
+        serde_json::from_slice::<T>(&body).map_err(|err| {
             CliError::Http(format!(
                 "error decoding response body: {err}; status: {}; body: {}",
                 status.as_u16(),
                 summarize_response_body(&body_text)
             ))
-        })?;
-        Ok(envelope.data)
+        })
     } else {
         Err(CliError::Http(format!(
             "bench request failed with status {}: {}",
