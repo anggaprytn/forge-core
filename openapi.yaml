@@ -23,7 +23,7 @@ paths:
   /readyz:
     get:
       summary: Readiness check
-      description: Cache-backed control-plane readiness. Serves cached convergence state and must remain bounded-time. Not intended for fleet diagnostics or per-project health inspection.
+      description: Cache-backed control-plane readiness. Serves cached convergence state, startup phase, and degraded reasons in bounded time. It must not perform fleet scans, replay execution, or per-project health inspection on the request path.
       security: []
       responses:
         '200':
@@ -41,7 +41,7 @@ paths:
   /metrics:
     get:
       summary: Cached control-plane metrics
-      description: Cache-backed convergence and dependency metrics. Request handling is bounded-time and does not trigger live Docker or Caddy scans.
+      description: Cache-backed JSON control-plane telemetry including startup phase, leadership, replay, cache age, dependency breaker, and split-brain detection fields. Request handling is bounded-time and does not trigger live Docker or Caddy scans.
       security: []
       responses:
         '200':
@@ -49,7 +49,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/MetricsSnapshot'
   /api/projects:
     post:
       summary: Create or update a project registry entry
@@ -496,11 +496,16 @@ components:
       type: object
       required:
         - status
+        - startup_phase
       properties:
         status:
           type: string
           example: ready
           description: Control-plane readiness status. Common values are ready, degraded, and not_ready.
+        startup_phase:
+          type: string
+          example: leader_active
+          description: Current daemon startup phase. Values are booting, replaying, leader_acquiring, follower, leader_active, or degraded.
         reason:
           type:
             - string
@@ -510,6 +515,105 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ReadyzReason'
+    DependencyBreakerDiagnostics:
+      type: object
+      properties:
+        state:
+          type: string
+        failure_count:
+          type: integer
+          format: int64
+        last_success_unix:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        next_retry_unix:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        last_error:
+          type:
+            - string
+            - 'null'
+    MetricsDependencySnapshot:
+      type: object
+      properties:
+        probe_latency_ms:
+          type: integer
+          format: int64
+        breaker:
+          $ref: '#/components/schemas/DependencyBreakerDiagnostics'
+    ClusterDiagnostics:
+      type: object
+      properties:
+        observed_nodes:
+          type: integer
+        active_reconcilers:
+          type: integer
+        lease_epoch_divergence:
+          type: boolean
+        split_brain_suspected:
+          type: boolean
+        multiple_active_reconcilers:
+          type: boolean
+        checkpoint_owner_mismatch:
+          type: boolean
+        snapshot_owner_mismatch:
+          type: boolean
+        local_role:
+          type: string
+        heartbeat_age_ms:
+          type: integer
+          format: int64
+    MetricsSnapshot:
+      type: object
+      required:
+        - startup_phase
+        - leader
+        - follower_mode
+        - reconciliation_enabled
+        - replay_in_progress
+        - lease_epoch
+        - readiness_cache_age_ms
+      properties:
+        startup_phase:
+          type: string
+        leader:
+          type: boolean
+        follower_mode:
+          type: boolean
+        reconciliation_enabled:
+          type: boolean
+        replay_in_progress:
+          type: boolean
+        lease_epoch:
+          type: integer
+          format: int64
+        readiness_cache_age_ms:
+          type: integer
+          format: int64
+        convergence_loop_duration_ms:
+          type: integer
+          format: int64
+        queue_depth:
+          type: integer
+        pending_intents:
+          type: integer
+        replay_queue_depth:
+          type: integer
+        replay_paused:
+          type: boolean
+        replay_quarantined_total:
+          type: integer
+          format: int64
+        docker:
+          $ref: '#/components/schemas/MetricsDependencySnapshot'
+        caddy:
+          $ref: '#/components/schemas/MetricsDependencySnapshot'
+        cluster:
+          $ref: '#/components/schemas/ClusterDiagnostics'
     ReadyzReason:
       type: object
       required:

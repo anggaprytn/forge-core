@@ -10,24 +10,22 @@ forge daemon
 
 It is intentionally aligned to the current implementation, not an aspirational installer.
 
-## Alpha Core Loop v4 Validated (May 2026)
+## Alpha Core Loop v5 Validated (May 2026)
 
-The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration loop on VPS infrastructure with persisted runtime policy, cache-backed readiness, and degraded-runtime operator signals.
+The Forge Alpha Core Loop v5 milestone freezes the durable single-writer control plane on VPS infrastructure.
 
-### Validated Capabilities (v4)
+### Validated Capabilities (v5)
 
-- **Per-Service CPU/Memory/Restart Policy**: Runtime policy persists per service and round-trips through status, diagnostics, rollback, and convergence.
-- **Rollback Restores Historical Runtime Policy**: VPS rollback restores the exact historical runtime policy of the rollback target.
-- **Convergence Repairs Runtime Policy Drift**: Manual Docker-side policy drift is detected and repaired back to promoted truth.
-- **OOM/Crash-Loop/Restart-Storm Promotion Gates**: Warmup refuses to promote unstable services.
-- **Termination Diagnostics**: Diagnose/status expose exit reason, signal, OOM state, restart count, and tails when available.
-- **Runtime Usage Snapshots**: Active services expose captured CPU and memory usage snapshots.
-- **Cache-Backed Readiness**: Convergence computes readiness asynchronously and `/readyz` serves cached control-plane truth.
-- **Single-Writer Leadership Lease**: Forge persists a bounded filesystem lease in `control_plane/leader_lease.json` and allows only one active reconciler at a time.
-- **Non-Fatal Route Repair Failures**: Route repair issues degrade readiness without falsely claiming full readiness.
-- **Readyz Active Degradation Semantics**: `/readyz` may return `degraded` with active repair reasons while `/healthz` remains live.
-- **Clean Diagnostics API Repair Fields**: Current unresolved runtime policy and volume repair events remain visible; healthy historical noise is suppressed.
-- **Multi-Service Stateful Baseline**: v3 topology, state, backup/restore, and restore-lineage guarantees remain validated.
+- **Durable Checkpoints**: `convergence_checkpoint.json` restores cache-backed readiness after restart.
+- **Control-Plane Snapshots**: `runtime_snapshot.json`, `route_snapshot.json`, and `dependency_snapshot.json` support diagnostics with bounded retention.
+- **Persistent Node Identity**: Stable `node_id`, metadata, boot timestamp, and capabilities survive daemon restart.
+- **Operational Journal**: `operations.jsonl` records leadership, degradation, route, deploy/restore, and GC events.
+- **Lease-Based Single Writer**: `leader_lease.json` fences mutating work to one active leader and advances `lease_epoch` on takeover.
+- **Follower Read-Only Mode**: Followers serve cache-backed reads only and never mutate shared control-plane state.
+- **Split-Brain Detection Scaffolding**: `cluster_nodes.json` tracks heartbeat observations and degraded signals such as `split_brain_suspected`.
+- **Deterministic Replay Recovery**: Startup phases are explicit and replay is bounded, resumable, leader-only, and quarantine-aware.
+- **Cache-Backed Request Paths**: `/readyz` and `/metrics` remain bounded and do not perform fleet scans.
+- **Validated Live Checks**: local `/readyz` around `8ms`; `forge bench leader` and `forge bench convergence` around `0.23ms` p95; daemon restart returns to `leader_active`.
 
 ## Alpha Core Loop v2 Validated (May 2026)
 
@@ -255,8 +253,14 @@ systemctl enable --now forge
 
 ```bash
 curl http://127.0.0.1:8080/healthz
-curl http://127.0.0.1:8080/readyz
-curl http://127.0.0.1:8080/metrics
+curl -s http://127.0.0.1:8080/readyz | jq
+curl -s http://127.0.0.1:8080/metrics | jq
+forge control-plane leader
+forge control-plane lease
+forge --url http://127.0.0.1:8080 bench leader
+forge --url http://127.0.0.1:8080 bench convergence
+forge --url http://127.0.0.1:8080 bench diagnostics
+forge --url http://127.0.0.1:8080 bench snapshots
 ```
 
 Semantics:

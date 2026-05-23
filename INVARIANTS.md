@@ -268,6 +268,29 @@ Runtime policy invariants:
 - promotion must fail closed when warmup detects OOM kills, crash loops, restart storms, or unstable required dependencies
 - degraded readiness may report active repair failures while basic liveness remains healthy
 
+Durable single-writer control-plane invariants:
+
+- only the active leader may mutate shared runtime or control-plane state
+- follower nodes are read-only and serve cached truth only
+- replay requires valid lease ownership
+- every replay mutation is lease-fenced by current owner and `lease_epoch`
+- destructive replay is blocked unless explicitly safe
+- corrupted intents are quarantined
+- readiness remains bounded during replay
+- convergence computes operational truth asynchronously
+- APIs serve cached truth
+
+Startup and replay invariants:
+
+- startup phases are explicit: `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, `degraded`
+- replay cannot run without valid lease ownership
+- convergence does not start before replay stabilizes
+- followers never replay
+- replay aborts on lease loss
+- replay is bounded and resumable
+- checkpoint and snapshot owner mismatches degrade readiness instead of being silently repaired
+- split-brain handling is detection and degradation only, not automatic distributed recovery
+
 ---
 
 ## 14. Restart Recovery Invariants

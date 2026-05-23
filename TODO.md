@@ -1,11 +1,37 @@
 # Forge TODO
 
-Current baseline: Alpha Core Loop v4 is validated.
-Goal: harden the frozen single-node stateful runtime without reopening core scope.
+Current baseline: Alpha Core Loop v5 is validated.
+Goal: harden the frozen durable single-writer control plane without reopening runtime scope.
 
 ---
 
 # Frozen Milestone
+
+Validated and frozen in Alpha Core Loop v5:
+
+- [x] Durable control-plane checkpoints
+- [x] Cache-backed warm startup
+- [x] Checkpoint schema versioning
+- [x] Stale/corrupt checkpoint degradation
+- [x] Runtime snapshots
+- [x] Route snapshots
+- [x] Dependency snapshots
+- [x] Snapshot retention and GC
+- [x] Persistent node identity
+- [x] Node metadata and boot timestamp
+- [x] Append-only operational journal
+- [x] Lease-based single-writer control plane
+- [x] Leader lease epoch fencing
+- [x] Follower read-only mode
+- [x] Mutating APIs require leader
+- [x] Split-brain detection scaffolding
+- [x] Reconciliation intent log
+- [x] Replay cursor and bounded replay
+- [x] Replay quarantine for corrupted intents
+- [x] Deterministic startup phases
+- [x] Cache-backed `/readyz`
+- [x] Cache-backed JSON `/metrics`
+- [x] Restart recovery returns to `leader_active`
 
 Validated and frozen in Alpha Core Loop v4:
 
@@ -56,7 +82,7 @@ Validated and frozen in Alpha Core Loop v3:
 - [ ] Improve `forge diagnose` restore lineage readability
 - [ ] Improve `forge history` / backup history cross-linking
 - [ ] Improve per-service status/log formatting
-- [ ] Improve degraded `readyz` operator messaging
+- [ ] Improve degraded `readyz` and replay/quarantine operator messaging
 - [ ] Improve termination diagnostics readability in CLI output
 - [ ] Improve restore safety messaging in CLI and API output
 
@@ -67,6 +93,7 @@ Validated and frozen in Alpha Core Loop v3:
 - [ ] Docker unavailable recovery for restore paths
 - [ ] Caddy unavailable recovery during restore promotion
 - [ ] Extend recovery coverage for repeated route repair failure paths
+- [ ] Add deeper validation for malformed journal rotation edge cases
 
 ## Auth And Operator Flows
 
@@ -139,8 +166,8 @@ Do this in narrow slices.
 ## 2.1 Metrics
 
 - [x] Add minimal metrics registry
-- [x] Expose `GET /metrics`
-- [x] Output Prometheus text format
+- [x] Expose cache-backed JSON `GET /metrics`
+- [x] Keep metrics request path bounded and cache-backed
 
 Track:
 

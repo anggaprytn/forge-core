@@ -141,6 +141,30 @@ forge diagnose my-app production
 
 `forge diagnose` is the deep diagnostics surface. It reports runtime truth, termination details such as restart count, exit code, signal, OOM state, termination reason, and unresolved runtime-policy or volume-repair events when the environment is degraded.
 
+### Inspect Control-Plane Leadership
+
+```bash
+forge control-plane leader
+forge control-plane lease
+```
+
+Use these commands to inspect the current `node_id`, active leader, `lease_epoch`, lease age, follower mode, and split-brain detection scaffolding from cached control-plane telemetry.
+
+### Benchmark Cache-Backed Control-Plane Paths
+
+```bash
+forge --url http://127.0.0.1:18080 bench leader
+forge --url http://127.0.0.1:18080 bench convergence
+forge --url http://127.0.0.1:18080 bench diagnostics
+forge --url http://127.0.0.1:18080 bench snapshots
+```
+
+Validated live measurements for the v5 milestone:
+
+- local `/readyz`: around `8ms`
+- `forge bench leader` p95: around `0.23ms`
+- `forge bench convergence` p95: around `0.23ms`
+
 After a backup restore, `forge diagnose` reports active lineage similar to:
 
 ```txt
@@ -370,7 +394,7 @@ ok
 ready
 ```
 
-`/metrics` returns Prometheus text exposition for operational visibility.
+`/metrics` returns cache-backed JSON control-plane telemetry for operational visibility.
 `/` returns the embedded `web/index.html` landing page.
 The alpha web UI is intentionally framework-free: plain HTML, CSS, and vanilla JS served directly by Forge with no frontend build step.
 CLI login uses a short-lived browser approval flow:
@@ -686,20 +710,25 @@ curl http://localhost:8080/events
 
 # Metrics
 
-Forge exposes a minimal Prometheus-compatible metrics endpoint:
+Forge exposes a cache-backed JSON metrics endpoint:
 
 ```bash
-curl http://localhost:8080/metrics
+curl -s http://127.0.0.1:18080/metrics | jq
 ```
 
-Current metrics:
+Representative fields:
 
-- `forge_deployments_total`
-- `forge_deployments_failed_total`
-- `forge_deployments_rollback_total`
-- `forge_queue_depth`
+- `startup_phase`
+- `leader`
+- `follower_mode`
+- `reconciliation_enabled`
+- `lease_epoch`
+- `replay_in_progress`
+- `readiness_cache_age_ms`
+- `convergence_loop_duration_ms`
+- `cluster.split_brain_suspected`
 
-`forge_queue_depth` reports the current number of queued deployments waiting to run.
+The metrics endpoint must stay bounded and cache-backed. It does not perform live Docker scans, live Caddy scans, replay, or cross-node communication on the request path.
 
 ---
 

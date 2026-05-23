@@ -24,7 +24,7 @@ Forge treats deployment as a continuous state machine, not a one-time event. It 
 
 ### 1. Simple Configuration (`forge.yml`)
 
-Forge Alpha Core Loop v4 extends the single-node multi-service model with persisted per-service runtime policy, rollback/convergence policy fidelity, warmup promotion gates for unstable runtimes, cache-backed readiness, runtime usage snapshots, and cleaner operator diagnostics.
+Forge Alpha Core Loop v5 freezes the durable single-writer control-plane loop on top of the single-node multi-service model. The validated scope now includes lease-based single-writer control, cache-backed readiness and metrics, durable checkpoints, immutable control-plane snapshots, node identity, split-brain detection scaffolding, and deterministic startup/replay recovery.
 
 ```yaml
 version: 1
@@ -144,27 +144,30 @@ Isolation and tenancy notes:
 - **Stateful Alpha Scope:** Docker-volume backed stateful services are supported on one host with backup/restore primitives.
 - **Secret-Safe:** Automated redaction across logs, events, and diagnostics.
 
-### Alpha Core Loop v4 Validated
+### Alpha Core Loop v5 Validated
 
-Forge Alpha Core Loop v4 freezes the single-node stateful orchestration loop with runtime policy fidelity and degraded-runtime promotion safety.
+Forge Alpha Core Loop v5 freezes the durable single-writer control plane for the current single-node stateful runtime.
 
-- **Per-Service Runtime Policy:** Each service persists CPU, memory, and restart policy in generation metadata.
-- **Rollback Runtime Policy Fidelity:** Rollback restores the exact historical runtime policy for each service.
-- **Convergence Runtime Policy Repair:** Drift in restart policy, CPU limit, memory limit, or attached runtime policy is repaired back to promoted truth.
-- **Promotion Gates For Unstable Runtime:** OOM kills, crash loops, restart storms, unstable probes, and unstable required dependencies block promotion.
-- **Termination Diagnostics:** `forge diagnose` and API diagnostics expose exit reason, exit code, signal, restart count, OOM state, and log tails when available.
-- **Runtime Usage Snapshots:** Status and diagnostics surface captured CPU and memory usage snapshots for active services.
-- **Cache-Backed Readiness:** The convergence loop computes readiness asynchronously and `/readyz` serves cached control-plane truth in bounded time.
-- **Single-Writer Lease Semantics:** Forge now persists a bounded filesystem lease under `control_plane/leader_lease.json` so only one node is allowed to reconcile shared control-plane state at a time.
-- **Distributed-Reconciliation Preparation:** Forge now persists `control_plane/cluster_nodes.json`, runs a separate heartbeat loop, and exposes heuristic split-brain signals without adding cross-node dependencies to request paths.
-- **Reconciliation Intent Journaling:** Every replayable reconciliation mutation now records a durable intent in `control_plane/reconciliation_log.jsonl` before mutating runtime state.
-- **Deterministic Replay Cursor:** Forge tracks bounded replay progress in `control_plane/reconciliation_cursor.json` so crash recovery stays resumable and request paths remain cache-backed.
-- **Cache-Backed Metrics:** `/metrics` exposes cached convergence timings, readiness counters, cache age, and Docker/Caddy breaker state without live scans on the request path.
-- **Dependency Circuit Breakers:** Docker and Caddy probing use bounded retries with automatic degraded-mode backoff and automatic recovery closure.
-- **Non-Fatal Route Repair Failures:** Startup route-repair failure degrades readiness reporting without failing basic liveness.
-- **Readyz Active Degradation Semantics:** `/readyz` returns `degraded` with concrete reasons while the daemon remains operational enough to serve requests.
-- **Clean Repair Diagnostics:** Diagnostics separate current repair signals from historical repair noise for runtime policy and volume repair fields.
-- **Stateful Multi-Service Baseline:** Multi-service topology, internal DNS, stateful volumes, backup/restore, restore lineage, and GC safety remain part of the validated core.
+- **Durable Control-Plane Checkpoints:** `control_plane/convergence_checkpoint.json` restores cached readiness, breaker state, queue depth, and control-plane freshness on warm startup. Checkpoints are schema-versioned; stale or corrupt files degrade readiness and are ignored rather than trusted.
+- **Immutable Runtime And Route Snapshots:** `control_plane/control_plane_snapshots/` stores `runtime_snapshot.json`, `route_snapshot.json`, and `dependency_snapshot.json` with bounded retention and GC. Operators can use them for diagnostics when live dependencies are unavailable, and corrupted snapshots are skipped and rebuilt later.
+- **Persistent Node Identity:** `control_plane/node.json` stores stable `node_id`, node metadata, boot timestamp, and capability hints. Node identity survives daemon restart and is used for leadership attribution and diagnostics only.
+- **Operational Journal:** `control_plane/operations.jsonl` is an append-only JSONL journal for leadership changes, convergence degradation, route changes, deployment and restore events, and GC activity. Rotation is bounded and malformed entries are skipped rather than blocking startup.
+- **Lease-Based Single Writer:** `control_plane/leader_lease.json` fences the active reconciler. The leader heartbeats a bounded lease, every takeover advances `lease_epoch`, stale leases can be taken over only after expiry, followers stay read-only, and mutating APIs require the local node to be the active leader.
+- **Split-Brain Detection Scaffolding:** `control_plane/cluster_nodes.json` stores heartbeat observations, `observed_nodes`, `active_reconcilers`, `lease_epoch_divergence`, owner mismatch signals, and `split_brain_suspected`. This milestone performs detection and degradation only; it does not do automatic distributed repair.
+- **Reconciliation Intent Log:** `control_plane/reconciliation_log.jsonl` is the intent-first mutation boundary and `control_plane/reconciliation_cursor.json` tracks replay progress. Intents are classified as `replay_safe`, `idempotent`, `destructive`, or `requires_operator_intervention`; corrupted entries are quarantined.
+- **Deterministic Startup And Replay Recovery:** Startup phases are explicit: `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, `degraded`. Replay never runs without valid lease ownership, followers never replay, convergence waits for replay stabilization, lease loss aborts replay, and request paths stay cache-backed while recovery remains bounded and resumable.
+- **Cache-Backed Readiness And Metrics:** `/healthz` is process liveness, `/readyz` is cache-backed control-plane readiness, `/metrics` is cache-backed control-plane telemetry, and `forge diagnose` plus `forge status` remain the deep/runtime inspection surfaces. Request paths never perform fleet scans.
+- **Validated Restart Recovery:** After daemon restart Forge returns to `ready`, `startup_phase=leader_active`, `replay_in_progress=false`, `leader=true`, `follower_mode=false`, and `reconciliation_enabled=true` without reopening synchronous inspection on the request path.
+
+Measured live checks for this milestone:
+
+- local `/readyz`: about `8ms`
+- `startup_phase`: `leader_active`
+- `replay_in_progress`: `false`
+- `leader`: `true`
+- `follower_mode`: `false`
+- `forge bench leader` p95: about `0.23ms`
+- `forge bench convergence` p95: about `0.23ms`
 
 Operational benchmarking helpers are available through:
 
@@ -172,8 +175,12 @@ Operational benchmarking helpers are available through:
 forge --url http://127.0.0.1:18080 bench readyz
 forge --url http://127.0.0.1:18080 bench leader
 forge --url http://127.0.0.1:18080 bench convergence
+forge --url http://127.0.0.1:18080 bench diagnostics
+forge --url http://127.0.0.1:18080 bench snapshots
 forge control-plane leader
 forge control-plane lease
+curl -s http://127.0.0.1:18080/readyz | jq
+curl -s http://127.0.0.1:18080/metrics | jq
 ```
 
 Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, which produced pathological latency in the 48s to 150s range. The current model keeps readiness off the fleet-inspection path and bounded under scale.
@@ -188,20 +195,15 @@ Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, w
 - current multi-node work is preparatory only: Forge remains single-writer with one active reconciler
 - no PITR, no distributed storage, no automatic quiescing
 
-### Leadership And Follower Mode
+### Strong Non-Goals
 
-Forge is still not a distributed orchestrator. The new lease layer is a safety primitive, not HA consensus, and it prepares future HA work while keeping the current model single-writer.
-
-- The active leader renews a bounded TTL lease and is the only node allowed to reconcile routing, retention, backup GC, and convergence checkpoints.
-- Follower nodes do not mutate shared control-plane state. They serve cached reads only, including cached `/readyz` and `/metrics` responses, expose lease state, and stay ready when cached control-plane truth is still valid.
-- Lease takeover is allowed only after expiry and each successful acquisition advances a monotonic `lease_epoch`.
-- Mutating APIs require the active leader. Deploy, backup/restore, retention, and other shared-state mutation paths are rejected on followers.
-- The filesystem-backed lease is not safe for true multi-writer distributed storage unless every node uses the same shared filesystem with correct atomic create/write/rename semantics.
-- `control_plane/cluster_nodes.json` is topology and heartbeat state only. It is not consensus membership, not a lock service, and not an authority for automatic repair.
-- Split-brain handling is heuristic detection and degraded signaling only. Forge does not attempt automatic multi-node repair.
-- `/readyz` now degrades for leadership-specific uncertainty such as `leadership uncertain`, `convergence ownership lost`, `lease stale`, `checkpoint epoch mismatch`, `split_brain_suspected`, `multiple_active_reconcilers`, `checkpoint_owner_mismatch`, and `lease_epoch_divergence`.
-- `/readyz` also degrades for replay-specific states such as `reconciliation_replay_incomplete`, `unrecoverable_pending_intents`, `destructive_replay_blocked`, `replay_cursor_corrupted`, and `reconciliation_log_corrupted`.
-- Request paths remain isolated from reconciliation and cross-node communication. Followers stay read-only during divergence and continue serving cache-backed reads in bounded time.
+- Forge does not implement Raft.
+- Forge does not implement distributed consensus.
+- Forge does not provide true HA yet.
+- The filesystem-backed lease is a single-writer safety primitive, not consensus.
+- Multi-node support in this milestone is scaffolding and detection only.
+- Split-brain handling is detection and degradation, not automatic distributed recovery.
+- Request paths never depend on cross-node communication.
 
 ### Reconciliation Replay
 
@@ -214,7 +216,7 @@ Forge is still not a distributed orchestrator. The new lease layer is a safety p
 
 ## Status
 
-Forge is in **Alpha**. Alpha Core Loop v4 is the current frozen orchestration milestone for single-node stateful deployments.
+Forge is in **Alpha**. Alpha Core Loop v5 is the current frozen milestone for the durable single-writer control plane on single-node stateful deployments.
 
 [Roadmap](./ROADMAP.md) | [Architecture](./ARCHITECTURE.md) | [Invariants](./INVARIANTS.md)
 

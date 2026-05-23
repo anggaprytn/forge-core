@@ -39,23 +39,32 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 ---
 
-# Alpha Core Loop v4 Validated (May 2026)
+# Alpha Core Loop v5 Validated (May 2026)
 
-The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration model with persisted runtime policy, cache-backed readiness, and degraded-runtime repair semantics.
+The Forge Alpha Core Loop v5 milestone freezes the durable single-writer control plane for the current single-node stateful runtime.
 
 ### Validated Capabilities
 
-- **Per-Service Runtime Policy**: CPU, memory, and restart policy persist per service.
-- **Rollback Policy Fidelity**: Rollback restores the exact historical runtime policy of the selected generation.
-- **Convergence Policy Repair**: Runtime policy drift is detected and repaired back to promoted truth.
-- **Promotion Safety Gates**: OOM kills, crash loops, restart storms, and unstable required dependencies block promotion.
-- **Termination Diagnostics**: Diagnose/status surface termination reason, exit code, signal, restart count, OOM state, and tails when available.
-- **Runtime Usage Snapshots**: Operators can inspect captured CPU/memory usage snapshots for services.
-- **Cache-Backed Readiness**: Convergence computes readiness asynchronously and `/readyz` serves cached control-plane truth.
-- **Readyz Degradation Semantics**: `/readyz` can return `degraded` with repair reasons while `/healthz` remains `ok`.
-- **Non-Fatal Route Repair Failures**: Route repair issues surface as degraded readiness and repair work, not silent success.
-- **Clean Repair Visibility**: Diagnostics expose current unresolved repair fields separately from historical repair noise.
-- **Multi-Service Stateful Baseline**: Multi-service topology, stateful volumes, backup/restore, restore lineage, and GC safety remain validated.
+- **Durable Checkpoints**: `convergence_checkpoint.json` restores cache-backed readiness, breaker state, and convergence freshness on warm startup.
+- **Checkpoint Safety**: Schema versioning, stale checkpoint detection, and corrupt checkpoint rejection degrade readiness instead of restoring unsafe truth.
+- **Control-Plane Snapshots**: `runtime_snapshot.json`, `route_snapshot.json`, and `dependency_snapshot.json` support offline diagnostics with bounded retention and GC.
+- **Persistent Node Identity**: `node_id`, metadata, boot timestamp, and capabilities survive daemon restart.
+- **Operational Journal**: Append-only `operations.jsonl` captures leadership, degradation, route, deploy/restore, and GC events with bounded rotation.
+- **Lease-Based Single Writer**: One active leader renews the lease and owns reconciliation; followers remain read-only and mutating APIs require the leader.
+- **Split-Brain Detection Scaffolding**: `cluster_nodes.json` tracks observed nodes, heartbeat state, active reconcilers, `lease_epoch_divergence`, and owner mismatch signals.
+- **Intent-First Replay**: `reconciliation_log.jsonl` and `reconciliation_cursor.json` fence mutations, classify replay safety, and quarantine corrupted entries.
+- **Deterministic Startup Recovery**: Startup phases are explicit and bounded: `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, `degraded`.
+- **Cache-Backed Readiness And Metrics**: `/readyz` and `/metrics` remain bounded during replay, follower mode, dependency outages, and restart recovery.
+
+Measured live checks:
+
+- local `/readyz`: around `8ms`
+- `startup_phase`: `leader_active`
+- `replay_in_progress`: `false`
+- `leader`: `true`
+- `follower_mode`: `false`
+- `forge bench leader` p95: around `0.23ms`
+- `forge bench convergence` p95: around `0.23ms`
 
 ---
 
@@ -191,8 +200,9 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 
 ### Cache-Backed APIs
 
-- `/readyz` returns cached control-plane readiness only.
-- `/metrics` returns cached JSON diagnostics and counters in constant time.
+- `/healthz` returns process liveness only.
+- `/readyz` returns cache-backed control-plane readiness only.
+- `/metrics` returns cache-backed JSON diagnostics and counters in constant time.
 - Request handlers read cached state only; Docker and Caddy probing happens in the background loop.
 
 ### Metrics and Diagnostics
@@ -230,10 +240,14 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 ### Durable Control-Plane State
 
 - `convergence_checkpoint.json` is the warm-start artifact for per-environment readiness, dependency, breaker, and queue-depth state.
+- Checkpoints are schema-versioned and may restore ready state from cached truth after daemon restart.
+- Stale or corrupt checkpoints degrade readiness and are ignored rather than replayed as authority.
 - `control_plane_snapshots/` stores immutable per-cycle `runtime_snapshot`, `route_snapshot`, and `dependency_snapshot` artifacts with bounded retention.
+- Snapshot GC is bounded; the latest useful diagnostic baseline remains preserved.
 - `control_plane/node.json` stores stable node identity, boot time, and capability flags.
 - `control_plane/cluster_nodes.json` stores per-node topology and heartbeat observations including role, advertised address, lease epoch seen, and control-plane version.
 - `control_plane/operations.jsonl` is the append-only operational journal for deployments, breaker transitions, daemon restarts, and other bounded audit events.
+- Malformed journal lines are skipped so journal corruption does not block startup.
 - `control_plane/reconciliation_log.jsonl` stores reconciliation intents with replay safety markers and mutable status transitions.
 - `control_plane/reconciliation_cursor.json` stores replay position, replay status, recovered operations, and skipped operations.
 
@@ -258,6 +272,11 @@ Operator replay workflow:
 Replay fencing and quarantine:
 
 - Every replay mutation verifies that the active lease owner is still the local node and that the active `lease_epoch` still matches the intent epoch.
+- Followers never replay. Replay cannot run without valid lease ownership.
+- Convergence does not start before replay stabilizes.
+- Replay aborts on lease loss.
+- Request paths do not block on replay.
+- Corrupted intents are quarantined and surfaced as degraded readiness.
 - If fencing fails, Forge aborts replay, writes a `lease_fencing_failed` journal event, increments fencing counters, and marks startup degraded.
 - Replay startup is bounded by a duration budget and an entry budget. If either budget is exceeded, replay pauses and request paths remain unaffected.
 - Quarantined intents and corrupted replay entries are moved under `control_plane/quarantine/` and removed from active replay.

@@ -31,9 +31,34 @@ Current stage:
 alpha
 ```
 
+**Alpha Core Loop v5 Validated (May 2026)**:
+
+The Forge Alpha Core Loop v5 milestone freezes the durable single-writer control plane. The runtime remains single-node and stateful, but the control plane now has lease fencing, cache-backed readiness and metrics, durable checkpoints, immutable control-plane snapshots, deterministic replay, and split-brain detection scaffolding.
+
+### Validated Capabilities (v5)
+
+- **Durable Convergence Checkpoints**: `convergence_checkpoint.json` restores cached readiness and dependency state on warm startup with schema versioning and bounded stale/corrupt handling.
+- **Runtime/Route/Dependency Snapshots**: `runtime_snapshot.json`, `route_snapshot.json`, and `dependency_snapshot.json` support snapshot-based diagnostics with bounded retention and GC.
+- **Persistent Node Identity**: Stable `node_id`, node metadata, boot timestamp, and capability hints survive daemon restart.
+- **Operational Journal**: Append-only `operations.jsonl` records leadership, degradation, route, deployment, restore, and GC events with bounded rotation.
+- **Lease-Based Single Writer**: One lease holder reconciles shared control-plane state; followers are read-only and mutating APIs require the leader.
+- **Split-Brain Detection Scaffolding**: `cluster_nodes.json` tracks heartbeat observations, `observed_nodes`, `active_reconcilers`, owner mismatch signals, `lease_epoch_divergence`, and `split_brain_suspected`.
+- **Reconciliation Intent Log**: `reconciliation_log.jsonl` and `reconciliation_cursor.json` make replay deterministic, bounded, resumable, and quarantine-aware.
+- **Deterministic Startup Recovery**: Explicit startup phases are `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, and `degraded`.
+- **Cache-Backed Request Paths**: `/readyz` and `/metrics` remain bounded and cache-backed during replay, follower mode, dependency degradation, and daemon restart.
+- **Validated Live Checks**: `/readyz` stayed around `8ms`; `forge bench leader` and `forge bench convergence` completed with about `0.23ms` p95; daemon restart returned to `leader_active` and `ready`.
+
+Strong non-goals at this milestone:
+
+- no Raft
+- no distributed consensus
+- no true HA
+- no automatic split-brain recovery
+- no request-path dependency on cross-node communication
+
 **Alpha Core Loop v4 Validated (May 2026)**:
 
-The Forge Alpha Core Loop v4 milestone hardens the single-node application orchestration loop with persisted per-service runtime policy, rollback/convergence policy fidelity, runtime usage snapshots, termination diagnostics, and degraded-runtime promotion safety.
+The Forge Alpha Core Loop v4 milestone hardened the single-node application orchestration loop with persisted per-service runtime policy, rollback/convergence policy fidelity, runtime usage snapshots, termination diagnostics, and degraded-runtime promotion safety.
 
 ### Validated Capabilities (v4)
 
@@ -127,9 +152,9 @@ Forge Alpha Core Loop v1 proves that git-backed immutable deployments can achiev
 
 Current runtime note:
 
-Forge has now frozen the single-node stateful orchestration loop. The next phase should favor UX hardening, recovery depth, and operator ergonomics over broad new runtime scope.
+Forge has now frozen the durable single-writer control-plane loop for the single-node stateful runtime. The next phase should favor operator UX, recovery inspection, and visibility polish over broader runtime scope.
 
-Post-v4 focus:
+Post-v5 focus:
 - operator UX polish for status, diagnose, history, and restore lineage
 - broader recovery-path validation around backup/restore and daemon crashes
 - human visibility surfaces layered on top of the frozen runtime core

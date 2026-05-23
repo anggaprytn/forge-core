@@ -111,12 +111,18 @@ The request path for `/readyz` must remain constant-time. It must never trigger 
 Durability model:
 
 - Forge computes operational truth asynchronously and persists it as durable control-plane state.
-- Each environment now carries a bounded, atomic convergence checkpoint.
-- Each convergence cycle can emit immutable runtime, route, and dependency snapshots for replayable debugging.
-- Node identity is durable and informational only. It does not imply clustering, leader election, or distributed control.
+- Each environment carries a bounded, atomic `control_plane/convergence_checkpoint.json`.
+- Checkpoints are schema-versioned and warm startup may restore cached readiness from them before live probing catches up.
+- Stale or corrupt checkpoints are ignored and surfaced as degraded readiness, not silently trusted.
+- Each convergence cycle may emit immutable `runtime_snapshot.json`, `route_snapshot.json`, and `dependency_snapshot.json` artifacts under `control_plane/control_plane_snapshots/`.
+- Snapshot retention is bounded. GC removes older snapshots without removing the latest diagnostic baseline.
+- Corrupted snapshots are skipped and later cycles rebuild them.
+- `control_plane/node.json` stores persistent `node_id`, node metadata, boot timestamp, and capability hints.
+- Node identity survives daemon restart and is used for attribution and diagnostics only. It is not consensus membership.
 - `control_plane/cluster_nodes.json` persists observed node topology, heartbeat state, lease epochs, and capability hints for future distributed reconciliation work.
 - The cluster topology document is advisory coordination state, not consensus membership and not distributed locking.
-- An append-only operational journal records durable control-plane events without adding writes to the request path.
+- `control_plane/operations.jsonl` is the append-only operational journal for leadership transitions, convergence degradation, route changes, deployment/restore activity, and GC events.
+- Malformed journal lines are skipped during load so journal corruption does not block startup.
 - `control_plane/reconciliation_log.jsonl` is the append-only reconciliation intent journal. Intent durability is the boundary before route, promotion, rollback, restore, snapshot, and repair mutations.
 - `control_plane/reconciliation_cursor.json` stores bounded replay state including last applied intent, replay position, replay status, and recovered/skipped operations.
 
@@ -134,6 +140,7 @@ Replay model:
 - Daemon startup is phase-ordered and deterministic: `storage init -> node identity load -> lease recovery -> replay cursor load -> replay scan -> replay execution -> leadership acquisition -> heartbeat start -> convergence enable -> readiness publish`.
 - Startup state is explicit and cached as one of `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, or `degraded`.
 - Replay resumes only operations classified `replay_safe` or `idempotent`.
+- Operations classified `destructive` or `requires_operator_intervention` remain blocked until an operator acts.
 - Replay is lease-fenced. Every replay mutation verifies the current lease owner and `lease_epoch` still match the intent epoch before the mutation is allowed to stand.
 - Operations classified `requires_operator_intervention` or `destructive` are surfaced through readiness, metrics, and CLI diagnostics and remain pending until explicitly handled.
 - Replay is resumable and bounded by cursor progress, a startup duration budget, and a startup entry budget. If the budget is exceeded, replay pauses, readiness degrades, and request paths stay cache-backed.
@@ -156,8 +163,11 @@ Non-goals:
 
 - no consensus or Raft
 - no distributed database
+- no true HA
 - no synchronous request-path replay
 - no multi-writer control plane
+- no automatic split-brain recovery
+- no request-path dependency on cross-node communication
 
 Convergence domains:
 

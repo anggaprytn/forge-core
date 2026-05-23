@@ -36,6 +36,14 @@ Included in v1:
 - bounded log streaming
 - append-only event stream
 - restore lineage tracking
+- durable control-plane checkpoints
+- cache-backed readiness and JSON metrics
+- persistent node identity
+- append-only operational journal
+- lease-based single-writer control plane
+- split-brain detection scaffolding
+- reconciliation intent log with replay cursor and quarantine
+- deterministic startup phases and replay recovery
 
 Excluded from v1:
 
@@ -52,6 +60,9 @@ Excluded from v1:
 - DNS automation
 - multi-tenant isolation
 - AI auto-remediation
+- Raft or distributed consensus
+- true multi-node HA
+- automatic split-brain recovery
 
 ## 2. Core Invariants
 
@@ -72,6 +83,11 @@ Forge v1 MUST enforce these invariants:
 - Failed generations never become active pointers.
 - Generation numbers are monotonically increasing per `(project_id, environment)` and never reused.
 - Only one deployment may execute at a time across the daemon.
+- Only the active lease holder may mutate shared control-plane state.
+- Followers are read-only and serve cached truth only.
+- Replay requires active lease ownership and every replay mutation is lease-fenced by `lease_epoch`.
+- Destructive replay is blocked unless explicitly safe.
+- Corrupted intents are quarantined rather than replayed.
 - CLI, API, webhook, and web requests must feed the same deployment queue and state machine.
 
 ## 3. Environment Model
