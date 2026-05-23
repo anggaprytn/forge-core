@@ -6209,6 +6209,34 @@ pub mod multi_service_convergence_and_gc {
         .unwrap();
     }
 
+    fn set_multi_service_runtime_policy(
+        root: &std::path::Path,
+        generation: u64,
+        cpu_limit: &str,
+        memory_limit_mb: u64,
+        restart_policy: &str,
+        max_retries: Option<u64>,
+    ) {
+        let env = EnvironmentPaths::new(root, "api", "production");
+        let runtime_path = env.generation_dir(generation).join("runtime.json");
+        let mut runtime: PersistedRuntimeInfo =
+            serde_json::from_str(&std::fs::read_to_string(&runtime_path).unwrap()).unwrap();
+        runtime.runtime_policy = PersistedRuntimePolicy {
+            cpu_limit: Some(cpu_limit.into()),
+            memory_limit_mb: Some(memory_limit_mb),
+            restart_policy: restart_policy.into(),
+            max_retries,
+        };
+        if let Some(api) = runtime.services.get_mut("api") {
+            api.runtime_policy = runtime.runtime_policy.clone();
+        }
+        crate::storage::atomic_write(
+            runtime_path,
+            format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()).as_bytes(),
+        )
+        .unwrap();
+    }
+
     fn setup_stateful_generation(
         root: &std::path::Path,
         generation: u64,
@@ -6332,6 +6360,74 @@ pub mod multi_service_convergence_and_gc {
                 .iter()
                 .any(|call| call == "prod-api-worker-gen-1")
         );
+    }
+
+    #[test]
+    fn convergence_repairs_resource_policy_drift() {
+        let root = test_root("convergence-repairs-resource-policy-drift");
+        register_project(&root, "api", "example.com");
+        setup_multi_service_generation(&root, 1);
+        set_multi_service_runtime_policy(&root, 1, "1.5", 512, "on-failure", Some(4));
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-api-gen-1".into(), true);
+        docker
+            .containers
+            .insert("prod-api-worker-gen-1".into(), true);
+        docker.network_ips.insert(
+            "prod-api-api-gen-1".into(),
+            BTreeMap::from([("forge-test".into(), "172.18.0.12".into())]),
+        );
+        docker.network_ips.insert(
+            "prod-api-worker-gen-1".into(),
+            BTreeMap::from([("forge-test".into(), "172.18.0.13".into())]),
+        );
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        assert!(
+            docker
+                .remove_calls
+                .iter()
+                .any(|call| call == "prod-api-api-gen-1")
+        );
+        assert!(
+            docker
+                .create_calls
+                .iter()
+                .any(|call| call == "prod-api-api-gen-1")
+        );
+    }
+
+    #[test]
+    fn manual_docker_update_detected_as_drift() {
+        let root = test_root("manual-docker-update-detected-as-drift");
+        register_project(&root, "api", "example.com");
+        setup_multi_service_generation(&root, 1);
+        set_multi_service_runtime_policy(&root, 1, "1.5", 512, "on-failure", Some(4));
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-api-gen-1".into(), true);
+        docker
+            .containers
+            .insert("prod-api-worker-gen-1".into(), true);
+        let mut routing = TestRoutingRuntime::default();
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        let events = EventStore::list_all(&root).unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "RUNTIME_POLICY_DRIFT_REPAIRED" && event.generation == Some(1)
+        }));
     }
 
     #[test]

@@ -121,6 +121,74 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/environments/{environment}/status:
+    get:
+      summary: Get runtime status for one project environment
+      operationId: getProjectEnvironmentStatus
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: environment
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Environment runtime status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeProjectEnvironmentStatus'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project or environment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/environments/{environment}/diagnostics:
+    get:
+      summary: Get diagnostics for one project environment
+      operationId: getProjectEnvironmentDiagnostics
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: environment
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Environment diagnostics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeEnvironmentDiagnostics'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project or environment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/projects/{project_id}/environments/{environment}/backups:
     post:
       summary: Create a crash-consistent backup for the active generation
@@ -541,6 +609,274 @@ components:
           type: array
           items:
             type: string
+    PersistedRuntimePolicy:
+      type: object
+      required:
+        - restart_policy
+      properties:
+        cpu_limit:
+          type: string
+          nullable: true
+        memory_limit_mb:
+          type: integer
+          format: int64
+          nullable: true
+        restart_policy:
+          type: string
+        max_retries:
+          type: integer
+          format: int64
+          nullable: true
+    PersistedRuntimeUsageSnapshot:
+      type: object
+      required:
+        - captured_at_unix
+      properties:
+        captured_at_unix:
+          type: integer
+          format: int64
+        cpu_percent:
+          type: string
+          nullable: true
+        memory_usage_mb:
+          type: integer
+          format: int64
+          nullable: true
+        memory_limit_mb:
+          type: integer
+          format: int64
+          nullable: true
+    PersistedTerminationInfo:
+      type: object
+      required:
+        - oom_killed
+        - restart_count
+      properties:
+        oom_killed:
+          type: boolean
+        exit_code:
+          type: integer
+          format: int32
+          nullable: true
+        last_exit_code:
+          type: integer
+          format: int32
+          nullable: true
+        exit_signal:
+          type: integer
+          format: int32
+          nullable: true
+        reason:
+          type: string
+          nullable: true
+        termination_reason:
+          type: string
+          nullable: true
+        restart_count:
+          type: integer
+          format: int64
+    PersistedServiceState:
+      type: string
+      enum: [queued, building, starting, warming, validating, unstable, crash_loop, oom_killed, healthy, failed]
+    DeploymentLifecycleState:
+      type: string
+      enum: [queued, building, starting, warming, validating, unstable, crash_loop, oom_killed, promoted, rollback, failed, gc_eligible]
+    PersistedValidationSummary:
+      type: object
+      properties:
+        restart_count_initial: { type: integer, format: int64 }
+        restart_count_current: { type: integer, format: int64 }
+        restart_count_stable: { type: boolean }
+        validation_succeeded: { type: boolean }
+        last_probe_error:
+          type: string
+          nullable: true
+        unstable_probe_failures: { type: integer, format: int32 }
+        restart_storm_detected: { type: boolean }
+        oom_detected: { type: boolean }
+    PersistedPromotionSummary:
+      type: object
+      properties:
+        warmup_succeeded: { type: boolean }
+        validation_succeeded: { type: boolean }
+        route_verification_succeeded: { type: boolean }
+        runtime_snapshot_persisted: { type: boolean }
+        convergence_target_stable: { type: boolean }
+        promoted_at_unix:
+          type: integer
+          format: int64
+          nullable: true
+        gate_reason:
+          type: string
+          nullable: true
+    RetentionRole:
+      type: string
+      enum: [current, rollback_target, retained, gc_eligible]
+    ServiceRuntimeStatus:
+      type: object
+      required:
+        - service_id
+        - role
+        - depends_on
+        - dns_aliases
+        - running
+        - runtime_policy
+        - restart_count
+        - route
+        - health
+      properties:
+        service_id: { type: string }
+        role: { type: string }
+        depends_on:
+          type: array
+          items: { type: string }
+        dns_aliases:
+          type: array
+          items: { type: string }
+        container_name:
+          type: string
+          nullable: true
+        image_ref:
+          type: string
+          nullable: true
+        running: { type: boolean }
+        state_status:
+          type: string
+          nullable: true
+        lifecycle_state:
+          allOf:
+            - $ref: '#/components/schemas/PersistedServiceState'
+          nullable: true
+        runtime_policy:
+          $ref: '#/components/schemas/PersistedRuntimePolicy'
+        runtime_usage:
+          allOf:
+            - $ref: '#/components/schemas/PersistedRuntimeUsageSnapshot'
+          nullable: true
+        termination:
+          allOf:
+            - $ref: '#/components/schemas/PersistedTerminationInfo'
+          nullable: true
+        restart_count:
+          type: integer
+          format: int64
+        last_exit_code:
+          type: integer
+          format: int32
+          nullable: true
+        route: { type: string }
+        health: { type: string }
+        failure_reason:
+          type: string
+          nullable: true
+    ProjectEnvironmentStatus:
+      type: object
+      required:
+        - project_id
+        - environment
+        - status
+        - domain
+        - container_running
+        - route_active
+        - runtime_policy
+        - restart_count
+        - startup_order
+        - services
+      properties:
+        project_id: { type: string }
+        environment: { type: string }
+        status: { type: string }
+        active_generation:
+          type: integer
+          format: int64
+          nullable: true
+        domain: { type: string }
+        container_name:
+          type: string
+          nullable: true
+        container_running: { type: boolean }
+        container_status:
+          type: string
+          nullable: true
+        image_ref:
+          type: string
+          nullable: true
+        runtime_policy:
+          $ref: '#/components/schemas/PersistedRuntimePolicy'
+        runtime_usage:
+          allOf:
+            - $ref: '#/components/schemas/PersistedRuntimeUsageSnapshot'
+          nullable: true
+        termination:
+          allOf:
+            - $ref: '#/components/schemas/PersistedTerminationInfo'
+          nullable: true
+        restart_count:
+          type: integer
+          format: int64
+        startup_order:
+          type: array
+          items:
+            type: string
+        services:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceRuntimeStatus'
+        lifecycle_state:
+          allOf:
+            - $ref: '#/components/schemas/DeploymentLifecycleState'
+          nullable: true
+        validation_summary:
+          allOf:
+            - $ref: '#/components/schemas/PersistedValidationSummary'
+          nullable: true
+        promotion_summary:
+          allOf:
+            - $ref: '#/components/schemas/PersistedPromotionSummary'
+          nullable: true
+    EnvironmentDiagnostics:
+      type: object
+      required:
+        - project_id
+        - environment
+        - status
+        - services
+        - restart_instability
+        - probe_flapping
+      properties:
+        project_id: { type: string }
+        environment: { type: string }
+        status: { type: string }
+        active_generation:
+          type: integer
+          format: int64
+          nullable: true
+        services:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceRuntimeStatus'
+        active_lifecycle_state:
+          allOf:
+            - $ref: '#/components/schemas/DeploymentLifecycleState'
+          nullable: true
+        validation_summary:
+          allOf:
+            - $ref: '#/components/schemas/PersistedValidationSummary'
+          nullable: true
+        promotion_summary:
+          allOf:
+            - $ref: '#/components/schemas/PersistedPromotionSummary'
+          nullable: true
+        promotion_gate_reason:
+          type: string
+          nullable: true
+        warmup_failure_summary:
+          type: string
+          nullable: true
+        restart_instability:
+          type: boolean
+        probe_flapping:
+          type: boolean
     BackupVolumeRecord:
       type: object
       required:
@@ -758,6 +1094,20 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/DeploymentStatus'}
+    SuccessEnvelopeProjectEnvironmentStatus:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/ProjectEnvironmentStatus'}
+    SuccessEnvelopeEnvironmentDiagnostics:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/EnvironmentDiagnostics'}
     SuccessEnvelopeDeploymentLogs:
       type: object
       required: [request_id, correlation_id, data]

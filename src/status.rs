@@ -5739,6 +5739,139 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_reports_oom_details() {
+        let root = test_root("diagnose-reports-oom-details");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        write_validation_lifecycle(
+            &root,
+            7,
+            DeploymentLifecycleState::OomKilled,
+            PersistedValidationSummary {
+                restart_count_initial: 0,
+                restart_count_current: 1,
+                restart_count_stable: false,
+                validation_succeeded: false,
+                oom_detected: true,
+                ..PersistedValidationSummary::default()
+            },
+            PersistedPromotionSummary {
+                gate_reason: Some("container OOMKilled during warmup".into()),
+                ..PersistedPromotionSummary::default()
+            },
+        );
+        let mut docker = StubDockerRuntime {
+            inspection: Some(ContainerInspection {
+                container_name: "staging-api-gen-7".into(),
+                running: false,
+                state_status: "exited".into(),
+                exit_code: Some(137),
+                restart_count: 1,
+                started_at: Some("2026-05-21T12:00:00Z".into()),
+                finished_at: Some("2026-05-21T12:01:00Z".into()),
+                oom_killed: true,
+                error: None,
+                image_ref: "forge/api:staging-gen-7".into(),
+                labels: BTreeMap::new(),
+                network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
+                volume_mounts: Vec::new(),
+                restart_policy: "on-failure".into(),
+                restart_max_retries: Some(3),
+                cpu_limit: Some("1.5".into()),
+                memory_limit_mb: Some(512),
+                exit_signal: Some(9),
+                termination_reason: Some("oom_killed".into()),
+            }),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+        let termination = diagnostics.container.termination.unwrap();
+        assert!(termination.oom_killed);
+        assert_eq!(termination.last_exit_code, Some(137));
+        assert_eq!(termination.exit_signal, Some(9));
+        assert_eq!(
+            termination.termination_reason.as_deref(),
+            Some("oom_killed")
+        );
+        assert_eq!(
+            diagnostics.active_lifecycle_state,
+            Some(DeploymentLifecycleState::OomKilled)
+        );
+    }
+
+    #[test]
+    fn diagnose_reports_restart_loop() {
+        let root = test_root("diagnose-reports-restart-loop");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+        write_validation_lifecycle(
+            &root,
+            7,
+            DeploymentLifecycleState::CrashLoop,
+            PersistedValidationSummary {
+                restart_count_initial: 0,
+                restart_count_current: 4,
+                restart_count_stable: false,
+                validation_succeeded: false,
+                restart_storm_detected: true,
+                last_probe_error: Some("restart storm detected during warmup".into()),
+                ..PersistedValidationSummary::default()
+            },
+            PersistedPromotionSummary {
+                gate_reason: Some("required service entered restart storm".into()),
+                ..PersistedPromotionSummary::default()
+            },
+        );
+        let mut docker = StubDockerRuntime {
+            inspection: Some(ContainerInspection {
+                container_name: "staging-api-gen-7".into(),
+                running: false,
+                state_status: "restarting".into(),
+                exit_code: Some(1),
+                restart_count: 4,
+                started_at: Some("2026-05-21T12:00:00Z".into()),
+                finished_at: Some("2026-05-21T12:01:00Z".into()),
+                oom_killed: false,
+                error: Some("back-off".into()),
+                image_ref: "forge/api:staging-gen-7".into(),
+                labels: BTreeMap::new(),
+                network_ips: BTreeMap::from([("forge-managed".into(), "172.29.0.2".into())]),
+                volume_mounts: Vec::new(),
+                restart_policy: "on-failure".into(),
+                restart_max_retries: Some(5),
+                cpu_limit: None,
+                memory_limit_mb: None,
+                exit_signal: None,
+                termination_reason: Some("exit_code_1".into()),
+            }),
+        };
+        let mut routing = StubRoutingRuntime {
+            inspection: Some(healthy_route()),
+        };
+
+        let diagnostics =
+            load_environment_diagnostics(&root, None, &mut docker, &mut routing, "api", "staging")
+                .unwrap();
+        assert!(diagnostics.restart_instability);
+        assert!(
+            diagnostics
+                .warmup_failure_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("restart_stable=false"))
+        );
+        assert_eq!(diagnostics.container.termination.unwrap().restart_count, 4);
+        assert_eq!(
+            diagnostics.active_lifecycle_state,
+            Some(DeploymentLifecycleState::CrashLoop)
+        );
+    }
+
+    #[test]
     fn internal_service_has_no_route() {
         let root = test_root("internal-service-has-no-route");
         register_project(&root, "api", "api.example.com");

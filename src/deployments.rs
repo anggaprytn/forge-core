@@ -514,6 +514,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .as_ref()
             .and_then(|config| config.validation_timeout_ms())
             .unwrap_or(DEFAULT_VALIDATION_TIMEOUT_MS);
+        let requested_runtime_policy = forge_yaml
+            .as_ref()
+            .and_then(|config| config.services().values().next())
+            .map(|service| service.runtime_policy.clone())
+            .unwrap_or_default();
         let container_name = generation_container_name(record, artifacts.generation);
         let domain = match load_environment_domain(
             &self.storage_root,
@@ -730,10 +735,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 })
                 .collect(),
             command: None,
-            runtime_policy: ContainerRuntimePolicy {
-                restart_policy: "no".into(),
-                ..ContainerRuntimePolicy::default()
-            },
+            runtime_policy: container_runtime_policy(&requested_runtime_policy),
         }) {
             Ok(_) => {}
             Err(err) => {
@@ -865,7 +867,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 return Err(err.into());
             }
         };
-        let runtime_policy = default_runtime_policy();
+        let runtime_policy = persisted_runtime_policy(&requested_runtime_policy);
         if let Err(err) = validate_inspection(&inspection, &container_name, &runtime_policy) {
             let failure_reason = err.to_string();
             persist_lifecycle_transition(
@@ -4358,13 +4360,6 @@ fn container_runtime_policy(policy: &ForgeRuntimePolicy) -> ContainerRuntimePoli
     }
 }
 
-fn default_runtime_policy() -> PersistedRuntimePolicy {
-    PersistedRuntimePolicy {
-        restart_policy: "no".into(),
-        ..PersistedRuntimePolicy::default()
-    }
-}
-
 fn persisted_runtime_policy(policy: &ForgeRuntimePolicy) -> PersistedRuntimePolicy {
     PersistedRuntimePolicy {
         cpu_limit: policy.cpu_limit.clone(),
@@ -4672,6 +4667,54 @@ fn success_outputs_with_network(generation: u64, networks: &[(&str, &str)]) -> V
 }
 
 #[cfg(test)]
+fn success_outputs_with_runtime_policy(
+    generation: u64,
+    networks: &[(&str, &str)],
+    cpu_limit: &str,
+    memory_limit_mb: u64,
+    restart_policy: &str,
+    restart_max_retries: Option<u64>,
+) -> Vec<String> {
+    let mut extra = vec![
+        (
+            "nano_cpus".to_string(),
+            cpu_limit_to_nano_cpus(cpu_limit).to_string(),
+        ),
+        (
+            "memory_bytes".to_string(),
+            (memory_limit_mb * 1024 * 1024).to_string(),
+        ),
+        ("restart_policy".to_string(), restart_policy.to_string()),
+    ];
+    if let Some(retries) = restart_max_retries {
+        extra.push(("restart_max_retries".to_string(), retries.to_string()));
+    }
+    let inspection = inspection_output_with_details(
+        generation,
+        "running",
+        true,
+        0,
+        0,
+        networks,
+        &extra
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    vec![
+        format!("image_ref=forge/api:production-gen-{generation}"),
+        format!("prod-api-gen-{generation}"),
+        String::new(),
+        inspection.clone(),
+        inspection.clone(),
+        inspection.clone(),
+        inspection.clone(),
+        inspection,
+        String::new(),
+    ]
+}
+
+#[cfg(test)]
 fn networked_success_outputs_with_network(
     generation: u64,
     networks: &[(&str, &str)],
@@ -4717,6 +4760,38 @@ fn inspection_output_with_restart_count(
         )
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+fn cpu_limit_to_nano_cpus(cpu_limit: &str) -> u64 {
+    (cpu_limit.parse::<f64>().expect("cpu limit should parse") * 1_000_000_000_f64).round() as u64
+}
+
+#[cfg(test)]
+fn inspection_output_with_details(
+    generation: u64,
+    status: &str,
+    running: bool,
+    exit_code: i32,
+    restart_count: u64,
+    networks: &[(&str, &str)],
+    extra: &[(&str, &str)],
+) -> String {
+    let mut lines = inspection_output_with_restart_count(
+        generation,
+        status,
+        running,
+        exit_code,
+        restart_count,
+        networks,
+    )
+    .lines()
+    .map(ToOwned::to_owned)
+    .collect::<Vec<_>>();
+    for (key, value) in extra {
+        lines.push(format!("{key}={value}"));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -5272,6 +5347,234 @@ pub mod progressive_promotion_guards {
                 .is_none()
         );
         assert!(routing.updates.is_empty());
+    }
+
+    #[test]
+    fn restart_storm_detected() {
+        let inspection = ContainerInspection {
+            container_name: "prod-api-gen-1".into(),
+            running: false,
+            state_status: "restarting".into(),
+            exit_code: Some(1),
+            restart_count: 3,
+            started_at: None,
+            finished_at: Some("2026-05-22T00:00:05Z".into()),
+            oom_killed: false,
+            error: None,
+            image_ref: "forge/api:production-gen-1".into(),
+            labels: BTreeMap::new(),
+            network_ips: BTreeMap::new(),
+            volume_mounts: Vec::new(),
+            restart_policy: "no".into(),
+            restart_max_retries: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            exit_signal: None,
+            termination_reason: Some("exit_code_1".into()),
+        };
+        assert!(super::restart_storm_detected(0, &inspection));
+    }
+
+    #[test]
+    fn promotion_blocks_on_nonzero_exit_before_validation() {
+        let root = test_root("promotion-blocks-on-nonzero-exit-before-validation");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let exited = inspection_output_with_details(
+            1,
+            "exited",
+            false,
+            1,
+            0,
+            &[("forge-test", "172.18.0.2")],
+            &[("finished_at", "2026-05-22T00:00:05Z")],
+        );
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            "image_ref=forge/api:production-gen-1".into(),
+            "prod-api-gen-1".into(),
+            String::new(),
+            exited.clone(),
+            "service exited".into(),
+        ]));
+        let mut probes = SequencedProbeRuntime {
+            tcp_results: VecDeque::from(vec![Ok(true)]),
+            http_results: VecDeque::new(),
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: false,
+                http_health_path: None,
+                activation: ActivationMode::Direct,
+                ..ValidationPolicy::default()
+            },
+        )
+        .execute_next();
+
+        assert!(result.is_err());
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let lifecycle = load_generation_lifecycle(&env, 1).unwrap().unwrap();
+        assert_eq!(lifecycle.state, DeploymentLifecycleState::Failed);
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn crash_loop_lifecycle_state_persisted() {
+        let root = test_root("crash-loop-lifecycle-state-persisted");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        persist_lifecycle_transition(
+            &LifecycleStore::new(env.clone(), 1),
+            "api",
+            "production",
+            1,
+            DeploymentLifecycleState::CrashLoop,
+            "restart storm during warmup",
+            Some(PersistedValidationSummary {
+                restart_count_initial: 0,
+                restart_count_current: 3,
+                restart_count_stable: false,
+                validation_succeeded: false,
+                restart_storm_detected: true,
+                ..PersistedValidationSummary::default()
+            }),
+            None,
+        )
+        .unwrap();
+
+        let lifecycle = load_generation_lifecycle(&env, 1).unwrap().unwrap();
+        assert_eq!(lifecycle.state, DeploymentLifecycleState::CrashLoop);
+    }
+
+    #[test]
+    fn oom_killed_service_blocks_promotion() {
+        let root = test_root("oom-killed-service-blocks-promotion");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let oom_killed = inspection_output_with_details(
+            1,
+            "exited",
+            false,
+            137,
+            0,
+            &[("forge-test", "172.18.0.2")],
+            &[
+                ("oom_killed", "true"),
+                ("finished_at", "2026-05-22T00:00:05Z"),
+            ],
+        );
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            "image_ref=forge/api:production-gen-1".into(),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output_with_restart_count(
+                1,
+                "running",
+                true,
+                0,
+                0,
+                &[("forge-test", "172.18.0.2")],
+            ),
+            oom_killed.clone(),
+            "killed by oom".into(),
+        ]));
+        let mut probes = SequencedProbeRuntime {
+            tcp_results: VecDeque::from(vec![Ok(true)]),
+            http_results: VecDeque::new(),
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                required_consecutive_probe_passes: 2,
+                ..ValidationPolicy::default()
+            },
+        )
+        .execute_next();
+
+        assert!(result.is_err());
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        assert_eq!(
+            PointerStore::new(env.clone())
+                .read_pointer("current")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn oom_lifecycle_state_persisted() {
+        let root = test_root("oom-lifecycle-state-persisted");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let oom_killed = inspection_output_with_details(
+            1,
+            "exited",
+            false,
+            137,
+            0,
+            &[("forge-test", "172.18.0.2")],
+            &[
+                ("oom_killed", "true"),
+                ("finished_at", "2026-05-22T00:00:05Z"),
+            ],
+        );
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
+            "image_ref=forge/api:production-gen-1".into(),
+            "prod-api-gen-1".into(),
+            String::new(),
+            inspection_output_with_restart_count(
+                1,
+                "running",
+                true,
+                0,
+                0,
+                &[("forge-test", "172.18.0.2")],
+            ),
+            oom_killed.clone(),
+            oom_killed,
+            "killed by oom".into(),
+        ]));
+        let mut probes = SequencedProbeRuntime {
+            tcp_results: VecDeque::from(vec![Ok(true)]),
+            http_results: VecDeque::new(),
+            ..Default::default()
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let _ = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                required_consecutive_probe_passes: 2,
+                ..ValidationPolicy::default()
+            },
+        )
+        .execute_next();
+
+        let lifecycle =
+            load_generation_lifecycle(&EnvironmentPaths::new(&root, "api", "production"), 1)
+                .unwrap()
+                .unwrap();
+        assert_eq!(lifecycle.state, DeploymentLifecycleState::OomKilled);
     }
 
     #[test]
@@ -6023,6 +6326,25 @@ pub mod git_backed_rollback_status_correctness {
         }
     }
 
+    fn write_generation_runtime_policy(
+        root: &Path,
+        project_id: &str,
+        environment: &str,
+        generation: u64,
+        runtime_policy: PersistedRuntimePolicy,
+    ) {
+        let env = EnvironmentPaths::new(root, project_id, environment);
+        let runtime_path = env.generation_dir(generation).join("runtime.json");
+        let mut runtime: PersistedRuntimeInfo =
+            serde_json::from_str(&std::fs::read_to_string(&runtime_path).unwrap()).unwrap();
+        runtime.runtime_policy = runtime_policy;
+        std::fs::write(
+            runtime_path,
+            format!("{}\n", serde_json::to_string_pretty(&runtime).unwrap()),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn git_deploy_rollback_restores_previous_generation() {
         let root = test_root("git-deploy-rollback-restores-previous-generation");
@@ -6337,6 +6659,116 @@ pub mod git_backed_rollback_status_correctness {
                 .iter()
                 .any(|entry| entry.key == "FORGE_COMMIT_SHA" && entry.value == "aaa111")
         );
+    }
+
+    #[test]
+    fn rollback_restores_resource_limits() {
+        let root = test_root("rollback-restores-resource-limits");
+        register_project(&root, "api", "api.example.com");
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            1,
+            SnapshotState::Healthy,
+            "main",
+            "aaa111",
+        );
+        write_git_generation(
+            &root,
+            "api",
+            "production",
+            2,
+            SnapshotState::Healthy,
+            "release",
+            "bbb222",
+        );
+        write_generation_runtime_policy(
+            &root,
+            "api",
+            "production",
+            1,
+            PersistedRuntimePolicy {
+                cpu_limit: Some("1.5".into()),
+                memory_limit_mb: Some(512),
+                restart_policy: "on-failure".into(),
+                max_retries: Some(4),
+            },
+        );
+        write_generation_runtime_policy(
+            &root,
+            "api",
+            "production",
+            2,
+            PersistedRuntimePolicy {
+                cpu_limit: Some("2.0".into()),
+                memory_limit_mb: Some(1024),
+                restart_policy: "always".into(),
+                max_retries: None,
+            },
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let pointers = PointerStore::new(env.clone());
+        pointers.swap_current(1).unwrap();
+        pointers.swap_current(2).unwrap();
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-rollback".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "rollback".into(),
+                source_path: None,
+                source_ref: None,
+                repo_url: None,
+                commit_sha: None,
+            })
+            .unwrap();
+        let mut generation_one = container_inspection("api", "production", 1, "172.29.0.11");
+        generation_one.restart_policy = "on-failure".into();
+        generation_one.restart_max_retries = Some(4);
+        generation_one.cpu_limit = Some("1.5".into());
+        generation_one.memory_limit_mb = Some(512);
+        let mut docker = RollbackDockerRuntime {
+            inspections: BTreeMap::from([(generation_one.container_name.clone(), generation_one)]),
+        };
+        let mut probes = TestProbeRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![route_inspection(
+                "api",
+                "production",
+                "172.29.0.11",
+                Some("api.example.com"),
+            )],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut docker,
+            &mut routing,
+            "api",
+            "production",
+        )
+        .unwrap();
+        assert_eq!(status.active_generation, Some(1));
+        assert_eq!(status.runtime_policy.cpu_limit.as_deref(), Some("1.5"));
+        assert_eq!(status.runtime_policy.memory_limit_mb, Some(512));
+        assert_eq!(status.runtime_policy.restart_policy, "on-failure");
+        assert_eq!(status.runtime_policy.max_retries, Some(4));
     }
 
     #[test]
@@ -7184,6 +7616,49 @@ pub mod runtime_environment_snapshots {
         .unwrap();
     }
 
+    fn write_runtime_policy_forge_yaml(
+        root: &std::path::Path,
+        cpu_limit: &str,
+        memory_limit_mb: u64,
+        restart_policy: &str,
+        max_retries: u64,
+    ) {
+        fs::write(
+            root.join("forge.yml"),
+            format!(
+                concat!(
+                    "version: 1\n",
+                    "name: api\n",
+                    "type: web\n",
+                    "build:\n",
+                    "  dockerfile: Dockerfile\n",
+                    "  context: .\n",
+                    "runtime:\n",
+                    "  cpu:\n",
+                    "    limit: \"{cpu_limit}\"\n",
+                    "  memory:\n",
+                    "    limit_mb: {memory_limit_mb}\n",
+                    "  restart:\n",
+                    "    policy: {restart_policy}\n",
+                    "    max_retries: {max_retries}\n",
+                    "  port: 3000\n",
+                    "  healthcheck:\n",
+                    "    path: /health\n",
+                    "    expected_status: 200\n",
+                    "invariants:\n",
+                    "  - name: health\n",
+                    "    path: /health\n",
+                    "    expect_status: 200\n",
+                ),
+                cpu_limit = cpu_limit,
+                memory_limit_mb = memory_limit_mb,
+                restart_policy = restart_policy,
+                max_retries = max_retries,
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_secret_manifest(root: &std::path::Path, env_name: &str, secret_key: &str) {
         fs::write(
             root.join("forge.project.json"),
@@ -7297,6 +7772,112 @@ pub mod runtime_environment_snapshots {
         );
         assert!(snapshot.entries["DATABASE_URL"].redacted);
         assert!(resolved.entries["DATABASE_URL"].sealed_value.is_some());
+    }
+
+    #[test]
+    fn runtime_policy_persisted_per_generation() {
+        let root = test_root("runtime-policy-persisted-per-generation");
+        register_project(&root, "api", "api.example.com");
+        write_runtime_policy_forge_yaml(&root, "1.5", 512, "on-failure", 4);
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-policy-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.clone()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("sha-policy-1".into()),
+            })
+            .unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-policy-2".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.clone()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("sha-policy-2".into()),
+            })
+            .unwrap();
+
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs_with_runtime_policy(
+                1,
+                &[("forge-test", "172.18.0.2")],
+                "1.5",
+                512,
+                "on-failure",
+                Some(4),
+            )
+            .into_iter()
+            .chain(success_outputs_with_runtime_policy(
+                2,
+                &[("forge-test", "172.18.0.2")],
+                "1.5",
+                512,
+                "on-failure",
+                Some(4),
+            ))
+            .collect(),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![
+                RouteInspection {
+                    subtree_id: "forge:api:production".into(),
+                    active_target: "172.18.0.2:3000".into(),
+                    domain: Some("api.example.com".into()),
+                    activation_verified: true,
+                    verification_url: None,
+                    verification_host: None,
+                    verification_status_code: None,
+                    verification_response_body: None,
+                    health_checks_enabled: false,
+                };
+                2
+            ],
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let first = load_generation_runtime_info(&env, 1).unwrap().unwrap();
+        let second = load_generation_runtime_info(&env, 2).unwrap().unwrap();
+        for runtime in [&first, &second] {
+            assert_eq!(runtime.runtime_policy.cpu_limit.as_deref(), Some("1.5"));
+            assert_eq!(runtime.runtime_policy.memory_limit_mb, Some(512));
+            assert_eq!(runtime.runtime_policy.restart_policy, "on-failure");
+            assert_eq!(runtime.runtime_policy.max_retries, Some(4));
+        }
     }
 
     #[test]
@@ -10306,6 +10887,39 @@ pub mod multi_service_orchestration {
                 "required service failed health gating"
             ))
         ));
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unstable_dependency_blocks_exposed_service_promotion() {
+        let root = test_root("unstable-dependency-blocks-exposed-service-promotion");
+        register_project(&root, "api", "example.com");
+        fs::write(root.join("Dockerfile"), "FROM busybox\n").unwrap();
+        write_multi_service_forge_yaml(&root, None);
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = MultiServiceDockerRuntime::default();
+        let mut probes = HostProbeRuntime {
+            unhealthy_hosts: vec!["172.18.0.11".into()],
+        };
+        let mut routing = TestRoutingRuntime::default();
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .with_execution_config(default_execution_config(&root))
+        .execute_next();
+
+        assert!(result.is_err());
         let env = EnvironmentPaths::new(&root, "api", "production");
         assert_eq!(
             PointerStore::new(env).read_pointer("current").unwrap(),

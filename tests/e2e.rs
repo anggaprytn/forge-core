@@ -742,8 +742,9 @@ struct E2eHarness {
     runtime_root: PathBuf,
     network_name: String,
     caddy_container_name: String,
-    admin_port: u16,
-    public_port: u16,
+    caddy_container_id: String,
+    admin_base_url: String,
+    public_base_url: String,
     api_port: u16,
     token: String,
     config: DaemonConfig,
@@ -769,29 +770,38 @@ impl E2eHarness {
         cleanup_forge_volumes().expect("forge volumes should be cleaned between e2e runs");
         cleanup_e2e_caddy_containers()
             .expect("e2e caddy containers should be cleaned between e2e runs");
+        cleanup_e2e_caddy_networks()
+            .expect("e2e caddy networks should be cleaned between e2e runs");
 
         let runtime_root = common::runtime_root("e2e");
         let suffix = unique_suffix();
         let network_name = format!("forge-e2e-net-{test_name}-{suffix}");
         let caddy_container_name = format!("forge-e2e-caddy-{test_name}-{suffix}");
-        let admin_port = common::available_port();
-        let public_port = common::available_port();
         let api_port = common::available_port();
         let token = "test-token".to_string();
 
-        docker(&["network", "create", &network_name]).expect("docker network should be creatable");
-        write_caddy_config(&runtime_root);
         docker(&[
+            "network",
+            "create",
+            "--label",
+            "forge.e2e.caddy=true",
+            &network_name,
+        ])
+        .expect("docker network should be creatable");
+        write_caddy_config(&runtime_root);
+        let caddy_container_id = docker_stdout(&[
             "run",
             "-d",
             "--name",
             &caddy_container_name,
+            "--label",
+            "forge.e2e.caddy=true",
             "--network",
             &network_name,
             "-p",
-            &format!("127.0.0.1:{public_port}:8080"),
+            "127.0.0.1::8080",
             "-p",
-            &format!("127.0.0.1:{admin_port}:2019"),
+            "127.0.0.1::2019",
             "-v",
             &format!(
                 "{}:/etc/caddy/caddy.json:ro",
@@ -804,6 +814,16 @@ impl E2eHarness {
             "/etc/caddy/caddy.json",
         ])
         .expect("dockerized caddy should start");
+        let admin_base_url = format!(
+            "http://127.0.0.1:{}",
+            docker_host_port(&caddy_container_name, 2019)
+                .expect("caddy admin host port should be discoverable")
+        );
+        let public_base_url = format!(
+            "http://127.0.0.1:{}",
+            docker_host_port(&caddy_container_name, 8080)
+                .expect("caddy public host port should be discoverable")
+        );
 
         let config = DaemonConfig {
             storage_root: runtime_root.clone(),
@@ -818,17 +838,15 @@ impl E2eHarness {
             runtime_root,
             network_name,
             caddy_container_name,
-            admin_port,
-            public_port,
+            caddy_container_id,
+            admin_base_url: admin_base_url.clone(),
+            public_base_url: public_base_url.clone(),
             api_port,
             token,
             config: config.clone(),
             http_client: Client::new(),
             api_servers: Vec::new(),
-            routing: CaddyApiRuntime::new(
-                format!("http://127.0.0.1:{admin_port}"),
-                format!("http://127.0.0.1:{public_port}"),
-            ),
+            routing: CaddyApiRuntime::new(admin_base_url, public_base_url),
         };
 
         ProjectRegistryStore::new(&harness.runtime_root)
@@ -1274,11 +1292,11 @@ impl E2eHarness {
     }
 
     fn admin_base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.admin_port)
+        self.admin_base_url.clone()
     }
 
     fn public_base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.public_port)
+        self.public_base_url.clone()
     }
 
     fn public_url(&self, path: &str) -> String {
@@ -1313,8 +1331,9 @@ impl E2eHarness {
     }
 
     fn wait_for_caddy(&self) {
-        for _ in 0..480 {
-            if let Ok(response) = self
+        let mut last_observation = String::from("no successful response");
+        for attempt in 1..=120 {
+            match self
                 .http_client
                 .get(format!(
                     "{}/config/apps/http/servers/forge/routes",
@@ -1322,14 +1341,25 @@ impl E2eHarness {
                 ))
                 .send()
             {
-                if response.status().is_success() {
-                    return;
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().unwrap_or_default();
+                    if status.is_success() {
+                        return;
+                    }
+                    last_observation = format!(
+                        "attempt={attempt} status={status} body={}",
+                        truncate_debug_text(&body, 400)
+                    );
+                }
+                Err(err) => {
+                    last_observation = format!("attempt={attempt} request_error={err}");
                 }
             }
             thread::sleep(Duration::from_millis(250));
         }
         panic!(
-            "caddy admin endpoint did not become ready: {}",
+            "caddy admin endpoint did not become ready: {last_observation}; {}",
             self.caddy_debug_context()
         );
     }
@@ -1405,13 +1435,35 @@ impl E2eHarness {
 
     fn caddy_debug_context(&self) -> String {
         let admin_url = self.admin_base_url();
+        let public_url = self.public_base_url();
         let config = self
             .http_client
             .get(format!("{admin_url}/config/"))
             .send()
             .and_then(|response| response.text())
             .unwrap_or_else(|err| format!("config unavailable: {err}"));
-        format!("admin_url={admin_url} config={config}")
+        let logs = docker_stdout(&["logs", "--tail", "80", &self.caddy_container_name])
+            .unwrap_or_else(|err| format!("logs unavailable: {err}"));
+        let inspect = docker_stdout(&["inspect", &self.caddy_container_name])
+            .unwrap_or_else(|err| format!("inspect unavailable: {err}"));
+        let docker_ps = docker_stdout(&[
+            "ps",
+            "-a",
+            "--filter",
+            "label=forge.e2e.caddy=true",
+            "--format",
+            "{{.ID}} {{.Names}} {{.Status}} {{.Ports}}",
+        ])
+        .unwrap_or_else(|err| format!("docker ps unavailable: {err}"));
+        format!(
+            "admin_url={admin_url} public_url={public_url} container_name={} container_id={} inspect={} logs_tail={} docker_ps={} config_dump={}",
+            self.caddy_container_name,
+            self.caddy_container_id,
+            truncate_debug_text(&inspect, 2000),
+            truncate_debug_text(&logs, 2000),
+            truncate_debug_text(&docker_ps, 2000),
+            truncate_debug_text(&config, 2000),
+        )
     }
 }
 
@@ -1425,6 +1477,8 @@ impl Drop for E2eHarness {
         let _ = cleanup_forge_volumes();
         let _ = docker(&["rm", "-f", &self.caddy_container_name]);
         let _ = docker(&["network", "rm", &self.network_name]);
+        let _ = cleanup_e2e_caddy_containers();
+        let _ = cleanup_e2e_caddy_networks();
     }
 }
 
@@ -1621,6 +1675,23 @@ fn docker_output(args: &[&str]) -> Result<std::process::Output, String> {
     Ok(output)
 }
 
+fn docker_stdout(args: &[&str]) -> Result<String, String> {
+    let output = docker_output(args)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn docker_host_port(container_name: &str, container_port: u16) -> Result<u16, String> {
+    let output = docker_stdout(&["port", container_name, &container_port.to_string()])?;
+    output
+        .lines()
+        .find_map(|line| line.rsplit(':').next())
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| format!("unable to parse mapped host port from `{output}`"))
+}
+
 fn docker_container_ip(name: &str, network_name: &str) -> String {
     let output = Command::new("docker")
         .args(["inspect", name])
@@ -1697,6 +1768,35 @@ fn cleanup_e2e_caddy_containers() -> Result<(), String> {
         let _ = docker(&["rm", "-f", id.trim()]);
     }
     Ok(())
+}
+
+fn cleanup_e2e_caddy_networks() -> Result<(), String> {
+    let output = Command::new("docker")
+        .args([
+            "network",
+            "ls",
+            "-q",
+            "--filter",
+            "label=forge.e2e.caddy=true",
+        ])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let ids = String::from_utf8_lossy(&output.stdout);
+    for id in ids.lines().filter(|line| !line.trim().is_empty()) {
+        let _ = docker(&["network", "rm", id.trim()]);
+    }
+    Ok(())
+}
+
+fn truncate_debug_text(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        value.to_string()
+    } else {
+        format!("{}...[truncated]", &value[..max_len])
+    }
 }
 
 fn write_caddy_config(root: &Path) {
