@@ -11,13 +11,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use forge_core::api::{DeploymentRequest, ProjectUpsertRequest};
+use forge_core::api::{DeploymentRequest, MetricsResponse, ProjectUpsertRequest, ReadyzResponse};
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::{
     ActiveDeploymentDecider, ActiveTruth, ConvergenceEngine, RecoveryOutcome, TickInput,
 };
-use forge_core::daemon::Daemon;
+use forge_core::daemon::{
+    Daemon, READYZ_CACHE_STALE_AFTER_MS, run_readyz_refresh_loop_until_shutdown,
+};
 use forge_core::deployments::{
     ActivationMode, DeploymentError, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
 };
@@ -191,6 +193,45 @@ fn dogfood_daemon_restart_reconstructs_current_route() {
 }
 
 #[test]
+fn dogfood_readyz_and_metrics_return_quickly() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("readyz-fast") else {
+        return;
+    };
+
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+
+    let (readyz, readyz_elapsed) = harness.get_readyz();
+    let (metrics, metrics_elapsed) = harness.get_metrics();
+
+    assert_eq!(readyz.status, "ready");
+    assert!(readyz_elapsed < Duration::from_millis(250));
+    assert!(metrics_elapsed < Duration::from_millis(250));
+    assert!(metrics.readiness_cache_age_ms <= READYZ_CACHE_STALE_AFTER_MS);
+}
+
+#[test]
+fn dogfood_daemon_restart_preserves_cache_initialization_behavior() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("cache-init") else {
+        return;
+    };
+
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+    harness.restart_api_server(AllowAllDecider(true));
+
+    let (readyz, readyz_elapsed) = harness.get_readyz();
+    let (metrics, metrics_elapsed) = harness.get_metrics();
+
+    assert_eq!(readyz.status, "ready");
+    assert!(readyz_elapsed < Duration::from_millis(250));
+    assert!(metrics_elapsed < Duration::from_millis(250));
+    assert!(metrics.readiness_cache_age_ms <= READYZ_CACHE_STALE_AFTER_MS);
+}
+
+#[test]
 fn dogfood_reboot_recovery_restores_container_and_route() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("reboot-recovery") else {
@@ -305,6 +346,33 @@ fn dogfood_redis_restore_recovers_backup_time_state() {
             .as_str()
             .is_some_and(|value| value.contains("restore-gen-2-vol-redis"))
     );
+}
+
+#[test]
+fn dogfood_caddy_degraded_state_does_not_kill_daemon() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("caddy-degraded") else {
+        return;
+    };
+
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+    harness.restart_api_server_with_urls(
+        "http://127.0.0.1:9".into(),
+        harness.public_base_url(),
+        AllowAllDecider(true),
+    );
+
+    let (readyz, readyz_elapsed) = harness.get_readyz();
+    let (metrics, metrics_elapsed) = harness.get_metrics();
+    let diagnostics = harness.get_diagnostics();
+
+    assert_eq!(readyz.status, "degraded");
+    assert!(readyz_elapsed < Duration::from_millis(250));
+    assert!(metrics_elapsed < Duration::from_millis(250));
+    assert!(metrics.caddy.breaker.last_error.is_some());
+    assert_eq!(diagnostics["project_id"], "api");
+    assert_eq!(diagnostics["environment"], "production");
 }
 
 #[test]
@@ -591,6 +659,24 @@ fn dogfood_github_webhook_push_enqueues_and_deploys() {
 }
 
 #[test]
+fn dogfood_status_and_diagnose_flows_still_work() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("status-diagnose") else {
+        return;
+    };
+
+    let deployment_id = harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+
+    let deployment = harness.get_deployment(&deployment_id);
+    let diagnostics = harness.get_diagnostics();
+
+    assert_eq!(deployment["state"], "healthy");
+    assert_eq!(diagnostics["project_id"], "api");
+    assert_eq!(diagnostics["environment"], "production");
+}
+
+#[test]
 fn runtime_secret_is_injected_into_container() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("secret-injection") else {
@@ -758,6 +844,8 @@ struct E2eHarness {
 struct ApiServerHandle {
     shutdown: Sender<()>,
     join: JoinHandle<()>,
+    refresh_shutdown: Sender<()>,
+    refresh_join: JoinHandle<()>,
 }
 
 impl E2eHarness {
@@ -869,6 +957,21 @@ impl E2eHarness {
     }
 
     fn restart_api_server<A: ActiveDeploymentDecider + Send + 'static>(&mut self, decider: A) {
+        self.restart_api_server_with_urls(self.admin_base_url(), self.public_base_url(), decider);
+    }
+
+    fn restart_api_server_with_urls<A: ActiveDeploymentDecider + Send + 'static>(
+        &mut self,
+        admin_base_url: String,
+        public_base_url: String,
+        decider: A,
+    ) {
+        while let Some(server) = self.api_servers.pop() {
+            let _ = server.refresh_shutdown.send(());
+            let _ = server.shutdown.send(());
+            let _ = server.refresh_join.join();
+            let _ = server.join.join();
+        }
         std::fs::create_dir_all(&self.runtime_root).unwrap();
         self.wait_for_caddy();
         self.api_port = common::available_port();
@@ -877,14 +980,21 @@ impl E2eHarness {
         let mut daemon = Daemon::new(
             self.config.clone(),
             DockerCliRuntime::new(ProcessCommandRunner),
-            CaddyApiRuntime::new(self.admin_base_url(), self.public_base_url()),
+            CaddyApiRuntime::new(admin_base_url, public_base_url),
             decider,
         );
         daemon.start().unwrap();
         let control_plane_cache = Arc::new(RwLock::new(daemon.control_plane_snapshot()));
+        let daemon = Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>));
+        let (refresh_shutdown, refresh_rx) = mpsc::channel();
+        let refresh_daemon = daemon.clone();
+        let refresh_cache = control_plane_cache.clone();
+        let refresh_join = thread::spawn(move || {
+            run_readyz_refresh_loop_until_shutdown(refresh_daemon, refresh_cache, refresh_rx)
+        });
 
         let state = HttpState::new(
-            Arc::new(Mutex::new(Box::new(daemon) as Box<dyn ControlPlane>)),
+            daemon,
             control_plane_cache,
             self.token.clone(),
             IdempotencyStore::new(self.runtime_root.join("idempotency")).unwrap(),
@@ -895,7 +1005,13 @@ impl E2eHarness {
             None,
         );
         let app = router(state);
-        self.api_servers.push(spawn_http_server(self.api_port, app));
+        let (shutdown, join) = spawn_http_server(self.api_port, app);
+        self.api_servers.push(ApiServerHandle {
+            shutdown,
+            join,
+            refresh_shutdown,
+            refresh_join,
+        });
         self.wait_for_api_ready();
     }
 
@@ -1334,6 +1450,30 @@ impl E2eHarness {
         )
     }
 
+    fn get_readyz(&self) -> (ReadyzResponse, Duration) {
+        let started = std::time::Instant::now();
+        let response = self
+            .http_client
+            .get(self.api_url("readyz"))
+            .send()
+            .expect("readyz request should reach api");
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        (response.json::<ReadyzResponse>().unwrap(), elapsed)
+    }
+
+    fn get_metrics(&self) -> (MetricsResponse, Duration) {
+        let started = std::time::Instant::now();
+        let response = self
+            .http_client
+            .get(self.api_url("metrics"))
+            .send()
+            .expect("metrics request should reach api");
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        (response.json::<MetricsResponse>().unwrap(), elapsed)
+    }
+
     fn wait_for_caddy(&self) {
         let mut last_observation = String::from("no successful response");
         for attempt in 1..=120 {
@@ -1474,7 +1614,9 @@ impl E2eHarness {
 impl Drop for E2eHarness {
     fn drop(&mut self) {
         while let Some(server) = self.api_servers.pop() {
+            let _ = server.refresh_shutdown.send(());
             let _ = server.shutdown.send(());
+            let _ = server.refresh_join.join();
             let _ = server.join.join();
         }
         let _ = cleanup_forge_containers();
@@ -1486,7 +1628,7 @@ impl Drop for E2eHarness {
     }
 }
 
-fn spawn_http_server(port: u16, app: Router) -> ApiServerHandle {
+fn spawn_http_server(port: u16, app: Router) -> (Sender<()>, JoinHandle<()>) {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let join = thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("api runtime should start");
@@ -1502,10 +1644,7 @@ fn spawn_http_server(port: u16, app: Router) -> ApiServerHandle {
                 .await;
         });
     });
-    ApiServerHandle {
-        shutdown: shutdown_tx,
-        join,
-    }
+    (shutdown_tx, join)
 }
 
 #[derive(Clone, Copy)]

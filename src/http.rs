@@ -3014,6 +3014,138 @@ fn build_state(ready: bool) -> HttpState {
 }
 
 #[cfg(test)]
+struct PanicOnAccessControlPlane;
+
+#[cfg(test)]
+impl ControlPlane for PanicOnAccessControlPlane {
+    fn is_ready(&self) -> bool {
+        panic!("request path must not access control plane")
+    }
+
+    fn handle_post_deployments(
+        &mut self,
+        _request: DeploymentRequest,
+    ) -> Result<DeploymentAccepted, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn get_deployment(
+        &self,
+        _deployment_id: &str,
+    ) -> Result<Option<DeploymentStatus>, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn get_deployment_logs(
+        &self,
+        _deployment_id: &str,
+        _service_id: Option<&str>,
+    ) -> Result<DeploymentLogs, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn list_events(&self) -> Result<EventList, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn queue_depth(&self) -> Result<usize, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn get_project_environment_status(
+        &mut self,
+        _project_id: &str,
+        _environment: &str,
+    ) -> Result<ProjectEnvironmentStatus, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn get_project_environment_diagnostics(
+        &mut self,
+        _project_id: &str,
+        _environment: &str,
+    ) -> Result<EnvironmentDiagnostics, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn get_project_environment_history(
+        &mut self,
+        _project_id: &str,
+        _environment: &str,
+    ) -> Result<DeploymentHistoryResponse, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn get_project_environment_env(
+        &self,
+        _project_id: &str,
+        _environment: &str,
+    ) -> Result<EnvironmentVariableReport, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn get_project_environment_env_diff(
+        &self,
+        _project_id: &str,
+        _environment: &str,
+        _from_generation: u64,
+        _to_generation: u64,
+    ) -> Result<EnvironmentDiffResponse, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn create_backup(
+        &mut self,
+        _project_id: &str,
+        _environment: &str,
+    ) -> Result<BackupRecord, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn list_backups(
+        &self,
+        _project_id: &str,
+        _environment: &str,
+    ) -> Result<BackupListResponse, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn inspect_backup(&self, _backup_id: &str) -> Result<BackupRecord, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+
+    fn restore_backup(&mut self, _backup_id: &str) -> Result<BackupRestoreResponse, ErrorResponse> {
+        panic!("request path must not access control plane")
+    }
+}
+
+#[cfg(test)]
+fn build_cached_only_state(snapshot: ControlPlaneSnapshot) -> HttpState {
+    let root = test_root("http-cached-only");
+    let config = crate::config::DaemonConfig {
+        storage_root: root.clone(),
+        api_bind: "127.0.0.1:8080".into(),
+        bearer_token: "test-token".into(),
+        github_webhook_secret: None,
+        repository_cache_root: None,
+        sqlite_path: None,
+    };
+    HttpState::new(
+        Arc::new(Mutex::new(
+            Box::new(PanicOnAccessControlPlane) as Box<dyn ControlPlane>
+        )),
+        Arc::new(RwLock::new(snapshot)),
+        config.bearer_token,
+        IdempotencyStore::new(root.join("idempotency")).unwrap(),
+        None,
+        SecretStore::new(root.join("secrets")).unwrap(),
+        ProjectRegistryStore::new(&root),
+        WebAuthState::unconfigured(),
+        None,
+    )
+}
+
+#[cfg(test)]
 fn build_state_with_route_repair_failure() -> HttpState {
     use crate::storage::{
         EnvironmentPaths, PointerStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
@@ -4014,6 +4146,70 @@ pub mod http_readyz_cache_latency {
     }
 
     #[tokio::test]
+    async fn readyz_does_not_touch_docker_on_request_path() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: Default::default(),
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn stale_convergence_degrades_readyz_without_blocking() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "degraded".into(),
+                    reason: Some("convergence stalled".into()),
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: Default::default(),
+        });
+        let app = router(state);
+        let started = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["reason"], "convergence stalled");
+    }
+
+    #[tokio::test]
     async fn readyz_returns_under_timeout_with_slow_docker() {
         let state = build_state(true);
         let daemon = state.daemon.clone();
@@ -4184,6 +4380,41 @@ pub mod metrics_endpoint_exposes_cached_json {
         assert_eq!(metrics.queue_depth, 0);
         assert_eq!(metrics.readyz_requests_total, 0);
         assert!(metrics.readiness_cache_age_ms <= READYZ_CACHE_STALE_AFTER_MS);
+    }
+
+    #[tokio::test]
+    async fn metrics_does_not_touch_docker_on_request_path() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                queue_depth: 7,
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.queue_depth, 7);
     }
 }
 

@@ -375,9 +375,21 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
             RecoveryOutcome::Recovered(active) => Some(active),
             _ => None,
         };
-        self.scan_runtime_orphans(resumable_active, docker, routing)?;
+        if let Err(err) = self.scan_runtime_orphans(resumable_active, docker, routing) {
+            if startup_dependency_failure_is_nonfatal(&err) {
+                eprintln!("forge startup convergence deferred orphan scan: {err}");
+            } else {
+                return Err(err);
+            }
+        }
         repair_missing_previous_generation(&self.storage_root)?;
-        self.recover_finalized_current_generations(docker, routing)?;
+        if let Err(err) = self.recover_finalized_current_generations(docker, routing) {
+            if startup_dependency_failure_is_nonfatal(&err) {
+                eprintln!("forge startup convergence deferred finalized recovery: {err}");
+            } else {
+                return Err(err);
+            }
+        }
         Ok(outcome)
     }
 
@@ -661,6 +673,13 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
 
         Ok(())
     }
+}
+
+fn startup_dependency_failure_is_nonfatal(err: &ConvergenceError) -> bool {
+    matches!(
+        err,
+        ConvergenceError::Docker(_) | ConvergenceError::Routing(_)
+    )
 }
 
 pub struct ConvergenceEngine<'a, D, P, R> {

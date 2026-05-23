@@ -2,6 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1227,13 +1228,34 @@ pub fn run_readyz_refresh_loop(
     control_plane_cache: std::sync::Arc<std::sync::RwLock<ControlPlaneSnapshot>>,
 ) -> ! {
     loop {
-        if let Ok(mut daemon) = daemon.lock() {
-            daemon.refresh_readyz_cache();
-            if let Ok(mut cache) = control_plane_cache.write() {
-                *cache = daemon.control_plane_snapshot();
-            }
-        }
+        refresh_control_plane_snapshot(&daemon, &control_plane_cache);
         thread::sleep(Duration::from_millis(READYZ_REFRESH_INTERVAL_MS));
+    }
+}
+
+pub fn run_readyz_refresh_loop_until_shutdown(
+    daemon: std::sync::Arc<std::sync::Mutex<Box<dyn crate::http::ControlPlane>>>,
+    control_plane_cache: std::sync::Arc<std::sync::RwLock<ControlPlaneSnapshot>>,
+    shutdown: Receiver<()>,
+) {
+    loop {
+        refresh_control_plane_snapshot(&daemon, &control_plane_cache);
+        match shutdown.recv_timeout(Duration::from_millis(READYZ_REFRESH_INTERVAL_MS)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+pub fn refresh_control_plane_snapshot(
+    daemon: &std::sync::Arc<std::sync::Mutex<Box<dyn crate::http::ControlPlane>>>,
+    control_plane_cache: &std::sync::Arc<std::sync::RwLock<ControlPlaneSnapshot>>,
+) {
+    if let Ok(mut daemon) = daemon.lock() {
+        daemon.refresh_readyz_cache();
+        if let Ok(mut cache) = control_plane_cache.write() {
+            *cache = daemon.control_plane_snapshot();
+        }
     }
 }
 
@@ -1826,6 +1848,48 @@ impl Default for FailingRouteVerificationRuntime {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct UnavailableRoutingRuntime;
+
+#[cfg(test)]
+impl RoutingRuntime for UnavailableRoutingRuntime {
+    fn update_route(
+        &mut self,
+        _request: crate::runtime::RouteUpdateRequest,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        Err(crate::runtime::RoutingRuntimeError::InspectionFailed(
+            "caddy admin unavailable".into(),
+        ))
+    }
+
+    fn inspect_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<crate::runtime::RouteInspection, crate::runtime::RoutingRuntimeError> {
+        Err(crate::runtime::RoutingRuntimeError::InspectionFailed(
+            "caddy admin unavailable".into(),
+        ))
+    }
+
+    fn list_managed_routes(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::RouteInspection>, crate::runtime::RoutingRuntimeError> {
+        Err(crate::runtime::RoutingRuntimeError::InspectionFailed(
+            "caddy admin unavailable".into(),
+        ))
+    }
+
+    fn remove_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        Err(crate::runtime::RoutingRuntimeError::InspectionFailed(
+            "caddy admin unavailable".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
 impl RoutingRuntime for FailingRouteVerificationRuntime {
     fn update_route(
         &mut self,
@@ -1960,6 +2024,7 @@ fn seed_recoverable_http_generation(root: &std::path::Path) {
 #[cfg(test)]
 pub mod daemon_starts_only_after_bootstrap_succeeds {
     use super::*;
+    use crate::storage::PointerStore;
 
     #[test]
     fn daemon_waits_when_storage_root_is_missing() {
@@ -2023,6 +2088,35 @@ pub mod daemon_starts_only_after_bootstrap_succeeds {
             runtime_state.last_error_code.as_deref(),
             Some("route_activation_verification_failed")
         );
+    }
+
+    #[test]
+    fn daemon_startup_survives_caddy_control_plane_outage() {
+        let root = test_root("daemon-startup-survives-caddy-control-plane-outage");
+        seed_recoverable_http_generation(&root);
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            UnavailableRoutingRuntime,
+            StaticDecider(true),
+        );
+
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.state(), &DaemonState::Ready);
+        assert_eq!(daemon.readyz_status(), "degraded");
+        let readiness = daemon.readyz_response();
+        assert!(
+            readiness.reasons.iter().any(|reason| {
+                reason.marker == "caddy_admin_unreachable"
+                    && reason.message.contains("caddy admin unavailable")
+            }),
+            "expected caddy degraded reason, got {readiness:?}"
+        );
+        let current = PointerStore::new(EnvironmentPaths::new(&root, "api", "production"))
+            .read_pointer("current")
+            .unwrap();
+        assert_eq!(current, Some(1));
     }
 }
 
@@ -2538,6 +2632,267 @@ pub mod daemon_operational_hardening {
             daemon.control_plane_snapshot.metrics.docker.breaker.state,
             "closed"
         );
+    }
+}
+
+#[cfg(test)]
+pub mod daemon_refresh_loop_hardening {
+    use super::*;
+    use std::sync::mpsc;
+
+    struct SlowTimeoutDockerRuntime {
+        delay: Duration,
+    }
+
+    impl DockerRuntime for SlowTimeoutDockerRuntime {
+        fn probe_control_plane(&mut self) -> Result<(), crate::runtime::DockerRuntimeError> {
+            thread::sleep(self.delay);
+            Err(crate::runtime::DockerRuntimeError::CommandFailed(
+                "docker probe timed out".into(),
+            ))
+        }
+
+        fn build_image(
+            &mut self,
+            request: crate::runtime::BuildImageRequest,
+        ) -> Result<String, crate::runtime::DockerRuntimeError> {
+            Ok(request.image_tag)
+        }
+
+        fn ensure_network(
+            &mut self,
+            _network_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn ensure_volume(
+            &mut self,
+            _request: crate::runtime::CreateVolumeRequest,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn create_container(
+            &mut self,
+            request: crate::runtime::CreateContainerRequest,
+        ) -> Result<String, crate::runtime::DockerRuntimeError> {
+            Ok(request.container_name)
+        }
+
+        fn start_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn inspect_container(
+            &mut self,
+            container_name: &str,
+        ) -> Result<crate::runtime::ContainerInspection, crate::runtime::DockerRuntimeError>
+        {
+            let mut inner = NoopDockerRuntime;
+            inner.inspect_container(container_name)
+        }
+
+        fn container_logs(
+            &mut self,
+            _container_name: &str,
+            _tail_lines: usize,
+        ) -> Result<String, crate::runtime::DockerRuntimeError> {
+            Ok(String::new())
+        }
+
+        fn list_managed_containers(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ContainerInspection>, crate::runtime::DockerRuntimeError>
+        {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_images(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedImage>, crate::runtime::DockerRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn list_managed_volumes(
+            &mut self,
+        ) -> Result<Vec<crate::runtime::ManagedVolume>, crate::runtime::DockerRuntimeError>
+        {
+            Ok(Vec::new())
+        }
+
+        fn stop_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_container(
+            &mut self,
+            _container_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_image(
+            &mut self,
+            _image_ref: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+
+        fn remove_volume(
+            &mut self,
+            _volume_name: &str,
+        ) -> Result<(), crate::runtime::DockerRuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("condition not met before timeout");
+    }
+
+    #[test]
+    fn background_refresh_updates_readiness_cache() {
+        let root = test_root("background-refresh-updates-readiness-cache");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.convergence_last_success_unix = Some(current_unix_timestamp().saturating_sub(60));
+
+        let control_plane_cache =
+            std::sync::Arc::new(std::sync::RwLock::new(daemon.control_plane_snapshot()));
+        let daemon = std::sync::Arc::new(std::sync::Mutex::new(
+            Box::new(daemon) as Box<dyn crate::http::ControlPlane>
+        ));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let refresh_daemon = daemon.clone();
+        let refresh_cache = control_plane_cache.clone();
+        let join = thread::spawn(move || {
+            run_readyz_refresh_loop_until_shutdown(refresh_daemon, refresh_cache, shutdown_rx)
+        });
+
+        wait_until(|| {
+            control_plane_cache
+                .read()
+                .map(|cache| cache.readyz.response.status == "degraded")
+                .unwrap_or(false)
+        });
+
+        shutdown_tx.send(()).unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn background_refresh_shutdown_is_deterministic() {
+        let root = test_root("background-refresh-shutdown-is-deterministic");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let control_plane_cache =
+            std::sync::Arc::new(std::sync::RwLock::new(daemon.control_plane_snapshot()));
+        let daemon = std::sync::Arc::new(std::sync::Mutex::new(
+            Box::new(daemon) as Box<dyn crate::http::ControlPlane>
+        ));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let refresh_daemon = daemon.clone();
+        let refresh_cache = control_plane_cache.clone();
+        let join = thread::spawn(move || {
+            run_readyz_refresh_loop_until_shutdown(refresh_daemon, refresh_cache, shutdown_rx)
+        });
+
+        wait_until(|| {
+            control_plane_cache
+                .read()
+                .map(|cache| cache.readyz.updated_at_unix_ms > 0)
+                .unwrap_or(false)
+        });
+
+        let started = Instant::now();
+        shutdown_tx.send(()).unwrap();
+        join.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn circuit_breaker_does_not_block_shutdown() {
+        let root = test_root("circuit-breaker-does-not-block-shutdown");
+        let fail_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            SwitchableDockerRuntime {
+                fail_probe: fail_probe.clone(),
+            },
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let control_plane_cache =
+            std::sync::Arc::new(std::sync::RwLock::new(daemon.control_plane_snapshot()));
+        let daemon = std::sync::Arc::new(std::sync::Mutex::new(
+            Box::new(daemon) as Box<dyn crate::http::ControlPlane>
+        ));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let refresh_daemon = daemon.clone();
+        let refresh_cache = control_plane_cache.clone();
+        let join = thread::spawn(move || {
+            run_readyz_refresh_loop_until_shutdown(refresh_daemon, refresh_cache, shutdown_rx)
+        });
+
+        wait_until(|| {
+            control_plane_cache
+                .read()
+                .map(|cache| cache.metrics.docker.breaker.state == "open")
+                .unwrap_or(false)
+        });
+
+        let started = Instant::now();
+        shutdown_tx.send(()).unwrap();
+        join.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dependency_probe_timeout_does_not_hang_refresh_loop() {
+        let root = test_root("dependency-probe-timeout-does-not-hang-refresh-loop");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            SlowTimeoutDockerRuntime {
+                delay: Duration::from_millis(50),
+            },
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let started = Instant::now();
+        daemon.refresh_readyz_cache();
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(daemon.readyz_response().status, "degraded");
     }
 }
 
