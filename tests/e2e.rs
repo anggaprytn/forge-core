@@ -212,6 +212,28 @@ fn dogfood_readyz_and_metrics_return_quickly() {
 }
 
 #[test]
+fn dogfood_single_node_starts_as_leader() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("single-node-leader") else {
+        return;
+    };
+
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+
+    let (readyz, readyz_elapsed) = harness.get_readyz();
+    let (metrics, metrics_elapsed) = harness.get_metrics();
+
+    assert_eq!(readyz.status, "ready");
+    assert!(readyz_elapsed < Duration::from_millis(250));
+    assert!(metrics_elapsed < Duration::from_millis(250));
+    assert!(metrics.leader);
+    assert!(metrics.reconciliation_enabled);
+    assert!(!metrics.follower_mode);
+    assert!(metrics.lease_epoch >= 1);
+}
+
+#[test]
 fn dogfood_daemon_restart_preserves_cache_initialization_behavior() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("cache-init") else {

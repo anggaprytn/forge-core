@@ -418,6 +418,13 @@ pub struct Daemon<D, R, A> {
     convergence_domains: Vec<ConvergenceDomainSummary>,
 }
 
+impl<D, R, A> Drop for Daemon<D, R, A> {
+    fn drop(&mut self) {
+        let _ = LeaderLeaseStore::new(&self.config.storage_root)
+            .release_if_owner(&self.node_metadata.node_id, current_unix_timestamp());
+    }
+}
+
 impl<D, R, A> Daemon<D, R, A>
 where
     D: DockerRuntime,
@@ -948,6 +955,14 @@ where
     pub fn graceful_shutdown(&mut self) {
         self.state = DaemonState::ShuttingDown;
         self.health_loops_started = false;
+        let store = LeaderLeaseStore::new(&self.config.storage_root);
+        let _ = store.release_if_owner(self.node_id(), current_unix_timestamp());
+        self.leadership = LeadershipState {
+            lease: store.load().ok().flatten(),
+            uncertain: false,
+            ownership_lost: false,
+            last_error: None,
+        };
         self.state = DaemonState::Stopped;
         self.refresh_readyz_cache();
     }
@@ -1284,7 +1299,12 @@ where
         let started = Instant::now();
         let now_unix = current_unix_timestamp();
         let updated_at_unix_ms = now_unix_ms();
-        self.refresh_leadership(now_unix);
+        if !matches!(
+            self.state(),
+            DaemonState::ShuttingDown | DaemonState::Stopped
+        ) {
+            self.refresh_leadership(now_unix);
+        }
         let queue_depth = self.queue_depth().unwrap_or_default();
         self.convergence_domains.clear();
         let dependency_started = Instant::now();
@@ -3810,6 +3830,11 @@ pub mod daemon_refresh_loop_hardening {
     }
 
     #[test]
+    fn leader_heartbeat_loop_stops_on_shutdown() {
+        background_refresh_shutdown_is_deterministic();
+    }
+
+    #[test]
     fn circuit_breaker_does_not_block_shutdown() {
         let root = test_root("circuit-breaker-does-not-block-shutdown");
         let fail_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3948,6 +3973,36 @@ pub mod daemon_drains_shutdown_safely {
             source_ref: None,
         });
         assert!(response.is_err());
+    }
+
+    #[test]
+    fn leader_takeover_after_shutdown() {
+        let root = test_root("leader-takeover-after-shutdown");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+        let first_lease = LeaderLeaseStore::new(&root).load().unwrap().unwrap();
+
+        daemon.graceful_shutdown();
+
+        let takeover = LeaderLeaseStore::new(&root)
+            .try_acquire_or_renew("node-b", current_unix_timestamp(), LEADER_LEASE_TTL_SECONDS)
+            .unwrap();
+        let takeover = match takeover {
+            LeaseAcquireOutcome::Leader(lease) => lease,
+            LeaseAcquireOutcome::Follower(_) => panic!("expected takeover after shutdown"),
+        };
+
+        assert_eq!(takeover.leader_node_id, "node-b");
+        assert_eq!(
+            takeover.lease_epoch,
+            first_lease.lease_epoch.saturating_add(1)
+        );
     }
 }
 
@@ -5150,5 +5205,59 @@ mod daemon_control_plane_durability {
                 node_id: local_node,
             }
         ));
+    }
+
+    #[test]
+    fn deploy_rejected_on_follower() {
+        let root = test_root("deploy-rejected-on-follower");
+        seed_project(&root);
+        let source = root.join("app");
+        std::fs::create_dir_all(&source).unwrap();
+        write_leader_lease(
+            &root,
+            "leader-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+        );
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let err = daemon
+            .handle_post_deployments(DeploymentRequest {
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(source),
+                source_ref: None,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, "not_leader");
+    }
+
+    #[test]
+    fn backup_restore_rejected_on_follower() {
+        let root = test_root("backup-restore-rejected-on-follower");
+        write_leader_lease(
+            &root,
+            "leader-node",
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+        );
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let err = daemon.restore_backup("backup-1").unwrap_err();
+        assert_eq!(err.code, "not_leader");
     }
 }

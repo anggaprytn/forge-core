@@ -187,11 +187,13 @@ Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, w
 
 ### Leadership And Follower Mode
 
-Forge is still not a distributed orchestrator. The new lease layer is a guardrail that prepares future HA work while keeping the current model single-writer.
+Forge is still not a distributed orchestrator. The new lease layer is a safety primitive, not HA consensus, and it prepares future HA work while keeping the current model single-writer.
 
 - The active leader renews a bounded TTL lease and is the only node allowed to reconcile routing, retention, backup GC, and convergence checkpoints.
-- Follower nodes do not mutate shared control-plane state. They serve cached `/readyz` and `/metrics` responses, expose lease state, and stay ready when cached control-plane truth is still valid.
+- Follower nodes do not mutate shared control-plane state. They serve cached reads only, including cached `/readyz` and `/metrics` responses, expose lease state, and stay ready when cached control-plane truth is still valid.
 - Lease takeover is allowed only after expiry and each successful acquisition advances a monotonic `lease_epoch`.
+- Mutating APIs require the active leader. Deploy, backup/restore, retention, and other shared-state mutation paths are rejected on followers.
+- The filesystem-backed lease is not safe for true multi-writer distributed storage unless every node uses the same shared filesystem with correct atomic create/write/rename semantics.
 - `/readyz` now degrades for leadership-specific uncertainty such as `leadership uncertain`, `convergence ownership lost`, `lease stale`, and `checkpoint epoch mismatch`.
 
 ---

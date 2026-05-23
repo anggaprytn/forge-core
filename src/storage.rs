@@ -1783,7 +1783,7 @@ impl LeaderLeaseStore {
             return Ok(LeaseAcquireOutcome::Follower(current));
         }
 
-        let next = if is_active {
+        let next = if current.leader_node_id == node_id {
             PersistedLeaderLease {
                 schema_version: CONTROL_PLANE_SCHEMA_VERSION,
                 leader_node_id: node_id.to_string(),
@@ -1804,6 +1804,24 @@ impl LeaderLeaseStore {
         };
         write_pretty_json(&path, &next)?;
         Ok(LeaseAcquireOutcome::Leader(next))
+    }
+
+    pub fn release_if_owner(&self, node_id: &str, now_unix: u64) -> StorageResult<()> {
+        let path = EnvironmentPaths::leader_lease_file(&self.storage_root);
+        if !path.exists() {
+            return Ok(());
+        }
+        let _guard = FileLock::acquire(path.with_extension("lock"))?;
+        let Some(mut current) = load_json_file::<PersistedLeaderLease>(&path)? else {
+            return Ok(());
+        };
+        if current.leader_node_id != node_id {
+            return Ok(());
+        }
+        current.expires_at_unix = now_unix;
+        current.last_heartbeat_unix = now_unix;
+        write_pretty_json(&path, &current)?;
+        Ok(())
     }
 }
 
@@ -2614,6 +2632,35 @@ pub mod leader_lease_semantics {
             .count();
         assert_eq!(leaders, 1);
         assert_eq!(followers, 1);
+    }
+
+    #[test]
+    fn lease_file_lock_released_after_acquisition() {
+        let root = test_root("lease-file-lock-released-after-acquisition");
+        let store = LeaderLeaseStore::new(&root);
+        store.try_acquire_or_renew("node-a", 100, 5).unwrap();
+
+        let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
+        let _guard = FileLock::acquire(lock_path).expect("lease lock should be released");
+    }
+
+    #[test]
+    fn stale_leader_takeover_does_not_duplicate_epoch() {
+        let root = test_root("stale-leader-takeover-does-not-duplicate-epoch");
+        let store = LeaderLeaseStore::new(&root);
+        store.try_acquire_or_renew("node-a", 100, 5).unwrap();
+
+        let first_takeover = match store.try_acquire_or_renew("node-b", 106, 5).unwrap() {
+            LeaseAcquireOutcome::Leader(lease) => lease,
+            LeaseAcquireOutcome::Follower(_) => panic!("expected stale lease takeover"),
+        };
+        let renewed = match store.try_acquire_or_renew("node-b", 107, 5).unwrap() {
+            LeaseAcquireOutcome::Leader(lease) => lease,
+            LeaseAcquireOutcome::Follower(_) => panic!("expected leader renewal"),
+        };
+
+        assert_eq!(first_takeover.lease_epoch, 2);
+        assert_eq!(renewed.lease_epoch, first_takeover.lease_epoch);
     }
 }
 

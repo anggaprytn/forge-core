@@ -3173,6 +3173,18 @@ impl ActiveDeploymentDecider for ResumeActiveDeployments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_core::storage::LeaseAcquireOutcome;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("forge-cli-{name}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     fn diagnostics_fixture(status: &str) -> EnvironmentDiagnostics {
         EnvironmentDiagnostics {
@@ -3419,6 +3431,26 @@ mod tests {
                 json: true,
             }
         );
+    }
+
+    #[test]
+    fn gc_rejected_on_follower() {
+        let root = temp_root("gc-rejected-on-follower");
+        let local_node = NodeMetadataStore::new(&root).load_or_create().unwrap();
+        match LeaderLeaseStore::new(&root)
+            .try_acquire_or_renew("other-node", 100, 5)
+            .unwrap()
+        {
+            LeaseAcquireOutcome::Leader(_) => {}
+            LeaseAcquireOutcome::Follower(_) => panic!("expected remote leader lease"),
+        }
+
+        let err = require_local_leader(&root).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "local node is not the active control-plane leader"
+        );
+        assert!(!local_node.node_id.is_empty());
     }
 
     #[test]

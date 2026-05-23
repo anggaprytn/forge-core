@@ -270,12 +270,14 @@ Semantics:
 
 Readiness derives from cached control-plane inputs such as storage accessibility, queue health, Docker reachability, Caddy admin reachability, unresolved fatal markers, and convergence freshness. Environment-level health belongs to diagnostics, not readiness.
 
-Forge is still single-writer. The new multi-node work is preparatory only:
+Forge is still single-writer. The new multi-node work is preparatory only. The lease is a safety primitive, not HA consensus:
 
 - the active leader refreshes `control_plane/leader_lease.json`
 - only the lease owner may reconcile shared control-plane state
-- follower nodes serve cached reads and metrics without mutating shared control-plane state
+- follower nodes serve cached reads only, including cached readiness and metrics, without mutating shared control-plane state
 - lease takeover is allowed only after expiry and advances a monotonic `lease_epoch`
+- mutating APIs require the active leader
+- the filesystem-backed lease is not safe for true multi-writer distributed storage unless all nodes share a filesystem with correct atomic semantics
 
 Leadership-specific degraded readiness reasons now include:
 

@@ -4204,8 +4204,7 @@ pub mod http_readyz_cache_latency {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn request_paths_constant_time_in_follower_mode() {
+    async fn assert_follower_request_paths_constant_time() {
         let state = build_cached_only_state(ControlPlaneSnapshot {
             readyz: DaemonReadyzCache {
                 response: ReadyzResponse {
@@ -4255,6 +4254,109 @@ pub mod http_readyz_cache_latency {
         assert_eq!(metrics_response.status(), StatusCode::OK);
         assert!(readyz_elapsed < Duration::from_millis(250));
         assert!(metrics_elapsed < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn request_paths_constant_time_in_follower_mode() {
+        assert_follower_request_paths_constant_time().await;
+    }
+
+    #[tokio::test]
+    async fn follower_request_paths_do_not_wait_for_leader() {
+        assert_follower_request_paths_constant_time().await;
+    }
+
+    #[tokio::test]
+    async fn follower_metrics_constant_time_without_leader() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                leader: false,
+                lease_epoch: 4,
+                convergence_owner: "leader-node".into(),
+                reconciliation_enabled: false,
+                follower_mode: true,
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+        let started = Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(elapsed < Duration::from_millis(250));
+        assert!(metrics.follower_mode);
+        assert!(!metrics.leader);
+    }
+
+    #[tokio::test]
+    async fn follower_readyz_reports_follower_mode_without_blocking() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                leader: false,
+                lease_epoch: 4,
+                convergence_owner: "leader-node".into(),
+                reconciliation_enabled: false,
+                follower_mode: true,
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+        let readyz_started = Instant::now();
+        let readyz = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let readyz_elapsed = readyz_started.elapsed();
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_body = to_bytes(metrics.into_body(), usize::MAX).await.unwrap();
+        let metrics: MetricsResponse = serde_json::from_slice(&metrics_body).unwrap();
+
+        assert!(readyz_elapsed < Duration::from_millis(250));
+        assert_eq!(readyz.status(), StatusCode::OK);
+        assert!(metrics.follower_mode);
     }
 
     #[tokio::test]
