@@ -1150,19 +1150,22 @@ impl ParsedArgs {
         }
 
         let config_path_from_env = env::var("FORGE_CONFIG").ok().map(PathBuf::from);
-        let command = parse_command(
-            args,
-            config_path
-                .or_else(|| config_path_from_env.clone())
-                .unwrap_or_else(|| PathBuf::from("forge.conf")),
-            caddy_admin_url
-                .or_else(|| env::var("FORGE_CADDY_ADMIN_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1:2019".into()),
-            caddy_public_url
-                .or_else(|| env::var("FORGE_CADDY_PUBLIC_URL").ok())
-                .unwrap_or_else(|| "http://127.0.0.1".into()),
-            metrics_url,
-        )?;
+        let command = resolve_local_command_defaults(
+            parse_command(
+                args,
+                config_path
+                    .or_else(|| config_path_from_env.clone())
+                    .unwrap_or_else(|| PathBuf::from("forge.conf")),
+                caddy_admin_url
+                    .or_else(|| env::var("FORGE_CADDY_ADMIN_URL").ok())
+                    .unwrap_or_else(|| "http://127.0.0.1:2019".into()),
+                caddy_public_url
+                    .or_else(|| env::var("FORGE_CADDY_PUBLIC_URL").ok())
+                    .unwrap_or_else(|| "http://127.0.0.1".into()),
+                metrics_url,
+            )?,
+            config_path_from_flag || config_path_from_env.is_some(),
+        );
         Ok(Self {
             base_url,
             token,
@@ -1222,6 +1225,34 @@ impl ParsedArgs {
             return Ok(None);
         };
         Ok(Some(ForgeClient::new(base_url, token)))
+    }
+}
+
+fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) -> Command {
+    match command {
+        Command::Doctor {
+            config_path: _,
+            caddy_admin_url,
+            metrics_url,
+            upgrade: true,
+        } if !config_path_explicit => Command::Doctor {
+            config_path: default_server_config_path(),
+            caddy_admin_url,
+            metrics_url,
+            upgrade: true,
+        },
+        other => other,
+    }
+}
+
+fn default_server_config_path() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/etc/forge/forge.conf")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        PathBuf::from("forge.conf")
     }
 }
 
@@ -3897,6 +3928,50 @@ mod tests {
             parsed.command,
             Command::ControlPlaneLease {
                 config_path: PathBuf::from("/tmp/forge.conf"),
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_upgrade_uses_default_server_config_path() {
+        unsafe {
+            env::remove_var("FORGE_CONFIG");
+        }
+        let parsed = ParsedArgs::parse(vec!["doctor".into(), "upgrade".into()]).unwrap();
+
+        assert!(!parsed.config_path_explicit);
+        assert_eq!(
+            parsed.command,
+            Command::Doctor {
+                config_path: default_server_config_path(),
+                caddy_admin_url: "http://127.0.0.1:2019".into(),
+                metrics_url: None,
+                upgrade: true,
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_upgrade_explicit_config_overrides_default() {
+        unsafe {
+            env::remove_var("FORGE_CONFIG");
+        }
+        let parsed = ParsedArgs::parse(vec![
+            "--config".into(),
+            "/tmp/custom-forge.conf".into(),
+            "doctor".into(),
+            "upgrade".into(),
+        ])
+        .unwrap();
+
+        assert!(parsed.config_path_explicit);
+        assert_eq!(
+            parsed.command,
+            Command::Doctor {
+                config_path: PathBuf::from("/tmp/custom-forge.conf"),
+                caddy_admin_url: "http://127.0.0.1:2019".into(),
+                metrics_url: None,
+                upgrade: true,
             }
         );
     }

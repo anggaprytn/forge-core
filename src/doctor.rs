@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use reqwest::blocking::Client;
@@ -91,12 +92,25 @@ pub struct DoctorOptions {
 
 #[derive(Debug)]
 pub enum DoctorError {
+    MissingConfig { path: PathBuf, upgrade: bool },
     Config(ConfigError),
 }
 
 impl Display for DoctorError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingConfig { path, upgrade } => {
+                let label = if *upgrade {
+                    "upgrade doctor failed"
+                } else {
+                    "doctor failed"
+                };
+                write!(
+                    f,
+                    "{label}:\n  missing config file: {}\n  fix: run with --config PATH or install Forge server config",
+                    path.display()
+                )
+            }
             Self::Config(err) => write!(f, "{err}"),
         }
     }
@@ -158,6 +172,12 @@ impl HttpReachability for ReqwestHttpChecker {
 }
 
 pub fn run(options: &DoctorOptions) -> Result<DoctorReport, DoctorError> {
+    if !options.config_path.exists() {
+        return Err(DoctorError::MissingConfig {
+            path: options.config_path.clone(),
+            upgrade: options.upgrade,
+        });
+    }
     let config = DaemonConfig::load_from_file(&options.config_path)?;
     let metrics_url = options
         .metrics_url
@@ -170,6 +190,7 @@ pub fn run(options: &DoctorOptions) -> Result<DoctorReport, DoctorError> {
         &options.caddy_admin_url,
         Some(&metrics_url),
         options.upgrade,
+        Some(&options.config_path),
         &mut docker,
         &http,
     ))
@@ -180,6 +201,7 @@ pub fn run_with_dependencies(
     caddy_admin_url: &str,
     metrics_url: Option<&str>,
     upgrade: bool,
+    config_path: Option<&Path>,
     docker: &mut dyn DockerReachability,
     http: &dyn HttpReachability,
 ) -> DoctorReport {
@@ -199,7 +221,7 @@ pub fn run_with_dependencies(
     }
 
     checks.push(check_storage_root_writable(&config.storage_root));
-    checks.push(check_master_key());
+    checks.push(check_master_key(config_path));
     checks.push(check_exists(
         &config.storage_root.join("queue"),
         "Queue root exists",
@@ -252,14 +274,88 @@ fn check_storage_root_writable(path: &Path) -> DoctorCheck {
     }
 }
 
-fn check_master_key() -> DoctorCheck {
-    match std::env::var("FORGE_MASTER_KEY") {
-        Ok(value) if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()) => {
-            DoctorCheck::ok("FORGE_MASTER_KEY configured")
+fn check_master_key(config_path: Option<&Path>) -> DoctorCheck {
+    match resolve_master_key(config_path) {
+        MasterKeyStatus::ValidEnv => DoctorCheck::ok("FORGE_MASTER_KEY configured"),
+        MasterKeyStatus::ValidEnvFile(path) => DoctorCheck::ok(format!(
+            "FORGE_MASTER_KEY configured via {}",
+            path.display()
+        )),
+        MasterKeyStatus::InvalidEnv => DoctorCheck::warn("FORGE_MASTER_KEY invalid"),
+        MasterKeyStatus::InvalidEnvFile(path) => {
+            DoctorCheck::warn(format!("FORGE_MASTER_KEY invalid in {}", path.display()))
         }
-        Ok(_) => DoctorCheck::warn("FORGE_MASTER_KEY invalid"),
-        Err(_) => DoctorCheck::warn("FORGE_MASTER_KEY missing"),
+        MasterKeyStatus::Missing => DoctorCheck::warn(
+            "FORGE_MASTER_KEY missing from current process environment; daemon EnvironmentFile may still provide it",
+        ),
     }
+}
+
+enum MasterKeyStatus {
+    ValidEnv,
+    ValidEnvFile(PathBuf),
+    InvalidEnv,
+    InvalidEnvFile(PathBuf),
+    Missing,
+}
+
+fn resolve_master_key(config_path: Option<&Path>) -> MasterKeyStatus {
+    match std::env::var("FORGE_MASTER_KEY") {
+        Ok(value) if is_valid_master_key(&value) => MasterKeyStatus::ValidEnv,
+        Ok(_) => MasterKeyStatus::InvalidEnv,
+        Err(_) => match config_path.and_then(conventional_env_file_path) {
+            Some(path) => match read_env_file_value(&path, "FORGE_MASTER_KEY") {
+                Ok(Some(value)) if is_valid_master_key(&value) => {
+                    MasterKeyStatus::ValidEnvFile(path)
+                }
+                Ok(Some(_)) => MasterKeyStatus::InvalidEnvFile(path),
+                Ok(None) | Err(_) => MasterKeyStatus::Missing,
+            },
+            None => MasterKeyStatus::Missing,
+        },
+    }
+}
+
+fn conventional_env_file_path(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|parent| parent.join("forge.env"))
+}
+
+fn read_env_file_value(path: &Path, key: &str) -> Result<Option<String>, std::io::Error> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((entry_key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if entry_key.trim() != key {
+            continue;
+        }
+        return Ok(Some(unquote_env_value(value.trim()).to_string()));
+    }
+    Ok(None)
+}
+
+fn unquote_env_value(value: &str) -> &str {
+    if value.len() >= 2 {
+        if (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''))
+        {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn is_valid_master_key(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn check_exists(path: &Path, label: &str) -> DoctorCheck {
@@ -526,6 +622,7 @@ mod tests {
             "http://127.0.0.1:2019",
             Some("http://127.0.0.1:8080/metrics"),
             false,
+            None,
             &mut docker,
             &http,
         );
@@ -555,6 +652,7 @@ mod tests {
             "http://127.0.0.1:2019",
             None,
             false,
+            None,
             &mut docker,
             &http,
         );
@@ -584,13 +682,14 @@ mod tests {
             "http://127.0.0.1:2019",
             None,
             false,
+            None,
             &mut docker,
             &http,
         );
 
-        assert!(
-            messages_with_status(&report, DoctorStatus::Warn).contains("FORGE_MASTER_KEY missing")
-        );
+        assert!(messages_with_status(&report, DoctorStatus::Warn).contains(
+            "FORGE_MASTER_KEY missing from current process environment; daemon EnvironmentFile may still provide it"
+        ));
     }
 
     #[test]
@@ -615,6 +714,7 @@ mod tests {
             "http://127.0.0.1:2019",
             None,
             true,
+            None,
             &mut docker,
             &http,
         );
@@ -624,5 +724,75 @@ mod tests {
         assert!(ok.contains("Checkpoint schema compatibility"));
         assert!(ok.contains("Reconciliation log schema compatibility"));
         assert!(ok.contains("Backup metadata compatibility"));
+    }
+
+    #[test]
+    fn doctor_upgrade_missing_config_reports_path_context() {
+        let path = test_root("doctor-upgrade-missing-config").join("missing.conf");
+        let err = run(&DoctorOptions {
+            config_path: path.clone(),
+            caddy_admin_url: "http://127.0.0.1:2019".into(),
+            metrics_url: None,
+            upgrade: true,
+        })
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("upgrade doctor failed:"));
+        assert!(message.contains(&format!("missing config file: {}", path.display())));
+        assert!(message.contains("fix: run with --config PATH or install Forge server config"));
+    }
+
+    #[test]
+    fn doctor_upgrade_never_returns_raw_os_error() {
+        let err = run(&DoctorOptions {
+            config_path: test_root("doctor-upgrade-raw-os-error").join("missing.conf"),
+            caddy_admin_url: "http://127.0.0.1:2019".into(),
+            metrics_url: None,
+            upgrade: true,
+        })
+        .unwrap_err();
+
+        assert!(!err.to_string().contains("os error 2"));
+        assert!(!err.to_string().contains("No such file or directory"));
+    }
+
+    #[test]
+    fn doctor_upgrade_reads_forge_env_file_for_master_key_if_available() {
+        unsafe {
+            std::env::remove_var("FORGE_MASTER_KEY");
+        }
+        let root = test_root("doctor-upgrade-reads-forge-env");
+        fs::create_dir_all(root.join("queue")).unwrap();
+        fs::create_dir_all(root.join("projects")).unwrap();
+        let config_path = root.join("forge.conf");
+        fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:8080\nbearer_token=test-token\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("forge.env"),
+            "FORGE_MASTER_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
+        )
+        .unwrap();
+
+        let report = run(&DoctorOptions {
+            config_path: config_path.clone(),
+            caddy_admin_url: "http://127.0.0.1:9".into(),
+            metrics_url: Some("http://127.0.0.1:9/metrics".into()),
+            upgrade: true,
+        })
+        .unwrap();
+
+        assert!(
+            messages_with_status(&report, DoctorStatus::Ok).contains(&format!(
+                "FORGE_MASTER_KEY configured via {}",
+                root.join("forge.env").display()
+            ))
+        );
     }
 }
