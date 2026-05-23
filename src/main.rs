@@ -661,10 +661,10 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
         .map_err(|err| CliError::Http(err.to_string()))?;
     let path = match target {
         "readyz" => "/readyz",
-        "convergence" => "/metrics",
+        "convergence" | "diagnostics" | "snapshots" => "/metrics",
         _ => {
             return Err(CliError::Usage(
-                "bench target must be readyz or convergence".into(),
+                "bench target must be readyz, convergence, diagnostics, or snapshots".into(),
             ));
         }
     };
@@ -686,7 +686,7 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
             "readyz" => {
                 last_readyz = Some(decode_raw_json::<ReadyzResponse>(response)?);
             }
-            "convergence" => {
+            "convergence" | "diagnostics" | "snapshots" => {
                 last_metrics = Some(decode_raw_json::<MetricsResponse>(response)?);
             }
             _ => {}
@@ -726,7 +726,7 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
                 metrics.convergence_loop_duration_ms
             );
         }
-        "convergence" => {
+        "convergence" | "diagnostics" | "snapshots" => {
             let metrics = last_metrics.expect("metrics benchmark should decode response");
             println!("cache_age_ms: {}", metrics.readiness_cache_age_ms);
             println!("lock_wait_ms: n/a (cache-backed endpoint)");
@@ -739,6 +739,12 @@ fn run_bench(parsed: &ParsedArgs, target: &str, samples: usize) -> Result<(), Cl
                 metrics.docker_probe_latency_ms
             );
             println!("caddy_probe_latency_ms: {}", metrics.caddy_probe_latency_ms);
+            if target == "diagnostics" {
+                println!("convergence_domains: {}", metrics.convergence_domains.len());
+            }
+            if target == "snapshots" {
+                println!("snapshot_read_latency_ms: {}", metrics.readyz_latency_ms);
+            }
         }
         _ => {}
     }
@@ -1165,7 +1171,7 @@ fn usage() -> String {
         "  forge logout",
         "  forge whoami",
         "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
-        "  forge [--url URL] bench <readyz|convergence> [--samples N]",
+        "  forge [--url URL] bench <readyz|convergence|diagnostics|snapshots> [--samples N]",
         "  forge [--url URL] [--token TOKEN] status <deployment_id>",
         "  forge [--url URL] [--token TOKEN] logs [--json] [--service SERVICE] <deployment_id>",
         "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
@@ -1329,10 +1335,17 @@ fn parse_bench_command(args: &[String]) -> Result<Command, CliError> {
     }
 
     match positionals.as_slice() {
-        [target] if target == "readyz" || target == "convergence" => Ok(Command::Bench {
-            target: target.clone(),
-            samples,
-        }),
+        [target]
+            if target == "readyz"
+                || target == "convergence"
+                || target == "diagnostics"
+                || target == "snapshots" =>
+        {
+            Ok(Command::Bench {
+                target: target.clone(),
+                samples,
+            })
+        }
         _ => Err(CliError::Usage(usage())),
     }
 }
@@ -3114,6 +3127,9 @@ mod tests {
             policy_drift_repairs: Vec::new(),
             current_policy_drift_repairs: Vec::new(),
             historical_policy_drift_repairs: Vec::new(),
+            convergence_checkpoint: None,
+            domain_summaries: Vec::new(),
+            node: None,
         }
     }
 

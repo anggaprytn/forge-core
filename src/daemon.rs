@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::PathBuf;
@@ -8,11 +9,12 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::{
-    BackupListResponse, BackupRecord, BackupRestoreResponse, DependencyBreakerDiagnostics,
-    DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest,
-    DeploymentStatus, EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport,
-    ErrorResponse, EventList, MetricsDependencySnapshot, MetricsResponse, ReadyzReason,
-    ReadyzResponse, ServiceLogGroup, validate_deployment_request,
+    BackupListResponse, BackupRecord, BackupRestoreResponse, ConvergenceDomainSummary,
+    DependencyBreakerDiagnostics, DeploymentAccepted, DeploymentHistoryResponse, DeploymentLogs,
+    DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics, EnvironmentDiffResponse,
+    EnvironmentVariableReport, ErrorResponse, EventList, MetricsDependencySnapshot,
+    MetricsResponse, NodeInfo, ReadyzReason, ReadyzResponse, ServiceLogGroup,
+    validate_deployment_request,
 };
 use crate::backups::{create_backup, inspect_backup, list_backups, restore_backup};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
@@ -35,9 +37,12 @@ use crate::status::{
     load_project_environment_status,
 };
 use crate::storage::{
-    DiagnosticsStore, EnvironmentPaths, EventStore, PersistedActivationMode, PersistedRuntimeInfo,
-    PersistedServiceRuntimeInfo, RuntimeHealthState, RuntimeStateStore, current_unix_timestamp,
-    load_generation_runtime_info,
+    CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT, ControlPlaneSnapshotStore, ConvergenceCheckpointStore,
+    DiagnosticsStore, EnvironmentPaths, EventStore, NodeMetadataStore, OperationalJournalEntry,
+    OperationalJournalStore, PersistedActivationMode, PersistedBreakerState,
+    PersistedControlPlaneSnapshot, PersistedDependencyState, PersistedEnvironmentCheckpoint,
+    PersistedNodeMetadata, PersistedRuntimeInfo, PersistedServiceRuntimeInfo, RuntimeHealthState,
+    RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
 };
 
 pub const READYZ_CACHE_STALE_AFTER_MS: u64 = 5_000;
@@ -359,6 +364,8 @@ pub struct Daemon<D, R, A> {
     convergence_failures_total: u64,
     docker_breaker: DependencyCircuitBreaker,
     caddy_breaker: DependencyCircuitBreaker,
+    node_metadata: PersistedNodeMetadata,
+    convergence_domains: Vec<ConvergenceDomainSummary>,
 }
 
 impl<D, R, A> Daemon<D, R, A>
@@ -374,6 +381,9 @@ where
         recovery_decider: A,
     ) -> Self {
         let startup_steps = vec![StartupStep::ConfigLoaded];
+        let node_metadata = NodeMetadataStore::new(&config.storage_root)
+            .load_or_create()
+            .unwrap_or_default();
         Self {
             config,
             docker_runtime,
@@ -394,6 +404,8 @@ where
             convergence_failures_total: 0,
             docker_breaker: DependencyCircuitBreaker::default(),
             caddy_breaker: DependencyCircuitBreaker::default(),
+            node_metadata,
+            convergence_domains: Vec::new(),
         }
     }
 
@@ -409,6 +421,17 @@ where
             BootstrapState::Ready => {
                 self.state = DaemonState::Recovering;
                 self.startup_steps.push(StartupStep::BootstrapReady);
+                let _ = OperationalJournalStore::new(&self.config.storage_root).append(
+                    &OperationalJournalEntry {
+                        schema_version: 1,
+                        timestamp_unix: current_unix_timestamp(),
+                        event_type: "daemon_restart".into(),
+                        project_id: None,
+                        environment: None,
+                        generation: None,
+                        payload: serde_json::json!({ "node_id": self.node_metadata.node_id }),
+                    },
+                );
 
                 let queue = PersistentQueue::new(self.config.storage_root.join("queue"))?;
                 let convergence = StartupConvergence::new(
@@ -427,6 +450,7 @@ where
                 self.health_loops_started = true;
                 self.startup_steps.push(StartupStep::HealthLoopsStarted);
                 self.state = DaemonState::Ready;
+                self.restore_readyz_cache_from_checkpoints();
                 self.refresh_readyz_cache();
                 Ok(())
             }
@@ -452,6 +476,9 @@ where
 
         let deployment_id = next_deployment_id();
         let resolved_source = resolve_deployment_source(&self.config.storage_root, &request)?;
+        let journal_project_id = request.project_id.clone();
+        let journal_environment = request.environment.clone();
+        let journal_intent = request.intent.clone();
         let record = DeploymentRecord {
             deployment_id: deployment_id.clone(),
             project_id: request.project_id,
@@ -464,6 +491,21 @@ where
         };
         queue.enqueue(record).map_err(queue_error_to_response)?;
         let queue_position = queue.queued_len().map_err(queue_error_to_response)?;
+        let _ = OperationalJournalStore::new(&self.config.storage_root).append(
+            &OperationalJournalEntry {
+                schema_version: 1,
+                timestamp_unix: current_unix_timestamp(),
+                event_type: "deployment".into(),
+                project_id: Some(journal_project_id),
+                environment: Some(journal_environment),
+                generation: None,
+                payload: serde_json::json!({
+                    "deployment_id": deployment_id,
+                    "queue_position": queue_position,
+                    "intent": journal_intent,
+                }),
+            },
+        );
 
         Ok(DeploymentAccepted {
             deployment_id,
@@ -904,13 +946,280 @@ where
         response
     }
 
+    fn restore_readyz_cache_from_checkpoints(&mut self) {
+        let mut reasons = Vec::new();
+        let now_unix = current_unix_timestamp();
+        let mut last_success = None;
+        for (project_id, environment, env) in self.environment_paths() {
+            let Ok(Some(checkpoint)) = ConvergenceCheckpointStore::new(env).load() else {
+                continue;
+            };
+            last_success = last_success.max(checkpoint.last_successful_convergence_unix);
+            let age_ms = now_unix
+                .saturating_sub(checkpoint.checkpointed_at_unix)
+                .saturating_mul(1_000);
+            if age_ms > READYZ_CACHE_STALE_AFTER_MS {
+                reasons.push(ReadyzReason {
+                    project_id,
+                    environment,
+                    generation: checkpoint.active_generation,
+                    active: checkpoint.active_generation.is_some(),
+                    unresolved: true,
+                    source: "convergence_checkpoint".into(),
+                    marker: "stale_checkpoint".into(),
+                    message: "checkpoint stale until next refresh".into(),
+                    last_checked_unix: Some(checkpoint.checkpointed_at_unix),
+                    cache_age_ms: age_ms,
+                });
+                continue;
+            }
+            for message in checkpoint.readyz_reasons {
+                reasons.push(ReadyzReason {
+                    project_id: project_id.clone(),
+                    environment: environment.clone(),
+                    generation: checkpoint.active_generation,
+                    active: checkpoint.active_generation.is_some(),
+                    unresolved: checkpoint.health_state != RuntimeHealthState::Healthy,
+                    source: "convergence_checkpoint".into(),
+                    marker: "checkpoint".into(),
+                    message,
+                    last_checked_unix: Some(checkpoint.checkpointed_at_unix),
+                    cache_age_ms: age_ms,
+                });
+            }
+        }
+        self.convergence_last_success_unix = last_success;
+        self.control_plane_snapshot.readyz = DaemonReadyzCache {
+            response: ReadyzResponse {
+                status: if reasons.is_empty() {
+                    "ready".into()
+                } else {
+                    "degraded".into()
+                },
+                reason: reasons.first().map(|value| value.message.clone()),
+                reasons,
+            },
+            updated_at_unix_ms: now_unix_ms(),
+        };
+    }
+
+    fn environment_paths(&self) -> Vec<(String, String, EnvironmentPaths)> {
+        let projects_root = self.config.storage_root.join("projects");
+        let Ok(projects) = fs::read_dir(projects_root) else {
+            return Vec::new();
+        };
+        let mut environments = Vec::new();
+        for project in projects.flatten() {
+            let project_id = project.file_name().to_string_lossy().into_owned();
+            let envs_dir = project.path().join("environments");
+            let Ok(envs) = fs::read_dir(envs_dir) else {
+                continue;
+            };
+            for env_entry in envs.flatten() {
+                let environment = env_entry.file_name().to_string_lossy().into_owned();
+                environments.push((
+                    project_id.clone(),
+                    environment.clone(),
+                    EnvironmentPaths::new(&self.config.storage_root, &project_id, &environment),
+                ));
+            }
+        }
+        environments
+    }
+
+    fn node_info(&self) -> NodeInfo {
+        NodeInfo {
+            node_id: self.node_metadata.node_id.clone(),
+            booted_at_unix: self.node_metadata.booted_at_unix,
+            hostname: self.node_metadata.hostname.clone(),
+            capabilities: self.node_metadata.capabilities.clone(),
+        }
+    }
+
+    fn persist_environment_checkpoint(
+        &self,
+        env: EnvironmentPaths,
+        project_id: &str,
+        environment: &str,
+        queue_depth: usize,
+        reasons: &[ReadyzReason],
+    ) {
+        let runtime_state = RuntimeStateStore::new(env.clone())
+            .load()
+            .unwrap_or_default();
+        let checkpoint = PersistedEnvironmentCheckpoint {
+            schema_version: 1,
+            project_id: project_id.into(),
+            environment: environment.into(),
+            checkpointed_at_unix: current_unix_timestamp(),
+            last_successful_convergence_unix: self.convergence_last_success_unix,
+            last_convergence_duration_ms: self.convergence_loop_duration_ms,
+            last_convergence_generation: runtime_state.active_generation,
+            last_convergence_error: runtime_state.last_error_code.clone(),
+            active_generation: runtime_state.active_generation,
+            health_state: runtime_state.health_state,
+            dependency_states: BTreeMap::from([
+                (
+                    "docker".into(),
+                    PersistedDependencyState {
+                        reachable: self.docker_readiness.last_known_reachable.unwrap_or(false),
+                        last_error: self.docker_readiness.last_error.clone(),
+                        last_latency_ms: self.docker_breaker.last_latency_ms,
+                    },
+                ),
+                (
+                    "caddy".into(),
+                    PersistedDependencyState {
+                        reachable: self.caddy_readiness.last_known_reachable.unwrap_or(false),
+                        last_error: self.caddy_readiness.last_error.clone(),
+                        last_latency_ms: self.caddy_breaker.last_latency_ms,
+                    },
+                ),
+            ]),
+            breaker_states: BTreeMap::from([
+                ("docker".into(), breaker_state(&self.docker_breaker)),
+                ("caddy".into(), breaker_state(&self.caddy_breaker)),
+            ]),
+            queue_depth_snapshot: queue_depth,
+            readyz_reasons: reasons
+                .iter()
+                .filter(|reason| {
+                    reason.project_id == project_id && reason.environment == environment
+                })
+                .map(|reason| reason.message.clone())
+                .collect(),
+            extra: BTreeMap::new(),
+        };
+        let _ = ConvergenceCheckpointStore::new(env.clone()).save(&checkpoint);
+        self.persist_runtime_truth_snapshots(env, &checkpoint);
+    }
+
+    fn persist_runtime_truth_snapshots(
+        &self,
+        env: EnvironmentPaths,
+        checkpoint: &PersistedEnvironmentCheckpoint,
+    ) {
+        let cycle_id = format!(
+            "{}-{}",
+            checkpoint.checkpointed_at_unix,
+            checkpoint
+                .active_generation
+                .unwrap_or(checkpoint.last_convergence_generation.unwrap_or(0))
+        );
+        let store = ControlPlaneSnapshotStore::new(env.clone());
+        let generation = checkpoint.active_generation;
+        let runtime_snapshot = PersistedControlPlaneSnapshot {
+            schema_version: 1,
+            snapshot_kind: "runtime_snapshot".into(),
+            project_id: checkpoint.project_id.clone(),
+            environment: checkpoint.environment.clone(),
+            cycle_id: cycle_id.clone(),
+            created_at_unix: checkpoint.checkpointed_at_unix,
+            generation,
+            payload: serde_json::json!({
+                "checkpoint": checkpoint,
+                "node": self.node_info(),
+                "domains": self.convergence_domains,
+            }),
+        };
+        let route_snapshot = PersistedControlPlaneSnapshot {
+            schema_version: 1,
+            snapshot_kind: "route_snapshot".into(),
+            project_id: checkpoint.project_id.clone(),
+            environment: checkpoint.environment.clone(),
+            cycle_id: cycle_id.clone(),
+            created_at_unix: checkpoint.checkpointed_at_unix,
+            generation,
+            payload: serde_json::json!({
+                "active_generation": checkpoint.active_generation,
+                "health_state": checkpoint.health_state,
+            }),
+        };
+        let dependency_snapshot = PersistedControlPlaneSnapshot {
+            schema_version: 1,
+            snapshot_kind: "dependency_snapshot".into(),
+            project_id: checkpoint.project_id.clone(),
+            environment: checkpoint.environment.clone(),
+            cycle_id,
+            created_at_unix: checkpoint.checkpointed_at_unix,
+            generation,
+            payload: serde_json::json!({
+                "dependencies": checkpoint.dependency_states,
+                "breakers": checkpoint.breaker_states,
+            }),
+        };
+        let _ = store.append(&runtime_snapshot, CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT);
+        let _ = store.append(&route_snapshot, CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT);
+        let _ = store.append(&dependency_snapshot, CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT);
+    }
+
     pub fn refresh_readyz_cache(&mut self) {
         let started = Instant::now();
         let now_unix = current_unix_timestamp();
         let updated_at_unix_ms = now_unix_ms();
         let queue_depth = self.queue_depth().unwrap_or_default();
+        self.convergence_domains.clear();
+        let dependency_started = Instant::now();
         let mut reasons = self.compute_readyz_reasons(now_unix);
+        self.convergence_domains.push(ConvergenceDomainSummary {
+            domain: "dependency_probing".into(),
+            status: if reasons
+                .iter()
+                .any(|reason| reason.project_id == "_control_plane")
+            {
+                "degraded".into()
+            } else {
+                "healthy".into()
+            },
+            duration_ms: dependency_started.elapsed().as_millis() as u64,
+            detail: None,
+        });
+        let runtime_started = Instant::now();
         reasons.extend(self.cached_environment_readyz_reasons_with_budget(now_unix));
+        self.convergence_domains.push(ConvergenceDomainSummary {
+            domain: "runtime_container_reconciliation".into(),
+            status: if reasons
+                .iter()
+                .any(|reason| reason.source == "runtime_state_cache")
+            {
+                "degraded".into()
+            } else {
+                "healthy".into()
+            },
+            duration_ms: runtime_started.elapsed().as_millis() as u64,
+            detail: None,
+        });
+        self.convergence_domains.push(ConvergenceDomainSummary {
+            domain: "routing_reconciliation".into(),
+            status: if reasons
+                .iter()
+                .any(|reason| reason.marker.contains("route") || reason.marker.contains("caddy"))
+            {
+                "degraded".into()
+            } else {
+                "healthy".into()
+            },
+            duration_ms: self.caddy_breaker.last_latency_ms,
+            detail: None,
+        });
+        self.convergence_domains.push(ConvergenceDomainSummary {
+            domain: "retention_reconciliation".into(),
+            status: "healthy".into(),
+            duration_ms: 0,
+            detail: Some("bounded no-op in single-node mode".into()),
+        });
+        self.convergence_domains.push(ConvergenceDomainSummary {
+            domain: "backup_reconciliation".into(),
+            status: "healthy".into(),
+            duration_ms: 0,
+            detail: Some("bounded no-op in single-node mode".into()),
+        });
+        self.convergence_domains.push(ConvergenceDomainSummary {
+            domain: "metrics_refresh".into(),
+            status: "healthy".into(),
+            duration_ms: 0,
+            detail: None,
+        });
         reasons.sort_by(|left, right| {
             (
                 left.project_id.as_str(),
@@ -968,7 +1277,7 @@ where
                     "ready".into()
                 },
                 reason,
-                reasons,
+                reasons: reasons.clone(),
             },
             updated_at_unix_ms,
         };
@@ -977,6 +1286,15 @@ where
             readyz: readyz.clone(),
             metrics: self.build_metrics_snapshot(queue_depth, &readyz),
         };
+        for (project_id, environment, env) in self.environment_paths() {
+            self.persist_environment_checkpoint(
+                env,
+                &project_id,
+                &environment,
+                queue_depth,
+                &reasons,
+            );
+        }
     }
 
     fn compute_readyz_reasons(&mut self, now_unix: u64) -> Vec<ReadyzReason> {
@@ -1244,6 +1562,7 @@ where
     A: ActiveDeploymentDecider,
 {
     fn probe_docker_dependency(&mut self, now_unix: u64) -> Option<ReadyzReason> {
+        let previous_state = self.docker_breaker.state.clone();
         if !self.docker_breaker.allow_request(now_unix) {
             self.docker_readiness.last_error = Some("docker circuit breaker open".into());
             self.docker_readiness.last_known_reachable = Some(false);
@@ -1257,6 +1576,11 @@ where
             Ok(_) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 self.docker_breaker.record_success(now_unix, latency_ms);
+                self.record_breaker_transition(
+                    "docker",
+                    &previous_state,
+                    &self.docker_breaker.state,
+                );
                 self.docker_readiness.last_known_reachable = Some(true);
                 self.docker_readiness.last_error = None;
                 None
@@ -1266,6 +1590,11 @@ where
                 let message = err.to_string();
                 self.docker_breaker
                     .record_failure(now_unix, latency_ms, message.clone());
+                self.record_breaker_transition(
+                    "docker",
+                    &previous_state,
+                    &self.docker_breaker.state,
+                );
                 self.docker_readiness.last_known_reachable = Some(false);
                 self.docker_readiness.last_error = Some(message.clone());
                 Some(control_plane_reason(
@@ -1281,6 +1610,7 @@ where
     }
 
     fn probe_caddy_dependency(&mut self, now_unix: u64) -> Option<ReadyzReason> {
+        let previous_state = self.caddy_breaker.state.clone();
         if !self.caddy_breaker.allow_request(now_unix) {
             self.caddy_readiness.last_error = Some("caddy circuit breaker open".into());
             self.caddy_readiness.last_known_reachable = Some(false);
@@ -1294,6 +1624,7 @@ where
             Ok(_) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 self.caddy_breaker.record_success(now_unix, latency_ms);
+                self.record_breaker_transition("caddy", &previous_state, &self.caddy_breaker.state);
                 self.caddy_readiness.last_known_reachable = Some(true);
                 self.caddy_readiness.last_error = None;
                 None
@@ -1303,6 +1634,7 @@ where
                 let message = err.to_string();
                 self.caddy_breaker
                     .record_failure(now_unix, latency_ms, message.clone());
+                self.record_breaker_transition("caddy", &previous_state, &self.caddy_breaker.state);
                 self.caddy_readiness.last_known_reachable = Some(false);
                 self.caddy_readiness.last_error = Some(message.clone());
                 Some(control_plane_reason(
@@ -1315,6 +1647,32 @@ where
                 ))
             }
         }
+    }
+
+    fn record_breaker_transition(
+        &self,
+        dependency: &str,
+        previous: &CircuitBreakerState,
+        current: &CircuitBreakerState,
+    ) {
+        if previous == current {
+            return;
+        }
+        let _ = OperationalJournalStore::new(&self.config.storage_root).append(
+            &OperationalJournalEntry {
+                schema_version: 1,
+                timestamp_unix: current_unix_timestamp(),
+                event_type: "breaker_transition".into(),
+                project_id: None,
+                environment: None,
+                generation: None,
+                payload: serde_json::json!({
+                    "dependency": dependency,
+                    "from": previous.as_str(),
+                    "to": current.as_str(),
+                }),
+            },
+        );
     }
 
     fn build_metrics_snapshot(
@@ -1338,7 +1696,20 @@ where
             caddy_probe_latency_ms: self.caddy_breaker.last_latency_ms,
             docker: self.docker_breaker.metrics_snapshot(),
             caddy: self.caddy_breaker.metrics_snapshot(),
+            convergence_domains: self.convergence_domains.clone(),
+            node: Some(self.node_info()),
         }
+    }
+}
+
+fn breaker_state(value: &DependencyCircuitBreaker) -> PersistedBreakerState {
+    PersistedBreakerState {
+        state: value.state.as_str().into(),
+        failure_count: value.failure_count,
+        last_success_unix: value.last_success_unix,
+        next_retry_unix: value.next_retry_unix,
+        last_error: value.last_error.clone(),
+        last_latency_ms: value.last_latency_ms,
     }
 }
 
@@ -3811,5 +4182,274 @@ pub mod deployment_status_reflects_runtime_state {
         assert_eq!(logs.services.len(), 1);
         assert_eq!(logs.services[0].service_id, "worker");
         assert_eq!(logs.services[0].lines, vec!["worker polling".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod daemon_control_plane_durability {
+    use super::*;
+    use crate::api::{DeploymentRequest, ProjectUpsertRequest};
+    use crate::storage::{
+        ControlPlaneSnapshotStore, ConvergenceCheckpointStore, OperationalJournalStore,
+    };
+
+    fn seed_project(root: &std::path::Path) {
+        ProjectRegistryStore::new(root)
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("api".into()),
+                    repo_url: "https://example.com/api.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn convergence_checkpoint_survives_restart() {
+        let root = test_root("convergence-checkpoint-survives-restart");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        RuntimeStateStore::new(env.clone())
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Degraded,
+                failed_probe_count: 1,
+                successful_probe_count: 0,
+                restart_attempted: false,
+                degraded_since_unix: Some(current_unix_timestamp()),
+                last_transition: "degraded".into(),
+                last_error_code: Some("tcp_unreachable".into()),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let checkpoint = ConvergenceCheckpointStore::new(env)
+            .load()
+            .unwrap()
+            .expect("checkpoint should exist");
+        assert_eq!(checkpoint.active_generation, Some(1));
+
+        let mut restarted = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        restarted.start().unwrap();
+        assert_ne!(
+            restarted.readyz_cache_snapshot().response.status,
+            "not_ready"
+        );
+    }
+
+    #[test]
+    fn readiness_cache_restores_from_checkpoint() {
+        let root = test_root("readiness-cache-restores-from-checkpoint");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: current_unix_timestamp(),
+                last_successful_convergence_unix: Some(current_unix_timestamp()),
+                last_convergence_duration_ms: 10,
+                last_convergence_generation: Some(1),
+                last_convergence_error: Some("tcp_unreachable".into()),
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Degraded,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                readyz_reasons: vec!["restored from checkpoint".into()],
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.restore_readyz_cache_from_checkpoints();
+        let readyz = daemon.cached_readyz_response();
+        assert_eq!(readyz.status, "degraded");
+        assert_eq!(readyz.reasons[0].source, "convergence_checkpoint");
+    }
+
+    #[test]
+    fn stale_checkpoint_degrades_until_refresh() {
+        let root = test_root("stale-checkpoint-degrades-until-refresh");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: current_unix_timestamp().saturating_sub(60),
+                last_successful_convergence_unix: Some(current_unix_timestamp().saturating_sub(60)),
+                last_convergence_duration_ms: 10,
+                last_convergence_generation: Some(1),
+                last_convergence_error: None,
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Healthy,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                readyz_reasons: Vec::new(),
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.restore_readyz_cache_from_checkpoints();
+        let readyz = daemon.cached_readyz_response();
+        assert_eq!(readyz.status, "degraded");
+        assert_eq!(readyz.reasons[0].marker, "stale_checkpoint");
+    }
+
+    #[test]
+    fn corrupted_checkpoint_fails_gracefully() {
+        let root = test_root("corrupted-checkpoint-fails-gracefully");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        std::fs::write(env.checkpoint_file(), "{ invalid json").unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.restore_readyz_cache_from_checkpoints();
+        assert!(daemon.readyz_cache_snapshot().response.reasons.is_empty());
+    }
+
+    #[test]
+    fn runtime_snapshot_written_after_convergence() {
+        let root = test_root("runtime-snapshot-written-after-convergence");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        RuntimeStateStore::new(env.clone())
+            .save(&crate::storage::RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Healthy,
+                ..crate::storage::RuntimeState::default()
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let latest = ControlPlaneSnapshotStore::new(env)
+            .latest_by_kind("runtime_snapshot")
+            .unwrap()
+            .expect("runtime snapshot should exist");
+        assert_eq!(latest.snapshot_kind, "runtime_snapshot");
+    }
+
+    #[test]
+    fn breaker_transition_written_to_journal() {
+        let root = test_root("breaker-transition-written-to-journal");
+        seed_project(&root);
+        let fail_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            SwitchableDockerRuntime { fail_probe },
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            daemon.refresh_readyz_cache();
+        }
+        let entries = OperationalJournalStore::new(root).read_all().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.event_type == "breaker_transition")
+        );
+    }
+
+    #[test]
+    fn deployment_written_to_journal() {
+        let root = test_root("deployment-written-to-journal");
+        seed_project(&root);
+        let source = root.join("app");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon
+            .handle_post_deployments(DeploymentRequest {
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(source),
+                source_ref: None,
+            })
+            .unwrap();
+
+        let entries = OperationalJournalStore::new(root).read_all().unwrap();
+        assert!(entries.iter().any(|entry| entry.event_type == "deployment"));
+    }
+
+    #[test]
+    fn journal_rotation_preserves_recent_entries() {
+        let root = test_root("journal-rotation-preserves-recent-entries");
+        let journal = OperationalJournalStore::new(&root);
+        for index in 0..2000 {
+            journal
+                .append(&OperationalJournalEntry {
+                    schema_version: 1,
+                    timestamp_unix: current_unix_timestamp(),
+                    event_type: "gc_action".into(),
+                    project_id: None,
+                    environment: None,
+                    generation: None,
+                    payload: serde_json::json!({
+                        "index": index,
+                        "padding": "x".repeat(256),
+                    }),
+                })
+                .unwrap();
+        }
+        let entries = journal.read_all().unwrap();
+        assert!(entries.iter().any(|entry| entry.payload["index"] == 1999));
     }
 }

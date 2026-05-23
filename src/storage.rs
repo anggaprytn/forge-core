@@ -2,6 +2,7 @@ use crate::events::{EventRecord, redact_text};
 use crate::secrets::SealedValueRecord;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -14,6 +15,10 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_RETRY_LIMIT: usize = 200;
 const DIAGNOSTIC_LOG_MAX_LINES: usize = 64;
 const DIAGNOSTIC_LOG_MAX_BYTES: usize = 4096;
+const CONTROL_PLANE_SCHEMA_VERSION: u64 = 1;
+pub const CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT: usize = 12;
+const OPERATIONAL_JOURNAL_MAX_BYTES: u64 = 256 * 1024;
+const OPERATIONAL_JOURNAL_ROTATIONS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotState {
@@ -63,11 +68,132 @@ impl From<std::io::Error> for StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedDependencyState {
+    pub reachable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedBreakerState {
+    #[serde(default = "default_breaker_state")]
+    pub state: String,
+    #[serde(default)]
+    pub failure_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedEnvironmentCheckpoint {
+    #[serde(default = "default_control_plane_schema_version")]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub checkpointed_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_convergence_unix: Option<u64>,
+    #[serde(default)]
+    pub last_convergence_duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_convergence_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_convergence_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_generation: Option<u64>,
+    #[serde(default = "default_runtime_health_state")]
+    pub health_state: RuntimeHealthState,
+    #[serde(default)]
+    pub dependency_states: BTreeMap<String, PersistedDependencyState>,
+    #[serde(default)]
+    pub breaker_states: BTreeMap<String, PersistedBreakerState>,
+    #[serde(default)]
+    pub queue_depth_snapshot: usize,
+    #[serde(default)]
+    pub readyz_reasons: Vec<String>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedControlPlaneSnapshot {
+    #[serde(default = "default_control_plane_schema_version")]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub snapshot_kind: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub cycle_id: String,
+    #[serde(default)]
+    pub created_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedNodeMetadata {
+    #[serde(default = "default_control_plane_schema_version")]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub booted_at_unix: u64,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub runtime_info: BTreeMap<String, String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OperationalJournalEntry {
+    #[serde(default = "default_control_plane_schema_version")]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub timestamp_unix: u64,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub payload: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeHealthState {
     Healthy,
     Degraded,
     Unavailable,
+}
+
+impl Default for RuntimeHealthState {
+    fn default() -> Self {
+        Self::Healthy
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -878,8 +1004,30 @@ impl EnvironmentPaths {
         self.root.join("gc.json")
     }
 
+    pub fn checkpoint_file(&self) -> PathBuf {
+        self.root.join("convergence_checkpoint.json")
+    }
+
+    pub fn control_plane_snapshots_dir(&self) -> PathBuf {
+        self.root.join("control_plane_snapshots")
+    }
+
     pub fn backups_root(storage_root: impl AsRef<Path>) -> PathBuf {
         storage_root.as_ref().join("backups")
+    }
+
+    pub fn node_metadata_file(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root
+            .as_ref()
+            .join("control_plane")
+            .join("node.json")
+    }
+
+    pub fn operational_journal_file(storage_root: impl AsRef<Path>) -> PathBuf {
+        storage_root
+            .as_ref()
+            .join("control_plane")
+            .join("operations.jsonl")
     }
 
     fn ensure_pointer_file(&self, name: &str) -> StorageResult<()> {
@@ -996,6 +1144,22 @@ pub struct RetentionStore {
 
 pub struct GcStore {
     env: EnvironmentPaths,
+}
+
+pub struct ConvergenceCheckpointStore {
+    env: EnvironmentPaths,
+}
+
+pub struct ControlPlaneSnapshotStore {
+    env: EnvironmentPaths,
+}
+
+pub struct NodeMetadataStore {
+    storage_root: PathBuf,
+}
+
+pub struct OperationalJournalStore {
+    storage_root: PathBuf,
 }
 
 impl RuntimeStateStore {
@@ -1441,6 +1605,179 @@ impl GcStore {
     }
 }
 
+impl ConvergenceCheckpointStore {
+    pub fn new(env: EnvironmentPaths) -> Self {
+        Self { env }
+    }
+
+    pub fn load(&self) -> StorageResult<Option<PersistedEnvironmentCheckpoint>> {
+        load_json_file(self.env.checkpoint_file())
+    }
+
+    pub fn save(&self, checkpoint: &PersistedEnvironmentCheckpoint) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        write_pretty_json(self.env.checkpoint_file(), checkpoint)
+    }
+}
+
+impl ControlPlaneSnapshotStore {
+    pub fn new(env: EnvironmentPaths) -> Self {
+        Self { env }
+    }
+
+    pub fn append(
+        &self,
+        snapshot: &PersistedControlPlaneSnapshot,
+        retention_limit: usize,
+    ) -> StorageResult<()> {
+        self.env.ensure_exists()?;
+        fs::create_dir_all(self.env.control_plane_snapshots_dir())?;
+        let file_name = format!(
+            "{}-{}.json",
+            snapshot.created_at_unix, snapshot.snapshot_kind
+        );
+        write_pretty_json(
+            self.env.control_plane_snapshots_dir().join(file_name),
+            snapshot,
+        )?;
+        self.gc(retention_limit)?;
+        Ok(())
+    }
+
+    pub fn list(&self) -> StorageResult<Vec<PersistedControlPlaneSnapshot>> {
+        let dir = self.env.control_plane_snapshots_dir();
+        let mut paths = Vec::new();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        let mut snapshots = Vec::new();
+        for path in paths {
+            if let Some(snapshot) = load_json_file(path)? {
+                snapshots.push(snapshot);
+            }
+        }
+        Ok(snapshots)
+    }
+
+    pub fn latest_by_kind(
+        &self,
+        snapshot_kind: &str,
+    ) -> StorageResult<Option<PersistedControlPlaneSnapshot>> {
+        let mut snapshots = self
+            .list()?
+            .into_iter()
+            .filter(|snapshot| snapshot.snapshot_kind == snapshot_kind)
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.created_at_unix.cmp(&right.created_at_unix));
+        Ok(snapshots.pop())
+    }
+
+    pub fn gc(&self, retention_limit: usize) -> StorageResult<()> {
+        let dir = self.env.control_plane_snapshots_dir();
+        if !dir.exists() {
+            return Ok(());
+        }
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        let excess = paths.len().saturating_sub(retention_limit);
+        for path in paths.into_iter().take(excess) {
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
+}
+
+impl NodeMetadataStore {
+    pub fn new(storage_root: impl AsRef<Path>) -> Self {
+        Self {
+            storage_root: storage_root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn load_or_create(&self) -> StorageResult<PersistedNodeMetadata> {
+        if let Some(metadata) =
+            load_json_file(EnvironmentPaths::node_metadata_file(&self.storage_root))?
+        {
+            return Ok(metadata);
+        }
+        let metadata = PersistedNodeMetadata {
+            schema_version: CONTROL_PLANE_SCHEMA_VERSION,
+            node_id: generated_node_id(),
+            booted_at_unix: current_unix_timestamp(),
+            hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
+            capabilities: vec!["docker".into(), "caddy".into(), "backups".into()],
+            runtime_info: BTreeMap::from([
+                ("pid".into(), std::process::id().to_string()),
+                ("version".into(), env!("CARGO_PKG_VERSION").into()),
+            ]),
+            metadata: BTreeMap::new(),
+        };
+        write_pretty_json(
+            EnvironmentPaths::node_metadata_file(&self.storage_root),
+            &metadata,
+        )?;
+        Ok(metadata)
+    }
+}
+
+impl OperationalJournalStore {
+    pub fn new(storage_root: impl AsRef<Path>) -> Self {
+        Self {
+            storage_root: storage_root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn append(&self, entry: &OperationalJournalEntry) -> StorageResult<()> {
+        let path = EnvironmentPaths::operational_journal_file(&self.storage_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        rotate_journal_if_needed(&path)?;
+        let line = serde_json::to_string(entry).map_err(json_io_error)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn read_all(&self) -> StorageResult<Vec<OperationalJournalEntry>> {
+        let path = EnvironmentPaths::operational_journal_file(&self.storage_root);
+        let mut paths = vec![path.clone()];
+        for index in 1..=OPERATIONAL_JOURNAL_ROTATIONS {
+            paths.push(path.with_extension(format!("jsonl.{index}")));
+        }
+        let mut entries = Vec::new();
+        for file in paths {
+            if !file.exists() {
+                continue;
+            }
+            let raw = fs::read_to_string(file)?;
+            for line in raw.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let parsed = serde_json::from_str(line).map_err(json_io_error)?;
+                entries.push(parsed);
+            }
+        }
+        Ok(entries)
+    }
+}
+
 impl CleanupRecord {
     pub fn new(
         generation_failure_reason: impl Into<String>,
@@ -1775,8 +2112,70 @@ fn default_true() -> bool {
     true
 }
 
+fn default_breaker_state() -> String {
+    "closed".into()
+}
+
+fn default_control_plane_schema_version() -> u64 {
+    CONTROL_PLANE_SCHEMA_VERSION
+}
+
+fn default_runtime_health_state() -> RuntimeHealthState {
+    RuntimeHealthState::Healthy
+}
+
 fn default_restart_policy() -> String {
     "no".into()
+}
+
+fn generated_node_id() -> String {
+    format!("forge-node-{}", unique_suffix())
+}
+
+fn json_io_error(err: impl ToString) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
+}
+
+fn write_pretty_json(path: impl AsRef<Path>, value: &impl Serialize) -> StorageResult<()> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(json_io_error)?;
+    atomic_write(path, &bytes)
+}
+
+fn load_json_file<T: for<'de> Deserialize<'de>>(
+    path: impl AsRef<Path>,
+) -> StorageResult<Option<T>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|err| StorageError::Io(json_io_error(err)))
+}
+
+fn rotate_journal_if_needed(path: &Path) -> StorageResult<()> {
+    let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if size < OPERATIONAL_JOURNAL_MAX_BYTES {
+        return Ok(());
+    }
+    for index in (1..=OPERATIONAL_JOURNAL_ROTATIONS).rev() {
+        let source = if index == 1 {
+            path.to_path_buf()
+        } else {
+            path.with_extension(format!("jsonl.{}", index - 1))
+        };
+        let target = path.with_extension(format!("jsonl.{index}"));
+        if source.exists() {
+            let _ = fs::remove_file(&target);
+            fs::rename(source, target)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn normalize_restart_policy_name(policy: &str) -> String {

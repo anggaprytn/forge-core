@@ -108,6 +108,25 @@ Readiness model:
 
 The request path for `/readyz` must remain constant-time. It must never trigger synchronous Docker scans, Caddy scans, generation reconciliation, route reconciliation, or environment-wide diagnostics.
 
+Durability model:
+
+- Forge computes operational truth asynchronously and persists it as durable control-plane state.
+- Each environment now carries a bounded, atomic convergence checkpoint.
+- Each convergence cycle can emit immutable runtime, route, and dependency snapshots for replayable debugging.
+- Node identity is durable and informational only. It does not imply clustering, leader election, or distributed control.
+- An append-only operational journal records durable control-plane events without adding writes to the request path.
+
+Convergence domains:
+
+- routing reconciliation
+- runtime/container reconciliation
+- retention reconciliation
+- backup reconciliation
+- metrics refresh
+- dependency probing
+
+These domains are intentionally isolated so a degraded subsystem can mark its own domain degraded without collapsing the rest of the control plane.
+
 Previous readiness behavior coupled probe handling to full fleet diagnostics. Under scale, that produced pathological latency in the 48s to 150s range. The current model breaks that coupling.
 
 1. HTTP API

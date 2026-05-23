@@ -1,8 +1,8 @@
 use crate::events::EventRecord;
 use crate::storage::{
-    DeploymentLifecycleState, PersistedPromotionSummary, PersistedRuntimePolicy,
-    PersistedRuntimeUsageSnapshot, PersistedServiceState, PersistedTerminationInfo,
-    PersistedValidationSummary,
+    DeploymentLifecycleState, PersistedEnvironmentCheckpoint, PersistedPromotionSummary,
+    PersistedRuntimePolicy, PersistedRuntimeUsageSnapshot, PersistedServiceState,
+    PersistedTerminationInfo, PersistedValidationSummary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -385,6 +385,32 @@ pub struct EnvironmentDiagnostics {
     pub current_policy_drift_repairs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub historical_policy_drift_repairs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_checkpoint: Option<PersistedEnvironmentCheckpoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_summaries: Vec<ConvergenceDomainSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConvergenceDomainSummary {
+    pub domain: String,
+    pub status: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub booted_at_unix: u64,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,6 +669,10 @@ pub struct MetricsResponse {
     pub caddy_probe_latency_ms: u64,
     pub docker: MetricsDependencySnapshot,
     pub caddy: MetricsDependencySnapshot,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub convergence_domains: Vec<ConvergenceDomainSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

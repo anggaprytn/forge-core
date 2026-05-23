@@ -216,6 +216,20 @@ Forge now exposes cache-backed control-plane observability through `/readyz`, `/
 - Readiness continues to serve cached degraded state while the loop waits for the next retry budget.
 - Recovery automatically closes the breaker after a successful probe.
 
+### Durable Control-Plane State
+
+- `convergence_checkpoint.json` is the warm-start artifact for per-environment readiness, dependency, breaker, and queue-depth state.
+- `control_plane_snapshots/` stores immutable per-cycle `runtime_snapshot`, `route_snapshot`, and `dependency_snapshot` artifacts with bounded retention.
+- `control_plane/node.json` stores stable node identity, boot time, and capability flags.
+- `control_plane/operations.jsonl` is the append-only operational journal for deployments, breaker transitions, daemon restarts, and other bounded audit events.
+
+### Recovery Model
+
+- On daemon restart, Forge restores cached operational truth from checkpoints before live probing catches up.
+- If a checkpoint or snapshot is stale, readiness degrades until the next bounded convergence refresh.
+- If a checkpoint or snapshot is corrupted, Forge skips it, keeps the API up, and rebuilds truth from surviving durable state plus the next live convergence cycle.
+- Diagnostics should prefer durable snapshots when live dependencies are unavailable, so status remains usable during Docker or Caddy outages.
+
 ### Readiness Cache Staleness
 
 - If the readiness cache ages past the freshness threshold, `/readyz` returns `degraded` immediately.

@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{
-    ContainerRuntimeDiagnostics, DeploymentHistoryEntry, DeploymentHistoryResponse,
-    EnvironmentDiagnostics, EnvironmentDiffEntry, EnvironmentDiffResponse, EnvironmentDiffSummary,
-    EnvironmentValueChange, EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse,
+    ContainerRuntimeDiagnostics, ConvergenceDomainSummary, DeploymentHistoryEntry,
+    DeploymentHistoryResponse, EnvironmentDiagnostics, EnvironmentDiffEntry,
+    EnvironmentDiffResponse, EnvironmentDiffSummary, EnvironmentValueChange,
+    EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse, NodeInfo,
     ProbeStabilityDiagnostics, ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction,
     RetentionRole, RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic,
     SecretReferenceChange, ServiceRuntimeStatus, VolumeRuntimeStatus,
@@ -29,7 +30,8 @@ use crate::runtime_env::restore_runtime_env;
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
 use crate::secrets::SecretStore;
 use crate::storage::{
-    DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord,
+    ControlPlaneSnapshotStore, ConvergenceCheckpointStore, DeploymentLifecycleState,
+    DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord, NodeMetadataStore,
     PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary, PersistedResolvedRuntime,
     PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedRuntimePolicy,
@@ -1213,6 +1215,20 @@ where
         truth.active_generation,
         &status_value,
     )?;
+    let convergence_checkpoint = ConvergenceCheckpointStore::new(env.clone())
+        .load()
+        .ok()
+        .flatten();
+    let domain_summaries = latest_domain_summaries(&env);
+    let node = NodeMetadataStore::new(storage_root)
+        .load_or_create()
+        .ok()
+        .map(|metadata| NodeInfo {
+            node_id: metadata.node_id,
+            booted_at_unix: metadata.booted_at_unix,
+            hostname: metadata.hostname,
+            capabilities: metadata.capabilities,
+        });
     Ok(EnvironmentDiagnostics {
         project_id: project_id.to_string(),
         environment: environment.to_string(),
@@ -1308,6 +1324,9 @@ where
         policy_drift_repairs: policy_drift_repairs.current.clone(),
         current_policy_drift_repairs: policy_drift_repairs.current,
         historical_policy_drift_repairs: policy_drift_repairs.historical,
+        convergence_checkpoint,
+        domain_summaries,
+        node,
     })
 }
 
@@ -2451,6 +2470,20 @@ fn runtime_env_snapshot_metadata(
             })
             .collect(),
     }
+}
+
+fn latest_domain_summaries(env: &EnvironmentPaths) -> Vec<ConvergenceDomainSummary> {
+    let Ok(Some(snapshot)) =
+        ControlPlaneSnapshotStore::new(env.clone()).latest_by_kind("runtime_snapshot")
+    else {
+        return Vec::new();
+    };
+    snapshot
+        .payload
+        .get("domains")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
 }
 
 fn runtime_env_source_name(source: &crate::storage::PersistedRuntimeEnvSource) -> &'static str {
