@@ -29,3 +29,4 @@ pub mod source;
 pub mod status;
 pub mod storage;
 pub mod topology;
+pub mod users;

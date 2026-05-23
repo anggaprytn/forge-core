@@ -1167,6 +1167,28 @@ Everything else depends on this remaining true.
 - Backup metadata includes explicit sensitivity warnings.
 - Protect `/var/lib/forge/backups` with filesystem permissions, host access controls, and backup-retention discipline.
 
+## Registration Control
+
+- `ALLOW_NEW_REGISTRATION` defaults to `false`.
+- Existing users can still log in when registration is closed.
+- Unknown GitHub users are rejected with `Registration is closed`.
+- This is account-creation control only, not RBAC, teams, billing, or invites.
+
+Recommended bootstrap flow:
+
+1. Set `ALLOW_NEW_REGISTRATION=true` in `/etc/forge/forge.env`.
+2. Log in once with the owner GitHub account.
+3. Set `ALLOW_NEW_REGISTRATION=false`.
+4. Restart Forge.
+
+```bash
+sudo editor /etc/forge/forge.env
+
+ALLOW_NEW_REGISTRATION=false
+
+sudo systemctl restart forge
+```
+
 ## Release Hygiene
 
 - `forge version` is the canonical runtime fingerprint for support and release verification.

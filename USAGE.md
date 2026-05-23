@@ -405,6 +405,8 @@ forge login https://forge.example.com
 
 Forge creates a pending CLI login, opens or prints `/login/cli?code=...`, reuses the existing GitHub web session for approval, and stores the resulting token in `~/.config/forge/config.toml`. `FORGE_URL` and `FORGE_TOKEN` override the saved config when present.
 
+GitHub OAuth registration is closed by default on self-hosted installs. Set `ALLOW_NEW_REGISTRATION=true` for the initial owner login, then change it back to `false` and restart Forge. Existing users can still log in after registration is closed. Unknown GitHub users see `Registration is closed`. This is registration control only, not RBAC or team management.
+
 Endpoint semantics:
 
 - `/healthz`: process liveness only

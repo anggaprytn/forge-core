@@ -8,3 +8,8 @@ bearer_token=replace-with-a-long-random-token
 # repository_cache_root=/var/cache/forge/repositories
 # github_webhook_secret=replace-with-a-webhook-secret
 # sqlite_path=/var/lib/forge/forge.sqlite
+#
+# Set ALLOW_NEW_REGISTRATION in /etc/forge/forge.env for initial GitHub OAuth bootstrap.
+# Example:
+# ALLOW_NEW_REGISTRATION=true
+# Log in once, then set ALLOW_NEW_REGISTRATION=false and restart Forge.

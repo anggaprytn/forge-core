@@ -213,14 +213,33 @@ FORGE_GITHUB_OAUTH_CLIENT_SECRET=...
 FORGE_PUBLIC_URL=https://forge.example.com
 FORGE_SESSION_SECRET=...
 FORGE_CLI_TOKEN_SECRET=...
+ALLOW_NEW_REGISTRATION=false
 ```
 
 `FORGE_PUBLIC_URL` must be the public Forge origin used by operators and `forge login`.
 `FORGE_CLI_TOKEN_SECRET` signs CLI bearer tokens issued after browser approval.
+`ALLOW_NEW_REGISTRATION` controls whether GitHub OAuth may create a new Forge user. Default is `false`.
 
 `/login` starts the GitHub OAuth flow, `/app` requires the resulting session cookie, `/login/cli?code=...` serves the CLI approval page, and `/api/cli-login/*` drives the short-lived browser approval flow used by `forge login`.
 The static control-plane assets under `web/` are served by Forge itself, so the same process remains authoritative for auth, session validation, and protected page delivery.
 CLI commands and bearer-token API auth remain available for automation and operator usage. Web actions are not a separate deployment engine; they flow through the same API and queue.
+
+Bootstrap a new self-hosted install like this:
+
+1. Set `ALLOW_NEW_REGISTRATION=true`.
+2. Log in once with the owner GitHub account.
+3. Set `ALLOW_NEW_REGISTRATION=false`.
+4. Restart Forge.
+
+```bash
+sudo editor /etc/forge/forge.env
+
+ALLOW_NEW_REGISTRATION=false
+
+sudo systemctl restart forge
+```
+
+When registration is closed, existing users can still log in. Unknown GitHub users are rejected with `Registration is closed`. This is registration control only, not RBAC, teams, invites, billing, or org policy.
 
 ---
 

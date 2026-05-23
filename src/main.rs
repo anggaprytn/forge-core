@@ -3712,7 +3712,8 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
         forge_core::secrets::SecretStore::new(config.storage_root.join("secrets"))
             .map_err(|err| CliError::Usage(err.to_string()))?,
         ProjectRegistryStore::new(&config.storage_root),
-        WebAuthState::from_env(),
+        WebAuthState::from_env(config.storage_root.join("auth"))
+            .map_err(|err| CliError::Usage(err.to_string()))?,
         forge_core::http::CliAuthState::from_env(config.storage_root.join("auth"))
             .map_err(|err| CliError::Usage(err.to_string()))?,
     );

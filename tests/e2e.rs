@@ -1048,7 +1048,7 @@ impl E2eHarness {
             self.github_webhook_state(),
             SecretStore::new(self.runtime_root.join("secrets")).unwrap(),
             ProjectRegistryStore::new(&self.runtime_root),
-            WebAuthState::from_env(),
+            WebAuthState::from_env(self.runtime_root.join("auth")).unwrap(),
             None,
         );
         let app = router(state);

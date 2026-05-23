@@ -254,3 +254,28 @@ MIT License. Built for the era of agentic software.
 - Backup artifacts can contain sensitive application data.
 - Backups are not encrypted yet.
 - Backup files inherit host filesystem protections and should be treated as sensitive data under `/var/lib/forge/backups`.
+
+## Registration Control
+
+- `ALLOW_NEW_REGISTRATION` controls whether GitHub OAuth may create a new local Forge user.
+- Default is `false`.
+- Accepted true values: `true`, `1`, `yes`.
+- Accepted false values: `false`, `0`, `no`, empty, or unset.
+- Existing users can still log in when registration is closed.
+- Unknown GitHub users are rejected with `Registration is closed`.
+- This is registration control only, not RBAC, teams, org allowlists, or invites.
+
+Recommended self-hosted bootstrap flow:
+
+1. Set `ALLOW_NEW_REGISTRATION=true` in `/etc/forge/forge.env`.
+2. Log in once with the owner GitHub account.
+3. Set `ALLOW_NEW_REGISTRATION=false`.
+4. Restart Forge.
+
+```bash
+sudo editor /etc/forge/forge.env
+
+ALLOW_NEW_REGISTRATION=false
+
+sudo systemctl restart forge
+```

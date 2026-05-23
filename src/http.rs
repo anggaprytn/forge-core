@@ -41,6 +41,7 @@ use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::status::ProjectEnvironmentStatus;
 use crate::storage::atomic_write;
+use crate::users::{RegistrationDecision, UserRecord, UserStore, UserStoreError};
 
 const AUTHORIZATION: &str = "authorization";
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
@@ -359,26 +360,34 @@ impl HttpState {
 pub struct WebAuthState {
     config: Option<WebAuthConfig>,
     github_oauth: Arc<dyn GitHubOAuthProvider>,
+    users: UserStore,
 }
 
 impl WebAuthState {
-    pub fn from_env() -> Self {
-        Self {
-            config: load_web_auth_config_from_env(),
+    pub fn from_env(root: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(Self {
+            config: load_web_auth_config_from_env()?,
             github_oauth: Arc::new(RealGitHubOAuthProvider),
-        }
+            users: UserStore::new(root.as_ref().join("users")).map_err(|err| err.to_string())?,
+        })
     }
 
     #[cfg(test)]
-    fn unconfigured() -> Self {
+    fn unconfigured(root: impl AsRef<Path>) -> Self {
         Self {
             config: None,
             github_oauth: Arc::new(MockGitHubOAuthProvider::default()),
+            users: UserStore::new(root.as_ref().join("users")).unwrap(),
         }
     }
 
     #[cfg(test)]
-    fn configured_for_tests(login: &str, user_id: u64) -> Self {
+    fn configured_for_tests(
+        root: impl AsRef<Path>,
+        login: &str,
+        user_id: u64,
+        allow_new_registration: bool,
+    ) -> Self {
         Self {
             config: Some(WebAuthConfig {
                 public_url: "https://forge.example.com".into(),
@@ -386,13 +395,45 @@ impl WebAuthState {
                 client_secret: "test-client-secret".into(),
                 session_secret: "test-session-secret".into(),
                 secure_cookies: true,
+                allow_new_registration,
             }),
             github_oauth: Arc::new(MockGitHubOAuthProvider {
                 login: login.into(),
                 user_id,
                 fail: false,
             }),
+            users: UserStore::new(root.as_ref().join("users")).unwrap(),
         }
+    }
+
+    fn resolve_oauth_user(
+        &self,
+        user: &GitHubUser,
+    ) -> Result<RegistrationDecision, UserStoreError> {
+        self.users.resolve_from_github(
+            user.id,
+            &user.login,
+            self.config
+                .as_ref()
+                .map(|config| config.allow_new_registration)
+                .unwrap_or(false),
+        )
+    }
+
+    fn read_registered_user(&self, github_id: u64) -> Result<Option<UserRecord>, UserStoreError> {
+        self.users.read_by_github_id(github_id)
+    }
+
+    #[cfg(test)]
+    fn seed_user(&self, github_login: &str, github_id: u64) {
+        self.users
+            .write_record(&UserRecord {
+                github_id,
+                github_login: github_login.into(),
+                created_at_unix: 1,
+                updated_at_unix: 1,
+            })
+            .unwrap();
     }
 }
 
@@ -403,6 +444,7 @@ struct WebAuthConfig {
     client_secret: String,
     session_secret: String,
     secure_cookies: bool,
+    allow_new_registration: bool,
 }
 
 impl WebAuthConfig {
@@ -611,11 +653,11 @@ impl CliAuthState {
             .approve(code, session)
     }
 
-    fn poll_request(&self, code: &str) -> Result<CliLoginPollStatus, String> {
+    fn poll_request(&self, code: &str, users: &UserStore) -> Result<CliLoginPollStatus, String> {
         self.requests
             .lock()
             .map_err(|_| "cli login state lock poisoned".to_string())?
-            .poll(code, self.verifier.as_ref())
+            .poll(code, self.verifier.as_ref(), users)
     }
 
     fn verify_token(&self, token: &str) -> Result<Option<AuthenticatedPrincipal>, TokenStoreError> {
@@ -861,6 +903,7 @@ impl CliLoginStore {
         &mut self,
         code: &str,
         verifier: &CliTokenVerifier,
+        users: &UserStore,
     ) -> Result<CliLoginPollStatus, String> {
         let Some(mut record) = self.read(code)? else {
             return Ok(CliLoginPollStatus::Expired);
@@ -873,6 +916,14 @@ impl CliLoginStore {
             record.approved_by_id,
             record.approved_at_unix,
         ) {
+            if !users
+                .user_exists(github_id)
+                .map_err(|err| err.to_string())?
+            {
+                record.consumed_at_unix = Some(unix_now());
+                self.write(code, &record)?;
+                return Ok(CliLoginPollStatus::Expired);
+            }
             let token = verifier
                 .issue_token(TokenIssueRequest {
                     name: format!("cli-login-{github_login}"),
@@ -1169,6 +1220,7 @@ async fn get_oauth_github_callback(
         return redirect_response("/login");
     };
     let clear_state_cookie = build_clear_cookie(OAUTH_STATE_COOKIE_NAME, config.secure_cookies);
+    let clear_session_cookie = build_clear_cookie(SESSION_COOKIE_NAME, config.secure_cookies);
     let Some(expected_state) = read_signed_cookie::<OAuthStateCookie>(
         &headers,
         OAUTH_STATE_COOKIE_NAME,
@@ -1204,15 +1256,35 @@ async fn get_oauth_github_callback(
             return html_response_with_cookies(
                 StatusCode::BAD_GATEWAY,
                 "github login failed",
-                &[clear_state_cookie],
+                &[clear_state_cookie, clear_session_cookie],
+            );
+        }
+    };
+
+    let registered = match state.web_auth.resolve_oauth_user(&user) {
+        Ok(RegistrationDecision::Existing(record)) | Ok(RegistrationDecision::Created(record)) => {
+            record
+        }
+        Ok(RegistrationDecision::RegistrationClosed) => {
+            eprintln!(
+                "registration_rejected reason=registration_closed github_id={} github_login={}",
+                user.id, user.login
+            );
+            return registration_closed_response(&[clear_state_cookie, clear_session_cookie]);
+        }
+        Err(_) => {
+            return html_response_with_cookies(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "user lookup failed",
+                &[clear_state_cookie, clear_session_cookie],
             );
         }
     };
 
     let session_cookie = match encode_signed_value(
         &SessionCookie {
-            github_login: user.login,
-            github_id: user.id,
+            github_login: registered.github_login,
+            github_id: registered.github_id,
         },
         &config.session_secret,
     ) {
@@ -1221,7 +1293,7 @@ async fn get_oauth_github_callback(
             return html_response_with_cookies(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "session creation failed",
-                &[clear_state_cookie],
+                &[clear_state_cookie, clear_session_cookie],
             );
         }
     };
@@ -1389,7 +1461,7 @@ async fn post_cli_login_poll(
         );
     };
 
-    match cli_auth.poll_request(&request.code) {
+    match cli_auth.poll_request(&request.code, &state.web_auth.users) {
         Ok(CliLoginPollStatus::Pending) => json_response(
             StatusCode::OK,
             &request_id,
@@ -1504,7 +1576,41 @@ async fn post_token_create(
             },
         );
     }
-    let issue_request = token_issue_request_for_principal(&principal, request.name.trim());
+    let registered_user = match registered_user_for_principal(&state, &principal) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                &request_id,
+                ErrorResponse {
+                    code: "registered_user_required".into(),
+                    message: "token creation requires an existing authenticated user".into(),
+                },
+            );
+        }
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &request_id,
+                ErrorResponse {
+                    code: "user_store_error".into(),
+                    message: err.to_string(),
+                },
+            );
+        }
+    };
+    let Some(issue_request) =
+        token_issue_request_for_principal(&principal, &registered_user, request.name.trim())
+    else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            &request_id,
+            ErrorResponse {
+                code: "registered_user_required".into(),
+                message: "token creation requires an existing authenticated user".into(),
+            },
+        );
+    };
     match cli_auth.issue_token(issue_request) {
         Ok(result) => json_response(
             StatusCode::OK,
@@ -2634,21 +2740,17 @@ fn principal_can_access_token(
 
 fn token_issue_request_for_principal(
     principal: &AuthenticatedPrincipal,
+    user: &UserRecord,
     name: &str,
-) -> TokenIssueRequest {
+) -> Option<TokenIssueRequest> {
     match principal.auth_source {
-        AuthSource::BootstrapToken => TokenIssueRequest {
+        AuthSource::BootstrapToken => None,
+        AuthSource::CliToken | AuthSource::LegacyCliToken => Some(TokenIssueRequest {
             name: name.into(),
-            github_login: "bootstrap-admin".into(),
-            github_id: 0,
+            github_login: user.github_login.clone(),
+            github_id: user.github_id,
             source: "token_create".into(),
-        },
-        AuthSource::CliToken | AuthSource::LegacyCliToken => TokenIssueRequest {
-            name: name.into(),
-            github_login: principal.github_login.clone().unwrap_or_default(),
-            github_id: principal.github_id.unwrap_or(0),
-            source: "token_create".into(),
-        },
+        }),
     }
 }
 
@@ -2691,6 +2793,16 @@ fn token_store_error_response(request_id: &str, err: TokenStoreError) -> Respons
             },
         ),
     }
+}
+
+fn registered_user_for_principal(
+    state: &HttpState,
+    principal: &AuthenticatedPrincipal,
+) -> Result<Option<UserRecord>, UserStoreError> {
+    let Some(github_id) = principal.github_id else {
+        return Ok(None);
+    };
+    state.web_auth.read_registered_user(github_id)
 }
 
 fn github_error_response(request_id: &str, err: GitHubError) -> Response {
@@ -2822,20 +2934,76 @@ fn redirect_with_cookies(status: StatusCode, location: &str, cookies: &[String])
     response
 }
 
-fn load_web_auth_config_from_env() -> Option<WebAuthConfig> {
-    let client_id = std::env::var("FORGE_GITHUB_OAUTH_CLIENT_ID").ok()?;
-    let client_secret = std::env::var("FORGE_GITHUB_OAUTH_CLIENT_SECRET").ok()?;
-    let public_url = std::env::var("FORGE_PUBLIC_URL").ok()?;
-    let session_secret = std::env::var("FORGE_SESSION_SECRET").ok()?;
+fn load_web_auth_config_from_env() -> Result<Option<WebAuthConfig>, String> {
+    let Ok(client_id) = std::env::var("FORGE_GITHUB_OAUTH_CLIENT_ID") else {
+        return Ok(None);
+    };
+    let Ok(client_secret) = std::env::var("FORGE_GITHUB_OAUTH_CLIENT_SECRET") else {
+        return Ok(None);
+    };
+    let Ok(public_url) = std::env::var("FORGE_PUBLIC_URL") else {
+        return Ok(None);
+    };
+    let Ok(session_secret) = std::env::var("FORGE_SESSION_SECRET") else {
+        return Ok(None);
+    };
     let secure_cookies = public_url.starts_with("https://");
+    let allow_new_registration = parse_allow_new_registration()?;
 
-    Some(WebAuthConfig {
+    Ok(Some(WebAuthConfig {
         public_url,
         client_id,
         client_secret,
         session_secret,
         secure_cookies,
-    })
+        allow_new_registration,
+    }))
+}
+
+fn parse_allow_new_registration() -> Result<bool, String> {
+    let Some(value) = std::env::var_os("ALLOW_NEW_REGISTRATION") else {
+        return Ok(false);
+    };
+    parse_allow_new_registration_value(&value.to_string_lossy())
+}
+
+fn parse_allow_new_registration_value(value: &str) -> Result<bool, String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(false);
+    }
+
+    match value.as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(
+            "invalid ALLOW_NEW_REGISTRATION value; expected true, 1, yes, false, 0, or no".into(),
+        ),
+    }
+}
+
+fn registration_closed_response(cookies: &[String]) -> Response {
+    html_response_with_cookies(
+        StatusCode::FORBIDDEN,
+        concat!(
+            "<!doctype html>\n",
+            "<html lang=\"en\">\n",
+            "<head>\n",
+            "  <meta charset=\"utf-8\">\n",
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+            "  <title>Registration Closed</title>\n",
+            "</head>\n",
+            "<body>\n",
+            "  <main>\n",
+            "    <h1>Registration is closed</h1>\n",
+            "    <p>Registration is closed</p>\n",
+            "    <p><a href=\"/login\">Return to login</a></p>\n",
+            "  </main>\n",
+            "</body>\n",
+            "</html>\n",
+        ),
+        cookies,
+    )
 }
 
 fn generate_nonce() -> String {
@@ -3258,7 +3426,7 @@ fn build_state_with_root(ready: bool) -> (HttpState, PathBuf) {
             None,
             SecretStore::new(root.join("secrets")).unwrap(),
             ProjectRegistryStore::new(&root),
-            WebAuthState::unconfigured(),
+            WebAuthState::unconfigured(&root),
             None,
         ),
         root,
@@ -3400,7 +3568,7 @@ fn build_cached_only_state(snapshot: ControlPlaneSnapshot) -> HttpState {
         None,
         SecretStore::new(root.join("secrets")).unwrap(),
         ProjectRegistryStore::new(&root),
-        WebAuthState::unconfigured(),
+        WebAuthState::unconfigured(&root),
         None,
     )
 }
@@ -3594,9 +3762,22 @@ fn git_test(root: &Path, args: &[&str]) {
 #[cfg(test)]
 fn build_cli_login_state() -> HttpState {
     let (mut state, root) = build_state_with_root(true);
-    state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+    state.web_auth = WebAuthState::configured_for_tests(&root, "octocat", 7, false);
+    state.web_auth.seed_user("octocat", 7);
     state.cli_auth = Some(CliAuthState::configured_for_tests(root.join("cli-logins")));
     state
+}
+
+#[cfg(test)]
+fn oauth_state_cookie(session_secret: &str, state_value: &str) -> String {
+    encode_signed_value(
+        &OAuthStateCookie {
+            nonce: state_value.into(),
+            return_to: None,
+        },
+        session_secret,
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -3881,7 +4062,8 @@ pub mod login_endpoint_shows_continue_with_github_when_configured {
     #[tokio::test]
     async fn login_endpoint_shows_continue_with_github_when_configured() {
         let mut state = build_state(true);
-        state.web_auth = WebAuthState::configured_for_tests("octocat", 1);
+        state.web_auth =
+            WebAuthState::configured_for_tests(test_root("login-configured"), "octocat", 1, false);
         let app = router(state);
         let request = Request::builder()
             .method(axum::http::Method::GET)
@@ -3907,7 +4089,8 @@ pub mod oauth_start_redirects_to_github {
     #[tokio::test]
     async fn oauth_start_redirects_to_github() {
         let mut state = build_state(true);
-        state.web_auth = WebAuthState::configured_for_tests("octocat", 1);
+        state.web_auth =
+            WebAuthState::configured_for_tests(test_root("oauth-start"), "octocat", 1, false);
         let app = router(state);
         let request = Request::builder()
             .method(axum::http::Method::GET)
@@ -4188,7 +4371,8 @@ pub mod oauth_callback_creates_session_cookie {
     #[tokio::test]
     async fn oauth_callback_creates_session_cookie() {
         let mut state = build_state(true);
-        state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+        state.web_auth =
+            WebAuthState::configured_for_tests(test_root("oauth-callback"), "octocat", 7, true);
         let config = state.web_auth.config.clone().unwrap();
         let app = router(state);
         let state_value = "test-state";
@@ -4232,6 +4416,426 @@ pub mod oauth_callback_creates_session_cookie {
 }
 
 #[cfg(test)]
+pub mod allow_new_registration_defaults_false {
+    use super::*;
+
+    #[test]
+    fn allow_new_registration_defaults_false() {
+        assert!(!parse_allow_new_registration_value("").unwrap());
+    }
+}
+
+#[cfg(test)]
+pub mod existing_user_can_login_when_registration_closed {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn existing_user_can_login_when_registration_closed() {
+        let root = test_root("existing-user-login-closed");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "octocat", 7, false);
+        state.web_auth.seed_user("octocat", 7);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state);
+        let state_value = "closed-existing";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!(
+                        "/oauth/github/callback?code=test-code&state={state_value}"
+                    ))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, state_value)
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&format!("{SESSION_COOKIE_NAME}=")))
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod unknown_user_rejected_when_registration_closed {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn unknown_user_rejected_when_registration_closed() {
+        let root = test_root("unknown-user-rejected");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "new-user", 9, false);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state.clone());
+        let state_value = "closed-unknown";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!(
+                        "/oauth/github/callback?code=test-code&state={state_value}"
+                    ))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, state_value)
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Registration is closed"));
+        assert!(!state.web_auth.users.user_exists(9).unwrap());
+    }
+}
+
+#[cfg(test)]
+pub mod unknown_user_created_when_registration_open {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn unknown_user_created_when_registration_open() {
+        let root = test_root("unknown-user-open");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "new-user", 9, true);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state.clone());
+        let state_value = "open-unknown";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!(
+                        "/oauth/github/callback?code=test-code&state={state_value}"
+                    ))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, state_value)
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(state.web_auth.users.user_exists(9).unwrap());
+    }
+}
+
+#[cfg(test)]
+pub mod registration_closed_does_not_create_user_record {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn registration_closed_does_not_create_user_record() {
+        let root = test_root("registration-closed-no-user");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "new-user", 10, false);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state.clone());
+        let state_value = "closed-no-create";
+
+        let _response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!(
+                        "/oauth/github/callback?code=test-code&state={state_value}"
+                    ))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, state_value)
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!state.web_auth.users.user_exists(10).unwrap());
+    }
+}
+
+#[cfg(test)]
+pub mod github_id_match_allows_login_even_if_login_changed {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn github_id_match_allows_login_even_if_login_changed() {
+        let root = test_root("github-id-rename");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "renamed-octocat", 7, false);
+        state.web_auth.seed_user("octocat", 7);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state.clone());
+        let state_value = "rename-login";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!(
+                        "/oauth/github/callback?code=test-code&state={state_value}"
+                    ))
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, state_value)
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let record = state.web_auth.users.read_by_github_id(7).unwrap().unwrap();
+        assert_eq!(record.github_login, "renamed-octocat");
+    }
+}
+
+#[cfg(test)]
+pub mod cli_login_does_not_create_unknown_user_when_registration_closed {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn cli_login_does_not_create_unknown_user_when_registration_closed() {
+        let root = test_root("cli-login-closed");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "new-user", 11, false);
+        state.cli_auth = Some(CliAuthState::configured_for_tests(root.join("cli-logins")));
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state.clone());
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let start_body = to_bytes(start.into_body(), usize::MAX).await.unwrap();
+        let start_json: Value = serde_json::from_slice(&start_body).unwrap();
+        let code = start_json["data"]["code"].as_str().unwrap();
+
+        let callback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/oauth/github/callback?code=test-code&state=cli-closed")
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, "cli-closed")
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::FORBIDDEN);
+
+        let poll = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/cli-login/poll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let poll_body = to_bytes(poll.into_body(), usize::MAX).await.unwrap();
+        let poll_json: Value = serde_json::from_slice(&poll_body).unwrap();
+        assert_eq!(poll_json["data"]["status"], "pending");
+        assert!(!state.web_auth.users.user_exists(11).unwrap());
+    }
+}
+
+#[cfg(test)]
+pub mod token_creation_requires_existing_authenticated_user {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn token_creation_requires_existing_authenticated_user() {
+        let state = build_cli_login_state();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/tokens")
+                    .header("authorization", "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"laptop"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("token creation requires an existing authenticated user"));
+    }
+}
+
+#[cfg(test)]
+pub mod oauth_rejection_does_not_set_session_cookie {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn oauth_rejection_does_not_set_session_cookie() {
+        let root = test_root("oauth-reject-no-session");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "new-user", 12, false);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/oauth/github/callback?code=test-code&state=no-session")
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, "no-session")
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(cookies.iter().any(
+            |value| value.starts_with(&format!("{SESSION_COOKIE_NAME}="))
+                && value.contains("Max-Age=0")
+        ));
+        assert!(!cookies.iter().any(
+            |value| value.starts_with(&format!("{SESSION_COOKIE_NAME}="))
+                && !value.contains("Max-Age=0")
+        ));
+    }
+}
+
+#[cfg(test)]
+pub mod registration_closed_error_page_is_rendered {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn registration_closed_error_page_is_rendered() {
+        let root = test_root("registration-closed-page");
+        let mut state = build_state(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "new-user", 13, false);
+        let config = state.web_auth.config.clone().unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/oauth/github/callback?code=test-code&state=closed-page")
+                    .header(
+                        header::COOKIE,
+                        format!(
+                            "{OAUTH_STATE_COOKIE_NAME}={}",
+                            oauth_state_cookie(&config.session_secret, "closed-page")
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<h1>Registration is closed</h1>"));
+    }
+}
+
+#[cfg(test)]
 pub mod app_requires_valid_session {
     use super::*;
     use axum::body::Body;
@@ -4241,7 +4845,12 @@ pub mod app_requires_valid_session {
     #[tokio::test]
     async fn app_requires_session() {
         let mut state = build_state(true);
-        state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+        state.web_auth = WebAuthState::configured_for_tests(
+            test_root("app-requires-session"),
+            "octocat",
+            7,
+            false,
+        );
         let app = router(state);
         let request = Request::builder()
             .method(axum::http::Method::GET)
@@ -4342,7 +4951,12 @@ pub mod logout_clears_session_cookie {
     #[tokio::test]
     async fn logout_clears_session_cookie() {
         let mut state = build_state(true);
-        state.web_auth = WebAuthState::configured_for_tests("octocat", 7);
+        state.web_auth = WebAuthState::configured_for_tests(
+            test_root("logout-clears-session"),
+            "octocat",
+            7,
+            false,
+        );
         let app = router(state);
         let request = Request::builder()
             .method(axum::http::Method::POST)
