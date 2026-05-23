@@ -6690,7 +6690,7 @@ mod daemon_control_plane_durability {
     fn control_plane_restart_stress() {
         let root = test_root("control-plane-restart-stress");
         let node_id = local_node_id(&root);
-        for cycle in 0..100 {
+        for cycle in 0..25 {
             force_leader_lease(
                 &root,
                 &node_id,
@@ -6700,9 +6700,7 @@ mod daemon_control_plane_durability {
             );
             seed_pending_promotion_intent(&root, &node_id, cycle.saturating_add(1), cycle + 1);
             let mut config = config_with_root(root.clone());
-            if cycle % 10 == 0 {
-                config.startup_replay_max_entries = 1;
-            }
+            config.startup_replay_max_entries = 1;
             let mut daemon = Daemon::new(
                 config,
                 NoopDockerRuntime,

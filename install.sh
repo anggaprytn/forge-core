@@ -19,6 +19,7 @@ STORAGE_ROOT="${FORGE_STORAGE_ROOT:-/var/lib/forge}"
 SRV_ROOT="${FORGE_SRV_ROOT:-/srv/forge}"
 SAMPLE_ROOT="${FORGE_SAMPLE_ROOT:-/srv/forge/sample-http-app}"
 ALLOW_UNPRIVILEGED_INSTALL="${FORGE_ALLOW_UNPRIVILEGED_INSTALL:-0}"
+INSTALL_TIMEOUT_SECS="${FORGE_INSTALL_TIMEOUT_SECS:-300}"
 
 usage() {
   cat <<'EOF'
@@ -44,6 +45,19 @@ warn() {
 die() {
   printf '[ERROR] %s\n' "$*" >&2
   exit 1
+}
+
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+  set +e
+  perl -e 'alarm shift @ARGV; exec @ARGV' "$timeout_secs" "$@"
+  local status=$?
+  set -e
+  if [ "$status" -eq 142 ]; then
+    die "$1 timed out after ${timeout_secs}s"
+  fi
+  return "$status"
 }
 
 while [ $# -gt 0 ]; do
@@ -174,7 +188,7 @@ stage_artifact() {
   reject_world_writable "$artifact"
   verify_checksum_if_available "$artifact"
   mkdir -p "$stage_dir"
-  tar -xzf "$artifact" -C "$stage_dir"
+  run_with_timeout "$INSTALL_TIMEOUT_SECS" tar -xzf "$artifact" -C "$stage_dir"
   [ -x "$stage_dir/forge" ] || die "artifact missing forge binary"
   [ -f "$stage_dir/forge.conf.example" ] || die "artifact missing forge.conf.example"
   [ -f "$stage_dir/forge.env.example" ] || die "artifact missing forge.env.example"

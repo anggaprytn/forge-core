@@ -10,10 +10,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::api::ForgeSchemaVersions;
 use crate::config::DaemonConfig;
 use crate::doctor::{
     DockerCliChecker, DoctorCheck, DoctorStatus, ReqwestHttpChecker, run_with_dependencies,
 };
+use crate::process::{CommandError, run_command_with_timeout};
 use crate::storage::{atomic_write, current_unix_timestamp};
 
 pub const MANIFEST_SCHEMA_VERSION: u64 = 1;
@@ -22,6 +24,11 @@ const DEFAULT_BINARY_PATH: &str = "/usr/local/bin/forge";
 const DEFAULT_PREVIOUS_BINARY_PATH: &str = "/usr/local/bin/forge.previous";
 const READYZ_TIMEOUT: Duration = Duration::from_secs(30);
 const READYZ_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DF_TIMEOUT: Duration = Duration::from_secs(5);
+const TAR_TIMEOUT: Duration = Duration::from_secs(30);
+const VERSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
+const SUDO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum UpgradeError {
@@ -82,6 +89,13 @@ pub struct UpgradePlanOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BinaryVersionInfo {
+    version: String,
+    #[serde(default)]
+    schema_versions: Option<ForgeSchemaVersions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeApplyOutput {
     pub from_version: String,
     pub to_version: String,
@@ -99,7 +113,7 @@ pub struct UpgradeOptions {
 
 pub fn plan(options: &UpgradeOptions) -> Result<UpgradePlanOutput, UpgradeError> {
     let config = load_config(&options.config_path)?;
-    let current_version = current_binary_version(&current_binary_path())?;
+    let current_version = inspect_binary_version(&current_binary_path())?;
     let artifact = inspect_artifact(&options.artifact_path)?;
     let mut checks = vec![
         check_file_readable(&options.config_path, "Config readable"),
@@ -123,34 +137,18 @@ pub fn plan(options: &UpgradeOptions) -> Result<UpgradePlanOutput, UpgradeError>
     );
     checks.extend(report.checks.into_iter().map(map_doctor_check));
     checks.push(check_systemd_unit_exists());
+    checks.extend(compatibility_checks(
+        &current_version.schema_versions,
+        &artifact.schema_versions,
+    ));
 
-    let output = UpgradePlanOutput {
-        current_version: current_version.clone(),
-        target_version: artifact.version.clone(),
+    Ok(UpgradePlanOutput {
+        current_version: current_version.version,
+        target_version: artifact.version,
         artifact_path: options.artifact_path.display().to_string(),
-        artifact_checksum: artifact.checksum.clone(),
+        artifact_checksum: artifact.checksum,
         checks,
-    };
-
-    write_journal(
-        &config.storage_root,
-        &UpgradeEvent {
-            timestamp_unix: current_unix_timestamp(),
-            action: "plan".into(),
-            from_version: current_version,
-            to_version: artifact.version,
-            artifact_checksum: Some(artifact.checksum),
-            operator_source: operator_source("forge upgrade plan"),
-            result: if output.checks.iter().any(|check| check.status == "error") {
-                "failed".into()
-            } else {
-                "ok".into()
-            },
-            failure_reason: None,
-        },
-    )?;
-
-    Ok(output)
+    })
 }
 
 pub fn apply(options: &UpgradeOptions) -> Result<UpgradeApplyOutput, UpgradeError> {
@@ -207,8 +205,8 @@ pub fn apply(options: &UpgradeOptions) -> Result<UpgradeApplyOutput, UpgradeErro
 
 pub fn rollback(config_path: &Path) -> Result<UpgradeApplyOutput, UpgradeError> {
     let config = load_config(config_path)?;
-    let from_version = current_binary_version(&current_binary_path())?;
-    let to_version = current_binary_version(Path::new(&previous_binary_path()))?;
+    let from_version = inspect_binary_version(&current_binary_path())?.version;
+    let to_version = inspect_binary_version(Path::new(&previous_binary_path()))?.version;
     restore_previous_binary(Path::new(&previous_binary_path()), &current_binary_path())?;
     systemctl(&["restart", "forge.service"])?;
     wait_readyz(&config).map_err(UpgradeError::Readyz)?;
@@ -278,9 +276,10 @@ fn check_file_readable(path: &Path, label: &str) -> UpgradeCheckResult {
 }
 
 fn check_disk_space(path: &Path) -> UpgradeCheckResult {
-    let output = Command::new("df")
-        .args(["-Pk", &path.display().to_string()])
-        .output();
+    let output = run_command_with_timeout(
+        Command::new("df").args(["-Pk", &path.display().to_string()]),
+        DF_TIMEOUT,
+    );
     let Ok(output) = output else {
         return UpgradeCheckResult {
             status: "warn".into(),
@@ -327,35 +326,97 @@ fn check_systemd_unit_exists() -> UpgradeCheckResult {
     }
 }
 
-fn current_binary_version(binary_path: &Path) -> Result<String, UpgradeError> {
-    let output = Command::new(binary_path)
-        .arg("version")
-        .output()
-        .map_err(|err| {
-            UpgradeError::Command(format!(
-                "failed to execute {}: {err}",
-                binary_path.display()
-            ))
-        })?;
+fn compatibility_checks(
+    current: &Option<ForgeSchemaVersions>,
+    target: &Option<ForgeSchemaVersions>,
+) -> Vec<UpgradeCheckResult> {
+    let (Some(current), Some(target)) = (current.as_ref(), target.as_ref()) else {
+        return vec![UpgradeCheckResult {
+            status: "warn".into(),
+            message: "Schema compatibility: unavailable from version output".into(),
+        }];
+    };
+    let mut checks = Vec::new();
+    if current.storage_compatibility == target.storage_compatibility {
+        checks.push(UpgradeCheckResult {
+            status: "ok".into(),
+            message: format!("Storage compatibility: {}", target.storage_compatibility),
+        });
+    } else {
+        checks.push(UpgradeCheckResult {
+            status: "error".into(),
+            message: format!(
+                "Storage compatibility mismatch: current={} target={}",
+                current.storage_compatibility, target.storage_compatibility
+            ),
+        });
+    }
+    for (label, current_value, target_value) in [
+        (
+            "Manifest schema compatibility",
+            current.manifest_schema,
+            target.manifest_schema,
+        ),
+        (
+            "Snapshot schema compatibility",
+            current.snapshot_schema,
+            target.snapshot_schema,
+        ),
+        (
+            "Checkpoint schema compatibility",
+            current.checkpoint_schema,
+            target.checkpoint_schema,
+        ),
+        (
+            "Reconciliation log schema compatibility",
+            current.reconciliation_log_schema,
+            target.reconciliation_log_schema,
+        ),
+    ] {
+        let (status, message) = if target_value >= current_value {
+            (
+                "ok",
+                format!("{label}: current={current_value} target={target_value}"),
+            )
+        } else {
+            (
+                "error",
+                format!("{label} mismatch: current={current_value} target={target_value}"),
+            )
+        };
+        checks.push(UpgradeCheckResult {
+            status: status.into(),
+            message,
+        });
+    }
+    checks
+}
+
+fn inspect_binary_version(binary_path: &Path) -> Result<BinaryVersionInfo, UpgradeError> {
+    let output = run_command_with_timeout(
+        Command::new(binary_path).arg("version"),
+        VERSION_COMMAND_TIMEOUT,
+    )
+    .map_err(|err| command_error(err, format!("failed to execute {}", binary_path.display())))?;
     if !output.status.success() {
         return Err(UpgradeError::Command(format!(
             "failed to read version from {}",
             binary_path.display()
         )));
     }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|err| {
+    serde_json::from_slice(&output.stdout).map_err(|err| {
         UpgradeError::Command(format!(
             "failed to parse version output from {}: {err}",
             binary_path.display()
         ))
-    })?;
-    Ok(json["version"].as_str().unwrap_or("unknown").to_string())
+    })
 }
 
 #[derive(Debug, Clone)]
 struct InspectedArtifact {
     version: String,
     checksum: String,
+    schema_versions: Option<ForgeSchemaVersions>,
 }
 
 fn inspect_artifact(path: &Path) -> Result<InspectedArtifact, UpgradeError> {
@@ -363,6 +424,7 @@ fn inspect_artifact(path: &Path) -> Result<InspectedArtifact, UpgradeError> {
     let checksum = sha256_file(path)?;
     verify_checksum_if_available(path, &checksum)?;
     let temp_root = unique_temp_dir("forge-upgrade-artifact");
+    let _cleanup = TempDirGuard::new(&temp_root);
     fs::create_dir_all(&temp_root)?;
     unpack_artifact(path, &temp_root)?;
     let binary_path = temp_root.join("forge");
@@ -371,8 +433,12 @@ fn inspect_artifact(path: &Path) -> Result<InspectedArtifact, UpgradeError> {
             "artifact missing forge binary".into(),
         ));
     }
-    let version = current_binary_version(&binary_path)?;
-    Ok(InspectedArtifact { version, checksum })
+    let version = inspect_binary_version(&binary_path)?;
+    Ok(InspectedArtifact {
+        version: version.version,
+        checksum,
+        schema_versions: version.schema_versions,
+    })
 }
 
 fn reject_world_writable(path: &Path) -> Result<(), UpgradeError> {
@@ -433,18 +499,15 @@ fn sha256_file(path: &Path) -> Result<String, UpgradeError> {
 }
 
 fn unpack_artifact(path: &Path, destination: &Path) -> Result<(), UpgradeError> {
-    let output = Command::new("tar")
-        .args(["-xzf"])
-        .arg(path)
-        .args(["-C"])
-        .arg(destination)
-        .output()
-        .map_err(|err| {
-            UpgradeError::Command(format!(
-                "failed to unpack artifact {}: {err}",
-                path.display()
-            ))
-        })?;
+    let output = run_command_with_timeout(
+        Command::new("tar")
+            .args(["-xzf"])
+            .arg(path)
+            .args(["-C"])
+            .arg(destination),
+        TAR_TIMEOUT,
+    )
+    .map_err(|err| command_error(err, format!("failed to unpack artifact {}", path.display())))?;
     if !output.status.success() {
         return Err(UpgradeError::Command(format!(
             "failed to unpack artifact {}: {}",
@@ -457,6 +520,7 @@ fn unpack_artifact(path: &Path, destination: &Path) -> Result<(), UpgradeError> 
 
 fn install_artifact_binary(artifact_path: &Path, destination: &Path) -> Result<(), UpgradeError> {
     let temp_root = unique_temp_dir("forge-upgrade-install");
+    let _cleanup = TempDirGuard::new(&temp_root);
     fs::create_dir_all(&temp_root)?;
     unpack_artifact(artifact_path, &temp_root)?;
     let binary_path = temp_root.join("forge");
@@ -466,16 +530,23 @@ fn install_artifact_binary(artifact_path: &Path, destination: &Path) -> Result<(
         ));
     }
     let contents = fs::read(&binary_path)?;
-    atomic_write(destination, &contents)
-        .map_err(|err| UpgradeError::Io(storage_error_to_io(err)))?;
-    let mut permissions = fs::metadata(destination)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(destination, permissions)?;
-    Ok(())
+    write_binary_atomically(destination, &contents)
 }
 
 fn backup_current_binary(current: &Path, previous: &str) -> Result<(), UpgradeError> {
     if !current.exists() {
+        return Ok(());
+    }
+    if path_requires_sudo(current) || path_requires_sudo(Path::new(previous)) {
+        run_command(
+            privileged_command("cp").arg(current).arg(previous),
+            SUDO_TIMEOUT,
+            format!(
+                "failed to back up current binary {} -> {}",
+                current.display(),
+                previous
+            ),
+        )?;
         return Ok(());
     }
     fs::copy(current, previous)?;
@@ -484,11 +555,7 @@ fn backup_current_binary(current: &Path, previous: &str) -> Result<(), UpgradeEr
 
 fn restore_previous_binary(previous: &Path, current: &Path) -> Result<(), UpgradeError> {
     let contents = fs::read(previous)?;
-    atomic_write(current, &contents).map_err(|err| UpgradeError::Io(storage_error_to_io(err)))?;
-    let mut permissions = fs::metadata(current)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(current, permissions)?;
-    Ok(())
+    write_binary_atomically(current, &contents)
 }
 
 fn wait_readyz(config: &DaemonConfig) -> Result<(), String> {
@@ -505,13 +572,21 @@ fn wait_readyz(config: &DaemonConfig) -> Result<(), String> {
         .map(Duration::from_millis)
         .unwrap_or(READYZ_POLL_INTERVAL);
     let started = Instant::now();
+    let mut attempts = 0_u64;
+    let mut last_error = "no response".to_string();
     while started.elapsed() < timeout {
+        attempts += 1;
         match client.get(&readyz_url).send() {
             Ok(response) if response.status().is_success() => return Ok(()),
-            _ => thread::sleep(poll_interval),
+            Ok(response) => last_error = format!("status {}", response.status()),
+            Err(err) => last_error = err.to_string(),
         }
+        thread::sleep(poll_interval);
     }
-    Err(format!("readyz failed at {readyz_url}"))
+    Err(format!(
+        "readyz failed at {readyz_url} after {}ms across {attempts} attempts: {last_error}",
+        started.elapsed().as_millis()
+    ))
 }
 
 fn readyz_url(config: &DaemonConfig) -> String {
@@ -524,9 +599,13 @@ fn readyz_url(config: &DaemonConfig) -> String {
 
 fn systemctl(args: &[&str]) -> Result<(), UpgradeError> {
     let binary = std::env::var("FORGE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into());
-    let output = Command::new(&binary).args(args).output().map_err(|err| {
-        UpgradeError::Command(format!("systemctl {} failed: {err}", args.join(" ")))
-    })?;
+    let mut command = if std::env::var("FORGE_SYSTEMCTL_BIN").is_ok() || running_as_root() {
+        Command::new(&binary)
+    } else {
+        privileged_command(&binary)
+    };
+    let output = run_command_with_timeout(command.args(args), SYSTEMCTL_TIMEOUT)
+        .map_err(|err| command_error(err, format!("systemctl {} failed", args.join(" "))))?;
     if output.status.success() {
         return Ok(());
     }
@@ -585,8 +664,105 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "{prefix}-{}-{}",
         std::process::id(),
-        current_unix_timestamp()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
     ))
+}
+
+fn command_error(err: CommandError, prefix: String) -> UpgradeError {
+    UpgradeError::Command(format!("{prefix}: {err}"))
+}
+
+fn run_command(
+    command: &mut Command,
+    timeout: Duration,
+    prefix: String,
+) -> Result<(), UpgradeError> {
+    let output = run_command_with_timeout(command, timeout)
+        .map_err(|err| command_error(err, prefix.clone()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(UpgradeError::Command(format!(
+        "{prefix}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn write_binary_atomically(destination: &Path, contents: &[u8]) -> Result<(), UpgradeError> {
+    if path_requires_sudo(destination) {
+        let temp_root = unique_temp_dir("forge-upgrade-sudo-install");
+        let _cleanup = TempDirGuard::new(&temp_root);
+        fs::create_dir_all(&temp_root)?;
+        let source = temp_root.join("forge");
+        fs::write(&source, contents)?;
+        let target_tmp = destination.with_extension(format!("tmp.{}", current_unix_timestamp()));
+        run_command(
+            privileged_command("install")
+                .args(["-m", "0755"])
+                .arg(&source)
+                .arg(&target_tmp),
+            SUDO_TIMEOUT,
+            format!("failed to stage binary at {}", target_tmp.display()),
+        )?;
+        return run_command(
+            privileged_command("mv").arg(&target_tmp).arg(destination),
+            SUDO_TIMEOUT,
+            format!("failed to install binary at {}", destination.display()),
+        );
+    }
+    atomic_write(destination, contents)
+        .map_err(|err| UpgradeError::Io(storage_error_to_io(err)))?;
+    let mut permissions = fs::metadata(destination)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(destination, permissions)?;
+    Ok(())
+}
+
+fn privileged_command(program: &str) -> Command {
+    if let Ok(binary) = std::env::var("FORGE_SUDO_BIN") {
+        let mut command = Command::new(binary);
+        command.arg(program);
+        return command;
+    }
+    let mut command = Command::new("sudo");
+    command.args(["-n", program]);
+    command
+}
+
+fn path_requires_sudo(path: &Path) -> bool {
+    if std::env::var("FORGE_UPGRADE_FORCE_SUDO").ok().as_deref() == Some("1") {
+        return true;
+    }
+    !running_as_root() && path.starts_with("/usr/local/bin")
+}
+
+fn running_as_root() -> bool {
+    let output = run_command_with_timeout(Command::new("id").arg("-u"), DF_TIMEOUT);
+    let Ok(output) = output else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "0"
+}
+
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn storage_error_to_io(err: crate::storage::StorageError) -> std::io::Error {

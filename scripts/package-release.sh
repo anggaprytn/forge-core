@@ -11,6 +11,7 @@ CONFIG_SRC="${FORGE_PACKAGE_CONFIG:-$REPO_ROOT/deploy/forge.conf.example}"
 ENV_SRC="${FORGE_PACKAGE_ENV:-$REPO_ROOT/examples/forge.env.example}"
 LICENSE_SRC="${FORGE_PACKAGE_LICENSE:-$REPO_ROOT/LICENSE}"
 INSTALLER_SRC="$REPO_ROOT/install.sh"
+PACKAGE_TIMEOUT_SECS="${FORGE_PACKAGE_TIMEOUT_SECS:-1800}"
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -19,6 +20,19 @@ log() {
 die() {
   printf '[ERROR] %s\n' "$*" >&2
   exit 1
+}
+
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+  set +e
+  perl -e 'alarm shift @ARGV; exec @ARGV' "$timeout_secs" "$@"
+  local status=$?
+  set -e
+  if [ "$status" -eq 142 ]; then
+    die "$1 timed out after ${timeout_secs}s"
+  fi
+  return "$status"
 }
 
 sha256_file() {
@@ -62,7 +76,7 @@ binary_path_for_target() {
   fi
   local triple
   triple="$(target_triple "$target")" || die "unsupported target label: $target"
-  cargo build --release --bin forge --target "$triple" >/dev/null
+  run_with_timeout "$PACKAGE_TIMEOUT_SECS" cargo build --release --bin forge --target "$triple" >/dev/null
   printf '%s\n' "$REPO_ROOT/target/$triple/release/forge"
 }
 
@@ -86,7 +100,7 @@ stage_target() {
   mkdir -p "$DIST_DIR"
   (
     cd "$stage_dir"
-    tar -czf "$DIST_DIR/$archive_name" \
+    run_with_timeout "$PACKAGE_TIMEOUT_SECS" tar -czf "$DIST_DIR/$archive_name" \
       forge \
       install.sh \
       README.md \
