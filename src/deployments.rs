@@ -74,6 +74,9 @@ impl Display for DeploymentError {
 impl std::error::Error for DeploymentError {}
 
 const MAX_PROBE_HISTORY_ENTRIES: usize = 64;
+const RESTART_STORM_DELTA_THRESHOLD: u64 = 3;
+const EXITS_BEFORE_VALIDATION_THRESHOLD: u64 = 2;
+const PROBE_INSTABILITY_THRESHOLD: u32 = 3;
 
 fn sanitize_volume_component(value: &str) -> String {
     value
@@ -267,6 +270,19 @@ struct ServiceWarmupObservation {
     service_id: String,
     state: PersistedServiceState,
     validation_summary: PersistedValidationSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct FailureSummaryDetails {
+    blocking_service_name: Option<String>,
+    blocking_reason: Option<String>,
+    restart_storm: bool,
+    restart_policy: Option<String>,
+    restart_count_delta: Option<u64>,
+    oom_killed: Option<bool>,
+    last_exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    termination_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,6 +483,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     generation_container_name(record, artifacts.generation),
                     None,
                     None,
+                    FailureSummaryDetails::default(),
                     &[],
                     &[],
                 )?;
@@ -514,6 +531,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     container_name.clone(),
                     None,
                     None,
+                    FailureSummaryDetails::default(),
                     &[],
                     &[],
                 )?;
@@ -531,6 +549,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     container_name.clone(),
                     None,
                     Some("required secret resolution failed".into()),
+                    FailureSummaryDetails::default(),
                     &[],
                     &[],
                 )?;
@@ -594,6 +613,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     container_name.clone(),
                     None,
                     None,
+                    FailureSummaryDetails::default(),
                     &[],
                     &[],
                 )?;
@@ -644,6 +664,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "building",
                     &failure_reason,
                     None,
+                    FailureSummaryDetails::default(),
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -680,6 +701,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "preparing",
                     &failure_reason,
                     None,
+                    FailureSummaryDetails::default(),
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -737,6 +759,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "preparing",
                     &failure_reason,
                     None,
+                    FailureSummaryDetails::default(),
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -795,6 +818,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "starting",
                 &failure_reason,
                 None,
+                FailureSummaryDetails::default(),
                 &redacted_env_preview,
                 &secret_values,
             )?;
@@ -834,6 +858,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "validating_runtime",
                     &failure_reason,
                     None,
+                    FailureSummaryDetails::default(),
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -868,6 +893,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "validating_runtime",
                 &failure_reason,
                 None,
+                FailureSummaryDetails::default(),
                 &redacted_env_preview,
                 &secret_values,
             )?;
@@ -1044,6 +1070,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "routing",
                 &err.to_string(),
                 None,
+                FailureSummaryDetails::default(),
                 &redacted_env_preview,
                 &secret_values,
             )?;
@@ -1285,6 +1312,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     default_container_name,
                     None,
                     Some(dependency_graph_summary),
+                    FailureSummaryDetails::default(),
                     &[],
                     &[],
                 )?;
@@ -1310,6 +1338,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     default_container_name,
                     None,
                     Some(dependency_graph_summary),
+                    FailureSummaryDetails::default(),
                     &[],
                     &[],
                 )?;
@@ -1348,6 +1377,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     default_container_name,
                     None,
                     Some(dependency_graph_summary),
+                    FailureSummaryDetails::default(),
                     &[],
                     &[],
                 )?;
@@ -1387,6 +1417,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     ),
                     None,
                     Some(dependency_graph_summary.clone()),
+                    FailureSummaryDetails::default(),
                     &redacted_env_preview,
                     &secret_values,
                 )?;
@@ -1399,7 +1430,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         }
 
         let mut service_builds = BTreeMap::new();
-        let mut service_runtime = BTreeMap::new();
+        let mut service_runtime: BTreeMap<String, PersistedServiceRuntimeInfo> = BTreeMap::new();
         for service_id in config.startup_order() {
             let service = config
                 .services()
@@ -1419,6 +1450,64 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 ),
                 &secret_values,
             )?;
+            if let Some((dependency_id, dependency_state)) =
+                service.depends_on.iter().find_map(|dependency_id| {
+                    service_runtime
+                        .get(dependency_id)
+                        .filter(|runtime| runtime.state != PersistedServiceState::Healthy)
+                        .map(|runtime| (dependency_id, runtime.state.clone()))
+                })
+            {
+                let failure_reason = format!(
+                    "service `{service_id}` blocked by unstable dependency `{dependency_id}` ({dependency_state:?})"
+                );
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env: env.clone(),
+                        generation,
+                        events: EventStore::new(env.clone(), generation),
+                        diagnostics: DiagnosticsStore::new(env.clone(), generation),
+                        lifecycle_store: LifecycleStore::new(env.clone(), generation),
+                        writer: SnapshotWriter::new(env.clone(), generation)?,
+                    },
+                    "warming",
+                    &failure_reason,
+                    generation_service_container_name(
+                        record,
+                        generation,
+                        service_id,
+                        config.services().len(),
+                    ),
+                    Some(service_id.clone()),
+                    Some(dependency_graph_summary.clone()),
+                    FailureSummaryDetails {
+                        blocking_service_name: Some(dependency_id.clone()),
+                        blocking_reason: Some(failure_reason.clone()),
+                        ..FailureSummaryDetails::default()
+                    },
+                    &redacted_env_preview,
+                    &secret_values,
+                )?;
+                persist_lifecycle_transition(
+                    &lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Unstable,
+                    &failure_reason,
+                    None,
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        runtime_snapshot_persisted: true,
+                        convergence_target_stable: true,
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
+                return Err(DeploymentError::ValidationFailed(
+                    "unstable dependency blocked promotion",
+                ));
+            }
             let container_name = generation_service_container_name(
                 record,
                 generation,
@@ -1478,6 +1567,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                             container_name.clone(),
                             Some(service_id.clone()),
                             Some(dependency_graph_summary.clone()),
+                            FailureSummaryDetails::default(),
                             &redacted_env_preview,
                             &secret_values,
                         )?;
@@ -1555,6 +1645,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 service,
                 validation_timeout_ms,
                 &env,
+                &lifecycle_store,
                 generation,
                 &container_name,
                 &events,
@@ -1820,6 +1911,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         service: &ForgeServiceConfig,
         validation_timeout_ms: u64,
         env: &EnvironmentPaths,
+        lifecycle_store: &LifecycleStore,
         generation: u64,
         container_name: &str,
         events: &EventStore,
@@ -1832,7 +1924,71 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             ActivationMode::Http { internal_port } => Some(internal_port),
             ActivationMode::Direct => None,
         };
+        let initial_inspection = self.docker.inspect_container(container_name)?;
+        let restart_count_initial = initial_inspection.restart_count;
         if !service.validation.tcp_required && service.validation.http_health_path.is_none() {
+            if !initial_inspection.running {
+                let failure_reason =
+                    format!("service `{service_id}` exited before validation completed");
+                let termination = self.persist_service_runtime_diagnostics(
+                    diagnostics,
+                    service_id,
+                    &initial_inspection,
+                    secret_values,
+                )?;
+                let validation_summary = PersistedValidationSummary {
+                    restart_count_initial,
+                    restart_count_current: initial_inspection.restart_count,
+                    restart_count_stable: true,
+                    validation_succeeded: false,
+                    last_probe_error: Some(failure_reason.clone()),
+                    oom_detected: initial_inspection.oom_killed,
+                    ..PersistedValidationSummary::default()
+                };
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    if initial_inspection.oom_killed {
+                        DeploymentLifecycleState::OomKilled
+                    } else {
+                        DeploymentLifecycleState::Failed
+                    },
+                    &failure_reason,
+                    Some(validation_summary),
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        runtime_snapshot_persisted: true,
+                        convergence_target_stable: true,
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
+                self.record_failed_attempt(
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    "warming",
+                    &failure_reason,
+                    None,
+                    FailureSummaryDetails {
+                        blocking_service_name: Some(service_id.to_string()),
+                        blocking_reason: Some(failure_reason.clone()),
+                        oom_killed: Some(initial_inspection.oom_killed),
+                        last_exit_code: termination.last_exit_code,
+                        exit_signal: termination.exit_signal,
+                        termination_reason: termination.termination_reason,
+                        restart_policy: Some(initial_inspection.restart_policy.clone()),
+                        ..FailureSummaryDetails::default()
+                    },
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(DeploymentError::ValidationFailed(
+                    "required service exited before validation completed",
+                ));
+            }
             diagnostics.append_log_line(
                 &format!("service `{service_id}` marked healthy without active probes"),
                 secret_values,
@@ -1846,12 +2002,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 },
             });
         }
-
-        let inspection = self.docker.inspect_container(container_name)?;
-        let probe_host =
-            resolve_selected_network_host(&inspection, self.execution.network_name.as_deref())?;
+        let probe_host = resolve_selected_network_host(
+            &initial_inspection,
+            self.execution.network_name.as_deref(),
+        )?;
         let started = Instant::now();
         let required_passes = service.validation.required_consecutive_probe_passes.max(1);
+        let minimum_uptime_seconds = service.validation.minimum_uptime_seconds;
         let mut tcp_passes = 0u32;
         let mut http_passes = if service.validation.http_health_path.is_some() {
             0
@@ -1859,8 +2016,186 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             required_passes
         };
         let mut last_error = None;
+        let mut unstable_probe_failures = 0u32;
         let budget = Duration::from_millis(validation_timeout_ms);
         loop {
+            let inspection = self.docker.inspect_container(container_name)?;
+            let restart_count_current = inspection.restart_count;
+            let restart_count_delta = restart_count_delta(restart_count_initial, &inspection);
+            let restart_storm = restart_storm_detected(restart_count_initial, &inspection);
+            let observed_exit_count =
+                observed_exit_count_before_validation(restart_count_initial, &inspection);
+            let prior_probe_success = if service.validation.http_health_path.is_some() {
+                http_passes > 0
+            } else {
+                tcp_passes > 0
+            };
+            if inspection.oom_killed
+                || (!inspection.running && inspection.exit_code.unwrap_or(0) != 0)
+            {
+                let lifecycle_state = if inspection.oom_killed {
+                    DeploymentLifecycleState::OomKilled
+                } else if restart_storm || observed_exit_count > EXITS_BEFORE_VALIDATION_THRESHOLD {
+                    DeploymentLifecycleState::CrashLoop
+                } else {
+                    DeploymentLifecycleState::Failed
+                };
+                let service_state = if inspection.oom_killed {
+                    PersistedServiceState::OomKilled
+                } else if restart_storm || observed_exit_count > EXITS_BEFORE_VALIDATION_THRESHOLD {
+                    PersistedServiceState::CrashLoop
+                } else {
+                    PersistedServiceState::Failed
+                };
+                let failure_reason = if inspection.oom_killed {
+                    format!("service `{service_id}` OOMKilled during warmup")
+                } else {
+                    format!(
+                        "service `{service_id}` exited with nonzero status before validation completed"
+                    )
+                };
+                let termination = self.persist_service_runtime_diagnostics(
+                    diagnostics,
+                    service_id,
+                    &inspection,
+                    secret_values,
+                )?;
+                let validation_summary = PersistedValidationSummary {
+                    tcp_consecutive_passes: tcp_passes,
+                    http_consecutive_passes: http_passes,
+                    required_consecutive_passes: required_passes,
+                    minimum_uptime_seconds,
+                    observed_uptime_seconds: started.elapsed().as_secs(),
+                    restart_count_initial,
+                    restart_count_current,
+                    restart_count_stable: restart_count_delta == 0,
+                    route_verification_stable: true,
+                    validation_succeeded: false,
+                    last_probe_error: Some(failure_reason.clone()),
+                    unstable_probe_failures,
+                    restart_storm_detected: restart_storm,
+                    oom_detected: inspection.oom_killed,
+                };
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    lifecycle_state,
+                    &failure_reason,
+                    Some(validation_summary),
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        runtime_snapshot_persisted: true,
+                        convergence_target_stable: true,
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
+                let probe_target = internal_port.map(|port| ProbeTargetContext {
+                    host: probe_host.clone(),
+                    port,
+                    path: service.validation.http_health_path.clone(),
+                });
+                self.record_failed_attempt(
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    "warming",
+                    &failure_reason,
+                    probe_target.as_ref(),
+                    FailureSummaryDetails {
+                        blocking_service_name: Some(service_id.to_string()),
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_storm,
+                        restart_policy: Some(inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_count_delta),
+                        oom_killed: Some(inspection.oom_killed),
+                        last_exit_code: termination.last_exit_code,
+                        exit_signal: termination.exit_signal,
+                        termination_reason: termination.termination_reason,
+                    },
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(DeploymentError::ValidationFailed(match service_state {
+                    PersistedServiceState::OomKilled => "required service was OOMKilled",
+                    PersistedServiceState::CrashLoop => "required service entered crash loop",
+                    _ => "required service exited before validation completed",
+                }));
+            }
+            if restart_storm {
+                let failure_reason =
+                    format!("service `{service_id}` entered restart storm during warmup");
+                let termination = self.persist_service_runtime_diagnostics(
+                    diagnostics,
+                    service_id,
+                    &inspection,
+                    secret_values,
+                )?;
+                let validation_summary = PersistedValidationSummary {
+                    tcp_consecutive_passes: tcp_passes,
+                    http_consecutive_passes: http_passes,
+                    required_consecutive_passes: required_passes,
+                    minimum_uptime_seconds,
+                    observed_uptime_seconds: started.elapsed().as_secs(),
+                    restart_count_initial,
+                    restart_count_current,
+                    restart_count_stable: false,
+                    route_verification_stable: true,
+                    validation_succeeded: false,
+                    last_probe_error: Some(failure_reason.clone()),
+                    unstable_probe_failures,
+                    restart_storm_detected: true,
+                    oom_detected: inspection.oom_killed,
+                };
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::CrashLoop,
+                    &failure_reason,
+                    Some(validation_summary),
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        runtime_snapshot_persisted: true,
+                        convergence_target_stable: true,
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
+                let probe_target = internal_port.map(|port| ProbeTargetContext {
+                    host: probe_host.clone(),
+                    port,
+                    path: service.validation.http_health_path.clone(),
+                });
+                self.record_failed_attempt(
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    "warming",
+                    &failure_reason,
+                    probe_target.as_ref(),
+                    FailureSummaryDetails {
+                        blocking_service_name: Some(service_id.to_string()),
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_storm: true,
+                        restart_policy: Some(inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_count_delta),
+                        oom_killed: Some(inspection.oom_killed),
+                        last_exit_code: termination.last_exit_code,
+                        exit_signal: termination.exit_signal,
+                        termination_reason: termination.termination_reason,
+                    },
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(DeploymentError::ValidationFailed(
+                    "required service entered restart storm",
+                ));
+            }
+
             let tcp_ok = if let Some(port) = internal_port {
                 let probe_started = Instant::now();
                 let ok = self.probes.probe_tcp(&probe_host, port).unwrap_or(false);
@@ -1909,6 +2244,14 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 last_error = Some(format!("service `{service_id}` tcp probe failed"));
             }
 
+            if tcp_ok && http_passes >= required_passes {
+                unstable_probe_failures = 0;
+            } else if !tcp_ok || service.validation.http_health_path.is_some() && http_passes == 0 {
+                if prior_probe_success {
+                    unstable_probe_failures += 1;
+                }
+            }
+
             if tcp_passes >= required_passes && http_passes >= required_passes {
                 append_event(events, record, generation, "VALIDATION_PASSED", None)?;
                 diagnostics
@@ -1920,11 +2263,88 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         tcp_consecutive_passes: tcp_passes,
                         http_consecutive_passes: http_passes,
                         required_consecutive_passes: required_passes,
+                        minimum_uptime_seconds,
                         observed_uptime_seconds: started.elapsed().as_secs(),
+                        restart_count_initial,
+                        restart_count_current,
+                        restart_count_stable: restart_count_current == restart_count_initial,
                         validation_succeeded: true,
+                        unstable_probe_failures,
                         ..PersistedValidationSummary::default()
                     },
                 });
+            }
+
+            if unstable_probe_failures >= PROBE_INSTABILITY_THRESHOLD {
+                let failure_reason =
+                    format!("service `{service_id}` probe instability exceeded threshold");
+                let termination = self.persist_service_runtime_diagnostics(
+                    diagnostics,
+                    service_id,
+                    &inspection,
+                    secret_values,
+                )?;
+                let validation_summary = PersistedValidationSummary {
+                    tcp_consecutive_passes: tcp_passes,
+                    http_consecutive_passes: http_passes,
+                    required_consecutive_passes: required_passes,
+                    minimum_uptime_seconds,
+                    observed_uptime_seconds: started.elapsed().as_secs(),
+                    restart_count_initial,
+                    restart_count_current,
+                    restart_count_stable: restart_count_current == restart_count_initial,
+                    route_verification_stable: true,
+                    validation_succeeded: false,
+                    last_probe_error: Some(failure_reason.clone()),
+                    unstable_probe_failures,
+                    restart_storm_detected: false,
+                    oom_detected: inspection.oom_killed,
+                };
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Unstable,
+                    &failure_reason,
+                    Some(validation_summary),
+                    Some(PersistedPromotionSummary {
+                        gate_reason: Some(failure_reason.clone()),
+                        runtime_snapshot_persisted: true,
+                        convergence_target_stable: true,
+                        ..PersistedPromotionSummary::default()
+                    }),
+                )?;
+                let probe_target = internal_port.map(|port| ProbeTargetContext {
+                    host: probe_host.clone(),
+                    port,
+                    path: service.validation.http_health_path.clone(),
+                });
+                self.record_failed_attempt(
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    "warming",
+                    &failure_reason,
+                    probe_target.as_ref(),
+                    FailureSummaryDetails {
+                        blocking_service_name: Some(service_id.to_string()),
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_policy: Some(inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_count_delta),
+                        oom_killed: Some(inspection.oom_killed),
+                        last_exit_code: termination.last_exit_code,
+                        exit_signal: termination.exit_signal,
+                        termination_reason: termination.termination_reason,
+                        ..FailureSummaryDetails::default()
+                    },
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(DeploymentError::ValidationFailed(
+                    "required service probe instability exceeded threshold",
+                ));
             }
 
             if started.elapsed() >= budget {
@@ -1950,6 +2370,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "warming",
                     &failure_reason,
                     probe_target.as_ref(),
+                    FailureSummaryDetails {
+                        blocking_service_name: Some(service_id.to_string()),
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_policy: Some(inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_count_delta),
+                        oom_killed: Some(inspection.oom_killed),
+                        last_exit_code: inspection.exit_code,
+                        exit_signal: inspection.exit_signal,
+                        termination_reason: inspection.termination_reason.clone(),
+                        ..FailureSummaryDetails::default()
+                    },
                     redacted_env_preview,
                     secret_values,
                 )?;
@@ -2011,6 +2442,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "validation",
                     &failure_reason,
                     None,
+                    FailureSummaryDetails::default(),
                     redacted_env_preview,
                     secret_values,
                 )?;
@@ -2039,7 +2471,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 ..PersistedPromotionSummary::default()
             };
             let context = ValidationFailureContext {
-                inspection: Some(inspection),
+                inspection: Some(inspection.clone()),
                 probe_target: None,
                 attempts: None,
                 elapsed_ms: Some(validation_started.elapsed().as_millis()),
@@ -2059,7 +2491,11 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 &record.project_id,
                 &record.environment,
                 generation,
-                DeploymentLifecycleState::Failed,
+                if inspection.oom_killed {
+                    DeploymentLifecycleState::OomKilled
+                } else {
+                    DeploymentLifecycleState::Failed
+                },
                 &failure_reason,
                 Some(validation_summary),
                 Some(promotion_summary),
@@ -2076,6 +2512,16 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 "validation",
                 &failure_reason,
                 None,
+                FailureSummaryDetails {
+                    blocking_reason: Some(failure_reason.clone()),
+                    restart_policy: Some(inspection.restart_policy.clone()),
+                    restart_count_delta: Some(0),
+                    oom_killed: Some(inspection.oom_killed),
+                    last_exit_code: inspection.exit_code,
+                    exit_signal: inspection.exit_signal,
+                    termination_reason: inspection.termination_reason.clone(),
+                    ..FailureSummaryDetails::default()
+                },
                 redacted_env_preview,
                 secret_values,
             )?;
@@ -2107,7 +2553,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     ..PersistedPromotionSummary::default()
                 };
                 let context = ValidationFailureContext {
-                    inspection: Some(inspection),
+                    inspection: Some(inspection.clone()),
                     probe_target: None,
                     attempts: None,
                     elapsed_ms: Some(validation_started.elapsed().as_millis()),
@@ -2144,6 +2590,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "validation",
                     &failure_reason,
                     None,
+                    FailureSummaryDetails::default(),
                     redacted_env_preview,
                     secret_values,
                 )?;
@@ -2155,6 +2602,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             port: internal_port,
             path: None,
         };
+        if let Some(note) = bridge_reachability_diagnostic(
+            &inspection,
+            selected_network.as_deref(),
+            Some(&tcp_probe_target),
+        ) {
+            diagnostics.append_log_line(&note, secret_values)?;
+        }
         let mut tcp_consecutive_passes = 0u32;
         let mut http_consecutive_passes = if probe_path.is_none() {
             required_passes
@@ -2165,6 +2619,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         let mut last_probe_error = None;
         let budget = Duration::from_millis(validation_timeout_ms);
         let inspect_each_attempt = minimum_uptime_seconds > 0 || required_passes > 1;
+        let mut unstable_probe_failures = 0u32;
 
         loop {
             attempts += 1;
@@ -2173,8 +2628,27 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             } else {
                 self.docker.inspect_container(container_name)?
             };
+            let prior_probe_success = if probe_path.is_some() {
+                http_consecutive_passes > 0
+            } else {
+                tcp_consecutive_passes > 0
+            };
             if !current_inspection.running {
-                let failure_reason = container_exited_failure_reason("warmup", &current_inspection);
+                let restart_delta = restart_count_delta(restart_count_initial, &current_inspection);
+                let restart_storm =
+                    restart_storm_detected(restart_count_initial, &current_inspection);
+                let lifecycle_state = if current_inspection.oom_killed {
+                    DeploymentLifecycleState::OomKilled
+                } else if restart_storm {
+                    DeploymentLifecycleState::CrashLoop
+                } else {
+                    DeploymentLifecycleState::Failed
+                };
+                let failure_reason = if current_inspection.oom_killed {
+                    "container OOMKilled during warmup".to_string()
+                } else {
+                    container_exited_failure_reason("warmup", &current_inspection)
+                };
                 let validation_summary = PersistedValidationSummary {
                     tcp_consecutive_passes,
                     http_consecutive_passes,
@@ -2183,13 +2657,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     observed_uptime_seconds: validation_started.elapsed().as_secs(),
                     restart_count_initial,
                     restart_count_current: current_inspection.restart_count,
-                    restart_count_stable: current_inspection.restart_count == restart_count_initial,
+                    restart_count_stable: restart_delta == 0,
                     route_verification_stable: true,
                     validation_succeeded: false,
                     last_probe_error: Some(failure_reason.clone()),
                     oom_detected: current_inspection.oom_killed,
-                    restart_storm_detected: false,
-                    unstable_probe_failures: 0,
+                    restart_storm_detected: restart_storm,
+                    unstable_probe_failures,
                 };
                 let promotion_summary = PersistedPromotionSummary {
                     runtime_snapshot_persisted: true,
@@ -2202,13 +2676,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     &record.project_id,
                     &record.environment,
                     generation,
-                    DeploymentLifecycleState::Failed,
+                    lifecycle_state,
                     &failure_reason,
                     Some(validation_summary.clone()),
                     Some(promotion_summary.clone()),
                 )?;
                 let context = ValidationFailureContext {
-                    inspection: Some(current_inspection),
+                    inspection: Some(current_inspection.clone()),
                     probe_target: Some(tcp_probe_target.clone()),
                     attempts: Some(attempts),
                     elapsed_ms: Some(validation_started.elapsed().as_millis()),
@@ -2235,6 +2709,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "warming",
                     &failure_reason,
                     Some(&tcp_probe_target),
+                    FailureSummaryDetails {
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_storm,
+                        restart_policy: Some(current_inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_delta),
+                        oom_killed: Some(current_inspection.oom_killed),
+                        last_exit_code: current_inspection.exit_code,
+                        exit_signal: current_inspection.exit_signal,
+                        termination_reason: current_inspection.termination_reason.clone(),
+                        ..FailureSummaryDetails::default()
+                    },
                     redacted_env_preview,
                     secret_values,
                 )?;
@@ -2243,9 +2728,10 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 ));
             }
 
-            if current_inspection.restart_count != restart_count_initial {
+            if restart_storm_detected(restart_count_initial, &current_inspection) {
+                let restart_delta = restart_count_delta(restart_count_initial, &current_inspection);
                 let failure_reason = format!(
-                    "restart count increased during warmup ({} -> {})",
+                    "restart storm detected during warmup ({} -> {}, delta={restart_delta})",
                     restart_count_initial, current_inspection.restart_count
                 );
                 let validation_summary = PersistedValidationSummary {
@@ -2262,7 +2748,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     last_probe_error: Some(failure_reason.clone()),
                     oom_detected: current_inspection.oom_killed,
                     restart_storm_detected: true,
-                    unstable_probe_failures: 0,
+                    unstable_probe_failures,
                 };
                 let promotion_summary = PersistedPromotionSummary {
                     runtime_snapshot_persisted: true,
@@ -2280,7 +2766,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     &record.project_id,
                     &record.environment,
                     generation,
-                    DeploymentLifecycleState::Failed,
+                    DeploymentLifecycleState::CrashLoop,
                     &failure_reason,
                     Some(validation_summary),
                     Some(promotion_summary),
@@ -2297,6 +2783,17 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "warming",
                     &failure_reason,
                     Some(&tcp_probe_target),
+                    FailureSummaryDetails {
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_storm: true,
+                        restart_policy: Some(current_inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_delta),
+                        oom_killed: Some(current_inspection.oom_killed),
+                        last_exit_code: current_inspection.exit_code,
+                        exit_signal: current_inspection.exit_signal,
+                        termination_reason: current_inspection.termination_reason.clone(),
+                        ..FailureSummaryDetails::default()
+                    },
                     redacted_env_preview,
                     secret_values,
                 )?;
@@ -2369,6 +2866,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 } else {
                     0
                 };
+                if prior_probe_success {
+                    unstable_probe_failures += 1;
+                }
             } else if let Some(path) = probe_path {
                 let http_started = Instant::now();
                 match self.probes.probe_http(&probe_host, internal_port, path) {
@@ -2382,6 +2882,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                             None,
                         )?;
                         http_consecutive_passes += 1;
+                        unstable_probe_failures = 0;
                     }
                     Ok(false) => {
                         let failure_reason =
@@ -2396,6 +2897,9 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         )?;
                         http_consecutive_passes = 0;
                         last_probe_error = Some(failure_reason);
+                        if prior_probe_success {
+                            unstable_probe_failures += 1;
+                        }
                     }
                     Err(err) => {
                         let failure_reason = err.to_string();
@@ -2409,8 +2913,13 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                         )?;
                         http_consecutive_passes = 0;
                         last_probe_error = Some(failure_reason);
+                        if prior_probe_success {
+                            unstable_probe_failures += 1;
+                        }
                     }
                 }
+            } else {
+                unstable_probe_failures = 0;
             }
 
             let validation_summary = PersistedValidationSummary {
@@ -2427,7 +2936,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 last_probe_error: last_probe_error.clone(),
                 oom_detected: current_inspection.oom_killed,
                 restart_storm_detected: false,
-                unstable_probe_failures: 0,
+                unstable_probe_failures,
             };
             let promotion_summary = PersistedPromotionSummary {
                 runtime_snapshot_persisted: true,
@@ -2473,6 +2982,68 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 });
             }
 
+            if unstable_probe_failures >= PROBE_INSTABILITY_THRESHOLD {
+                let failure_reason =
+                    "probe instability exceeded threshold during warmup".to_string();
+                let validation_summary = PersistedValidationSummary {
+                    validation_succeeded: false,
+                    last_probe_error: Some(
+                        last_probe_error
+                            .clone()
+                            .unwrap_or_else(|| failure_reason.clone()),
+                    ),
+                    unstable_probe_failures,
+                    ..validation_summary
+                };
+                let promotion_summary = PersistedPromotionSummary {
+                    runtime_snapshot_persisted: true,
+                    convergence_target_stable: true,
+                    gate_reason: Some(failure_reason.clone()),
+                    ..PersistedPromotionSummary::default()
+                };
+                persist_lifecycle_transition(
+                    lifecycle_store,
+                    &record.project_id,
+                    &record.environment,
+                    generation,
+                    DeploymentLifecycleState::Unstable,
+                    &failure_reason,
+                    Some(validation_summary.clone()),
+                    Some(promotion_summary.clone()),
+                )?;
+                self.record_failed_generation(
+                    env,
+                    events,
+                    diagnostics,
+                    record,
+                    generation,
+                    container_name,
+                    Some(image_ref),
+                    None,
+                    "warming",
+                    &failure_reason,
+                    Some(&tcp_probe_target),
+                    FailureSummaryDetails {
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_policy: Some(current_inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_count_delta(
+                            restart_count_initial,
+                            &current_inspection,
+                        )),
+                        oom_killed: Some(current_inspection.oom_killed),
+                        last_exit_code: current_inspection.exit_code,
+                        exit_signal: current_inspection.exit_signal,
+                        termination_reason: current_inspection.termination_reason.clone(),
+                        ..FailureSummaryDetails::default()
+                    },
+                    redacted_env_preview,
+                    secret_values,
+                )?;
+                return Err(DeploymentError::ValidationFailed(
+                    "probe instability exceeded threshold",
+                ));
+            }
+
             if validation_started.elapsed() >= budget {
                 let observed_failure_reason = last_probe_error
                     .clone()
@@ -2508,7 +3079,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     Some(promotion_summary.clone()),
                 )?;
                 let context = ValidationFailureContext {
-                    inspection: Some(current_inspection),
+                    inspection: Some(current_inspection.clone()),
                     probe_target: Some(ProbeTargetContext {
                         host: probe_host.clone(),
                         port: internal_port,
@@ -2539,6 +3110,19 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     "warming",
                     &failure_reason,
                     context.probe_target.as_ref(),
+                    FailureSummaryDetails {
+                        blocking_reason: Some(failure_reason.clone()),
+                        restart_policy: Some(current_inspection.restart_policy.clone()),
+                        restart_count_delta: Some(restart_count_delta(
+                            restart_count_initial,
+                            &current_inspection,
+                        )),
+                        oom_killed: Some(current_inspection.oom_killed),
+                        last_exit_code: current_inspection.exit_code,
+                        exit_signal: current_inspection.exit_signal,
+                        termination_reason: current_inspection.termination_reason.clone(),
+                        ..FailureSummaryDetails::default()
+                    },
                     redacted_env_preview,
                     secret_values,
                 )?;
@@ -2567,6 +3151,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         failure_stage: &str,
         failure_reason: &str,
         probe_target: Option<&ProbeTargetContext>,
+        summary_details: FailureSummaryDetails,
         redacted_env_preview: &[String],
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
@@ -2587,11 +3172,23 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             deployment_id: Some(record.deployment_id.clone()),
             failure_stage: failure_stage.into(),
             failure_reason: failure_reason.into(),
+            blocking_reason: summary_details
+                .blocking_reason
+                .clone()
+                .or_else(|| Some(failure_reason.into())),
             container_name: String::new(),
-            failed_service_name: None,
+            failed_service_name: summary_details.blocking_service_name.clone(),
+            blocking_service_name: summary_details.blocking_service_name,
             probe_target_host: probe_target.map(|target| target.host.clone()),
             probe_target_port: probe_target.map(|target| target.port),
             probe_target_path: probe_target.and_then(|target| target.path.clone()),
+            restart_storm: summary_details.restart_storm,
+            restart_policy: summary_details.restart_policy,
+            restart_count_delta: summary_details.restart_count_delta,
+            oom_killed: summary_details.oom_killed,
+            last_exit_code: summary_details.last_exit_code,
+            exit_signal: summary_details.exit_signal,
+            termination_reason: summary_details.termination_reason,
             cleanup_recorded: false,
             dependency_graph_summary: None,
             runtime_env_preview: redacted_env_preview.to_vec(),
@@ -2610,6 +3207,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         container_name: String,
         failed_service_name: Option<String>,
         dependency_graph_summary: Option<String>,
+        summary_details: FailureSummaryDetails,
         redacted_env_preview: &[String],
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
@@ -2654,11 +3252,25 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             deployment_id: Some(record.deployment_id.clone()),
             failure_stage: failure_stage.into(),
             failure_reason: failure_reason.into(),
+            blocking_reason: summary_details
+                .blocking_reason
+                .clone()
+                .or_else(|| Some(failure_reason.into())),
             container_name,
-            failed_service_name,
+            failed_service_name: failed_service_name
+                .clone()
+                .or_else(|| summary_details.blocking_service_name.clone()),
+            blocking_service_name: summary_details.blocking_service_name,
             probe_target_host: None,
             probe_target_port: None,
             probe_target_path: None,
+            restart_storm: summary_details.restart_storm,
+            restart_policy: summary_details.restart_policy,
+            restart_count_delta: summary_details.restart_count_delta,
+            oom_killed: summary_details.oom_killed,
+            last_exit_code: summary_details.last_exit_code,
+            exit_signal: summary_details.exit_signal,
+            termination_reason: summary_details.termination_reason,
             cleanup_recorded: false,
             dependency_graph_summary,
             runtime_env_preview: redacted_env_preview.to_vec(),
@@ -2872,6 +3484,29 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         Ok(())
     }
 
+    fn persist_service_runtime_diagnostics(
+        &mut self,
+        diagnostics: &DiagnosticsStore,
+        service_id: &str,
+        inspection: &ContainerInspection,
+        secret_values: &[String],
+    ) -> Result<PersistedTerminationInfo, DeploymentError> {
+        let logs_tail = self.read_container_logs_tail(&inspection.container_name);
+        diagnostics.write_artifact(
+            &format!("services/{service_id}/logs_tail.log"),
+            &logs_tail,
+            secret_values,
+        )?;
+        let termination = inspection_termination_info(inspection, Some(logs_tail.clone()));
+        let payload = serde_json::to_string_pretty(&termination).map_err(json_storage_error)?;
+        diagnostics.write_artifact(
+            &format!("services/{service_id}/termination.json"),
+            &format!("{payload}\n"),
+            secret_values,
+        )?;
+        Ok(termination)
+    }
+
     fn read_container_logs_tail(&mut self, container_name: &str) -> String {
         for _ in 0..5 {
             let logs_tail = self
@@ -2899,6 +3534,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
         failure_stage: &str,
         failure_reason: &str,
         probe_target: Option<&ProbeTargetContext>,
+        summary_details: FailureSummaryDetails,
         redacted_env_preview: &[String],
         secret_values: &[String],
     ) -> Result<(), DeploymentError> {
@@ -2931,11 +3567,23 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             deployment_id: Some(record.deployment_id.clone()),
             failure_stage: failure_stage.into(),
             failure_reason: failure_reason.into(),
+            blocking_reason: summary_details
+                .blocking_reason
+                .clone()
+                .or_else(|| Some(failure_reason.into())),
             container_name: container_name.into(),
-            failed_service_name: None,
+            failed_service_name: summary_details.blocking_service_name.clone(),
+            blocking_service_name: summary_details.blocking_service_name,
             probe_target_host: probe_target.map(|target| target.host.clone()),
             probe_target_port: probe_target.map(|target| target.port),
             probe_target_path: probe_target.and_then(|target| target.path.clone()),
+            restart_storm: summary_details.restart_storm,
+            restart_policy: summary_details.restart_policy,
+            restart_count_delta: summary_details.restart_count_delta,
+            oom_killed: summary_details.oom_killed,
+            last_exit_code: summary_details.last_exit_code,
+            exit_signal: summary_details.exit_signal,
+            termination_reason: summary_details.termination_reason,
             cleanup_recorded: true,
             dependency_graph_summary: None,
             runtime_env_preview: redacted_env_preview.to_vec(),
@@ -3735,7 +4383,21 @@ fn inspection_runtime_policy(inspection: &ContainerInspection) -> PersistedRunti
         cpu_limit: inspection.cpu_limit.clone(),
         memory_limit_mb: inspection.memory_limit_mb,
         restart_policy: inspection.restart_policy.clone(),
-        max_retries: inspection.restart_max_retries,
+        max_retries: normalize_restart_max_retries(
+            &inspection.restart_policy,
+            inspection.restart_max_retries,
+        ),
+    }
+}
+
+pub(crate) fn normalize_restart_max_retries(
+    restart_policy: &str,
+    max_retries: Option<u64>,
+) -> Option<u64> {
+    if restart_policy == "no" {
+        None
+    } else {
+        max_retries
     }
 }
 
@@ -3760,14 +4422,33 @@ fn inspection_termination_info(
 ) -> PersistedTerminationInfo {
     PersistedTerminationInfo {
         oom_killed: inspection.oom_killed,
+        observed_at_unix: Some(current_unix_timestamp()),
         exit_code: inspection.exit_code,
+        last_exit_code: inspection.exit_code,
         exit_signal: inspection.exit_signal,
         finished_at: inspection.finished_at.clone(),
         error: inspection.error.clone(),
         reason: inspection.termination_reason.clone(),
-        stderr_tail,
+        termination_reason: inspection.termination_reason.clone(),
+        stderr_tail: stderr_tail.clone(),
+        logs_tail: stderr_tail,
         restart_count: inspection.restart_count,
     }
+}
+
+fn restart_count_delta(initial: u64, inspection: &ContainerInspection) -> u64 {
+    inspection.restart_count.saturating_sub(initial)
+}
+
+fn observed_exit_count_before_validation(initial: u64, inspection: &ContainerInspection) -> u64 {
+    restart_count_delta(initial, inspection)
+        + u64::from(!inspection.running && inspection.exit_code.unwrap_or(0) != 0)
+}
+
+fn restart_storm_detected(initial: u64, inspection: &ContainerInspection) -> bool {
+    restart_count_delta(initial, inspection) >= RESTART_STORM_DELTA_THRESHOLD
+        || observed_exit_count_before_validation(initial, inspection)
+            > EXITS_BEFORE_VALIDATION_THRESHOLD
 }
 
 fn validate_route_activation(
@@ -3983,6 +4664,8 @@ fn success_outputs_with_network(generation: u64, networks: &[(&str, &str)]) -> V
         String::new(),
         inspection.clone(),
         inspection.clone(),
+        inspection.clone(),
+        inspection.clone(),
         inspection,
         String::new(),
     ]
@@ -4047,8 +4730,9 @@ pub mod deployment_fails_if_tcp_unreachable {
         let root = test_root("tcp-unreachable");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker =
-            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(1, &[("forge-test", "172.18.0.2")]),
+        ));
         let mut probes = TestProbeRuntime {
             tcp_ok: false,
             http_ok: true,
@@ -4495,6 +5179,7 @@ pub mod progressive_promotion_guards {
             format!("image_ref=forge/api:production-gen-1"),
             "prod-api-gen-1".into(),
             String::new(),
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
             inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
             inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
             inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
@@ -7110,6 +7795,17 @@ pub mod git_deploy_non_api_project_staging {
                 "network:forge-net=172.19.0.8",
             ]
             .join("\n"),
+            [
+                "name=/staging-web-gen-1",
+                "status=running",
+                "running=true",
+                "exit_code=0",
+                "image=forge/web:staging-gen-1",
+                "restart_policy=no",
+                "network:forge-net=172.19.0.8",
+            ]
+            .join("\n"),
+            String::new(),
         ]));
         let mut probes = RecordingProbeRuntime {
             tcp_ok: true,
@@ -7223,6 +7919,17 @@ pub mod git_deploy_non_api_project_staging {
                 "network:forge-net=172.19.0.8",
             ]
             .join("\n"),
+            [
+                "name=/staging-web-gen-1",
+                "status=running",
+                "running=true",
+                "exit_code=0",
+                "image=forge/web:staging-gen-1",
+                "restart_policy=no",
+                "network:forge-net=172.19.0.8",
+            ]
+            .join("\n"),
+            String::new(),
         ]));
         let mut probes = RecordingProbeRuntime {
             tcp_ok: true,
@@ -7489,6 +8196,8 @@ pub mod tcp_probe_reinspects_container_before_probe {
             String::new(),
             inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.2")]),
             inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.7")]),
+            inspection_output(1, "running", true, 0, &[("bridge", "172.18.0.7")]),
+            String::new(),
         ]));
         let mut probes = RecordingProbeRuntime {
             tcp_ok: true,

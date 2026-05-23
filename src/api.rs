@@ -211,6 +211,8 @@ pub struct RecentDeploymentFailure {
     pub generation: u64,
     pub failure_stage: String,
     pub failure_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_service_name: Option<String>,
     #[serde(default)]
     pub historical: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

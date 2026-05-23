@@ -1441,7 +1441,10 @@ fn validate_inspection(
         ));
     }
     if inspection.restart_policy != expected_policy.restart_policy
-        || inspection.restart_max_retries != expected_policy.max_retries
+        || crate::deployments::normalize_restart_max_retries(
+            &inspection.restart_policy,
+            inspection.restart_max_retries,
+        ) != expected_policy.max_retries
         || inspection.cpu_limit != expected_policy.cpu_limit
         || inspection.memory_limit_mb != expected_policy.memory_limit_mb
     {

@@ -66,7 +66,11 @@ fn runtime_policy_matches(
     expected.cpu_limit == inspection.cpu_limit
         && expected.memory_limit_mb == inspection.memory_limit_mb
         && expected.restart_policy == inspection.restart_policy
-        && expected.max_retries == inspection.restart_max_retries
+        && expected.max_retries
+            == crate::deployments::normalize_restart_max_retries(
+                &inspection.restart_policy,
+                inspection.restart_max_retries,
+            )
 }
 
 fn runtime_policy_as_container(expected: &PersistedRuntimePolicy) -> ContainerRuntimePolicy {
@@ -2220,11 +2224,20 @@ fn persist_cleanup_state(
         deployment_id,
         failure_stage: "startup_recovery".into(),
         failure_reason: merged.failure_reason.clone(),
+        blocking_reason: Some(merged.failure_reason.clone()),
         container_name: merged.container_name.clone().unwrap_or_default(),
         failed_service_name: None,
+        blocking_service_name: None,
         probe_target_host: None,
         probe_target_port: None,
         probe_target_path: None,
+        restart_storm: false,
+        restart_policy: None,
+        restart_count_delta: None,
+        oom_killed: None,
+        last_exit_code: None,
+        exit_signal: None,
+        termination_reason: None,
         cleanup_recorded: true,
         dependency_graph_summary: None,
         runtime_env_preview: Vec::new(),

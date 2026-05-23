@@ -148,6 +148,9 @@ pub enum PersistedServiceState {
     Starting,
     Warming,
     Validating,
+    Unstable,
+    CrashLoop,
+    OomKilled,
     Healthy,
     Failed,
 }
@@ -368,7 +371,11 @@ pub struct PersistedTerminationInfo {
     #[serde(default)]
     pub oom_killed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_signal: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -378,7 +385,11 @@ pub struct PersistedTerminationInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_tail: Option<String>,
     #[serde(default)]
     pub restart_count: u64,
 }
@@ -569,15 +580,33 @@ pub struct DiagnosticSummary {
     pub deployment_id: Option<String>,
     pub failure_stage: String,
     pub failure_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_reason: Option<String>,
     pub container_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_service_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_target_path: Option<String>,
+    #[serde(default)]
+    pub restart_storm: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_count_delta: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oom_killed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_reason: Option<String>,
     pub cleanup_recorded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_graph_summary: Option<String>,
