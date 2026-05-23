@@ -260,6 +260,14 @@ Stateful backup and restore semantics:
 - restore is not rollback; rollback keeps topology semantics only and does not restore DB history
 - Forge remains single-node and Docker-volume only for stateful workloads
 
+Runtime policy invariants:
+
+- per-service CPU limit, memory limit, and restart policy are part of the immutable runtime artifact
+- rollback restores the historical runtime policy of the selected generation without recomputing policy from current config drift
+- convergence repairs observed runtime policy drift back to promoted truth
+- promotion must fail closed when warmup detects OOM kills, crash loops, restart storms, or unstable required dependencies
+- degraded readiness may report active repair failures while basic liveness remains healthy
+
 ---
 
 ## 14. Restart Recovery Invariants

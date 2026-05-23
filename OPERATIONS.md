@@ -39,22 +39,22 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 ---
 
-# Alpha Core Loop v3 Validated (May 2026)
+# Alpha Core Loop v4 Validated (May 2026)
 
-The Forge Alpha Core Loop v3 milestone freezes the current single-node stateful orchestration model.
+The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration model with persisted runtime policy and degraded-runtime repair semantics.
 
 ### Validated Capabilities
 
-- **Multi-Service Topology**: A project can run multiple coordinated services in one generation.
-- **Per-Service Build/Runtime**: Each service can define its own image/build/runtime contract.
-- **Internal Service DNS**: Services can resolve each other on the Forge-managed network.
-- **Per-Service Logs/Status/Diagnostics**: Operators can inspect runtime truth per service.
-- **Stateful Volumes**: Services can attach persistent or ephemeral Docker volumes.
-- **Stateful Rollback Boundary**: Rollback restores topology and runtime/env truth, not database history.
-- **Backup/Restore Primitives**: Operators can create, list, inspect, and restore backups.
-- **Backup Hooks**: Services may run `pre_backup_command` hooks such as `redis-cli SAVE`.
-- **Restore Lineage**: Restored generations expose source backup and restored volume lineage.
-- **GC Safety**: Garbage collection preserves backups and persistent volumes.
+- **Per-Service Runtime Policy**: CPU, memory, and restart policy persist per service.
+- **Rollback Policy Fidelity**: Rollback restores the exact historical runtime policy of the selected generation.
+- **Convergence Policy Repair**: Runtime policy drift is detected and repaired back to promoted truth.
+- **Promotion Safety Gates**: OOM kills, crash loops, restart storms, and unstable required dependencies block promotion.
+- **Termination Diagnostics**: Diagnose/status surface termination reason, exit code, signal, restart count, OOM state, and tails when available.
+- **Runtime Usage Snapshots**: Operators can inspect captured CPU/memory usage snapshots for services.
+- **Readyz Degradation Semantics**: `/readyz` can return `degraded` with repair reasons while `/healthz` remains `ok`.
+- **Non-Fatal Route Repair Failures**: Route repair issues surface as degraded readiness and repair work, not silent success.
+- **Clean Repair Visibility**: Diagnostics expose current unresolved repair fields separately from historical repair noise.
+- **Multi-Service Stateful Baseline**: Multi-service topology, stateful volumes, backup/restore, restore lineage, and GC safety remain validated.
 
 ---
 

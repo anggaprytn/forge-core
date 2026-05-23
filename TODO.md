@@ -1,11 +1,37 @@
 # Forge TODO
 
-Current baseline: Alpha Core Loop v3 is validated.
+Current baseline: Alpha Core Loop v4 is validated.
 Goal: harden the frozen single-node stateful runtime without reopening core scope.
 
 ---
 
 # Frozen Milestone
+
+Validated and frozen in Alpha Core Loop v4:
+
+- [x] Per-service CPU/memory/restart policy
+- [x] Runtime policy persistence
+- [x] Rollback restores historical runtime policy
+- [x] Convergence repairs runtime policy drift
+- [x] OOM/crash-loop/restart-storm promotion gates
+- [x] Termination diagnostics
+- [x] Runtime usage snapshots
+- [x] Non-fatal route repair failures
+- [x] Readyz active degradation semantics
+- [x] Clean diagnostics API repair fields
+- [x] Multi-service topology
+- [x] Per-service build/runtime
+- [x] Internal service DNS aliases
+- [x] Per-service logs/status/diagnostics
+- [x] Stateful service volumes
+- [x] Persistent vs ephemeral volume semantics
+- [x] Stateful rollback boundary
+- [x] Backup/restore primitives
+- [x] Helper-container Docker volume archive/restore
+- [x] Backup hooks such as `redis-cli SAVE`
+- [x] Restore lineage
+- [x] Restored primary service truth
+- [x] GC preserves backups and persistent volumes
 
 Validated and frozen in Alpha Core Loop v3:
 
@@ -30,6 +56,8 @@ Validated and frozen in Alpha Core Loop v3:
 - [ ] Improve `forge diagnose` restore lineage readability
 - [ ] Improve `forge history` / backup history cross-linking
 - [ ] Improve per-service status/log formatting
+- [ ] Improve degraded `readyz` operator messaging
+- [ ] Improve termination diagnostics readability in CLI output
 - [ ] Improve restore safety messaging in CLI and API output
 
 ## Recovery Hardening
@@ -38,6 +66,7 @@ Validated and frozen in Alpha Core Loop v3:
 - [ ] Crash during backup restore recovery
 - [ ] Docker unavailable recovery for restore paths
 - [ ] Caddy unavailable recovery during restore promotion
+- [ ] Extend recovery coverage for repeated route repair failure paths
 
 ## Auth And Operator Flows
 

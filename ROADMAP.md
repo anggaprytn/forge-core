@@ -31,11 +31,25 @@ Current stage:
 alpha
 ```
 
+**Alpha Core Loop v4 Validated (May 2026)**:
+
+The Forge Alpha Core Loop v4 milestone hardens the single-node application orchestration loop with persisted per-service runtime policy, rollback/convergence policy fidelity, runtime usage snapshots, termination diagnostics, and degraded-runtime promotion safety.
+
+### Validated Capabilities (v4)
+
+- **Per-Service CPU/Memory/Restart Policy**: Each service persists its runtime policy in generation metadata.
+- **Runtime Policy Persistence**: Stored runtime policy survives restart, status inspection, and diagnostics inspection.
+- **Rollback Restores Historical Runtime Policy**: Rollback reinstates the exact CPU, memory, and restart policy captured by the rollback target.
+- **Convergence Repairs Runtime Policy Drift**: Drift in stored runtime policy is detected and repaired back to promoted truth.
+- **OOM/Crash-Loop/Restart-Storm Promotion Gates**: Warmup refuses promotion when unstable runtime signals are observed.
+- **Termination Diagnostics**: Diagnose/status include exit reason, signals, restart count, OOM state, and available tails.
+- **Runtime Usage Snapshots**: Status and diagnostics expose captured CPU and memory usage snapshots.
+- **Non-Fatal Route Repair Failures**: Route repair failures can degrade readiness without turning the daemon fully unavailable.
+- **Readyz Active Degradation Semantics**: `/readyz` reports `degraded` plus reasons when active repairs or failures remain unresolved.
+- **Clean Diagnostics API Repair Fields**: Current unresolved repair signals stay visible while healthy historical noise is suppressed.
+- **Multi-Service Stateful Baseline Preserved**: v3 topology, volume, backup/restore, and restore-lineage guarantees remain validated.
+
 **Alpha Core Loop v3 Validated (May 2026)**:
-
-The Forge Alpha Core Loop v4 milestone hardens the single-node application orchestration loop with persisted per-service resource policy, restart semantics, crash/OOM diagnostics, and promotion safety gates for unstable runtimes.
-
-### Validated Capabilities (v3)
 
 - **Multi-Service Topology**: Multiple services per project with deterministic dependency ordering.
 - **Per-Service Build/Runtime**: Build and runtime configuration can be declared independently per service.
@@ -115,11 +129,10 @@ Current runtime note:
 
 Forge has now frozen the single-node stateful orchestration loop. The next phase should favor UX hardening, recovery depth, and operator ergonomics over broad new runtime scope.
 
-Alpha Core Loop v4 focus:
-- per-service CPU and memory limits persisted into generation metadata
-- Docker restart policy convergence and rollback fidelity
-- OOM/restart-loop warmup gating before promotion
-- operator-facing status and diagnose surfacing effective policy and runtime usage
+Post-v4 focus:
+- operator UX polish for status, diagnose, history, and restore lineage
+- broader recovery-path validation around backup/restore and daemon crashes
+- human visibility surfaces layered on top of the frozen runtime core
 
 ---
 
@@ -132,7 +145,7 @@ Recommended implementation order for the next alpha phase:
 Goal:
 
 ```txt
-improve visibility, recovery confidence, and operator ergonomics around the frozen v3 runtime
+improve visibility, recovery confidence, and operator ergonomics around the frozen v4 runtime
 ```
 
 Scope:

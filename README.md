@@ -24,7 +24,7 @@ Forge treats deployment as a continuous state machine, not a one-time event. It 
 
 ### 1. Simple Configuration (`forge.yml`)
 
-Forge Alpha Core Loop v4 extends the single-node multi-service model with per-service runtime policy persistence, Docker restart policy mapping, warmup crash gating, and basic runtime isolation signals.
+Forge Alpha Core Loop v4 extends the single-node multi-service model with persisted per-service runtime policy, rollback/convergence policy fidelity, warmup promotion gates for unstable runtimes, runtime usage snapshots, and cleaner operator diagnostics.
 
 ```yaml
 version: 1
@@ -132,20 +132,20 @@ Isolation and tenancy notes:
 - **Stateful Alpha Scope:** Docker-volume backed stateful services are supported on one host with backup/restore primitives.
 - **Secret-Safe:** Automated redaction across logs, events, and diagnostics.
 
-### Alpha Core Loop v3 Validated
+### Alpha Core Loop v4 Validated
 
-Forge Alpha Core Loop v3 freezes the stateful single-node orchestration milestone.
+Forge Alpha Core Loop v4 freezes the single-node stateful orchestration loop with runtime policy fidelity and degraded-runtime promotion safety.
 
-- **Multi-Service Topology:** One project can declare multiple services with dependency ordering and per-service build/runtime settings.
-- **Internal Service DNS:** Services resolve each other by Forge-managed aliases inside the project network.
-- **Per-Service Diagnostics:** Status, logs, and diagnostics are reported per service, including volume state and restore lineage.
-- **Stateful Volumes:** Services can declare Docker volumes with `persistent` or `ephemeral` retention semantics.
-- **Rollback Boundary:** Rollback restores topology and historical runtime/env truth, not database history.
-- **Backup/Restore Primitives:** Forge can create, list, inspect, and restore backups for persistent volumes.
-- **Helper-Container Archive Flow:** Docker helper containers archive and restore volume contents without host mountpoint assumptions.
-- **Backup Hooks:** Services can run pre-backup hooks such as `redis-cli SAVE`.
-- **Restore Lineage:** Restored generations preserve source backup lineage and report it in `forge diagnose`.
-- **GC Safety:** Garbage collection preserves backups and persistent volumes.
+- **Per-Service Runtime Policy:** Each service persists CPU, memory, and restart policy in generation metadata.
+- **Rollback Runtime Policy Fidelity:** Rollback restores the exact historical runtime policy for each service.
+- **Convergence Runtime Policy Repair:** Drift in restart policy, CPU limit, memory limit, or attached runtime policy is repaired back to promoted truth.
+- **Promotion Gates For Unstable Runtime:** OOM kills, crash loops, restart storms, unstable probes, and unstable required dependencies block promotion.
+- **Termination Diagnostics:** `forge diagnose` and API diagnostics expose exit reason, exit code, signal, restart count, OOM state, and log tails when available.
+- **Runtime Usage Snapshots:** Status and diagnostics surface captured CPU and memory usage snapshots for active services.
+- **Non-Fatal Route Repair Failures:** Startup route-repair failure degrades readiness reporting without failing basic liveness.
+- **Readyz Active Degradation Semantics:** `/readyz` returns `degraded` with concrete reasons while the daemon remains operational enough to serve requests.
+- **Clean Repair Diagnostics:** Diagnostics separate current repair signals from historical repair noise for runtime policy and volume repair fields.
+- **Stateful Multi-Service Baseline:** Multi-service topology, internal DNS, stateful volumes, backup/restore, restore lineage, and GC safety remain part of the validated core.
 
 ### Hard Invariants
 
@@ -160,7 +160,7 @@ Forge Alpha Core Loop v3 freezes the stateful single-node orchestration mileston
 
 ## Status
 
-Forge is in **Alpha**. Alpha Core Loop v3 is the current frozen orchestration milestone for single-node stateful deployments.
+Forge is in **Alpha**. Alpha Core Loop v4 is the current frozen orchestration milestone for single-node stateful deployments.
 
 [Roadmap](./ROADMAP.md) | [Architecture](./ARCHITECTURE.md) | [Invariants](./INVARIANTS.md)
 

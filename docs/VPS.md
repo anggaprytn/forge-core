@@ -10,24 +10,22 @@ forge daemon
 
 It is intentionally aligned to the current implementation, not an aspirational installer.
 
-## Alpha Core Loop v3 Validated (May 2026)
+## Alpha Core Loop v4 Validated (May 2026)
 
-The Forge Alpha Core Loop v3 milestone freezes the current single-node stateful orchestration loop on VPS infrastructure.
+The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration loop on VPS infrastructure with persisted runtime policy and degraded-runtime operator signals.
 
-### Validated Capabilities (v3)
+### Validated Capabilities (v4)
 
-- **Multi-Service Topology**: One project can deploy multiple services.
-- **Per-Service Build/Runtime**: Each service can define its own build/runtime settings.
-- **Internal Service DNS Aliases**: Internal services resolve over the Forge network.
-- **Per-Service Logs/Status/Diagnostics**: Diagnose and status expose service-specific runtime truth.
-- **Stateful Service Volumes**: Docker volume backed state can be attached per service.
-- **Persistent vs Ephemeral Volume Semantics**: Volume lifecycle is explicit.
-- **Stateful Rollback Boundary**: Rollback restores topology, not database history.
-- **Backup/Restore Primitives**: Backup create/list/inspect/restore are available.
-- **Helper-Container Docker Volume Archive/Restore**: Forge archives volume data via helper containers.
-- **Backup Hooks**: `pre_backup_command` can flush state before archive.
-- **Restore Lineage**: Restored generations report source backup lineage.
-- **GC Safety**: Backups and persistent volumes are preserved.
+- **Per-Service CPU/Memory/Restart Policy**: Runtime policy persists per service and round-trips through status, diagnostics, rollback, and convergence.
+- **Rollback Restores Historical Runtime Policy**: VPS rollback restores the exact historical runtime policy of the rollback target.
+- **Convergence Repairs Runtime Policy Drift**: Manual Docker-side policy drift is detected and repaired back to promoted truth.
+- **OOM/Crash-Loop/Restart-Storm Promotion Gates**: Warmup refuses to promote unstable services.
+- **Termination Diagnostics**: Diagnose/status expose exit reason, signal, OOM state, restart count, and tails when available.
+- **Runtime Usage Snapshots**: Active services expose captured CPU and memory usage snapshots.
+- **Non-Fatal Route Repair Failures**: Route repair issues degrade readiness without falsely claiming full readiness.
+- **Readyz Active Degradation Semantics**: `/readyz` may return `degraded` with active repair reasons while `/healthz` remains live.
+- **Clean Diagnostics API Repair Fields**: Current unresolved runtime policy and volume repair events remain visible; healthy historical noise is suppressed.
+- **Multi-Service Stateful Baseline**: v3 topology, state, backup/restore, and restore-lineage guarantees remain validated.
 
 ## Alpha Core Loop v2 Validated (May 2026)
 

@@ -268,6 +268,7 @@ Runtime Contracts are validated at deploy time and continuously in steady state.
 - container must expose required TCP service
 - container labels must be present
 - Docker restart behavior may be configured per service, but Forge must treat restart storms, OOM kills, and unstable warmup behavior as promotion blockers.
+- runtime policy drift is repairable steady-state drift; convergence may recreate a container to restore stored policy.
 
 Single-node isolation assumptions:
 - Forge relies on Docker cgroup and namespace controls on a single host.

@@ -131,11 +131,15 @@ Check the health and active generation of an environment.
 forge status my-app production
 ```
 
+Runtime status now includes effective runtime policy and, when available, captured runtime usage snapshots for the active service set.
+
 ### Diagnose Failures
 View detailed diagnostic information for a specific deployment or environment.
 ```bash
 forge diagnose my-app production
 ```
+
+Diagnostics now surface termination details such as restart count, exit code, signal, OOM state, termination reason, and unresolved runtime-policy or volume-repair events when the environment is degraded.
 
 After a backup restore, `forge diagnose` reports active lineage similar to:
 
@@ -260,6 +264,13 @@ services:
       context: .
     runtime:
       port: 3000
+      cpu:
+        limit: "1.5"
+      memory:
+        limit_mb: 512
+      restart:
+        policy: on-failure
+        max_retries: 5
       healthcheck:
         path: /health
         expected_status: 200
@@ -267,6 +278,15 @@ services:
         - redis
     expose: true
 ```
+
+Runtime policy fields under `runtime` are persisted per service. Forge uses them as rollback truth and convergence repair targets:
+
+- `runtime.cpu.limit`
+- `runtime.memory.limit_mb`
+- `runtime.restart.policy`
+- `runtime.restart.max_retries`
+
+Promotion is blocked if warmup detects OOM kills, crash loops, restart storms, or unstable required dependencies.
 
 Notes:
 
