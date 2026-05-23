@@ -24,7 +24,7 @@ Forge treats deployment as a continuous state machine, not a one-time event. It 
 
 ### 1. Simple Configuration (`forge.yml`)
 
-Forge Alpha Core Loop v4 extends the single-node multi-service model with persisted per-service runtime policy, rollback/convergence policy fidelity, warmup promotion gates for unstable runtimes, runtime usage snapshots, and cleaner operator diagnostics.
+Forge Alpha Core Loop v4 extends the single-node multi-service model with persisted per-service runtime policy, rollback/convergence policy fidelity, warmup promotion gates for unstable runtimes, cache-backed readiness, runtime usage snapshots, and cleaner operator diagnostics.
 
 ```yaml
 version: 1
@@ -90,6 +90,17 @@ Forge follows a rigid lifecycle: `Candidate → Validated → Finalized → Acti
 3. **Validate:** Exhaustive TCP and HTTP probes verify the app is actually ready.
 4. **Promote:** Only healthy generations receive traffic via atomic Caddy route updates.
 
+### Control-Plane Surfaces
+
+Forge exposes four distinct operator surfaces:
+
+- **`/healthz`**: process liveness only. Verifies the daemon is running and responding. Keep it lightweight.
+- **`/readyz`**: control-plane readiness only. Serves cached readiness state derived from asynchronous convergence. It is not fleet health inspection.
+- **`forge status`**: lightweight runtime and environment summary for operators.
+- **`forge diagnose`**: deep runtime truth inspection for debugging and incident response.
+
+Architectural principle: `Convergence computes truth. APIs serve cached truth.`
+
 ---
 
 ## Quick Start
@@ -142,10 +153,13 @@ Forge Alpha Core Loop v4 freezes the single-node stateful orchestration loop wit
 - **Promotion Gates For Unstable Runtime:** OOM kills, crash loops, restart storms, unstable probes, and unstable required dependencies block promotion.
 - **Termination Diagnostics:** `forge diagnose` and API diagnostics expose exit reason, exit code, signal, restart count, OOM state, and log tails when available.
 - **Runtime Usage Snapshots:** Status and diagnostics surface captured CPU and memory usage snapshots for active services.
+- **Cache-Backed Readiness:** The convergence loop computes readiness asynchronously and `/readyz` serves cached control-plane truth in bounded time.
 - **Non-Fatal Route Repair Failures:** Startup route-repair failure degrades readiness reporting without failing basic liveness.
 - **Readyz Active Degradation Semantics:** `/readyz` returns `degraded` with concrete reasons while the daemon remains operational enough to serve requests.
 - **Clean Repair Diagnostics:** Diagnostics separate current repair signals from historical repair noise for runtime policy and volume repair fields.
 - **Stateful Multi-Service Baseline:** Multi-service topology, internal DNS, stateful volumes, backup/restore, restore lineage, and GC safety remain part of the validated core.
+
+Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, which produced pathological latency in the 48s to 150s range. The current model keeps readiness off the fleet-inspection path and bounded under scale.
 
 ### Hard Invariants
 

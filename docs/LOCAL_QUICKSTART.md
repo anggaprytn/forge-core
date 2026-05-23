@@ -104,6 +104,27 @@ curl http://127.0.0.1:18080/readyz
 curl http://127.0.0.1:18080/metrics
 ```
 
+Semantics:
+
+- `/healthz`: process liveness only
+- `/readyz`: cached control-plane readiness only
+
+Local `/readyz` should stay bounded and typically return under 250ms. Current measured local response:
+
+```bash
+time curl -s http://127.0.0.1:18080/readyz >/dev/null
+# ~13ms
+```
+
+If the readiness cache is stale, Forge should return degraded immediately instead of recomputing fleet state on demand:
+
+```json
+{
+  "status": "degraded",
+  "reason": "readiness cache stale"
+}
+```
+
 ## 6. Deploy the Sample App
 
 From `tests/fixtures/sample-http-app` in a second shell:

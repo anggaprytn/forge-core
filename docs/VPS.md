@@ -12,7 +12,7 @@ It is intentionally aligned to the current implementation, not an aspirational i
 
 ## Alpha Core Loop v4 Validated (May 2026)
 
-The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration loop on VPS infrastructure with persisted runtime policy and degraded-runtime operator signals.
+The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration loop on VPS infrastructure with persisted runtime policy, cache-backed readiness, and degraded-runtime operator signals.
 
 ### Validated Capabilities (v4)
 
@@ -22,6 +22,7 @@ The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful 
 - **OOM/Crash-Loop/Restart-Storm Promotion Gates**: Warmup refuses to promote unstable services.
 - **Termination Diagnostics**: Diagnose/status expose exit reason, signal, OOM state, restart count, and tails when available.
 - **Runtime Usage Snapshots**: Active services expose captured CPU and memory usage snapshots.
+- **Cache-Backed Readiness**: Convergence computes readiness asynchronously and `/readyz` serves cached control-plane truth.
 - **Non-Fatal Route Repair Failures**: Route repair issues degrade readiness without falsely claiming full readiness.
 - **Readyz Active Degradation Semantics**: `/readyz` may return `degraded` with active repair reasons while `/healthz` remains live.
 - **Clean Diagnostics API Repair Fields**: Current unresolved runtime policy and volume repair events remain visible; healthy historical noise is suppressed.
@@ -57,8 +58,8 @@ The Forge Alpha Core Loop v1 milestone formalizes the first validated end-to-end
 - **Managed Docker runtime network**: Isolated container networks with Forge-managed lifecycles.
 - **Runtime validation and health probing**: TCP reachability and HTTP health check enforcement.
 - **Route activation and convergence**: Atomic Caddy route updates following successful validation.
-- **forge status**: Project and environment health and runtime monitoring.
-- **forge diagnose**: Deep inspection of runtime state and failure reasons.
+- **forge status**: Lightweight runtime and environment summary for operators.
+- **forge diagnose**: Deep inspection of runtime truth and failure reasons.
 - **forge env**: Inspection of generation-scoped runtime environment variables.
 - **Runtime env snapshots**: Authoritative, redacted snapshots of the effective runtime environment.
 - **Rollback**: Atomic restoration of the previous healthy generation and its specific metadata.
@@ -257,6 +258,46 @@ curl http://127.0.0.1:8080/readyz
 curl http://127.0.0.1:8080/metrics
 ```
 
+Semantics:
+
+- `/healthz`: process liveness only
+- `/readyz`: control-plane readiness only
+- `forge status`: lightweight operational inspection
+- `forge diagnose`: deep diagnostics for operators
+
+`/readyz` serves cached convergence state. It must not perform synchronous Docker scans, Caddy scans, route reconciliation, generation reconciliation, or environment-wide diagnostics on the request path.
+
+Readiness derives from cached control-plane inputs such as storage accessibility, queue health, Docker reachability, Caddy admin reachability, unresolved fatal markers, and convergence freshness. Environment-level health belongs to diagnostics, not readiness.
+
+Performance targets:
+
+- local `/readyz`: under 250ms
+- public `/readyz` TTFB: under 1s
+- stale readiness cache: degrade immediately
+
+Example degraded response:
+
+```json
+{
+  "status": "degraded",
+  "reason": "readiness cache stale"
+}
+```
+
+Observed validation:
+
+```bash
+time curl -s http://127.0.0.1:18080/readyz >/dev/null
+# ~13ms
+
+curl -sk -o /dev/null \
+  -w 'ttfb=%{time_starttransfer} total=%{time_total}\n' \
+  https://forge.anggaprytn.com/readyz
+# ttfb=0.028 total=0.028
+```
+
+The previous implementation coupled readiness to synchronous fleet-wide diagnostics and exhibited pathological 48s to 150s latency.
+
 ---
 
 ## 10. Deploy the Sample App
@@ -311,6 +352,15 @@ forge events | rg 'ORPHANED_|CLEANUP_'
 ---
 
 ## Troubleshooting VPS Deployments
+
+Probe guidance:
+
+- Use `/healthz` for liveness probes.
+- Use `/readyz` for load balancer and readiness probes.
+- Use `forge status` for operational overview.
+- Use `forge diagnose` for deep debugging.
+- Do not use `/readyz` as fleet health inspection or per-project monitoring.
+- Do not couple readiness probes to expensive reconciliation work.
 
 - **Caddy server ID**: Ensure Caddy is configured with server ID `"forge"`.
 - **Port Conflicts**: If port 8080 is taken, update `api_bind` in `forge.conf` and `FORGE_URL`.

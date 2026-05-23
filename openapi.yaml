@@ -11,6 +11,7 @@ paths:
   /healthz:
     get:
       summary: Health check
+      description: Lightweight process liveness only. Verifies the daemon is running and responding.
       security: []
       responses:
         '200':
@@ -22,20 +23,21 @@ paths:
   /readyz:
     get:
       summary: Readiness check
+      description: Cache-backed control-plane readiness. Serves cached convergence state and must remain bounded-time. Not intended for fleet diagnostics or per-project health inspection.
       security: []
       responses:
         '200':
-          description: Ready
+          description: Ready or degraded control-plane readiness
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthEnvelope'
+                $ref: '#/components/schemas/ReadinessEnvelope'
         '503':
           description: Not ready
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthEnvelope'
+                $ref: '#/components/schemas/ReadinessEnvelope'
   /metrics:
     get:
       summary: Prometheus metrics
@@ -489,6 +491,48 @@ components:
         status:
           type: string
           example: ok
+    ReadinessEnvelope:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: ready
+          description: Control-plane readiness status. Common values are ready, degraded, and not_ready.
+        reason:
+          type:
+            - string
+            - 'null'
+          example: readiness cache stale
+        reasons:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReadyzReason'
+    ReadyzReason:
+      type: object
+      required:
+        - project_id
+        - environment
+        - source
+        - marker
+        - message
+      properties:
+        project_id:
+          type: string
+        environment:
+          type: string
+        generation:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        source:
+          type: string
+        marker:
+          type: string
+        message:
+          type: string
     DeploymentRequest:
       type: object
       required:

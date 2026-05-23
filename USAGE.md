@@ -131,7 +131,7 @@ Check the health and active generation of an environment.
 forge status my-app production
 ```
 
-Runtime status now includes effective runtime policy and, when available, captured runtime usage snapshots for the active service set.
+`forge status` is the lightweight operational summary surface. It includes effective runtime policy and, when available, captured runtime usage snapshots for the active service set.
 
 ### Diagnose Failures
 View detailed diagnostic information for a specific deployment or environment.
@@ -139,7 +139,7 @@ View detailed diagnostic information for a specific deployment or environment.
 forge diagnose my-app production
 ```
 
-Diagnostics now surface termination details such as restart count, exit code, signal, OOM state, termination reason, and unresolved runtime-policy or volume-repair events when the environment is degraded.
+`forge diagnose` is the deep diagnostics surface. It reports runtime truth, termination details such as restart count, exit code, signal, OOM state, termination reason, and unresolved runtime-policy or volume-repair events when the environment is degraded.
 
 After a backup restore, `forge diagnose` reports active lineage similar to:
 
@@ -380,6 +380,24 @@ forge login https://forge.example.com
 ```
 
 Forge creates a pending CLI login, opens or prints `/login/cli?code=...`, reuses the existing GitHub web session for approval, and stores the resulting token in `~/.config/forge/config.toml`. `FORGE_URL` and `FORGE_TOKEN` override the saved config when present.
+
+Endpoint semantics:
+
+- `/healthz`: process liveness only
+- `/readyz`: control-plane readiness only
+- `forge status`: lightweight runtime and environment summary
+- `forge diagnose`: deep diagnostics for operators and debugging
+
+`/readyz` is cache-backed. The convergence loop computes readiness asynchronously, and the request path serves cached truth in bounded time. It must not perform synchronous Docker scans, Caddy scans, route reconciliation, generation reconciliation, or environment-wide diagnostics.
+
+If the readiness cache is stale, Forge should fail fast with degraded status:
+
+```json
+{
+  "status": "degraded",
+  "reason": "readiness cache stale"
+}
+```
 
 ---
 

@@ -97,6 +97,19 @@ Control-plane model:
 - API is the automation surface.
 - CLI, API, and web requests must converge into the same queue and deployment pipeline.
 
+Readiness model:
+
+- `Convergence computes truth. APIs serve cached truth.`
+- `/healthz` is liveness only. It verifies the daemon process is running and responding.
+- `/readyz` is control-plane readiness only. It serves cached readiness state from background convergence work.
+- `forge status` is a lightweight runtime and environment summary.
+- `forge diagnose` is deep runtime truth inspection for operators and debugging.
+- Environment-wide health investigation belongs to diagnostics, not readiness.
+
+The request path for `/readyz` must remain constant-time. It must never trigger synchronous Docker scans, Caddy scans, generation reconciliation, route reconciliation, or environment-wide diagnostics.
+
+Previous readiness behavior coupled probe handling to full fleet diagnostics. Under scale, that produced pathological latency in the 48s to 150s range. The current model breaks that coupling.
+
 1. HTTP API
 
 The control-plane entrypoint.
@@ -121,6 +134,12 @@ Responsibilities:
 The API is intentionally thin.
 
 Business logic lives in the executor and convergence engine.
+
+Health surface note:
+
+- `/healthz` should always be a cheap process-level response.
+- `/readyz` should fail fast from cached control-plane state.
+- Load balancers and uptime probes must not depend on deep runtime inspection.
 
 Current implementation note:
 
@@ -212,6 +231,56 @@ Verifies:
 application-level health semantics
 
 Deployments fail closed on probe failure.
+
+⸻
+
+Readiness Architecture
+
+Forge readiness is cache-backed.
+
+- The convergence loop computes readiness asynchronously.
+- `/readyz` serves the cached readiness snapshot.
+- The handler remains bounded-time even on large fleets.
+- If the cache is stale, readiness degrades immediately instead of recomputing on demand.
+
+Example degraded response:
+
+```json
+{
+  "status": "degraded",
+  "reason": "readiness cache stale"
+}
+```
+
+Cached readiness derives from control-plane convergence state such as:
+
+- storage accessibility
+- queue health
+- Docker reachability
+- Caddy admin reachability
+- unresolved fatal control-plane markers
+- convergence freshness and cache age
+
+This is intentionally narrower than environment truth. Per-project runtime health, route correctness, and deeper environment inspection are operator diagnostics surfaced through `forge status` and `forge diagnose`.
+
+Operational targets:
+
+- local `/readyz`: under 250ms
+- public `/readyz` TTFB: under 1s
+- stale readiness cache: return degraded immediately
+- readiness handlers: fail fast
+
+Observed validation:
+
+```bash
+time curl -s http://127.0.0.1:18080/readyz >/dev/null
+# ~13ms
+
+curl -sk -o /dev/null \
+  -w 'ttfb=%{time_starttransfer} total=%{time_total}\n' \
+  https://forge.anggaprytn.com/readyz
+# ttfb=0.028 total=0.028
+```
 
 ⸻
 

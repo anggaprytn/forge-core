@@ -41,7 +41,7 @@ Never bypass Forge orchestration semantics manually unless performing disaster r
 
 # Alpha Core Loop v4 Validated (May 2026)
 
-The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration model with persisted runtime policy and degraded-runtime repair semantics.
+The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful orchestration model with persisted runtime policy, cache-backed readiness, and degraded-runtime repair semantics.
 
 ### Validated Capabilities
 
@@ -51,6 +51,7 @@ The Forge Alpha Core Loop v4 milestone freezes the current single-node stateful 
 - **Promotion Safety Gates**: OOM kills, crash loops, restart storms, and unstable required dependencies block promotion.
 - **Termination Diagnostics**: Diagnose/status surface termination reason, exit code, signal, restart count, OOM state, and tails when available.
 - **Runtime Usage Snapshots**: Operators can inspect captured CPU/memory usage snapshots for services.
+- **Cache-Backed Readiness**: Convergence computes readiness asynchronously and `/readyz` serves cached control-plane truth.
 - **Readyz Degradation Semantics**: `/readyz` can return `degraded` with repair reasons while `/healthz` remains `ok`.
 - **Non-Fatal Route Repair Failures**: Route repair issues surface as degraded readiness and repair work, not silent success.
 - **Clean Repair Visibility**: Diagnostics expose current unresolved repair fields separately from historical repair noise.
@@ -145,6 +146,34 @@ Forge does not assume its internal metadata matches reality. It performs "Runtim
 - **Container Inspection**: Inspects live Docker labels to verify if the running container matches the intended generation.
 - **Route Inspection**: Queries the Caddy admin API to ensure routes point to the correct internal IPs.
 - **Deterministic Repair**: If drift is detected (e.g., container IP change after Docker restart), Forge automatically repairs the route or restarts the container to align with the `promoted` pointer.
+
+### Readiness Architecture
+
+Forge readiness is cache-backed.
+
+- The convergence loop computes readiness state asynchronously.
+- `/readyz` serves the cached readiness state.
+- The request path is constant-time and fail-fast.
+- Stale cache state returns degraded immediately.
+
+Architectural principle:
+
+`Convergence computes truth. APIs serve cached truth.`
+
+Readiness no longer triggers synchronous fleet scans, Docker enumeration, Caddy enumeration, generation reconciliation, or environment-wide status recomputation on the request path.
+
+The old design coupled readiness to fleet-wide diagnostics. In practice that created pathological 48s to 150s latency. Readiness is now separated from deep inspection.
+
+Readiness is derived from cached convergence state such as:
+
+- storage accessibility
+- queue health
+- Docker reachability
+- Caddy admin reachability
+- unresolved fatal control-plane markers
+- convergence freshness and cache age
+
+Environment-level health belongs to diagnostics, not readiness.
 
 ---
 
@@ -370,11 +399,46 @@ systemctl start forge
 
 ---
 
-## Check Health
+## Liveness And Readiness
 
 ```bash
 curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
+```
+
+Semantics:
+
+- `/healthz`: process liveness only. Verifies the daemon is running and responding. Keep it lightweight.
+- `/readyz`: control-plane readiness only. Verifies critical dependencies and cached convergence state. It is not fleet health or environment diagnostics.
+- `forge status`: lightweight operational summary for a project or environment.
+- `forge diagnose`: deep runtime truth inspection for operators and debugging.
+
+Performance targets:
+
+- local `/readyz`: under 250ms
+- public `/readyz` TTFB: under 1s
+- stale readiness cache: return degraded immediately
+- readiness handlers: bounded-time and fail-fast
+
+Example degraded response:
+
+```json
+{
+  "status": "degraded",
+  "reason": "readiness cache stale"
+}
+```
+
+Observed validation:
+
+```bash
+time curl -s http://127.0.0.1:18080/readyz >/dev/null
+# ~13ms
+
+curl -sk -o /dev/null \
+  -w 'ttfb=%{time_starttransfer} total=%{time_total}\n' \
+  https://forge.anggaprytn.com/readyz
+# ttfb=0.028 total=0.028
 ```
 
 ---
@@ -403,6 +467,8 @@ git push
 forge status <deployment_id>
 ```
 
+Use `forge status` for a lightweight operational view. It summarizes runtime and environment state without turning readiness probes into deep inspection.
+
 ---
 
 ## View Events
@@ -420,6 +486,21 @@ forge rollback api production
 ```
 
 Rollback restores the previous healthy finalized generation.
+
+## Troubleshooting Guidance
+
+Use:
+
+- `/healthz` for liveness probes
+- `/readyz` for control-plane readiness probes
+- `forge status` for operational overview
+- `forge diagnose` for deep debugging
+
+Do not:
+
+- use `/readyz` as fleet health inspection
+- use readiness endpoints for per-project monitoring
+- couple load balancer probes to expensive reconciliation work
 
 ## Manual Backup And Restore
 
