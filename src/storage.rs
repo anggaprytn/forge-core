@@ -15,7 +15,10 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_RETRY_LIMIT: usize = 200;
 const DIAGNOSTIC_LOG_MAX_LINES: usize = 64;
 const DIAGNOSTIC_LOG_MAX_BYTES: usize = 4096;
-const CONTROL_PLANE_SCHEMA_VERSION: u64 = 1;
+pub const CONTROL_PLANE_SCHEMA_VERSION: u64 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
+pub const CHECKPOINT_SCHEMA_VERSION: u64 = CONTROL_PLANE_SCHEMA_VERSION;
+pub const BACKUP_METADATA_VERSION: u64 = 1;
 pub const CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT: usize = 12;
 const OPERATIONAL_JOURNAL_MAX_BYTES: u64 = 256 * 1024;
 const OPERATIONAL_JOURNAL_ROTATIONS: usize = 2;
@@ -2368,7 +2371,7 @@ fn default_control_plane_schema_version() -> u64 {
 }
 
 fn default_snapshot_version() -> u64 {
-    1
+    SNAPSHOT_SCHEMA_VERSION
 }
 
 fn default_runtime_health_state() -> RuntimeHealthState {

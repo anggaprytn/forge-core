@@ -18,6 +18,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const RECONCILIATION_LOG_MAX_METADATA_KEYS: usize = 16;
 const RECONCILIATION_LOG_MAX_METADATA_STRING_BYTES: usize = 256;
 const RECONCILIATION_REPLAY_BATCH_LIMIT: usize = 256;
+pub const RECONCILIATION_LOG_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

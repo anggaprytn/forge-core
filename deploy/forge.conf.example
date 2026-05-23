@@ -1,6 +1,7 @@
 # Required
 storage_root=/var/lib/forge
 api_bind=127.0.0.1:8080
+# bootstrap/admin token; prefer CLI tokens for routine remote operation
 bearer_token=replace-with-a-long-random-token
 
 # Optional

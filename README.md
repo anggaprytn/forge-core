@@ -225,3 +225,32 @@ Forge is in **Alpha**. Alpha Core Loop v5 is the current frozen milestone for th
 ## License
 
 MIT License. Built for the era of agentic software.
+
+## Security Hardening
+
+- `forge token list`, `forge token create --name <name>`, and `forge token revoke <token_id>` manage CLI tokens without persisting plaintext server-side.
+- Forge stores only token hashes plus metadata: `token_id`, `name`, `created_at`, `last_used_at`, `revoked_at`, `github_login`, and `source`.
+- CLI login and `forge token create` show the token only once. Revoked tokens stop authenticating immediately.
+- `Authorization` headers, bearer tokens, Forge master keys, OAuth client secrets, and app secrets are redacted from logs, diagnostics, and persisted excerpts.
+
+## Token Rotation
+
+- Preferred rotation env vars are `FORGE_CLI_TOKEN_SECRET_CURRENT` and `FORGE_CLI_TOKEN_SECRET_PREVIOUS`.
+- Verification checks the current secret first and the previous secret second. New tokens are always issued with the current secret.
+- Rotation flow:
+  1. Set `FORGE_CLI_TOKEN_SECRET_CURRENT` to the new secret and `FORGE_CLI_TOKEN_SECRET_PREVIOUS` to the old secret.
+  2. Restart Forge and have all CLI users run `forge login <server_url>` again.
+  3. Remove `FORGE_CLI_TOKEN_SECRET_PREVIOUS` after the old tokens are no longer needed.
+
+## Bootstrap And Upgrade Hygiene
+
+- `bearer_token` in `forge.conf` remains the bootstrap/admin credential. Prefer CLI tokens for routine remote operation.
+- Do not paste the bootstrap bearer token into shell history; use env injection or a protected config file.
+- `forge version` reports the runtime version, embedded git commit and build timestamp when available, and the manifest/snapshot/checkpoint/reconciliation schema versions.
+- `forge doctor upgrade` is read-only and checks storage readability, checkpoint compatibility, reconciliation log compatibility, backup metadata compatibility, Docker, Caddy, write access, and Linux `systemd` sanity.
+
+## Backup Safety
+
+- Backup artifacts can contain sensitive application data.
+- Backups are not encrypted yet.
+- Backup files inherit host filesystem protections and should be treated as sensitive data under `/var/lib/forge/backups`.

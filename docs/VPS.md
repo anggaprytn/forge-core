@@ -389,3 +389,29 @@ Probe guidance:
 - **Caddy server ID**: Ensure Caddy is configured with server ID `"forge"`.
 - **Port Conflicts**: If port 8080 is taken, update `api_bind` in `forge.conf` and `FORGE_URL`.
 - **API Visibility**: Keep the API bound to `localhost` (127.0.0.1) for security.
+
+## Token And Secret Hygiene
+
+- `bearer_token` in `forge.conf` is the bootstrap/admin credential. Prefer CLI tokens for day-to-day remote operation.
+- Manage CLI tokens with `forge token list`, `forge token create --name <name>`, and `forge token revoke <token_id>`.
+- Forge stores only token hashes server-side and shows token plaintext once at creation time.
+- Redaction covers `Authorization` headers, bearer tokens, Forge master keys, OAuth client secrets, GitHub tokens, and sensitive app values in logs and diagnostics.
+
+## CLI Token Secret Rotation
+
+1. Set `FORGE_CLI_TOKEN_SECRET_CURRENT` to the new secret.
+2. Set `FORGE_CLI_TOKEN_SECRET_PREVIOUS` to the old secret during the migration window.
+3. Restart Forge.
+4. Have every operator run `forge login <server_url>` again.
+5. Remove `FORGE_CLI_TOKEN_SECRET_PREVIOUS` after the old tokens are retired.
+
+## Backup Handling
+
+- Backups may contain sensitive application data.
+- Backups are not encrypted yet.
+- Protect `/var/lib/forge/backups` with restrictive filesystem permissions and host access controls.
+
+## Upgrade Preflight
+
+- Use `forge version` to capture runtime build identity and schema versions.
+- Use `forge doctor upgrade` before upgrades. It is read-only and checks storage readability, schema compatibility, Docker, Caddy, write access, and Linux `systemd` sanity.

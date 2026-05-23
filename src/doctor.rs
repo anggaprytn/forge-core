@@ -5,6 +5,12 @@ use std::path::{Path, PathBuf};
 use reqwest::blocking::Client;
 
 use crate::config::{ConfigError, DaemonConfig};
+use crate::reconciliation::{ReconciliationCursor, ReconciliationIntentEntry};
+use crate::storage::{
+    BACKUP_METADATA_VERSION, CHECKPOINT_SCHEMA_VERSION, ConvergenceCheckpointStore,
+    EnvironmentPaths, PersistedBackupMetadata, PersistedEnvironmentCheckpoint,
+    SNAPSHOT_SCHEMA_VERSION,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoctorStatus {
@@ -80,6 +86,7 @@ pub struct DoctorOptions {
     pub config_path: PathBuf,
     pub caddy_admin_url: String,
     pub metrics_url: Option<String>,
+    pub upgrade: bool,
 }
 
 #[derive(Debug)]
@@ -162,6 +169,7 @@ pub fn run(options: &DoctorOptions) -> Result<DoctorReport, DoctorError> {
         &config,
         &options.caddy_admin_url,
         Some(&metrics_url),
+        options.upgrade,
         &mut docker,
         &http,
     ))
@@ -171,6 +179,7 @@ pub fn run_with_dependencies(
     config: &DaemonConfig,
     caddy_admin_url: &str,
     metrics_url: Option<&str>,
+    upgrade: bool,
     docker: &mut dyn DockerReachability,
     http: &dyn HttpReachability,
 ) -> DoctorReport {
@@ -210,7 +219,22 @@ pub fn run_with_dependencies(
         }
     }
 
+    if upgrade {
+        checks.extend(check_upgrade_readiness(config));
+    }
+
     DoctorReport { checks }
+}
+
+fn check_upgrade_readiness(config: &DaemonConfig) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+    checks.push(check_storage_schema_readable(&config.storage_root));
+    checks.push(check_checkpoint_schema_compatibility(&config.storage_root));
+    checks.push(check_reconciliation_log_compatibility(&config.storage_root));
+    checks.push(check_backup_metadata_compatibility(&config.storage_root));
+    #[cfg(target_os = "linux")]
+    checks.push(check_systemd_unit_sanity());
+    checks
 }
 
 fn check_storage_root_writable(path: &Path) -> DoctorCheck {
@@ -252,6 +276,170 @@ fn check_api_token(token: &str) -> DoctorCheck {
     } else {
         DoctorCheck::ok("API token configured")
     }
+}
+
+fn check_storage_schema_readable(storage_root: &Path) -> DoctorCheck {
+    let projects_root = storage_root.join("projects");
+    if !projects_root.exists() {
+        return DoctorCheck::warn("Storage schema readability: no projects directory found");
+    }
+    match fs::read_dir(&projects_root) {
+        Ok(_) => DoctorCheck::ok("Storage schema readability"),
+        Err(err) => DoctorCheck::error(format!("Storage schema readability: {err}")),
+    }
+}
+
+fn check_checkpoint_schema_compatibility(storage_root: &Path) -> DoctorCheck {
+    match scan_checkpoint_schema(storage_root) {
+        Ok(()) => DoctorCheck::ok("Checkpoint schema compatibility"),
+        Err(err) => DoctorCheck::error(format!("Checkpoint schema compatibility: {err}")),
+    }
+}
+
+fn check_reconciliation_log_compatibility(storage_root: &Path) -> DoctorCheck {
+    let log_path = EnvironmentPaths::reconciliation_log_file(storage_root);
+    if !log_path.exists() {
+        return DoctorCheck::ok("Reconciliation log schema compatibility");
+    }
+    let raw = match fs::read_to_string(&log_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return DoctorCheck::error(format!("Reconciliation log schema compatibility: {err}"));
+        }
+    };
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Err(err) = serde_json::from_str::<ReconciliationIntentEntry>(line) {
+            return DoctorCheck::error(format!("Reconciliation log schema compatibility: {err}"));
+        }
+    }
+    let cursor_path = storage_root
+        .join("control_plane")
+        .join("reconciliation_cursor.json");
+    if cursor_path.exists()
+        && serde_json::from_str::<ReconciliationCursor>(
+            &fs::read_to_string(&cursor_path).unwrap_or_default(),
+        )
+        .is_err()
+    {
+        return DoctorCheck::error(
+            "Reconciliation log schema compatibility: invalid reconciliation cursor",
+        );
+    }
+    DoctorCheck::ok("Reconciliation log schema compatibility")
+}
+
+fn check_backup_metadata_compatibility(storage_root: &Path) -> DoctorCheck {
+    match scan_backup_metadata(storage_root) {
+        Ok(()) => DoctorCheck::ok("Backup metadata compatibility"),
+        Err(err) => DoctorCheck::error(format!("Backup metadata compatibility: {err}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_systemd_unit_sanity() -> DoctorCheck {
+    let candidates = [
+        Path::new("/etc/systemd/system/forge.service"),
+        Path::new("/lib/systemd/system/forge.service"),
+    ];
+    if let Some(path) = candidates.iter().find(|path| path.exists()) {
+        match fs::read_to_string(path) {
+            Ok(contents)
+                if contents.contains("[Unit]")
+                    && contents.contains("[Service]")
+                    && contents.contains("ExecStart=") =>
+            {
+                DoctorCheck::ok("systemd unit sanity")
+            }
+            Ok(_) => {
+                DoctorCheck::warn("systemd unit sanity: forge.service missing expected sections")
+            }
+            Err(err) => DoctorCheck::warn(format!("systemd unit sanity: {err}")),
+        }
+    } else {
+        DoctorCheck::warn("systemd unit sanity: forge.service not found")
+    }
+}
+
+fn scan_checkpoint_schema(storage_root: &Path) -> Result<(), String> {
+    for env in discover_environments(storage_root)? {
+        let store = ConvergenceCheckpointStore::new(env.clone());
+        if let Some(checkpoint) = store.load().map_err(|err| err.to_string())? {
+            validate_checkpoint(&checkpoint)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint(checkpoint: &PersistedEnvironmentCheckpoint) -> Result<(), String> {
+    if checkpoint.snapshot_version != SNAPSHOT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported checkpoint snapshot_version {}",
+            checkpoint.snapshot_version
+        ));
+    }
+    if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported checkpoint schema_version {}",
+            checkpoint.schema_version
+        ));
+    }
+    Ok(())
+}
+
+fn scan_backup_metadata(storage_root: &Path) -> Result<(), String> {
+    for env in discover_environments(storage_root)? {
+        let backups_root = env.root.join("backups");
+        if !backups_root.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&backups_root).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let path = entry.path().join("metadata.json");
+            if !path.exists() {
+                continue;
+            }
+            let metadata: PersistedBackupMetadata =
+                serde_json::from_str(&fs::read_to_string(&path).map_err(|err| err.to_string())?)
+                    .map_err(|err| err.to_string())?;
+            if metadata.backup_version != BACKUP_METADATA_VERSION {
+                return Err(format!(
+                    "unsupported backup_version {} at {}",
+                    metadata.backup_version,
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn discover_environments(storage_root: &Path) -> Result<Vec<EnvironmentPaths>, String> {
+    let projects_root = storage_root.join("projects");
+    let mut environments = Vec::new();
+    if !projects_root.exists() {
+        return Ok(environments);
+    }
+    for project in fs::read_dir(&projects_root).map_err(|err| err.to_string())? {
+        let project = project.map_err(|err| err.to_string())?;
+        let environments_root = project.path().join("environments");
+        if !environments_root.exists() {
+            continue;
+        }
+        for environment in fs::read_dir(&environments_root).map_err(|err| err.to_string())? {
+            let environment = environment.map_err(|err| err.to_string())?;
+            let project_id = project.file_name().to_string_lossy().to_string();
+            let environment_name = environment.file_name().to_string_lossy().to_string();
+            environments.push(EnvironmentPaths::new(
+                storage_root,
+                &project_id,
+                &environment_name,
+            ));
+        }
+    }
+    Ok(environments)
 }
 
 #[cfg(test)]
@@ -337,6 +525,7 @@ mod tests {
             &config,
             "http://127.0.0.1:2019",
             Some("http://127.0.0.1:8080/metrics"),
+            false,
             &mut docker,
             &http,
         );
@@ -361,8 +550,14 @@ mod tests {
             )]),
         };
 
-        let report =
-            run_with_dependencies(&config, "http://127.0.0.1:2019", None, &mut docker, &http);
+        let report = run_with_dependencies(
+            &config,
+            "http://127.0.0.1:2019",
+            None,
+            false,
+            &mut docker,
+            &http,
+        );
 
         assert!(
             messages_with_status(&report, DoctorStatus::Error)
@@ -384,11 +579,50 @@ mod tests {
             results: BTreeMap::from([("http://127.0.0.1:2019/config/".into(), Ok(()))]),
         };
 
-        let report =
-            run_with_dependencies(&config, "http://127.0.0.1:2019", None, &mut docker, &http);
+        let report = run_with_dependencies(
+            &config,
+            "http://127.0.0.1:2019",
+            None,
+            false,
+            &mut docker,
+            &http,
+        );
 
         assert!(
             messages_with_status(&report, DoctorStatus::Warn).contains("FORGE_MASTER_KEY missing")
         );
+    }
+
+    #[test]
+    fn doctor_upgrade_reports_schema_checks() {
+        let root = test_root("doctor-upgrade");
+        fs::create_dir_all(root.join("queue")).unwrap();
+        fs::create_dir_all(
+            root.join("projects")
+                .join("api")
+                .join("environments")
+                .join("prod"),
+        )
+        .unwrap();
+        let config = test_config(&root);
+        let mut docker = StubDocker { result: Ok(()) };
+        let http = StubHttp {
+            results: BTreeMap::from([("http://127.0.0.1:2019/config/".into(), Ok(()))]),
+        };
+
+        let report = run_with_dependencies(
+            &config,
+            "http://127.0.0.1:2019",
+            None,
+            true,
+            &mut docker,
+            &http,
+        );
+
+        let ok = messages_with_status(&report, DoctorStatus::Ok);
+        assert!(ok.contains("Storage schema readability"));
+        assert!(ok.contains("Checkpoint schema compatibility"));
+        assert!(ok.contains("Reconciliation log schema compatibility"));
+        assert!(ok.contains("Backup metadata compatibility"));
     }
 }

@@ -25,6 +25,10 @@ use crate::api::{
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
     EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
     ProjectUpsertRequest, ReadyzResponse, SecretListResponse, SecretUnsetResponse,
+    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata, TokenRevokeResponse,
+};
+use crate::auth::{
+    AuthSource, AuthenticatedPrincipal, CliTokenVerifier, TokenIssueRequest, TokenStoreError,
 };
 use crate::daemon::{
     ControlPlaneSnapshot, Daemon, DaemonReadyzCache, DaemonState, READYZ_CACHE_STALE_AFTER_MS,
@@ -514,13 +518,6 @@ struct SessionCookie {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CliTokenClaims {
-    github_login: String,
-    github_id: u64,
-    issued_at_unix: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CliLoginQuery {
     code: Option<String>,
 }
@@ -561,27 +558,34 @@ enum CliLoginPollStatus {
 
 #[derive(Clone)]
 pub struct CliAuthState {
-    token_secret: Arc<String>,
+    verifier: Arc<CliTokenVerifier>,
     requests: Arc<Mutex<CliLoginStore>>,
 }
 
 impl CliAuthState {
     pub fn from_env(root: impl AsRef<Path>) -> Result<Option<Self>, std::io::Error> {
-        let Some(token_secret) = std::env::var("FORGE_CLI_TOKEN_SECRET").ok() else {
+        let root = root.as_ref();
+        let Some(verifier) = CliTokenVerifier::from_env(root.join("tokens"))
+            .map_err(|err| std::io::Error::other(err.to_string()))?
+        else {
             return Ok(None);
         };
         Ok(Some(Self {
-            token_secret: Arc::new(token_secret),
-            requests: Arc::new(Mutex::new(CliLoginStore::new(root, CLI_LOGIN_TTL_SECONDS)?)),
+            verifier: Arc::new(verifier),
+            requests: Arc::new(Mutex::new(CliLoginStore::new(
+                root.join("requests"),
+                CLI_LOGIN_TTL_SECONDS,
+            )?)),
         }))
     }
 
     #[cfg(test)]
     fn configured_for_tests(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
         Self {
-            token_secret: Arc::new("test-cli-token-secret".into()),
+            verifier: Arc::new(CliTokenVerifier::configured_for_tests(root.join("tokens"))),
             requests: Arc::new(Mutex::new(
-                CliLoginStore::new(root, CLI_LOGIN_TTL_SECONDS).unwrap(),
+                CliLoginStore::new(root.join("requests"), CLI_LOGIN_TTL_SECONDS).unwrap(),
             )),
         }
     }
@@ -611,11 +615,26 @@ impl CliAuthState {
         self.requests
             .lock()
             .map_err(|_| "cli login state lock poisoned".to_string())?
-            .poll(code, self.token_secret.as_ref())
+            .poll(code, self.verifier.as_ref())
     }
 
-    fn verify_token(&self, token: &str) -> bool {
-        decode_cli_token(token, self.token_secret.as_ref()).is_some()
+    fn verify_token(&self, token: &str) -> Result<Option<AuthenticatedPrincipal>, TokenStoreError> {
+        self.verifier.verify_token(token)
+    }
+
+    fn issue_token(
+        &self,
+        request: TokenIssueRequest,
+    ) -> Result<crate::auth::TokenIssueResult, TokenStoreError> {
+        self.verifier.issue_token(request)
+    }
+
+    fn list_tokens(&self) -> Result<Vec<crate::auth::TokenRecord>, TokenStoreError> {
+        self.verifier.list_tokens()
+    }
+
+    fn revoke_token(&self, token_id: &str) -> Result<crate::auth::TokenRecord, TokenStoreError> {
+        self.verifier.revoke_token(token_id)
     }
 }
 
@@ -838,7 +857,11 @@ impl CliLoginStore {
         Ok(true)
     }
 
-    fn poll(&mut self, code: &str, token_secret: &str) -> Result<CliLoginPollStatus, String> {
+    fn poll(
+        &mut self,
+        code: &str,
+        verifier: &CliTokenVerifier,
+    ) -> Result<CliLoginPollStatus, String> {
         let Some(mut record) = self.read(code)? else {
             return Ok(CliLoginPollStatus::Expired);
         };
@@ -850,14 +873,15 @@ impl CliLoginStore {
             record.approved_by_id,
             record.approved_at_unix,
         ) {
-            let token = encode_cli_token(
-                &CliTokenClaims {
+            let token = verifier
+                .issue_token(TokenIssueRequest {
+                    name: format!("cli-login-{github_login}"),
                     github_login,
                     github_id,
-                    issued_at_unix: unix_now(),
-                },
-                token_secret,
-            )?;
+                    source: "cli_login".into(),
+                })
+                .map_err(|err| err.to_string())?
+                .plaintext_token;
             record.consumed_at_unix = Some(unix_now());
             self.write(code, &record)?;
             return Ok(CliLoginPollStatus::Approved(token));
@@ -894,6 +918,8 @@ pub fn router(state: HttpState) -> Router {
         .route("/logout", get(get_logout).post(post_logout))
         .route("/api/cli-login/start", post(post_cli_login_start))
         .route("/api/cli-login/poll", post(post_cli_login_poll))
+        .route("/api/tokens", get(get_tokens).post(post_token_create))
+        .route("/api/tokens/{token_id}", delete(delete_token))
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
         .route("/metrics", get(get_metrics))
@@ -1408,6 +1434,154 @@ async fn post_cli_login_poll(
                 message: err,
             },
         ),
+    }
+}
+
+async fn get_tokens(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let request_id = next_request_id();
+    let principal = match ensure_authorized(&state, &headers, &request_id) {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let Some(cli_auth) = state.cli_auth.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            ErrorResponse {
+                code: "cli_tokens_not_configured".into(),
+                message: "cli tokens are not configured".into(),
+            },
+        );
+    };
+    match cli_auth.list_tokens() {
+        Ok(records) => {
+            let tokens = records
+                .into_iter()
+                .filter(|record| principal_can_access_token(&principal, record))
+                .map(token_metadata_from_record)
+                .collect();
+            json_response(
+                StatusCode::OK,
+                &request_id,
+                Json(SuccessEnvelope {
+                    request_id: request_id.clone(),
+                    correlation_id: request_id.clone(),
+                    data: TokenListResponse { tokens },
+                }),
+            )
+        }
+        Err(err) => token_store_error_response(&request_id, err),
+    }
+}
+
+async fn post_token_create(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<TokenCreateRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    let principal = match ensure_authorized(&state, &headers, &request_id) {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let Some(cli_auth) = state.cli_auth.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            ErrorResponse {
+                code: "cli_tokens_not_configured".into(),
+                message: "cli tokens are not configured".into(),
+            },
+        );
+    };
+    if request.name.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &request_id,
+            ErrorResponse {
+                code: "invalid_token_request".into(),
+                message: "token name must not be empty".into(),
+            },
+        );
+    }
+    let issue_request = token_issue_request_for_principal(&principal, request.name.trim());
+    match cli_auth.issue_token(issue_request) {
+        Ok(result) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: TokenCreateResponse {
+                    token: result.plaintext_token,
+                    metadata: token_metadata_from_record(result.record),
+                },
+            }),
+        ),
+        Err(err) => token_store_error_response(&request_id, err),
+    }
+}
+
+async fn delete_token(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(token_id): AxumPath<String>,
+) -> Response {
+    let request_id = next_request_id();
+    let principal = match ensure_authorized(&state, &headers, &request_id) {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let Some(cli_auth) = state.cli_auth.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &request_id,
+            ErrorResponse {
+                code: "cli_tokens_not_configured".into(),
+                message: "cli tokens are not configured".into(),
+            },
+        );
+    };
+    let existing = match cli_auth.list_tokens() {
+        Ok(records) => records
+            .into_iter()
+            .find(|record| record.token_id == token_id),
+        Err(err) => return token_store_error_response(&request_id, err),
+    };
+    let Some(existing) = existing else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &request_id,
+            ErrorResponse {
+                code: "token_not_found".into(),
+                message: "token not found".into(),
+            },
+        );
+    };
+    if !principal_can_access_token(&principal, &existing) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &request_id,
+            ErrorResponse {
+                code: "token_not_found".into(),
+                message: "token not found".into(),
+            },
+        );
+    }
+    match cli_auth.revoke_token(&token_id) {
+        Ok(record) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: TokenRevokeResponse {
+                    token_id: record.token_id,
+                    revoked: record.revoked_at.is_some(),
+                },
+            }),
+        ),
+        Err(err) => token_store_error_response(&request_id, err),
     }
 }
 
@@ -2409,7 +2583,7 @@ fn ensure_authorized(
     state: &HttpState,
     headers: &HeaderMap,
     request_id: &str,
-) -> Result<(), Response> {
+) -> Result<AuthenticatedPrincipal, Response> {
     let Some(value) = header_value(headers, AUTHORIZATION) else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
@@ -2423,15 +2597,21 @@ fn ensure_authorized(
 
     let expected = format!("Bearer {}", state.bearer_token);
     if value == expected {
-        return Ok(());
+        return Ok(AuthenticatedPrincipal {
+            auth_source: AuthSource::BootstrapToken,
+            github_login: None,
+            github_id: None,
+        });
     }
 
-    let cli_authorized = value
-        .strip_prefix("Bearer ")
-        .and_then(|token| state.cli_auth.as_ref().map(|auth| auth.verify_token(token)))
-        .unwrap_or(false);
-    if cli_authorized {
-        return Ok(());
+    let cli_authorized = value.strip_prefix("Bearer ").and_then(|token| {
+        state
+            .cli_auth
+            .as_ref()
+            .and_then(|auth| auth.verify_token(token).ok().flatten())
+    });
+    if let Some(principal) = cli_authorized {
+        return Ok(principal);
     }
 
     Err(error_response(
@@ -2442,6 +2622,75 @@ fn ensure_authorized(
             message: "invalid bearer token".into(),
         },
     ))
+}
+
+fn principal_can_access_token(
+    principal: &AuthenticatedPrincipal,
+    record: &crate::auth::TokenRecord,
+) -> bool {
+    matches!(principal.auth_source, AuthSource::BootstrapToken)
+        || principal.github_login.as_deref() == Some(record.github_login.as_str())
+}
+
+fn token_issue_request_for_principal(
+    principal: &AuthenticatedPrincipal,
+    name: &str,
+) -> TokenIssueRequest {
+    match principal.auth_source {
+        AuthSource::BootstrapToken => TokenIssueRequest {
+            name: name.into(),
+            github_login: "bootstrap-admin".into(),
+            github_id: 0,
+            source: "token_create".into(),
+        },
+        AuthSource::CliToken | AuthSource::LegacyCliToken => TokenIssueRequest {
+            name: name.into(),
+            github_login: principal.github_login.clone().unwrap_or_default(),
+            github_id: principal.github_id.unwrap_or(0),
+            source: "token_create".into(),
+        },
+    }
+}
+
+fn token_metadata_from_record(record: crate::auth::TokenRecord) -> TokenMetadata {
+    TokenMetadata {
+        token_id: record.token_id,
+        name: record.name,
+        created_at: record.created_at,
+        last_used_at: record.last_used_at,
+        revoked_at: record.revoked_at,
+        github_login: record.github_login,
+        source: record.source,
+    }
+}
+
+fn token_store_error_response(request_id: &str, err: TokenStoreError) -> Response {
+    match err {
+        TokenStoreError::TokenNotFound(_) => error_response(
+            StatusCode::NOT_FOUND,
+            request_id,
+            ErrorResponse {
+                code: "token_not_found".into(),
+                message: "token not found".into(),
+            },
+        ),
+        TokenStoreError::MissingCurrentSecret => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            request_id,
+            ErrorResponse {
+                code: "cli_tokens_not_configured".into(),
+                message: err.to_string(),
+            },
+        ),
+        TokenStoreError::Io(_) | TokenStoreError::InvalidData(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            request_id,
+            ErrorResponse {
+                code: "token_store_error".into(),
+                message: err.to_string(),
+            },
+        ),
+    }
 }
 
 fn github_error_response(request_id: &str, err: GitHubError) -> Response {
@@ -2614,26 +2863,6 @@ fn sign_value(secret: &str, payload: &str) -> Result<String, String> {
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|err| err.to_string())?;
     mac.update(payload.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
-}
-
-fn encode_cli_token(claims: &CliTokenClaims, secret: &str) -> Result<String, String> {
-    let payload = serde_json::to_vec(claims).map_err(|err| err.to_string())?;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
-    let signature = sign_value(secret, &payload)?;
-    Ok(format!("forge_cli.{payload}.{signature}"))
-}
-
-fn decode_cli_token(token: &str, secret: &str) -> Option<CliTokenClaims> {
-    let raw = token.strip_prefix("forge_cli.")?;
-    let (payload, signature) = raw.rsplit_once('.')?;
-    let expected = sign_value(secret, payload).ok()?;
-    if !bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
-        return None;
-    }
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
 }
 
 fn read_signed_cookie<T>(headers: &HeaderMap, name: &str, secret: &str) -> Option<T>
@@ -3391,6 +3620,135 @@ pub mod http_requires_bearer_token {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(test)]
+pub mod revoked_cli_token_is_rejected {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn revoked_cli_token_is_rejected() {
+        let state = build_cli_login_state();
+        let token = state
+            .cli_auth
+            .as_ref()
+            .unwrap()
+            .issue_token(TokenIssueRequest {
+                name: "laptop".into(),
+                github_login: "octocat".into(),
+                github_id: 7,
+                source: "token_create".into(),
+            })
+            .unwrap();
+        state
+            .cli_auth
+            .as_ref()
+            .unwrap()
+            .revoke_token(&token.record.token_id)
+            .unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/events")
+                    .header("authorization", format!("Bearer {}", token.plaintext_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(test)]
+pub mod token_list_never_exposes_plaintext {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn token_list_never_exposes_plaintext() {
+        let state = build_cli_login_state();
+        let issued = state
+            .cli_auth
+            .as_ref()
+            .unwrap()
+            .issue_token(TokenIssueRequest {
+                name: "laptop".into(),
+                github_login: "octocat".into(),
+                github_id: 7,
+                source: "token_create".into(),
+            })
+            .unwrap();
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/tokens")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+        assert!(rendered.contains(&issued.record.token_id));
+        assert!(!rendered.contains(&issued.plaintext_token));
+    }
+}
+
+#[cfg(test)]
+pub mod token_last_used_updates_on_request {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn token_last_used_updates_on_request() {
+        let state = build_cli_login_state();
+        let issued = state
+            .cli_auth
+            .as_ref()
+            .unwrap()
+            .issue_token(TokenIssueRequest {
+                name: "laptop".into(),
+                github_login: "octocat".into(),
+                github_id: 7,
+                source: "token_create".into(),
+            })
+            .unwrap();
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/events")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", issued.plaintext_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let records = state.cli_auth.as_ref().unwrap().list_tokens().unwrap();
+        let record = records
+            .into_iter()
+            .find(|record| record.token_id == issued.record.token_id)
+            .unwrap();
+        assert!(record.last_used_at.is_some());
     }
 }
 

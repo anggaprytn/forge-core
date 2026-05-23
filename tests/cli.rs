@@ -737,6 +737,48 @@ fn cli_doctor_reports_local_diagnostics() {
 }
 
 #[test]
+fn token_create_shows_token_once() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"data":{"token":"forge_cli.test-token","metadata":{"token_id":"tok-1","name":"laptop","created_at":1,"github_login":"octocat","source":"token_create"}}}"#,
+    );
+
+    let output = run_cli(&url, &["token", "create", "--name", "laptop"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(body.matches("forge_cli.test-token").count(), 1);
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/api/tokens");
+    assert_eq!(request.authorization, "Bearer test-token");
+    let json: Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(json["name"], "laptop");
+}
+
+#[test]
+fn forge_version_outputs_runtime_version() {
+    let output = run_cli_in_dir(Path::new("."), &["version"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"version\":"));
+    assert!(body.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn version_includes_schema_versions() {
+    let output = run_cli_in_dir(Path::new("."), &["version"]);
+    assert!(output.status.success());
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"schema_versions\""));
+    assert!(body.contains("\"manifest_schema\""));
+    assert!(body.contains("\"snapshot_schema\""));
+    assert!(body.contains("\"checkpoint_schema\""));
+    assert!(body.contains("\"reconciliation_log_schema\""));
+}
+
+#[test]
 fn init_creates_forge_yml() {
     let root = test_root("cli-init-creates");
 

@@ -8,6 +8,79 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /api/tokens:
+    get:
+      summary: List CLI tokens visible to the authenticated principal
+      description: Returns token metadata only. Plaintext token values are never returned.
+      responses:
+        '200':
+          description: CLI token metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeTokenList'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    post:
+      summary: Create a new CLI token
+      description: Issues a new CLI token signed with the current secret. The plaintext token is shown once in the response and is not stored server-side.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenCreateRequest'
+      responses:
+        '200':
+          description: Token created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeTokenCreate'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/tokens/{token_id}:
+    delete:
+      summary: Revoke one CLI token
+      parameters:
+        - in: path
+          name: token_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeTokenRevoke'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Token not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /healthz:
     get:
       summary: Health check
@@ -1215,6 +1288,57 @@ components:
         reason:
           type: string
           nullable: true
+    TokenMetadata:
+      type: object
+      required: [token_id, name, created_at, github_login, source]
+      properties:
+        token_id:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: integer
+        last_used_at:
+          type: integer
+          nullable: true
+        revoked_at:
+          type: integer
+          nullable: true
+        github_login:
+          type: string
+        source:
+          type: string
+    TokenList:
+      type: object
+      required: [tokens]
+      properties:
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/TokenMetadata'
+    TokenCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    TokenCreateResponse:
+      type: object
+      required: [token, metadata]
+      properties:
+        token:
+          type: string
+          description: Plaintext token returned once at creation time.
+        metadata:
+          $ref: '#/components/schemas/TokenMetadata'
+    TokenRevokeResponse:
+      type: object
+      required: [token_id, revoked]
+      properties:
+        token_id:
+          type: string
+        revoked:
+          type: boolean
     SuccessEnvelopeDeploymentAccepted:
       type: object
       required: [request_id, correlation_id, data]
@@ -1306,6 +1430,27 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/WebhookResult'}
+    SuccessEnvelopeTokenList:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/TokenList'}
+    SuccessEnvelopeTokenCreate:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/TokenCreateResponse'}
+    SuccessEnvelopeTokenRevoke:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/TokenRevokeResponse'}
     ErrorEnvelope:
       type: object
       required:

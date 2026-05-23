@@ -13,8 +13,10 @@ use forge_core::api::{
     CliLoginPollResponse, CliLoginStartResponse, ClusterDiagnostics, DeploymentAccepted,
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, MetricsResponse, ProjectList, ProjectRecord, ProjectUpsertRequest, ReadyzResponse,
-    RestoreLineage, RetentionRole, SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus,
+    EventList, ForgeSchemaVersions, ForgeVersionOutput, MetricsResponse, ProjectList,
+    ProjectRecord, ProjectUpsertRequest, ReadyzResponse, RestoreLineage, RetentionRole,
+    SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus, TokenCreateRequest,
+    TokenCreateResponse, TokenListResponse, TokenRevokeResponse,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -44,7 +46,11 @@ use forge_core::reconciliation::{
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
 use forge_core::storage::{
-    ClusterTopologyStore, LeaderLeaseStore, NodeMetadataStore, PersistedLeaderLease,
+    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, LeaderLeaseStore, NodeMetadataStore,
+    PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
+};
+use forge_core::{
+    reconciliation::RECONCILIATION_LOG_SCHEMA_VERSION, storage::CONTROL_PLANE_SCHEMA_VERSION,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
@@ -80,6 +86,7 @@ where
             | Command::Login { .. }
             | Command::Logout
             | Command::WhoAmI
+            | Command::Version
             | Command::ControlPlaneLeader { .. }
             | Command::ControlPlaneLease { .. }
             | Command::ControlPlaneReplayStatus { .. }
@@ -96,11 +103,13 @@ where
             config_path,
             caddy_admin_url,
             metrics_url,
+            upgrade,
         } => {
             let report = run_doctor(&DoctorOptions {
                 config_path,
                 caddy_admin_url,
                 metrics_url,
+                upgrade,
             })
             .map_err(|err| CliError::Usage(err.to_string()))?;
             print!("{}", report.render());
@@ -113,6 +122,22 @@ where
         Command::Login { server_url } => run_login(server_url)?,
         Command::Logout => run_logout()?,
         Command::WhoAmI => run_whoami(&parsed)?,
+        Command::Version => print_json(&forge_version_output())?,
+        Command::TokenList => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            print_json(&client.get_tokens()?)?;
+        }
+        Command::TokenCreate { name } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            print_json(&client.create_token(TokenCreateRequest { name })?)?;
+        }
+        Command::TokenRevoke { token_id } => {
+            let (base_url, token) = api_credentials.unwrap();
+            let client = ForgeClient::new(base_url, token);
+            print_json(&client.revoke_token(&token_id)?)?;
+        }
         Command::ControlPlaneLeader { config_path } => run_control_plane_leader(
             control_plane_remote_client,
             config_path,
@@ -625,6 +650,25 @@ impl ForgeClient {
         )
     }
 
+    fn get_tokens(&self) -> Result<TokenListResponse, CliError> {
+        self.send_json(self.http.get(format!("{}/api/tokens", self.base_url)))
+    }
+
+    fn create_token(&self, request: TokenCreateRequest) -> Result<TokenCreateResponse, CliError> {
+        self.send_json(
+            self.http
+                .post(format!("{}/api/tokens", self.base_url))
+                .json(&request),
+        )
+    }
+
+    fn revoke_token(&self, token_id: &str) -> Result<TokenRevokeResponse, CliError> {
+        self.send_json(
+            self.http
+                .delete(format!("{}/api/tokens/{token_id}", self.base_url)),
+        )
+    }
+
     fn check_auth(&self) -> Result<bool, CliError> {
         let response = self
             .http
@@ -892,6 +936,7 @@ enum Command {
         config_path: PathBuf,
         caddy_admin_url: String,
         metrics_url: Option<String>,
+        upgrade: bool,
     },
     Daemon(DaemonCommand),
     Init {
@@ -902,6 +947,14 @@ enum Command {
     },
     Logout,
     WhoAmI,
+    Version,
+    TokenList,
+    TokenCreate {
+        name: String,
+    },
+    TokenRevoke {
+        token_id: String,
+    },
     ControlPlaneLeader {
         config_path: PathBuf,
     },
@@ -1184,6 +1237,13 @@ fn parse_command(
             config_path,
             caddy_admin_url,
             metrics_url,
+            upgrade: false,
+        }),
+        [cmd, action] if cmd == "doctor" && action == "upgrade" => Ok(Command::Doctor {
+            config_path,
+            caddy_admin_url,
+            metrics_url,
+            upgrade: true,
         }),
         [cmd] if cmd == "daemon" => Ok(Command::Daemon(DaemonCommand {
             config_path,
@@ -1197,6 +1257,18 @@ fn parse_command(
         }),
         [cmd] if cmd == "logout" => Ok(Command::Logout),
         [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
+        [cmd] if cmd == "version" => Ok(Command::Version),
+        [group, action] if group == "token" && action == "list" => Ok(Command::TokenList),
+        [group, action, flag, name]
+            if group == "token" && action == "create" && flag == "--name" =>
+        {
+            Ok(Command::TokenCreate { name: name.clone() })
+        }
+        [group, action, token_id] if group == "token" && action == "revoke" => {
+            Ok(Command::TokenRevoke {
+                token_id: token_id.clone(),
+            })
+        }
         [group, action] if group == "control-plane" && action == "leader" => {
             Ok(Command::ControlPlaneLeader { config_path })
         }
@@ -1296,11 +1368,16 @@ fn usage() -> String {
     [
         "usage:",
         "  forge [--config PATH] [--caddy-admin-url URL] [--metrics-url URL] doctor",
+        "  forge [--config PATH] [--caddy-admin-url URL] [--metrics-url URL] doctor upgrade",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] daemon",
         "  forge init [--force]",
         "  forge login <server_url>",
         "  forge logout",
         "  forge whoami",
+        "  forge version",
+        "  forge [--url URL] [--token TOKEN] token list",
+        "  forge [--url URL] [--token TOKEN] token create --name <name>",
+        "  forge [--url URL] [--token TOKEN] token revoke <token_id>",
         "  forge [--config PATH] control-plane leader",
         "  forge [--config PATH] control-plane lease",
         "  forge [--config PATH] control-plane replay-status",
@@ -2958,6 +3035,20 @@ fn run_whoami(parsed: &ParsedArgs) -> Result<(), CliError> {
     })
 }
 
+fn forge_version_output() -> ForgeVersionOutput {
+    ForgeVersionOutput {
+        version: env!("CARGO_PKG_VERSION").into(),
+        git_commit: option_env!("FORGE_GIT_COMMIT").map(str::to_string),
+        build_timestamp: option_env!("FORGE_BUILD_TIMESTAMP").map(str::to_string),
+        schema_versions: ForgeSchemaVersions {
+            manifest_schema: 1,
+            snapshot_schema: SNAPSHOT_SCHEMA_VERSION,
+            checkpoint_schema: CHECKPOINT_SCHEMA_VERSION.max(CONTROL_PLANE_SCHEMA_VERSION),
+            reconciliation_log_schema: RECONCILIATION_LOG_SCHEMA_VERSION,
+        },
+    }
+}
+
 fn run_gc_command(
     config_path: PathBuf,
     caddy_admin_url: String,
@@ -3622,7 +3713,7 @@ fn run_daemon(command: DaemonCommand) -> Result<(), CliError> {
             .map_err(|err| CliError::Usage(err.to_string()))?,
         ProjectRegistryStore::new(&config.storage_root),
         WebAuthState::from_env(),
-        forge_core::http::CliAuthState::from_env(config.storage_root.join("cli-logins"))
+        forge_core::http::CliAuthState::from_env(config.storage_root.join("auth"))
             .map_err(|err| CliError::Usage(err.to_string()))?,
     );
     let app = router(state);

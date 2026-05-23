@@ -29,18 +29,19 @@ use crate::runtime::{
 use crate::runtime_env::{RuntimeEnvMetadata, generated_forge_vars, restore_runtime_env};
 use crate::status::derive_environment_domain;
 use crate::storage::{
-    DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths, EventStore, GenerationAllocator,
-    GenerationHistoryRecord, LifecycleStore, PersistedActivationMode, PersistedBackupHookRecord,
-    PersistedBackupMetadata, PersistedBackupRestoreRecord, PersistedBackupVolumeRecord,
-    PersistedBuildInfo, PersistedDeploymentLifecycle, PersistedPromotionSummary,
-    PersistedResolvedRuntime, PersistedResolvedRuntimeEntry, PersistedRuntimeEnvEntry,
-    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
-    PersistedServiceState, PersistedSnapshotMetadata, PersistedValidationSummary,
-    PersistedVolumeMount, PersistedVolumeRetention, PointerStore, RetentionStore,
-    RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
-    StorageError, atomic_write, current_unix_timestamp, load_generation_build_info,
-    load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    BACKUP_METADATA_VERSION, DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths,
+    EventStore, GenerationAllocator, GenerationHistoryRecord, LifecycleStore,
+    PersistedActivationMode, PersistedBackupHookRecord, PersistedBackupMetadata,
+    PersistedBackupRestoreRecord, PersistedBackupVolumeRecord, PersistedBuildInfo,
+    PersistedDeploymentLifecycle, PersistedPromotionSummary, PersistedResolvedRuntime,
+    PersistedResolvedRuntimeEntry, PersistedRuntimeEnvEntry, PersistedRuntimeEnvSnapshot,
+    PersistedRuntimeInfo, PersistedServiceRuntimeInfo, PersistedServiceState,
+    PersistedSnapshotMetadata, PersistedValidationSummary, PersistedVolumeMount,
+    PersistedVolumeRetention, PointerStore, RetentionStore, RuntimeHealthState, RuntimeState,
+    RuntimeStateStore, SnapshotState, SnapshotWriter, StorageError, atomic_write,
+    current_unix_timestamp, load_generation_build_info, load_generation_resolved_runtime,
+    load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    load_generation_snapshot_metadata,
 };
 use crate::topology::{runtime_with_primary_service, select_primary_service_id};
 
@@ -159,6 +160,7 @@ pub fn create_backup<D: DockerRuntime>(
                 timeout: VOLUME_HELPER_TIMEOUT,
             })?;
             let archive_path = archive_dir.join(&archive_file);
+            harden_backup_permissions(&archive_path)?;
             let bytes =
                 fs::read(&archive_path).map_err(|err| BackupError::Command(err.to_string()))?;
             manifest.push(PersistedBackupVolumeRecord {
@@ -184,7 +186,7 @@ pub fn create_backup<D: DockerRuntime>(
 
     let source_deployment_id = build.deployment_id.clone();
     let metadata = PersistedBackupMetadata {
-        backup_version: 1,
+        backup_version: BACKUP_METADATA_VERSION,
         backup_id: backup_id.clone(),
         project_id: project_id.into(),
         environment: environment.into(),
@@ -201,6 +203,10 @@ pub fn create_backup<D: DockerRuntime>(
         hooks,
         restores: Vec::new(),
         warnings: vec![
+            "backups may contain sensitive application data".into(),
+            "backup archives are not encrypted yet".into(),
+            "backup archives inherit filesystem access unless permissions are hardened".into(),
+            "operators must protect /var/lib/forge/backups".into(),
             "backups are crash-consistent only".into(),
             "Forge does not coordinate database quiescing".into(),
             "DB-consistent backups require service-level pre_backup_command hooks".into(),
@@ -1037,9 +1043,23 @@ fn write_backup_metadata(
     )
     .join("metadata.json");
     atomic_write(
-        path,
+        &path,
         format!("{}\n", serde_json::to_string_pretty(metadata).unwrap()).as_bytes(),
     )?;
+    harden_backup_permissions(&path)?;
+    Ok(())
+}
+
+fn harden_backup_permissions(path: &Path) -> Result<(), BackupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 

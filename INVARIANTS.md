@@ -614,3 +614,11 @@ secrets are never persisted or delivered plaintext
 
 Forge owns orchestration authority
 ```
+
+Additional hardening invariants:
+
+- CLI token plaintext is never persisted server-side after issuance.
+- Revoked CLI tokens must fail authentication.
+- Authorization headers and other sensitive credentials must be redacted before persistence or delivery.
+- Backup metadata must warn that backup artifacts may contain sensitive application data and are not encrypted yet.
+- `forge doctor upgrade` performs read-only compatibility checks and must not mutate control-plane state.

@@ -1145,3 +1145,29 @@ candidate
 ```
 
 Everything else depends on this remaining true.
+
+## Auth And Redaction Hygiene
+
+- Treat `bearer_token` as bootstrap/admin auth only. Prefer CLI tokens for routine remote operation.
+- CLI token issuance persists only token hashes and metadata; plaintext tokens are not stored server-side after issuance.
+- Revoked CLI tokens fail authentication immediately.
+- Authorization headers, bearer tokens, Forge master keys, OAuth client secrets, GitHub tokens, and application secrets are redacted from diagnostics, logs, and persisted excerpts.
+
+## CLI Token Rotation
+
+- Configure `FORGE_CLI_TOKEN_SECRET_CURRENT` for active issuance.
+- Configure `FORGE_CLI_TOKEN_SECRET_PREVIOUS` during a rotation window so older tokens still verify.
+- Re-login all users during the window.
+- Remove `FORGE_CLI_TOKEN_SECRET_PREVIOUS` after old clients are replaced.
+
+## Backup Handling
+
+- Backup archives may contain sensitive application data.
+- Backups are not encrypted yet.
+- Backup metadata includes explicit sensitivity warnings.
+- Protect `/var/lib/forge/backups` with filesystem permissions, host access controls, and backup-retention discipline.
+
+## Release Hygiene
+
+- `forge version` is the canonical runtime fingerprint for support and release verification.
+- `forge doctor upgrade` is a no-mutation preflight for storage readability, schema compatibility, Docker/Caddy reachability, write access, and Linux `systemd` sanity.

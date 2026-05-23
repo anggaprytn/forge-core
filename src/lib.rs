@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod backups;
 pub mod bootstrap;
 pub mod caddy;

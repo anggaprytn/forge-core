@@ -1118,3 +1118,50 @@ validated runtime
 ```
 
 That distinction is the foundation of Forge.
+
+## Token Lifecycle
+
+```bash
+forge token list
+forge token create --name laptop
+forge token revoke tok-1234abcd
+```
+
+- Forge stores only the token hash on the server.
+- Token plaintext is shown once at creation time and is never retrievable later.
+- Token metadata includes `token_id`, `name`, `created_at`, `last_used_at`, `revoked_at`, `github_login`, and `source`.
+- Existing CLI login tokens from earlier releases continue working until revoked or until CLI token secret rotation removes the verifying secret.
+
+## CLI Token Secret Rotation
+
+- `FORGE_CLI_TOKEN_SECRET_CURRENT` is the active signing secret.
+- `FORGE_CLI_TOKEN_SECRET_PREVIOUS` is optional and keeps older tokens valid during rotation.
+- New tokens always use the current secret.
+- Rotation steps:
+  1. Deploy Forge with both `FORGE_CLI_TOKEN_SECRET_CURRENT=<new>` and `FORGE_CLI_TOKEN_SECRET_PREVIOUS=<old>`.
+  2. Ask all users to re-run `forge login <server_url>`.
+  3. Remove `FORGE_CLI_TOKEN_SECRET_PREVIOUS` after the migration window closes.
+
+## Bootstrap Bearer Token
+
+- `bearer_token` in `forge.conf` is the bootstrap/admin credential.
+- Prefer CLI tokens for normal remote use.
+- Avoid pasting the bootstrap token into shell history. Use protected config, env injection, or a local credentials file.
+- Rotate it by updating `bearer_token` in `forge.conf`, restarting Forge, and updating any automation that still depends on the bootstrap credential.
+
+## Backup Sensitivity
+
+- Backups can contain sensitive application data.
+- Backups are not encrypted yet.
+- Backup metadata includes warnings so operators do not treat archives as sanitized artifacts.
+- Protect `/var/lib/forge/backups` with strict filesystem permissions and host-level access controls.
+
+## Version And Upgrade Checks
+
+```bash
+forge version
+forge doctor upgrade
+```
+
+- `forge version` prints the runtime version plus embedded git/build metadata when available.
+- `forge doctor upgrade` is read-only and checks storage readability, checkpoint compatibility, reconciliation log compatibility, backup metadata compatibility, Docker, Caddy, write permissions, and Linux `systemd` unit sanity.
