@@ -22,6 +22,8 @@ use crate::deployments::{
     DeploymentError, DeploymentExecution, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
 };
 use crate::events::EventRecord;
+#[cfg(test)]
+use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
 use crate::source::{ResolvedDeploymentSource, SourceResolver, SourceResolverError};
@@ -688,12 +690,53 @@ where
         self.last_recovery_outcome.as_ref()
     }
 
+    pub fn readyz_status(&self) -> &'static str {
+        if self.state() != &DaemonState::Ready {
+            return "not_ready";
+        }
+        if self.has_route_repair_failures() {
+            "degraded"
+        } else {
+            "ready"
+        }
+    }
+
     pub fn queue(&self) -> Option<&PersistentQueue> {
         self.queue.as_ref()
     }
 
     pub fn runtimes(&self) -> (&D, &R) {
         (&self.docker_runtime, &self.routing_runtime)
+    }
+
+    fn has_route_repair_failures(&self) -> bool {
+        let projects_root = self.config.storage_root.join("projects");
+        let Ok(projects) = fs::read_dir(projects_root) else {
+            return false;
+        };
+        for project in projects.flatten() {
+            let envs_dir = project.path().join("environments");
+            let Ok(envs) = fs::read_dir(envs_dir) else {
+                continue;
+            };
+            for env_entry in envs.flatten() {
+                let environment = env_entry.file_name().to_string_lossy().into_owned();
+                let env = EnvironmentPaths::new(
+                    &self.config.storage_root,
+                    &project.file_name().to_string_lossy(),
+                    &environment,
+                );
+                let Ok(runtime_state) = RuntimeStateStore::new(env).load() else {
+                    continue;
+                };
+                if runtime_state.last_error_code.as_deref()
+                    == Some("route_activation_verification_failed")
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1149,6 +1192,64 @@ impl RoutingRuntime for NoopRoutingRuntime {
 }
 
 #[cfg(test)]
+struct FailingRouteVerificationRuntime {
+    route: Option<crate::runtime::RouteInspection>,
+}
+
+#[cfg(test)]
+impl Default for FailingRouteVerificationRuntime {
+    fn default() -> Self {
+        Self { route: None }
+    }
+}
+
+#[cfg(test)]
+impl RoutingRuntime for FailingRouteVerificationRuntime {
+    fn update_route(
+        &mut self,
+        request: crate::runtime::RouteUpdateRequest,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        self.route = Some(crate::runtime::RouteInspection {
+            subtree_id: request.subtree_id,
+            active_target: request.target,
+            domain: request.domain,
+            activation_verified: false,
+            verification_url: Some("http://127.0.0.1:8080/health".into()),
+            verification_host: Some("api.example.com".into()),
+            verification_status_code: Some(502),
+            verification_response_body: Some("bad gateway".into()),
+            health_checks_enabled: request.health_checks_enabled,
+        });
+        Ok(())
+    }
+
+    fn inspect_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<crate::runtime::RouteInspection, crate::runtime::RoutingRuntimeError> {
+        self.route
+            .clone()
+            .ok_or(crate::runtime::RoutingRuntimeError::InspectionFailed(
+                "missing route".into(),
+            ))
+    }
+
+    fn list_managed_routes(
+        &mut self,
+    ) -> Result<Vec<crate::runtime::RouteInspection>, crate::runtime::RoutingRuntimeError> {
+        Ok(self.route.clone().into_iter().collect())
+    }
+
+    fn remove_route(
+        &mut self,
+        _subtree_id: &str,
+    ) -> Result<(), crate::runtime::RoutingRuntimeError> {
+        self.route = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 struct StaticProbeRuntime {
     tcp_ok: bool,
     http_ok: bool,
@@ -1198,6 +1299,43 @@ fn config_with_root(root: PathBuf) -> DaemonConfig {
 }
 
 #[cfg(test)]
+fn seed_recoverable_http_generation(root: &std::path::Path) {
+    use crate::api::ProjectUpsertRequest;
+    use crate::storage::{PointerStore, SnapshotState, SnapshotWriter};
+
+    ProjectRegistryStore::new(root)
+        .upsert(
+            ProjectUpsertRequest {
+                project_id: Some("api".into()),
+                repo_url: "https://example.com/api.git".into(),
+                default_branch: "main".into(),
+                base_domain: Some("api.example.com".into()),
+            },
+            None,
+        )
+        .unwrap();
+
+    let env = EnvironmentPaths::new(root, "api", "production");
+    let writer = SnapshotWriter::new(env.clone(), 1).unwrap();
+    writer
+        .write_artifact(
+            "build.json",
+            "{\n  \"deployment_id\": \"dep-1\",\n  \"image_ref\": \"forge/api:prod-gen-1\"\n}\n",
+        )
+        .unwrap();
+    writer
+        .write_artifact(
+            "runtime.json",
+            "{\n  \"container_name\": \"prod-api-gen-1\",\n  \"running\": true,\n  \"network_name\": \"forge-test\",\n  \"probe_path\": \"/health\",\n  \"activation\": { \"Http\": { \"internal_port\": 3000, \"route_subtree_id\": \"forge:api:production\", \"target_source\": \"ContainerIp\" } },\n  \"environment_variables\": {}\n}\n",
+        )
+        .unwrap();
+    writer
+        .finalize("api", "production", SnapshotState::Healthy)
+        .unwrap();
+    PointerStore::new(env).swap_current(1).unwrap();
+}
+
+#[cfg(test)]
 pub mod daemon_starts_only_after_bootstrap_succeeds {
     use super::*;
 
@@ -1238,6 +1376,30 @@ pub mod daemon_starts_only_after_bootstrap_succeeds {
                 StartupStep::QueueRecovered,
                 StartupStep::HealthLoopsStarted
             ]
+        );
+    }
+
+    #[test]
+    fn daemon_startup_survives_route_activation_failure() {
+        let root = test_root("daemon-startup-survives-route-activation-failure");
+        seed_recoverable_http_generation(&root);
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            FailingRouteVerificationRuntime::default(),
+            StaticDecider(true),
+        );
+
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.state(), &DaemonState::Ready);
+        assert_eq!(daemon.readyz_status(), "degraded");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let runtime_state = RuntimeStateStore::new(env).load().unwrap();
+        assert_eq!(runtime_state.health_state, RuntimeHealthState::Degraded);
+        assert_eq!(
+            runtime_state.last_error_code.as_deref(),
+            Some("route_activation_verification_failed")
         );
     }
 }

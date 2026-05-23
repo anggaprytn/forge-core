@@ -176,6 +176,11 @@ pub enum TickOutcome {
     NoActiveGeneration,
 }
 
+struct ReconstructedActiveGeneration {
+    generation: Option<u64>,
+    route_repair_failed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GarbageCollectionReport {
     pub actions: Vec<GcActionRecord>,
@@ -304,6 +309,11 @@ pub struct StartupConvergence<'a, D> {
     storage_root: PathBuf,
     queue: &'a PersistentQueue,
     decider: &'a D,
+}
+
+struct RouteRepairFailure {
+    message: String,
+    artifact: serde_json::Value,
 }
 
 impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
@@ -528,54 +538,108 @@ impl<'a, D: ActiveDeploymentDecider> StartupConvergence<'a, D> {
             if !snapshot_is_finalized(&env, generation) {
                 continue;
             }
-
-            let Some(runtime_info) = load_generation_runtime_info(&env, generation)? else {
-                continue;
-            };
-            let Some(build_info) = load_generation_build_info(&env, generation)? else {
-                continue;
-            };
-
-            let service_runtime = runtime_services(&runtime_info, &build_info.image_ref);
-            let mut inspections = BTreeMap::new();
-            for (service_id, service) in &service_runtime {
-                let inspection = ensure_generation_service_running(
-                    &self.storage_root,
+            if let Err(err) = self.recover_finalized_current_generation_environment(
+                docker,
+                routing,
+                &project_id,
+                &environment,
+                &env,
+                generation,
+            ) {
+                record_route_repair_degraded_state(
+                    &env,
                     &project_id,
                     &environment,
                     generation,
-                    &build_info.deployment_id,
-                    service,
-                    docker,
+                    None,
+                    "",
+                    None,
+                    "startup_recovery",
+                    &err.to_string(),
+                    None,
+                    true,
                 )?;
-                inspections.insert(service_id.clone(), inspection);
             }
+        }
+        Ok(())
+    }
 
-            for (service_id, service) in &service_runtime {
-                if !service.externally_exposed {
-                    continue;
-                }
-                if let Some(route_recovery) = persisted_http_route_recovery(
-                    &self.storage_root,
-                    service,
-                    &project_id,
-                    &environment,
-                    service_runtime.len(),
-                    Some(service_id.as_str()),
-                )? {
-                    ensure_http_route_matches_generation(
-                        routing,
-                        &route_recovery.subtree_id,
-                        inspections.get(service_id).expect("inspection collected"),
-                        route_recovery.internal_port,
-                        service.network_name.as_deref(),
-                        route_recovery.domain,
-                        &route_recovery.target_source,
-                        route_recovery.probe_path,
+    fn recover_finalized_current_generation_environment<RtD, RtR>(
+        &self,
+        docker: &mut RtD,
+        routing: &mut RtR,
+        project_id: &str,
+        environment: &str,
+        env: &EnvironmentPaths,
+        generation: u64,
+    ) -> Result<(), ConvergenceError>
+    where
+        RtD: DockerRuntime,
+        RtR: RoutingRuntime,
+    {
+        let Some(runtime_info) = load_generation_runtime_info(env, generation)? else {
+            return Ok(());
+        };
+        let Some(build_info) = load_generation_build_info(env, generation)? else {
+            return Ok(());
+        };
+
+        let service_runtime = runtime_services(&runtime_info, &build_info.image_ref);
+        let mut inspections = BTreeMap::new();
+        for (service_id, service) in &service_runtime {
+            let inspection = ensure_generation_service_running(
+                &self.storage_root,
+                project_id,
+                environment,
+                generation,
+                &build_info.deployment_id,
+                service,
+                docker,
+            )?;
+            inspections.insert(service_id.clone(), inspection);
+        }
+
+        for (service_id, service) in &service_runtime {
+            if !service.externally_exposed {
+                continue;
+            }
+            if let Some(route_recovery) = persisted_http_route_recovery(
+                &self.storage_root,
+                service,
+                project_id,
+                environment,
+                service_runtime.len(),
+                Some(service_id.as_str()),
+            )? {
+                if let Err(err) = ensure_http_route_matches_generation(
+                    routing,
+                    &route_recovery.subtree_id,
+                    inspections.get(service_id).expect("inspection collected"),
+                    route_recovery.internal_port,
+                    service.network_name.as_deref(),
+                    route_recovery.domain,
+                    &route_recovery.target_source,
+                    route_recovery.probe_path,
+                ) {
+                    record_route_repair_degraded_state(
+                        env,
+                        project_id,
+                        environment,
+                        generation,
+                        Some(build_info.deployment_id.clone()),
+                        &inspection_container_name(
+                            inspections.get(service_id).expect("inspection collected"),
+                        ),
+                        Some(service_id.as_str()),
+                        "startup_recovery",
+                        &err.message,
+                        Some(&err.artifact),
+                        true,
                     )?;
                 }
             }
         }
+
         Ok(())
     }
 }
@@ -615,7 +679,9 @@ where
         env.ensure_exists()?;
         self.reconcile_orphans(&input, &env)?;
 
-        let active_generation = self.reconstruct_active_generation(&input, &env)?;
+        let reconstructed = self.reconstruct_active_generation(&input, &env)?;
+        let active_generation = reconstructed.generation;
+        let route_repair_failed = reconstructed.route_repair_failed;
         let mut runtime_state = RuntimeStateStore::new(env.clone()).load()?;
         runtime_state.active_generation = active_generation;
 
@@ -690,7 +756,7 @@ where
             true
         };
 
-        if tcp_ok && http_ok {
+        if tcp_ok && http_ok && !route_repair_failed {
             runtime_state.failed_probe_count = 0;
             runtime_state.successful_probe_count += 1;
             if runtime_state.successful_probe_count >= 2 {
@@ -702,6 +768,17 @@ where
             }
             RuntimeStateStore::new(env).save(&runtime_state)?;
             return Ok(TickOutcome::Healthy(active_generation));
+        }
+
+        if route_repair_failed {
+            runtime_state.health_state = RuntimeHealthState::Degraded;
+            runtime_state.last_transition = "route_repair_failed".into();
+            runtime_state.last_error_code = Some("route_activation_verification_failed".into());
+            runtime_state
+                .degraded_since_unix
+                .get_or_insert(input.now_unix);
+            RuntimeStateStore::new(env).save(&runtime_state)?;
+            return Ok(TickOutcome::Degraded(active_generation));
         }
 
         runtime_state.successful_probe_count = 0;
@@ -890,7 +967,7 @@ where
         &mut self,
         input: &TickInput,
         env: &EnvironmentPaths,
-    ) -> Result<Option<u64>, ConvergenceError> {
+    ) -> Result<ReconstructedActiveGeneration, ConvergenceError> {
         match input.truth {
             ActiveTruth::HttpRouted { internal_port } => {
                 let pointers = PointerStore::new(env.clone());
@@ -901,7 +978,10 @@ where
                     select_newest_complete_generation(env, [authoritative, route_generation])?;
 
                 let Some(selected_generation) = selected else {
-                    return Ok(None);
+                    return Ok(ReconstructedActiveGeneration {
+                        generation: None,
+                        route_repair_failed: false,
+                    });
                 };
                 if current_pointer != Some(selected_generation) {
                     eprintln!(
@@ -911,24 +991,28 @@ where
                     pointers.swap_current(selected_generation)?;
                 }
                 let route_was_stale = route_generation != Some(selected_generation);
-                if self
-                    .repair_current_http_route(
-                        input,
-                        env,
-                        Some(selected_generation),
-                        internal_port,
-                    )?
-                    .is_some()
-                {
+                let (generation, route_repair_failed) = self.repair_current_http_route(
+                    input,
+                    env,
+                    Some(selected_generation),
+                    internal_port,
+                )?;
+                if generation.is_some() {
                     if route_was_stale {
                         eprintln!(
                             "forge convergence repaired route truth for {}/{} to generation {}",
                             input.project_id, input.environment, selected_generation
                         );
                     }
-                    Ok(Some(selected_generation))
+                    Ok(ReconstructedActiveGeneration {
+                        generation: Some(selected_generation),
+                        route_repair_failed,
+                    })
                 } else {
-                    Ok(None)
+                    Ok(ReconstructedActiveGeneration {
+                        generation: None,
+                        route_repair_failed,
+                    })
                 }
             }
             ActiveTruth::Direct => {
@@ -936,10 +1020,16 @@ where
                 let current_pointer = pointers.read_pointer("current")?;
                 let authoritative = pointers.read_authoritative_pointer()?;
                 let Some(current_generation) = authoritative else {
-                    return Ok(None);
+                    return Ok(ReconstructedActiveGeneration {
+                        generation: None,
+                        route_repair_failed: false,
+                    });
                 };
                 if !snapshot_is_finalized(env, current_generation) {
-                    return Ok(None);
+                    return Ok(ReconstructedActiveGeneration {
+                        generation: None,
+                        route_repair_failed: false,
+                    });
                 }
                 let container_name = generation_container_name(
                     &input.environment,
@@ -958,9 +1048,15 @@ where
                             );
                             pointers.swap_current(current_generation)?;
                         }
-                        Ok(Some(current_generation))
+                        Ok(ReconstructedActiveGeneration {
+                            generation: Some(current_generation),
+                            route_repair_failed: false,
+                        })
                     }
-                    _ => Ok(None),
+                    _ => Ok(ReconstructedActiveGeneration {
+                        generation: None,
+                        route_repair_failed: false,
+                    }),
                 }
             }
         }
@@ -995,15 +1091,15 @@ where
         env: &EnvironmentPaths,
         current: Option<u64>,
         _internal_port: u16,
-    ) -> Result<Option<u64>, ConvergenceError> {
+    ) -> Result<(Option<u64>, bool), ConvergenceError> {
         let Some(current_generation) = current else {
-            return Ok(None);
+            return Ok((None, false));
         };
         if !snapshot_is_finalized(env, current_generation) {
-            return Ok(None);
+            return Ok((None, false));
         }
         let Some(runtime_info) = load_generation_runtime_info(env, current_generation)? else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let build_info = load_generation_build_info(env, current_generation)?.ok_or_else(|| {
             ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
@@ -1012,6 +1108,7 @@ where
             )))
         })?;
         let service_runtime = runtime_services(&runtime_info, &build_info.image_ref);
+        let mut route_repair_failed = false;
         for (service_id, service) in &service_runtime {
             let inspection = ensure_generation_service_running(
                 &self.storage_root,
@@ -1039,7 +1136,7 @@ where
                     "missing route metadata",
                 )))
             })?;
-            ensure_http_route_matches_generation(
+            if let Err(err) = ensure_http_route_matches_generation(
                 self.routing,
                 &route_recovery.subtree_id,
                 &inspection,
@@ -1048,9 +1145,24 @@ where
                 route_recovery.domain,
                 &route_recovery.target_source,
                 route_recovery.probe_path,
-            )?;
+            ) {
+                route_repair_failed = true;
+                record_route_repair_degraded_state(
+                    env,
+                    &input.project_id,
+                    &input.environment,
+                    current_generation,
+                    Some(build_info.deployment_id.clone()),
+                    &inspection.container_name,
+                    Some(service_id.as_str()),
+                    "runtime",
+                    &err.message,
+                    Some(&err.artifact),
+                    false,
+                )?;
+            }
         }
-        Ok(Some(current_generation))
+        Ok((Some(current_generation), route_repair_failed))
     }
 
     fn rollback_to_previous(
@@ -1111,7 +1223,7 @@ where
                             ),
                         ))
                     })?;
-                    ensure_http_route_matches_generation(
+                    if let Err(err) = ensure_http_route_matches_generation(
                         self.routing,
                         &route_recovery.subtree_id,
                         &inspection,
@@ -1120,7 +1232,22 @@ where
                         route_recovery.domain,
                         &route_recovery.target_source,
                         route_recovery.probe_path,
-                    )?;
+                    ) {
+                        record_route_repair_degraded_state(
+                            env,
+                            &input.project_id,
+                            &input.environment,
+                            previous,
+                            Some(build_info.deployment_id.clone()),
+                            &inspection.container_name,
+                            Some(service_id.as_str()),
+                            "runtime",
+                            &err.message,
+                            Some(&err.artifact),
+                            false,
+                        )?;
+                        return Ok(false);
+                    }
                 }
                 PointerStore::new(env.clone()).swap_current(previous)?;
                 Ok(true)
@@ -2301,6 +2428,102 @@ fn append_retention_event(
     Ok(())
 }
 
+fn inspection_container_name(inspection: &ContainerInspection) -> String {
+    inspection.container_name.clone()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_route_repair_degraded_state(
+    env: &EnvironmentPaths,
+    project_id: &str,
+    environment: &str,
+    generation: u64,
+    deployment_id: Option<String>,
+    container_name: &str,
+    failed_service_name: Option<&str>,
+    failure_stage: &str,
+    failure_reason: &str,
+    route_activation_failure: Option<&serde_json::Value>,
+    startup_failure: bool,
+) -> Result<(), ConvergenceError> {
+    let diagnostics = DiagnosticsStore::new(env.clone(), generation);
+    diagnostics.write_failure_reason(failure_reason, &[])?;
+    diagnostics.append_log_line(failure_reason, &[])?;
+    if let Some(artifact) = route_activation_failure {
+        let artifact = serde_json::to_string_pretty(artifact).map_err(|err| {
+            ConvergenceError::Storage(crate::storage::StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )))
+        })?;
+        diagnostics.write_artifact(
+            "route_activation_failure.json",
+            &format!("{artifact}\n"),
+            &[],
+        )?;
+    }
+    diagnostics.write_summary(&DiagnosticSummary {
+        deployment_id: deployment_id.clone(),
+        failure_stage: failure_stage.into(),
+        failure_reason: failure_reason.into(),
+        blocking_reason: Some(failure_reason.into()),
+        container_name: container_name.into(),
+        failed_service_name: failed_service_name.map(str::to_string),
+        blocking_service_name: failed_service_name.map(str::to_string),
+        probe_target_host: None,
+        probe_target_port: None,
+        probe_target_path: None,
+        restart_storm: false,
+        restart_policy: None,
+        restart_count_delta: None,
+        oom_killed: None,
+        last_exit_code: None,
+        exit_signal: None,
+        termination_reason: None,
+        cleanup_recorded: false,
+        dependency_graph_summary: None,
+        runtime_env_preview: Vec::new(),
+    })?;
+
+    let runtime_store = RuntimeStateStore::new(env.clone());
+    let mut runtime_state = runtime_store.load()?;
+    runtime_state.active_generation = Some(generation);
+    runtime_state.health_state = RuntimeHealthState::Degraded;
+    runtime_state
+        .degraded_since_unix
+        .get_or_insert(current_unix_timestamp());
+    runtime_state.last_transition = if startup_failure {
+        "startup_route_repair_failed".into()
+    } else {
+        "route_repair_failed".into()
+    };
+    runtime_state.last_error_code = Some("route_activation_verification_failed".into());
+    runtime_store.save(&runtime_state)?;
+
+    let events = EventStore::new(env.clone(), generation);
+    events.append(&EventRecord {
+        timestamp_unix: current_unix_timestamp(),
+        project_id: project_id.into(),
+        environment: environment.into(),
+        generation: Some(generation),
+        deployment_id: deployment_id.clone(),
+        event_type: "ROUTE_ACTIVATION_VERIFICATION_FAILED".into(),
+        reason: Some(failure_reason.into()),
+    })?;
+    if startup_failure {
+        events.append(&EventRecord {
+            timestamp_unix: current_unix_timestamp(),
+            project_id: project_id.into(),
+            environment: environment.into(),
+            generation: Some(generation),
+            deployment_id,
+            event_type: "STARTUP_ROUTE_REPAIR_FAILED".into(),
+            reason: Some(failure_reason.into()),
+        })?;
+    }
+    Ok(())
+}
+
 fn append_gc_action(
     env: &EnvironmentPaths,
     project_id: &str,
@@ -3453,14 +3676,26 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
     domain: Option<String>,
     target_source: &PersistedRouteTargetSource,
     probe_path: Option<String>,
-) -> Result<(), ConvergenceError> {
+) -> Result<(), RouteRepairFailure> {
     let target = resolve_route_target(inspection, internal_port, preferred_network, target_source)
         .ok_or_else(|| {
             let message = preferred_network.map_or_else(
                 || "container missing network IP".to_string(),
                 |network_name| format!("container missing IP on docker network {network_name}"),
             );
-            ConvergenceError::Docker(crate::runtime::DockerRuntimeError::InvalidResponse(message))
+            RouteRepairFailure {
+                message: message.clone(),
+                artifact: serde_json::json!({
+                    "route_id": subtree_id,
+                    "domain": domain,
+                    "upstream_target": serde_json::Value::Null,
+                    "active_target": serde_json::Value::Null,
+                    "activation_verified": serde_json::Value::Null,
+                    "health_checks_enabled": serde_json::Value::Null,
+                    "network_name": preferred_network,
+                    "error": message,
+                }),
+            }
         })?;
     let route_matches = routing
         .inspect_route(subtree_id)
@@ -3475,24 +3710,64 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
         return Ok(());
     }
 
-    routing.update_route(RouteUpdateRequest {
-        subtree_id: subtree_id.to_string(),
-        target: target.clone(),
-        domain: domain.clone(),
-        health_checks_enabled: false,
-        probe_path,
-    })?;
-    let route = routing.inspect_route(subtree_id)?;
+    routing
+        .update_route(RouteUpdateRequest {
+            subtree_id: subtree_id.to_string(),
+            target: target.clone(),
+            domain: domain.clone(),
+            health_checks_enabled: false,
+            probe_path,
+        })
+        .map_err(|err| RouteRepairFailure {
+            message: err.to_string(),
+            artifact: serde_json::json!({
+                "route_id": subtree_id,
+                "domain": domain,
+                "upstream_target": target,
+                "active_target": serde_json::Value::Null,
+                "activation_verified": serde_json::Value::Null,
+                "health_checks_enabled": serde_json::Value::Null,
+                "network_name": preferred_network,
+                "error": err.to_string(),
+            }),
+        })?;
+    let route = routing
+        .inspect_route(subtree_id)
+        .map_err(|err| RouteRepairFailure {
+            message: err.to_string(),
+            artifact: serde_json::json!({
+                "route_id": subtree_id,
+                "domain": domain,
+                "upstream_target": target,
+                "active_target": serde_json::Value::Null,
+                "activation_verified": serde_json::Value::Null,
+                "health_checks_enabled": serde_json::Value::Null,
+                "network_name": preferred_network,
+                "error": err.to_string(),
+            }),
+        })?;
     if route.active_target != target
         || route.domain != domain
         || !route.activation_verified
         || route.health_checks_enabled
     {
-        return Err(ConvergenceError::Routing(
-            crate::runtime::RoutingRuntimeError::UpdateFailed(
-                "route activation verification failed".into(),
-            ),
-        ));
+        return Err(RouteRepairFailure {
+            message: "route activation verification failed".into(),
+            artifact: serde_json::json!({
+                "route_id": subtree_id,
+                "domain": domain,
+                "upstream_target": target,
+                "active_target": route.active_target,
+                "verification_url": route.verification_url,
+                "verification_host": route.verification_host,
+                "verification_status_code": route.verification_status_code,
+                "verification_response_body": route.verification_response_body,
+                "activation_verified": route.activation_verified,
+                "health_checks_enabled": route.health_checks_enabled,
+                "network_name": preferred_network,
+                "error": "route activation verification failed",
+            }),
+        });
     }
     Ok(())
 }
@@ -3858,12 +4133,25 @@ fn test_image_ref(container_name: &str) -> String {
 }
 
 #[cfg(test)]
-#[derive(Default)]
 struct TestRoutingRuntime {
     route: Option<RouteInspection>,
+    updated_route_activation_verified: bool,
     remove_failures: std::collections::BTreeMap<String, usize>,
     remove_calls: Vec<String>,
     updates: Vec<RouteUpdateRequest>,
+}
+
+#[cfg(test)]
+impl Default for TestRoutingRuntime {
+    fn default() -> Self {
+        Self {
+            route: None,
+            updated_route_activation_verified: true,
+            remove_failures: Default::default(),
+            remove_calls: Vec::new(),
+            updates: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3876,7 +4164,7 @@ impl RoutingRuntime for TestRoutingRuntime {
             subtree_id: request.subtree_id.clone(),
             active_target: request.target.clone(),
             domain: request.domain.clone(),
-            activation_verified: true,
+            activation_verified: self.updated_route_activation_verified,
             verification_url: None,
             verification_host: None,
             verification_status_code: None,
@@ -4332,6 +4620,7 @@ pub mod orphaned_candidate_generation_is_cleaned {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -4389,6 +4678,7 @@ pub mod orphaned_candidate_generation_is_cleaned {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -4555,6 +4845,7 @@ pub mod orphaned_candidate_generation_is_cleaned {
             }),
             remove_failures: std::collections::BTreeMap::from([("forge:api:production".into(), 2)]),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -5049,6 +5340,7 @@ pub mod current_pointer_matches_active_route_after_restart {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -5099,6 +5391,7 @@ pub mod current_pointer_matches_active_route_after_restart {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -5154,6 +5447,7 @@ pub mod promoted_runtime_route_drift_is_repaired {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -5212,6 +5506,7 @@ pub mod promoted_runtime_route_drift_is_repaired {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -5264,6 +5559,7 @@ pub mod promoted_runtime_route_drift_is_repaired {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -5316,6 +5612,7 @@ pub mod promoted_runtime_route_drift_is_repaired {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
         let mut engine =
@@ -5442,6 +5739,7 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
 
@@ -5451,6 +5749,56 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
 
         assert_eq!(pointers.read_pointer("current").unwrap(), Some(2));
         assert_eq!(pointers.read_pointer("promoted").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn startup_route_repair_failure_marks_environment_degraded() {
+        let root = test_root("startup-route-repair-failure-marks-environment-degraded");
+        register_project(&root, "api", "api.example.com");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        let mut routing = TestRoutingRuntime {
+            updated_route_activation_verified: false,
+            ..Default::default()
+        };
+
+        StartupConvergence::new(&root, &queue, &ResumeDecider(true))
+            .recover_active_deployment(&mut docker, &mut routing)
+            .unwrap();
+
+        let runtime_state = RuntimeStateStore::new(env.clone()).load().unwrap();
+        assert_eq!(runtime_state.health_state, RuntimeHealthState::Degraded);
+        assert_eq!(
+            runtime_state.last_error_code.as_deref(),
+            Some("route_activation_verification_failed")
+        );
+
+        let summary = DiagnosticsStore::new(env.clone(), 1)
+            .read_summary()
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.failure_stage, "startup_recovery");
+        assert_eq!(
+            summary.failure_reason,
+            "route activation verification failed"
+        );
+        assert!(
+            DiagnosticsStore::new(env.clone(), 1)
+                .read_text_artifact("route_activation_failure.json")
+                .unwrap()
+                .is_some()
+        );
+
+        let event_types = EventStore::list_all(&root)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"STARTUP_ROUTE_REPAIR_FAILED".to_string()));
+        assert!(event_types.contains(&"ROUTE_ACTIVATION_VERIFICATION_FAILED".to_string()));
     }
 
     #[test]
@@ -5506,6 +5854,7 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
 
@@ -5575,6 +5924,7 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
             }),
             remove_failures: Default::default(),
             remove_calls: Vec::new(),
+            updated_route_activation_verified: true,
             updates: Vec::new(),
         };
 
@@ -6077,6 +6427,53 @@ pub mod startup_recovery_reconstructs_finalized_current_generation {
         StartupConvergence::new(&root, &queue, &ResumeDecider(true))
             .recover_active_deployment(&mut docker, &mut routing)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+pub mod route_repair_failure_during_convergence {
+    use super::*;
+
+    #[test]
+    fn convergence_failure_does_not_exit_daemon() {
+        let root = test_root("convergence-failure-does-not-exit-daemon");
+        register_project(&root, "api", "api.example.com");
+        setup_recoverable_http_generation(&root, 1);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        PointerStore::new(env.clone()).swap_current(1).unwrap();
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        let mut docker = TestDockerRuntime::default();
+        docker.containers.insert("prod-api-gen-1".into(), true);
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updated_route_activation_verified: false,
+            ..Default::default()
+        };
+        let mut engine =
+            ConvergenceEngine::new(&root, &queue, &mut docker, &mut probes, &mut routing);
+
+        let outcome = engine
+            .tick(TickInput {
+                project_id: "api".into(),
+                environment: "production".into(),
+                now_unix: 100,
+                truth: ActiveTruth::HttpRouted {
+                    internal_port: 3000,
+                },
+                http_health_path: Some("/health".into()),
+            })
+            .unwrap();
+
+        assert_eq!(outcome, TickOutcome::Degraded(1));
+        let runtime_state = RuntimeStateStore::new(env).load().unwrap();
+        assert_eq!(runtime_state.health_state, RuntimeHealthState::Degraded);
+        assert_eq!(
+            runtime_state.last_error_code.as_deref(),
+            Some("route_activation_verification_failed")
+        );
     }
 }
 

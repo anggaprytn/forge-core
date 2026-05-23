@@ -64,6 +64,13 @@ const CLI_LOGIN_POLL_INTERVAL_SECONDS: u64 = 1;
 
 pub trait ControlPlane: Send {
     fn is_ready(&self) -> bool;
+    fn readyz_status(&self) -> &'static str {
+        if self.is_ready() {
+            "ready"
+        } else {
+            "not_ready"
+        }
+    }
     fn handle_post_deployments(
         &mut self,
         request: DeploymentRequest,
@@ -128,6 +135,10 @@ where
 {
     fn is_ready(&self) -> bool {
         self.state() == &DaemonState::Ready
+    }
+
+    fn readyz_status(&self) -> &'static str {
+        Daemon::readyz_status(self)
     }
 
     fn handle_post_deployments(
@@ -1333,11 +1344,11 @@ async fn post_cli_login_poll(
 
 async fn get_readyz(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
-    let ready = state
+    let (ready, readiness_status) = state
         .daemon
         .lock()
-        .map(|daemon| daemon.is_ready())
-        .unwrap_or(false);
+        .map(|daemon| (daemon.is_ready(), daemon.readyz_status()))
+        .unwrap_or((false, "not_ready"));
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1348,11 +1359,7 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
         status,
         &request_id,
         Json(HealthEnvelope {
-            status: if ready {
-                "ready".into()
-            } else {
-                "not_ready".into()
-            },
+            status: readiness_status.into(),
         }),
     )
 }
@@ -2958,6 +2965,41 @@ fn build_state(ready: bool) -> HttpState {
 }
 
 #[cfg(test)]
+fn build_state_with_route_repair_failure() -> HttpState {
+    use crate::storage::{
+        EnvironmentPaths, PointerStore, RuntimeHealthState, RuntimeState, RuntimeStateStore,
+        SnapshotState, SnapshotWriter,
+    };
+
+    let (state, root) = build_state_with_root(true);
+    let env = EnvironmentPaths::new(&root, "api", "production");
+    let writer = SnapshotWriter::new(env.clone(), 1).unwrap();
+    writer
+        .write_artifact(
+            "build.json",
+            "{\n  \"deployment_id\": \"dep-1\",\n  \"image_ref\": \"forge/api:prod-gen-1\"\n}\n",
+        )
+        .unwrap();
+    writer
+        .finalize("api", "production", SnapshotState::Healthy)
+        .unwrap();
+    PointerStore::new(env.clone()).swap_current(1).unwrap();
+    RuntimeStateStore::new(env.clone())
+        .save(&RuntimeState {
+            active_generation: Some(1),
+            health_state: RuntimeHealthState::Degraded,
+            failed_probe_count: 0,
+            successful_probe_count: 0,
+            restart_attempted: false,
+            degraded_since_unix: Some(1),
+            last_transition: "startup_route_repair_failed".into(),
+            last_error_code: Some("route_activation_verification_failed".into()),
+        })
+        .unwrap();
+    state
+}
+
+#[cfg(test)]
 fn seed_test_project(root: &Path) {
     use crate::api::ProjectUpsertRequest;
 
@@ -3810,7 +3852,7 @@ pub mod http_idempotency_key_replays_same_response {
 #[cfg(test)]
 pub mod http_readyz_false_before_daemon_ready {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
@@ -3825,6 +3867,46 @@ pub mod http_readyz_false_before_daemon_ready {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_degraded_route_repair() {
+        let app = router(build_state_with_route_repair_failure());
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "degraded");
+    }
+}
+
+#[cfg(test)]
+pub mod http_healthz_ignores_route_repair_failures {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn healthz_ok_when_route_repair_fails() {
+        let app = router(build_state_with_route_repair_failure());
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
     }
 }
 
