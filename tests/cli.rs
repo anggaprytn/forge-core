@@ -1106,8 +1106,88 @@ fn control_plane_local_missing_config_returns_helpful_error() {
     let output = run_cli_in_dir(&root, &["control-plane", "leader"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("missing config path; use --config /etc/forge/forge.conf"));
+    assert!(stderr.contains(
+        "missing config path; tried --config, FORGE_CONFIG, ./forge.conf, /etc/forge/forge.conf; use `forge --config /etc/forge/forge.conf control-plane leader`"
+    ));
     assert!(!stderr.contains("os error 2"));
+}
+
+#[test]
+fn control_plane_explicit_config_wins_over_cwd_config() {
+    let root = test_root("control-plane-explicit-config-wins");
+    let (cwd_config, cwd_leader) = create_control_plane_fixture(&root, "cwd-storage");
+    let explicit_root = root.join("explicit");
+    let (explicit_config, explicit_leader) =
+        create_control_plane_fixture(&explicit_root, "explicit-storage");
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "--config",
+            explicit_config.to_str().unwrap(),
+            "control-plane",
+            "leader",
+        ],
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains(&explicit_leader));
+    assert!(!body.contains(&cwd_leader));
+    assert!(cwd_config.exists());
+}
+
+#[test]
+fn control_plane_forge_config_env_wins_over_cwd_config() {
+    let root = test_root("control-plane-env-config-wins");
+    let (_cwd_config, cwd_leader) = create_control_plane_fixture(&root, "cwd-storage");
+    let env_root = root.join("env");
+    let (env_config, env_leader) = create_control_plane_fixture(&env_root, "env-storage");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(["control-plane", "leader"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("FORGE_CONFIG", &env_config)
+        .env_remove("FORGE_URL")
+        .env_remove("FORGE_TOKEN")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains(&env_leader));
+    assert!(!body.contains(&cwd_leader));
+}
+
+#[test]
+fn readiness_explain_remote_mode_does_not_require_local_config() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"taxonomy":"ready_no_active_failure","readiness_status":"ready","startup_phase":"leader_active","active_failure":false,"failure_scope":"none","historical_failures":false,"convergence_blocked":false,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","operator_interpretation":"Control-plane readiness is healthy and convergence is operating normally.","safe_next_action":"no action required"}"#,
+    );
+    let root = test_root("readiness-explain-remote-without-local-config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(["readiness", "explain", "--json"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("FORGE_URL", &url)
+        .env("FORGE_TOKEN", "remote-token")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"readiness_status\": \"ready\""));
+    assert!(!body.contains("remote-token"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.path, "/readiness/explain");
+    assert_eq!(request.authorization, "Bearer remote-token");
 }
 
 #[test]
@@ -1268,6 +1348,34 @@ fn run_cli_in_dir(workdir: &Path, args: &[&str]) -> std::process::Output {
         .env_remove("FORGE_CONFIG")
         .output()
         .unwrap()
+}
+
+fn create_control_plane_fixture(root: &Path, storage_name: &str) -> (PathBuf, String) {
+    let storage_root = root.join(storage_name);
+    fs::create_dir_all(&storage_root).unwrap();
+    let node = NodeMetadataStore::new(&storage_root)
+        .load_or_create()
+        .unwrap();
+    let lease = match LeaderLeaseStore::new(&storage_root)
+        .try_acquire_or_renew(&node.node_id, 100, 60)
+        .unwrap()
+    {
+        forge_core::storage::LeaseAcquireOutcome::Leader(lease) => lease,
+        forge_core::storage::LeaseAcquireOutcome::Follower(_) => {
+            panic!("expected local node to hold the lease")
+        }
+    };
+    let config_path = root.join("forge.conf");
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "storage_root={}\napi_bind=127.0.0.1:8080\nbearer_token=test-token\n",
+            storage_root.display()
+        ),
+    )
+    .unwrap();
+    (config_path, lease.leader_node_id)
 }
 
 fn spawn_server(

@@ -80,7 +80,6 @@ where
 {
     let parsed = ParsedArgs::parse(args)?;
     let control_plane_remote_client = parsed.remote_client_if_logged_in()?;
-    let config_path_explicit = parsed.config_path_explicit;
     let api_credentials = if matches!(
         parsed.command,
         Command::Doctor { .. }
@@ -114,6 +113,7 @@ where
             metrics_url,
             upgrade,
         } => {
+            ensure_local_config_available(parsed.local_config_found, "doctor")?;
             let report = run_doctor(&DoctorOptions {
                 config_path,
                 caddy_admin_url,
@@ -126,7 +126,10 @@ where
                 return Err(CliError::Usage("doctor found failing checks".into()));
             }
         }
-        Command::Daemon(command) => daemon_runner(command)?,
+        Command::Daemon(command) => {
+            ensure_local_config_available(parsed.local_config_found, "daemon")?;
+            daemon_runner(command)?
+        }
         Command::Init { force } => init_project_config(force)?,
         Command::Login { server_url } => run_login(server_url)?,
         Command::Logout => run_logout()?,
@@ -141,20 +144,23 @@ where
             signature_path,
             allow_unsigned,
             allow_dirty_artifact,
-        } => print_json(
-            &plan_upgrade(&UpgradeOptions {
-                config_path,
-                caddy_admin_url,
-                artifact_path,
-                release_tag,
-                manifest_path,
-                signature_path,
-                allow_unsigned,
-                allow_dirty_artifact,
-                auto_rollback: true,
-            })
-            .map_err(|err| CliError::Usage(err.to_string()))?,
-        )?,
+        } => {
+            ensure_local_config_available(parsed.local_config_found, "upgrade plan")?;
+            print_json(
+                &plan_upgrade(&UpgradeOptions {
+                    config_path,
+                    caddy_admin_url,
+                    artifact_path,
+                    release_tag,
+                    manifest_path,
+                    signature_path,
+                    allow_unsigned,
+                    allow_dirty_artifact,
+                    auto_rollback: true,
+                })
+                .map_err(|err| CliError::Usage(err.to_string()))?,
+            )?
+        }
         Command::UpgradeApply {
             config_path,
             caddy_admin_url,
@@ -165,23 +171,29 @@ where
             allow_unsigned,
             allow_dirty_artifact,
             no_auto_rollback,
-        } => print_json(
-            &apply_upgrade(&UpgradeOptions {
-                config_path,
-                caddy_admin_url,
-                artifact_path,
-                release_tag,
-                manifest_path,
-                signature_path,
-                allow_unsigned,
-                allow_dirty_artifact,
-                auto_rollback: !no_auto_rollback,
-            })
-            .map_err(|err| CliError::Usage(err.to_string()))?,
-        )?,
-        Command::UpgradeRollback { config_path } => print_json(
-            &rollback_upgrade(&config_path).map_err(|err| CliError::Usage(err.to_string()))?,
-        )?,
+        } => {
+            ensure_local_config_available(parsed.local_config_found, "upgrade apply")?;
+            print_json(
+                &apply_upgrade(&UpgradeOptions {
+                    config_path,
+                    caddy_admin_url,
+                    artifact_path,
+                    release_tag,
+                    manifest_path,
+                    signature_path,
+                    allow_unsigned,
+                    allow_dirty_artifact,
+                    auto_rollback: !no_auto_rollback,
+                })
+                .map_err(|err| CliError::Usage(err.to_string()))?,
+            )?
+        }
+        Command::UpgradeRollback { config_path } => {
+            ensure_local_config_available(parsed.local_config_found, "upgrade rollback")?;
+            print_json(
+                &rollback_upgrade(&config_path).map_err(|err| CliError::Usage(err.to_string()))?,
+            )?
+        }
         Command::TokenList => {
             let (base_url, token) = api_credentials.unwrap();
             let client = ForgeClient::new(base_url, token);
@@ -200,12 +212,12 @@ where
         Command::ControlPlaneLeader { config_path } => run_control_plane_leader(
             control_plane_remote_client,
             config_path,
-            config_path_explicit,
+            parsed.local_config_found,
         )?,
         Command::ControlPlaneLease { config_path } => run_control_plane_lease(
             control_plane_remote_client,
             config_path,
-            config_path_explicit,
+            parsed.local_config_found,
         )?,
         Command::ReadinessExplain {
             config_path,
@@ -214,14 +226,16 @@ where
         } => run_readiness_explain(
             control_plane_remote_client,
             config_path,
-            config_path_explicit,
+            parsed.local_config_found,
             json,
             offline,
         )?,
         Command::ControlPlaneReplayStatus { config_path } => {
-            run_control_plane_replay_status(config_path)?
+            run_control_plane_replay_status(config_path, parsed.local_config_found)?
         }
-        Command::ControlPlaneIntents { config_path } => run_control_plane_intents(config_path)?,
+        Command::ControlPlaneIntents { config_path } => {
+            run_control_plane_intents(config_path, parsed.local_config_found)?
+        }
         Command::ControlPlaneReplay {
             config_path,
             caddy_admin_url,
@@ -230,6 +244,7 @@ where
             resume,
         } => run_control_plane_replay(
             config_path,
+            parsed.local_config_found,
             caddy_admin_url,
             caddy_public_url,
             dry_run,
@@ -366,13 +381,16 @@ where
             caddy_public_url,
             dry_run,
             json,
-        } => run_gc_command(
-            config_path,
-            caddy_admin_url,
-            caddy_public_url,
-            dry_run,
-            json,
-        )?,
+        } => {
+            ensure_local_config_available(parsed.local_config_found, "gc")?;
+            run_gc_command(
+                config_path,
+                caddy_admin_url,
+                caddy_public_url,
+                dry_run,
+                json,
+            )?
+        }
         Command::Rollback {
             project_id,
             environment,
@@ -1012,8 +1030,16 @@ impl std::error::Error for CliError {}
 struct ParsedArgs {
     base_url: Option<String>,
     token: Option<String>,
-    config_path_explicit: bool,
+    local_config_found: bool,
     command: Command,
+}
+
+const INSTALLED_SERVER_CONFIG_PATH: &str = "/etc/forge/forge.conf";
+
+#[derive(Debug, Clone)]
+struct LocalConfigResolution {
+    path: PathBuf,
+    found: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1207,7 +1233,6 @@ impl ParsedArgs {
         let mut caddy_admin_url = None;
         let mut caddy_public_url = None;
         let mut metrics_url = None;
-        let mut config_path_from_flag = false;
 
         loop {
             if args.first().map(String::as_str) == Some("--url") {
@@ -1231,7 +1256,6 @@ impl ParsedArgs {
                     return Err(CliError::Usage("--config requires a value".into()));
                 }
                 config_path = Some(PathBuf::from(args[1].clone()));
-                config_path_from_flag = true;
                 args.drain(0..2);
                 continue;
             }
@@ -1264,27 +1288,25 @@ impl ParsedArgs {
             break;
         }
 
-        let config_path_from_env = env::var("FORGE_CONFIG").ok().map(PathBuf::from);
-        let command = resolve_local_command_defaults(
-            parse_command(
-                args,
-                config_path
-                    .or_else(|| config_path_from_env.clone())
-                    .unwrap_or_else(|| PathBuf::from("forge.conf")),
-                caddy_admin_url
-                    .or_else(|| env::var("FORGE_CADDY_ADMIN_URL").ok())
-                    .unwrap_or_else(|| "http://127.0.0.1:2019".into()),
-                caddy_public_url
-                    .or_else(|| env::var("FORGE_CADDY_PUBLIC_URL").ok())
-                    .unwrap_or_else(|| "http://127.0.0.1".into()),
-                metrics_url,
-            )?,
-            config_path_from_flag || config_path_from_env.is_some(),
+        let config_resolution = resolve_local_config_path(
+            config_path,
+            env::var("FORGE_CONFIG").ok().map(PathBuf::from),
         );
+        let command = parse_command(
+            args,
+            config_resolution.path.clone(),
+            caddy_admin_url
+                .or_else(|| env::var("FORGE_CADDY_ADMIN_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:2019".into()),
+            caddy_public_url
+                .or_else(|| env::var("FORGE_CADDY_PUBLIC_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1".into()),
+            metrics_url,
+        )?;
         Ok(Self {
             base_url,
             token,
-            config_path_explicit: config_path_from_flag || config_path_from_env.is_some(),
+            local_config_found: config_resolution.found,
             command,
         })
     }
@@ -1343,77 +1365,55 @@ impl ParsedArgs {
     }
 }
 
-fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) -> Command {
-    match command {
-        Command::Doctor {
-            config_path: _,
-            caddy_admin_url,
-            metrics_url,
-            upgrade: true,
-        } if !config_path_explicit => Command::Doctor {
-            config_path: default_server_config_path(),
-            caddy_admin_url,
-            metrics_url,
-            upgrade: true,
-        },
-        Command::UpgradePlan {
-            config_path: _,
-            caddy_admin_url,
-            artifact_path,
-            release_tag,
-            manifest_path,
-            signature_path,
-            allow_unsigned,
-            allow_dirty_artifact,
-        } if !config_path_explicit => Command::UpgradePlan {
-            config_path: default_server_config_path(),
-            caddy_admin_url,
-            artifact_path,
-            release_tag,
-            manifest_path,
-            signature_path,
-            allow_unsigned,
-            allow_dirty_artifact,
-        },
-        Command::UpgradeApply {
-            config_path: _,
-            caddy_admin_url,
-            artifact_path,
-            release_tag,
-            manifest_path,
-            signature_path,
-            allow_unsigned,
-            allow_dirty_artifact,
-            no_auto_rollback,
-        } if !config_path_explicit => Command::UpgradeApply {
-            config_path: default_server_config_path(),
-            caddy_admin_url,
-            artifact_path,
-            release_tag,
-            manifest_path,
-            signature_path,
-            allow_unsigned,
-            allow_dirty_artifact,
-            no_auto_rollback,
-        },
-        Command::UpgradeRollback { config_path: _ } if !config_path_explicit => {
-            Command::UpgradeRollback {
-                config_path: default_server_config_path(),
-            }
-        }
-        other => other,
+fn resolve_local_config_path(
+    config_path_from_flag: Option<PathBuf>,
+    config_path_from_env: Option<PathBuf>,
+) -> LocalConfigResolution {
+    if let Some(path) = config_path_from_flag {
+        return LocalConfigResolution { path, found: true };
+    }
+    if let Some(path) = config_path_from_env {
+        return LocalConfigResolution { path, found: true };
+    }
+
+    let cwd_config = PathBuf::from("forge.conf");
+    if cwd_config.exists() {
+        return LocalConfigResolution {
+            path: cwd_config,
+            found: true,
+        };
+    }
+
+    let installed_config = installed_server_config_path();
+    if installed_config.exists() {
+        return LocalConfigResolution {
+            path: installed_config,
+            found: true,
+        };
+    }
+
+    LocalConfigResolution {
+        path: cwd_config,
+        found: false,
     }
 }
 
-fn default_server_config_path() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        PathBuf::from("/etc/forge/forge.conf")
+fn installed_server_config_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = env::var_os("FORGE_TEST_ETC_FORGE_CONF") {
+        return PathBuf::from(path);
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        PathBuf::from("forge.conf")
+
+    PathBuf::from(INSTALLED_SERVER_CONFIG_PATH)
+}
+
+fn ensure_local_config_available(config_found: bool, command: &str) -> Result<(), CliError> {
+    if config_found {
+        return Ok(());
     }
+    Err(CliError::Usage(format!(
+        "missing config path; tried --config, FORGE_CONFIG, ./forge.conf, {INSTALLED_SERVER_CONFIG_PATH}; use `forge --config {INSTALLED_SERVER_CONFIG_PATH} {command}`"
+    )))
 }
 
 fn parse_command(
@@ -3550,13 +3550,13 @@ struct ControlPlaneLeaseView {
 fn run_control_plane_leader(
     remote_client: Option<ForgeClient>,
     config_path: PathBuf,
-    config_path_explicit: bool,
+    config_path_available: bool,
 ) -> Result<(), CliError> {
     let view = if let Some(client) = remote_client {
         control_plane_leader_view_from_metrics(&client.get_metrics()?)
     } else {
-        let (local_node_id, lease, cluster) =
-            load_local_control_plane_state(&config_path, config_path_explicit)?;
+        ensure_local_config_available(config_path_available, "control-plane leader")?;
+        let (local_node_id, lease, cluster) = load_local_control_plane_state(&config_path)?;
         control_plane_leader_view_from_storage(&local_node_id, lease.as_ref(), cluster)
     };
     print!("{}", render_control_plane_leader(&view));
@@ -3566,13 +3566,13 @@ fn run_control_plane_leader(
 fn run_control_plane_lease(
     remote_client: Option<ForgeClient>,
     config_path: PathBuf,
-    config_path_explicit: bool,
+    config_path_available: bool,
 ) -> Result<(), CliError> {
     let view = if let Some(client) = remote_client {
         control_plane_lease_view_from_metrics(&client.get_metrics()?)
     } else {
-        let (_, lease, cluster) =
-            load_local_control_plane_state(&config_path, config_path_explicit)?;
+        ensure_local_config_available(config_path_available, "control-plane lease")?;
+        let (_, lease, cluster) = load_local_control_plane_state(&config_path)?;
         control_plane_lease_view_from_storage(lease.as_ref(), cluster)
     };
     print!("{}", render_control_plane_lease(&view));
@@ -3582,16 +3582,16 @@ fn run_control_plane_lease(
 fn run_readiness_explain(
     remote_client: Option<ForgeClient>,
     config_path: PathBuf,
-    config_path_explicit: bool,
+    config_path_available: bool,
     json: bool,
     offline: bool,
 ) -> Result<(), CliError> {
     let explanation = if offline {
-        load_offline_readiness_explain(&config_path, config_path_explicit)?
+        load_offline_readiness_explain(&config_path, config_path_available)?
     } else if let Some(client) = remote_client {
         client.get_readiness_explain().map_err(offline_suggestion)?
     } else {
-        load_live_readiness_explain(&config_path, config_path_explicit)
+        load_live_readiness_explain(&config_path, config_path_available)
             .map_err(offline_suggestion)?
     };
     if json {
@@ -3602,7 +3602,11 @@ fn run_readiness_explain(
     Ok(())
 }
 
-fn run_control_plane_replay_status(config_path: PathBuf) -> Result<(), CliError> {
+fn run_control_plane_replay_status(
+    config_path: PathBuf,
+    config_path_available: bool,
+) -> Result<(), CliError> {
+    ensure_local_config_available(config_path_available, "control-plane replay-status")?;
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let store = ReconciliationStore::new(&config.storage_root);
@@ -3613,7 +3617,11 @@ fn run_control_plane_replay_status(config_path: PathBuf) -> Result<(), CliError>
     print_json(&cursor)
 }
 
-fn run_control_plane_intents(config_path: PathBuf) -> Result<(), CliError> {
+fn run_control_plane_intents(
+    config_path: PathBuf,
+    config_path_available: bool,
+) -> Result<(), CliError> {
+    ensure_local_config_available(config_path_available, "control-plane intents")?;
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let intents = ReconciliationStore::new(&config.storage_root)
@@ -3625,11 +3633,18 @@ fn run_control_plane_intents(config_path: PathBuf) -> Result<(), CliError> {
 
 fn run_control_plane_replay(
     config_path: PathBuf,
+    config_path_available: bool,
     caddy_admin_url: String,
     caddy_public_url: String,
     dry_run: bool,
     resume: bool,
 ) -> Result<(), CliError> {
+    let command = if dry_run {
+        "control-plane replay --dry-run"
+    } else {
+        "control-plane replay --resume"
+    };
+    ensure_local_config_available(config_path_available, command)?;
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let lease = require_local_leader(&config.storage_root)?;
@@ -3681,13 +3696,9 @@ fn control_plane_leader_view_from_metrics(metrics: &MetricsResponse) -> ControlP
 
 fn load_live_readiness_explain(
     config_path: &Path,
-    config_path_explicit: bool,
+    config_path_available: bool,
 ) -> Result<ReadinessExplainResponse, CliError> {
-    if !config_path_explicit && !config_path.exists() {
-        return Err(CliError::Usage(
-            "missing config path; use --config /etc/forge/forge.conf".into(),
-        ));
-    }
+    ensure_local_config_available(config_path_available, "readiness explain")?;
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let client = ForgeClient::new(
@@ -3718,13 +3729,9 @@ fn offline_suggestion(err: CliError) -> CliError {
 
 fn load_offline_readiness_explain(
     config_path: &Path,
-    config_path_explicit: bool,
+    config_path_available: bool,
 ) -> Result<ReadinessExplainResponse, CliError> {
-    if !config_path_explicit && !config_path.exists() {
-        return Err(CliError::Usage(
-            "missing config path; use --config /etc/forge/forge.conf".into(),
-        ));
-    }
+    ensure_local_config_available(config_path_available, "readiness explain")?;
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     Ok(build_offline_readiness_explain(&config.storage_root))
@@ -4351,13 +4358,7 @@ fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
 
 fn load_local_control_plane_state(
     config_path: &Path,
-    config_path_explicit: bool,
 ) -> Result<(String, Option<PersistedLeaderLease>, ClusterDiagnostics), CliError> {
-    if !config_path_explicit && !config_path.exists() {
-        return Err(CliError::Usage(
-            "missing config path; use --config /etc/forge/forge.conf".into(),
-        ));
-    }
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     let local_node = NodeMetadataStore::new(&config.storage_root)
@@ -4726,6 +4727,7 @@ impl ActiveDeploymentDecider for ResumeActiveDeployments {
 mod tests {
     use super::*;
     use forge_core::storage::LeaseAcquireOutcome;
+    use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4738,6 +4740,48 @@ mod tests {
         let path = std::env::temp_dir().join(format!("forge-cli-{name}-{unique}"));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn with_current_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        struct CurrentDirGuard(PathBuf);
+
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                env::set_current_dir(&self.0).unwrap();
+            }
+        }
+
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(dir).unwrap();
+        let _guard = CurrentDirGuard(previous);
+        f()
+    }
+
+    fn with_optional_env_var<T>(key: &str, value: Option<OsString>, f: impl FnOnce() -> T) -> T {
+        struct EnvVarGuard {
+            key: String,
+            previous: Option<OsString>,
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => unsafe { env::set_var(&self.key, value) },
+                    None => unsafe { env::remove_var(&self.key) },
+                }
+            }
+        }
+
+        let previous = env::var_os(key);
+        match value {
+            Some(value) => unsafe { env::set_var(key, value) },
+            None => unsafe { env::remove_var(key) },
+        }
+        let _guard = EnvVarGuard {
+            key: key.to_string(),
+            previous,
+        };
+        f()
     }
 
     fn diagnostics_fixture(status: &str) -> EnvironmentDiagnostics {
@@ -5199,7 +5243,7 @@ mod tests {
         assert_eq!(
             parsed.command,
             Command::UpgradeApply {
-                config_path: default_server_config_path(),
+                config_path: PathBuf::from("forge.conf"),
                 caddy_admin_url: "http://127.0.0.1:2019".into(),
                 artifact_path: PathBuf::from("/tmp/forge.tar.gz"),
                 release_tag: None,
@@ -5210,6 +5254,7 @@ mod tests {
                 no_auto_rollback: true,
             }
         );
+        assert!(!parsed.local_config_found);
     }
 
     #[test]
@@ -5225,7 +5270,7 @@ mod tests {
         assert_eq!(
             parsed.command,
             Command::UpgradePlan {
-                config_path: default_server_config_path(),
+                config_path: PathBuf::from("forge.conf"),
                 caddy_admin_url: "http://127.0.0.1:2019".into(),
                 artifact_path: PathBuf::new(),
                 release_tag: Some("alpha-core-loop-v5".into()),
@@ -5235,25 +5280,142 @@ mod tests {
                 allow_dirty_artifact: false,
             }
         );
+        assert!(!parsed.local_config_found);
     }
 
     #[test]
-    fn doctor_upgrade_uses_default_server_config_path() {
+    fn doctor_upgrade_uses_cwd_forge_conf_placeholder_when_no_config_is_found() {
         unsafe {
             env::remove_var("FORGE_CONFIG");
         }
         let parsed = ParsedArgs::parse(vec!["doctor".into(), "upgrade".into()]).unwrap();
 
-        assert!(!parsed.config_path_explicit);
+        assert!(!parsed.local_config_found);
         assert_eq!(
             parsed.command,
             Command::Doctor {
-                config_path: default_server_config_path(),
+                config_path: PathBuf::from("forge.conf"),
                 caddy_admin_url: "http://127.0.0.1:2019".into(),
                 metrics_url: None,
                 upgrade: true,
             }
         );
+    }
+
+    #[test]
+    fn explicit_config_wins_over_env_cwd_and_installed_config() {
+        let root = temp_root("explicit-config-wins");
+        std::fs::write(root.join("forge.conf"), "cwd-config\n").unwrap();
+        let installed = root.join("etc-forge.conf");
+        std::fs::write(&installed, "installed-config\n").unwrap();
+
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(installed.as_os_str().to_os_string()),
+                || {
+                    let resolved = resolve_local_config_path(
+                        Some(PathBuf::from("/tmp/explicit-forge.conf")),
+                        Some(PathBuf::from("/tmp/env-forge.conf")),
+                    );
+                    assert_eq!(resolved.path, PathBuf::from("/tmp/explicit-forge.conf"));
+                    assert!(resolved.found);
+                },
+            )
+        });
+    }
+
+    #[test]
+    fn forge_config_env_wins_over_cwd_config() {
+        let root = temp_root("env-config-wins");
+        std::fs::write(root.join("forge.conf"), "cwd-config\n").unwrap();
+
+        with_current_dir(&root, || {
+            let resolved =
+                resolve_local_config_path(None, Some(PathBuf::from("/tmp/env-forge.conf")));
+            assert_eq!(resolved.path, PathBuf::from("/tmp/env-forge.conf"));
+            assert!(resolved.found);
+        });
+    }
+
+    #[test]
+    fn cwd_forge_conf_wins_over_installed_config() {
+        let root = temp_root("cwd-config-wins");
+        std::fs::write(root.join("forge.conf"), "cwd-config\n").unwrap();
+        let installed = root.join("etc-forge.conf");
+        std::fs::write(&installed, "installed-config\n").unwrap();
+
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(installed.as_os_str().to_os_string()),
+                || {
+                    let resolved = resolve_local_config_path(None, None);
+                    assert_eq!(resolved.path, PathBuf::from("forge.conf"));
+                    assert!(resolved.found);
+                },
+            )
+        });
+    }
+
+    #[test]
+    fn installed_config_is_used_when_present_and_no_other_config_exists() {
+        let root = temp_root("installed-config-fallback");
+        let installed = root.join("etc-forge.conf");
+        std::fs::write(&installed, "installed-config\n").unwrap();
+
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(installed.as_os_str().to_os_string()),
+                || {
+                    let resolved = resolve_local_config_path(None, None);
+                    assert_eq!(resolved.path, installed);
+                    assert!(resolved.found);
+                },
+            )
+        });
+    }
+
+    #[test]
+    fn missing_local_config_reports_every_resolution_path() {
+        let root = temp_root("missing-config-error");
+        let missing_installed = root.join("missing-etc-forge.conf");
+
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(missing_installed.as_os_str().to_os_string()),
+                || {
+                    with_optional_env_var("FORGE_URL", None, || {
+                        with_optional_env_var("FORGE_TOKEN", None, || {
+                            with_optional_env_var(
+                                "HOME",
+                                Some(root.as_os_str().to_os_string()),
+                                || {
+                                    with_optional_env_var(
+                                        "XDG_CONFIG_HOME",
+                                        Some(root.as_os_str().to_os_string()),
+                                        || {
+                                            let err = run_with_args(
+                                                vec!["control-plane".into(), "leader".into()],
+                                                |_| Ok(()),
+                                            )
+                                            .unwrap_err();
+
+                                            assert_eq!(
+                                                err.to_string(),
+                                                "missing config path; tried --config, FORGE_CONFIG, ./forge.conf, /etc/forge/forge.conf; use `forge --config /etc/forge/forge.conf control-plane leader`"
+                                            );
+                                        },
+                                    )
+                                },
+                            )
+                        })
+                    })
+                },
+            )
+        });
     }
 
     #[test]
@@ -5269,7 +5431,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(parsed.config_path_explicit);
+        assert!(parsed.local_config_found);
         assert_eq!(
             parsed.command,
             Command::Doctor {
