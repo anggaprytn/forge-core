@@ -871,6 +871,10 @@ pub struct MetricsResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadinessExplainResponse {
+    #[serde(default = "default_readiness_explain_source")]
+    pub source: String,
+    #[serde(default = "default_readiness_explain_live")]
+    pub live: bool,
     pub taxonomy: String,
     pub readiness_status: String,
     pub startup_phase: String,
@@ -896,8 +900,28 @@ pub struct ReadinessExplainResponse {
     pub last_successful_convergence_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_historical_failure_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_updated_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_age_ms: Option<u64>,
+    #[serde(default = "default_readiness_explain_confidence")]
+    pub confidence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub operator_interpretation: String,
     pub safe_next_action: String,
+}
+
+fn default_readiness_explain_source() -> String {
+    "daemon_api".into()
+}
+
+fn default_readiness_explain_live() -> bool {
+    true
+}
+
+fn default_readiness_explain_confidence() -> String {
+    "high".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

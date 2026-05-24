@@ -23,8 +23,8 @@ use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
 use forge_core::convergence::garbage_collect;
 use forge_core::daemon::{
-    Daemon, DeploymentWorkerSettings, WorkerLeadership, run_deployment_worker_loop,
-    run_heartbeat_loop, run_readyz_refresh_loop,
+    Daemon, DeploymentWorkerSettings, READYZ_CACHE_STALE_AFTER_MS, WorkerLeadership,
+    run_deployment_worker_loop, run_heartbeat_loop, run_readyz_refresh_loop,
 };
 use forge_core::deployments::{
     ActivationMode, ExecutionConfig, FORGE_MANAGED_DOCKER_NETWORK, ValidationPolicy,
@@ -46,8 +46,9 @@ use forge_core::reconciliation::{
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
 use forge_core::storage::{
-    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, LeaderLeaseStore, NodeMetadataStore,
-    PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
+    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, ConvergenceCheckpointStore, EnvironmentPaths,
+    LeaderLeaseStore, NodeMetadataStore, PersistedEnvironmentCheckpoint, PersistedLeaderLease,
+    SNAPSHOT_SCHEMA_VERSION,
 };
 use forge_core::upgrade::{
     MANIFEST_SCHEMA_VERSION, STORAGE_COMPATIBILITY_VERSION, UpgradeOptions, apply as apply_upgrade,
@@ -206,11 +207,16 @@ where
             config_path,
             config_path_explicit,
         )?,
-        Command::ReadinessExplain { config_path, json } => run_readiness_explain(
+        Command::ReadinessExplain {
+            config_path,
+            json,
+            offline,
+        } => run_readiness_explain(
             control_plane_remote_client,
             config_path,
             config_path_explicit,
             json,
+            offline,
         )?,
         Command::ControlPlaneReplayStatus { config_path } => {
             run_control_plane_replay_status(config_path)?
@@ -1068,6 +1074,7 @@ enum Command {
     ReadinessExplain {
         config_path: PathBuf,
         json: bool,
+        offline: bool,
     },
     ControlPlaneReplayStatus {
         config_path: PathBuf,
@@ -1468,19 +1475,8 @@ fn parse_command(
         [group, action] if group == "control-plane" && action == "lease" => {
             Ok(Command::ControlPlaneLease { config_path })
         }
-        [group, action] if group == "readiness" && action == "explain" => {
-            Ok(Command::ReadinessExplain {
-                config_path,
-                json: false,
-            })
-        }
-        [group, action, flag]
-            if group == "readiness" && action == "explain" && flag == "--json" =>
-        {
-            Ok(Command::ReadinessExplain {
-                config_path,
-                json: true,
-            })
+        [group, action, rest @ ..] if group == "readiness" && action == "explain" => {
+            parse_readiness_explain_command(rest, config_path)
         }
         [group, action] if group == "control-plane" && action == "replay-status" => {
             Ok(Command::ControlPlaneReplayStatus { config_path })
@@ -1590,7 +1586,7 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] token revoke <token_id>",
         "  forge [--config PATH] control-plane leader",
         "  forge [--config PATH] control-plane lease",
-        "  forge [--config PATH] [--url URL] [--token TOKEN] readiness explain [--json]",
+        "  forge [--config PATH] [--url URL] [--token TOKEN] readiness explain [--json] [--offline]",
         "  forge [--config PATH] control-plane replay-status",
         "  forge [--config PATH] control-plane intents",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] control-plane replay --dry-run",
@@ -1656,6 +1652,30 @@ fn parse_upgrade_apply_command(
         allow_unsigned: parsed.allow_unsigned,
         allow_dirty_artifact: parsed.allow_dirty_artifact,
         no_auto_rollback: parsed.no_auto_rollback,
+    })
+}
+
+fn parse_readiness_explain_command(
+    args: &[String],
+    config_path: PathBuf,
+) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut offline = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--offline" => offline = true,
+            _ => {
+                return Err(CliError::Usage(
+                    "readiness explain accepts only --json and --offline".into(),
+                ));
+            }
+        }
+    }
+    Ok(Command::ReadinessExplain {
+        config_path,
+        json,
+        offline,
     })
 }
 
@@ -3564,11 +3584,15 @@ fn run_readiness_explain(
     config_path: PathBuf,
     config_path_explicit: bool,
     json: bool,
+    offline: bool,
 ) -> Result<(), CliError> {
-    let explanation = if let Some(client) = remote_client {
-        client.get_readiness_explain()?
+    let explanation = if offline {
+        load_offline_readiness_explain(&config_path, config_path_explicit)?
+    } else if let Some(client) = remote_client {
+        client.get_readiness_explain().map_err(offline_suggestion)?
     } else {
-        load_local_readiness_explain(&config_path, config_path_explicit)?
+        load_live_readiness_explain(&config_path, config_path_explicit)
+            .map_err(offline_suggestion)?
     };
     if json {
         print_json(&explanation)?;
@@ -3655,7 +3679,7 @@ fn control_plane_leader_view_from_metrics(metrics: &MetricsResponse) -> ControlP
     }
 }
 
-fn load_local_readiness_explain(
+fn load_live_readiness_explain(
     config_path: &Path,
     config_path_explicit: bool,
 ) -> Result<ReadinessExplainResponse, CliError> {
@@ -3671,6 +3695,396 @@ fn load_local_readiness_explain(
         config.bearer_token,
     );
     client.get_readiness_explain()
+}
+
+const OFFLINE_WARNING: &str = "offline snapshot may be stale";
+const OFFLINE_SNAPSHOT_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Debug)]
+struct OfflineCheckpointRecord {
+    project_id: String,
+    environment: String,
+    checkpoint: PersistedEnvironmentCheckpoint,
+}
+
+fn offline_suggestion(err: CliError) -> CliError {
+    match err {
+        CliError::Http(message) => CliError::Usage(format!(
+            "live readiness explain failed: {message}\ntry `forge readiness explain --offline` for a persisted postmortem snapshot"
+        )),
+        other => other,
+    }
+}
+
+fn load_offline_readiness_explain(
+    config_path: &Path,
+    config_path_explicit: bool,
+) -> Result<ReadinessExplainResponse, CliError> {
+    if !config_path_explicit && !config_path.exists() {
+        return Err(CliError::Usage(
+            "missing config path; use --config /etc/forge/forge.conf".into(),
+        ));
+    }
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    Ok(build_offline_readiness_explain(&config.storage_root))
+}
+
+fn build_offline_readiness_explain(storage_root: &Path) -> ReadinessExplainResponse {
+    let now_unix = now_unix();
+    let records = load_offline_checkpoint_records(storage_root);
+    let latest_snapshot = records
+        .iter()
+        .max_by_key(|record| record.checkpoint.checkpointed_at_unix);
+    let snapshot_updated_unix =
+        latest_snapshot.map(|record| record.checkpoint.checkpointed_at_unix);
+    let snapshot_age_ms =
+        snapshot_updated_unix.map(|value| now_unix.saturating_sub(value).saturating_mul(1_000));
+    let latest_startup_phase = latest_snapshot.and_then(|record| {
+        record
+            .checkpoint
+            .extra
+            .get("startup_phase")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned)
+    });
+
+    let degraded_records = records
+        .iter()
+        .filter(|record| checkpoint_readyz_status(&record.checkpoint) != "ready")
+        .collect::<Vec<_>>();
+    let stale_records = records
+        .iter()
+        .filter(|record| offline_checkpoint_stale(&record.checkpoint, now_unix))
+        .collect::<Vec<_>>();
+    let corrupt_count = offline_corrupt_checkpoint_count(storage_root);
+    let lease_view = offline_lease_view(storage_root, now_unix);
+
+    let readiness_status = if records.is_empty() {
+        "unknown".to_string()
+    } else if degraded_records.is_empty() {
+        "ready".to_string()
+    } else {
+        "degraded".to_string()
+    };
+    let startup_phase = latest_startup_phase.unwrap_or_else(|| {
+        if records.is_empty() {
+            "unknown".into()
+        } else {
+            lease_view.startup_phase
+        }
+    });
+
+    let (
+        taxonomy,
+        active_failure_reason,
+        failure_scope,
+        historical_failures,
+        last_historical_failure_unix,
+        operator_interpretation,
+        safe_next_action,
+    ) = if records.is_empty() {
+        let reason = if corrupt_count > 0 {
+            "checkpoint corrupt".to_string()
+        } else {
+            "no usable snapshot".to_string()
+        };
+        (
+            if corrupt_count > 0 {
+                "offline_checkpoint_corrupt"
+            } else {
+                "offline_no_usable_snapshot"
+            }
+            .to_string(),
+            Some(reason.clone()),
+            "unknown".to_string(),
+            false,
+            None,
+            if corrupt_count > 0 {
+                "Persisted readiness checkpoint data is corrupt, so Forge cannot produce a trustworthy offline explanation.".into()
+            } else {
+                "No persisted readiness snapshot is available, so Forge cannot report even a last-known control-plane state.".into()
+            },
+            if corrupt_count > 0 {
+                "repair or remove corrupt checkpoint files, then query the daemon for live readiness".into()
+            } else {
+                "query the daemon for live readiness, or wait for a fresh checkpoint to be persisted".into()
+            },
+        )
+    } else if let Some(record) = degraded_records
+        .iter()
+        .max_by_key(|record| record.checkpoint.checkpointed_at_unix)
+        .copied()
+    {
+        let reason = offline_checkpoint_reason(&record.checkpoint)
+            .unwrap_or_else(|| "last known degraded".into());
+        (
+            if stale_records.is_empty() {
+                "offline_last_known_degraded"
+            } else {
+                "offline_snapshot_stale"
+            }
+            .to_string(),
+            Some(reason.clone()),
+            "historical".to_string(),
+            true,
+            Some(record.checkpoint.checkpointed_at_unix),
+            format!(
+                "Last known control-plane readiness was degraded for {}/{}: {}.",
+                record.project_id, record.environment, reason
+            ),
+            if lease_view.lease_state_available {
+                "query the daemon for live readiness before taking repair action based on this snapshot".into()
+            } else {
+                "query the daemon for live readiness and inspect persisted leader lease state before acting".into()
+            },
+        )
+    } else {
+        (
+            if stale_records.is_empty() {
+                "offline_last_known_ready"
+            } else {
+                "offline_snapshot_stale"
+            }
+            .to_string(),
+            stale_records.first().map(|_| "snapshot stale".to_string()),
+            "none".to_string(),
+            false,
+            None,
+            if stale_records.is_empty() {
+                "Last known control-plane readiness was ready when the persisted snapshot was written.".into()
+            } else {
+                "Last known control-plane readiness was ready, but the persisted snapshot is stale."
+                    .into()
+            },
+            "query the daemon for live readiness if you need current control-plane truth".into(),
+        )
+    };
+
+    let active_failure = records.is_empty() || !degraded_records.is_empty();
+    let confidence = offline_confidence(
+        records.len(),
+        corrupt_count,
+        snapshot_age_ms,
+        lease_view.lease_state_available,
+    );
+    let last_successful_convergence_unix = records
+        .iter()
+        .filter_map(|record| record.checkpoint.last_successful_convergence_unix)
+        .max();
+    let convergence_blocked = readiness_status != "ready";
+
+    ReadinessExplainResponse {
+        source: "offline_snapshot".into(),
+        live: false,
+        taxonomy,
+        readiness_status,
+        startup_phase,
+        active_failure,
+        active_failure_reason,
+        failure_scope,
+        historical_failures,
+        convergence_blocked,
+        replay_running: false,
+        leader: lease_view.leader,
+        follower_mode: lease_view.follower_mode,
+        node_role: lease_view.node_role,
+        leadership_healthy: lease_view.leadership_healthy,
+        leadership_status: lease_view.leadership_status,
+        last_successful_convergence_unix,
+        last_historical_failure_unix,
+        snapshot_updated_unix,
+        snapshot_age_ms,
+        confidence,
+        warning: Some(OFFLINE_WARNING.into()),
+        operator_interpretation,
+        safe_next_action,
+    }
+}
+
+fn load_offline_checkpoint_records(storage_root: &Path) -> Vec<OfflineCheckpointRecord> {
+    let mut records = Vec::new();
+    let projects_root = storage_root.join("projects");
+    let Ok(projects) = fs::read_dir(projects_root) else {
+        return records;
+    };
+    for project in projects.flatten() {
+        let project_id = project.file_name().to_string_lossy().into_owned();
+        let envs_dir = project.path().join("environments");
+        let Ok(envs) = fs::read_dir(envs_dir) else {
+            continue;
+        };
+        for env_entry in envs.flatten() {
+            let environment = env_entry.file_name().to_string_lossy().into_owned();
+            let env = EnvironmentPaths::new(storage_root, &project_id, &environment);
+            let checkpoint = match ConvergenceCheckpointStore::new(env).load() {
+                Ok(Some(checkpoint)) => checkpoint,
+                _ => continue,
+            };
+            records.push(OfflineCheckpointRecord {
+                project_id: project_id.clone(),
+                environment,
+                checkpoint,
+            });
+        }
+    }
+    records
+}
+
+fn offline_corrupt_checkpoint_count(storage_root: &Path) -> usize {
+    let mut count = 0;
+    let projects_root = storage_root.join("projects");
+    let Ok(projects) = fs::read_dir(projects_root) else {
+        return 0;
+    };
+    for project in projects.flatten() {
+        let project_id = project.file_name().to_string_lossy().into_owned();
+        let envs_dir = project.path().join("environments");
+        let Ok(envs) = fs::read_dir(envs_dir) else {
+            continue;
+        };
+        for env_entry in envs.flatten() {
+            let environment = env_entry.file_name().to_string_lossy().into_owned();
+            let env = EnvironmentPaths::new(storage_root, &project_id, &environment);
+            if ConvergenceCheckpointStore::new(env).load().is_err() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn checkpoint_readyz_status(checkpoint: &PersistedEnvironmentCheckpoint) -> &str {
+    checkpoint
+        .extra
+        .get("readyz_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| {
+            if checkpoint.readyz_reasons.is_empty() {
+                "ready"
+            } else {
+                "degraded"
+            }
+        })
+}
+
+fn offline_checkpoint_reason(checkpoint: &PersistedEnvironmentCheckpoint) -> Option<String> {
+    checkpoint
+        .readyz_reasons
+        .first()
+        .cloned()
+        .or_else(|| checkpoint.last_convergence_error.clone())
+}
+
+fn offline_checkpoint_stale(checkpoint: &PersistedEnvironmentCheckpoint, now_unix: u64) -> bool {
+    now_unix
+        .saturating_sub(checkpoint.checkpointed_at_unix)
+        .saturating_mul(1_000)
+        > OFFLINE_SNAPSHOT_STALE_AFTER_MS.max(READYZ_CACHE_STALE_AFTER_MS)
+}
+
+fn offline_confidence(
+    usable_snapshots: usize,
+    corrupt_snapshots: usize,
+    snapshot_age_ms: Option<u64>,
+    lease_state_available: bool,
+) -> String {
+    if usable_snapshots == 0 {
+        return "low".into();
+    }
+    if corrupt_snapshots > 0
+        || !lease_state_available
+        || snapshot_age_ms.is_some_and(|age| age > OFFLINE_SNAPSHOT_STALE_AFTER_MS)
+    {
+        return "medium".into();
+    }
+    "high".into()
+}
+
+#[derive(Debug)]
+struct OfflineLeaseView {
+    leader: bool,
+    follower_mode: bool,
+    node_role: String,
+    leadership_healthy: bool,
+    leadership_status: String,
+    startup_phase: String,
+    lease_state_available: bool,
+}
+
+fn offline_lease_view(storage_root: &Path, now_unix: u64) -> OfflineLeaseView {
+    let local_node = NodeMetadataStore::new(storage_root).load().ok().flatten();
+    let lease = LeaderLeaseStore::new(storage_root).load().ok().flatten();
+    let cluster = ClusterTopologyStore::new(storage_root)
+        .load()
+        .ok()
+        .unwrap_or_default();
+    let active_reconcilers = cluster
+        .nodes
+        .iter()
+        .filter(|node| node.active_reconciler)
+        .count();
+    let leader_claims = cluster
+        .nodes
+        .iter()
+        .filter(|node| node.role == "leader" && node.active_reconciler)
+        .count();
+    let mut epochs = cluster
+        .nodes
+        .iter()
+        .filter_map(|node| (node.lease_epoch_seen > 0).then_some(node.lease_epoch_seen))
+        .collect::<Vec<_>>();
+    epochs.sort_unstable();
+    epochs.dedup();
+    let lease_state_available = local_node.is_some() || lease.is_some();
+    let leader = matches!(
+        (&local_node, &lease),
+        (Some(node), Some(lease))
+            if lease.leader_node_id == node.node_id && lease.expires_at_unix > now_unix
+    );
+    let follower_mode = matches!(
+        (&local_node, &lease),
+        (Some(node), Some(lease))
+            if lease.leader_node_id != node.node_id && lease.expires_at_unix > now_unix
+    );
+    let node_role = if leader {
+        "leader".to_string()
+    } else if follower_mode {
+        "follower".to_string()
+    } else if lease_state_available {
+        "candidate".to_string()
+    } else {
+        "unknown".to_string()
+    };
+    let leadership_uncertain =
+        leader_claims > 1 || active_reconcilers > 1 || epochs.len() > 1 || node_role == "unknown";
+    let leadership_status = if leadership_uncertain {
+        "uncertain".to_string()
+    } else if leader {
+        "active_leader".to_string()
+    } else if follower_mode {
+        "follower".to_string()
+    } else {
+        "candidate".to_string()
+    };
+    let startup_phase = if leader {
+        "leader_active".into()
+    } else if follower_mode {
+        "follower".into()
+    } else if lease_state_available {
+        "leader_acquiring".into()
+    } else {
+        "unknown".into()
+    };
+    OfflineLeaseView {
+        leader,
+        follower_mode,
+        node_role,
+        leadership_healthy: !leadership_uncertain,
+        leadership_status,
+        startup_phase,
+        lease_state_available,
+    }
 }
 
 fn control_plane_leader_view_from_storage(
@@ -3852,7 +4266,26 @@ fn render_control_plane_lease(view: &ControlPlaneLeaseView) -> String {
 
 fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
     let mut output = String::new();
-    output.push_str(&format!("Readiness: {}\n", view.readiness_status));
+    if view.live {
+        output.push_str(&format!("Readiness: {}\n", view.readiness_status));
+    } else {
+        output.push_str(&format!(
+            "Last known readiness: {}\n",
+            view.readiness_status
+        ));
+        output.push_str("Source: offline snapshot\n");
+        output.push_str("Warning: daemon was not queried\n");
+        if let Some(timestamp) = view.snapshot_updated_unix {
+            output.push_str(&format!("Snapshot updated: {timestamp}\n"));
+        }
+        if let Some(age_ms) = view.snapshot_age_ms {
+            output.push_str(&format!("Snapshot age ms: {age_ms}\n"));
+        }
+        output.push_str(&format!("Confidence: {}\n", view.confidence));
+        if let Some(warning) = view.warning.as_deref() {
+            output.push_str(&format!("Offline warning: {warning}\n"));
+        }
+    }
     output.push_str(&format!("Startup phase: {}\n", view.startup_phase));
     output.push_str(&format!(
         "Active failure: {}\n",
@@ -4367,6 +4800,8 @@ mod tests {
 
     fn readiness_explain_fixture() -> ReadinessExplainResponse {
         ReadinessExplainResponse {
+            source: "daemon_api".into(),
+            live: true,
             taxonomy: "ready_no_active_failure".into(),
             readiness_status: "ready".into(),
             startup_phase: "leader_active".into(),
@@ -4383,6 +4818,10 @@ mod tests {
             leadership_status: "active_leader".into(),
             last_successful_convergence_unix: Some(200),
             last_historical_failure_unix: Some(150),
+            snapshot_updated_unix: None,
+            snapshot_age_ms: None,
+            confidence: "high".into(),
+            warning: None,
             operator_interpretation:
                 "Control-plane readiness is healthy. Historical failures exist, but there is no active blocker."
                     .into(),
@@ -4506,6 +4945,7 @@ mod tests {
             Command::ReadinessExplain {
                 config_path: PathBuf::from("/tmp/forge.conf"),
                 json: false,
+                offline: false,
             }
         );
     }
@@ -4520,12 +4960,33 @@ mod tests {
             Command::ReadinessExplain {
                 config_path: PathBuf::from("forge.conf"),
                 json: true,
+                offline: false,
             }
         );
     }
 
     #[test]
-    fn local_readiness_explain_uses_daemon_endpoint() {
+    fn readiness_explain_offline_json_command_parses_in_any_order() {
+        let parsed = ParsedArgs::parse(vec![
+            "readiness".into(),
+            "explain".into(),
+            "--offline".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::ReadinessExplain {
+                config_path: PathBuf::from("forge.conf"),
+                json: true,
+                offline: true,
+            }
+        );
+    }
+
+    #[test]
+    fn live_readiness_explain_uses_daemon_endpoint() {
         let response = readiness_explain_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4561,9 +5022,118 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_local_readiness_explain(&config_path, true).unwrap();
+        let loaded = load_live_readiness_explain(&config_path, true).unwrap();
         server.join().unwrap();
         assert_eq!(loaded, response);
+    }
+
+    #[test]
+    fn offline_readiness_explain_reads_persisted_snapshot() {
+        let root = temp_root("offline-readiness-explain");
+        let config_path = root.join("forge.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:1\nbearer_token=test-token\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: now_unix(),
+                last_successful_convergence_unix: Some(777),
+                readyz_reasons: vec!["convergence stalled".into()],
+                extra: std::collections::BTreeMap::from([
+                    (
+                        "readyz_status".into(),
+                        serde_json::Value::String("degraded".into()),
+                    ),
+                    (
+                        "startup_phase".into(),
+                        serde_json::Value::String("leader_active".into()),
+                    ),
+                ]),
+                ..PersistedEnvironmentCheckpoint::default()
+            })
+            .unwrap();
+
+        let loaded = load_offline_readiness_explain(&config_path, true).unwrap();
+        assert_eq!(loaded.source, "offline_snapshot");
+        assert!(!loaded.live);
+        assert_eq!(loaded.readiness_status, "degraded");
+        assert_eq!(loaded.startup_phase, "leader_active");
+        assert_eq!(
+            loaded.active_failure_reason.as_deref(),
+            Some("convergence stalled")
+        );
+        assert_eq!(loaded.last_successful_convergence_unix, Some(777));
+        assert_eq!(loaded.warning.as_deref(), Some(OFFLINE_WARNING));
+    }
+
+    #[test]
+    fn offline_readiness_explain_does_not_claim_current_readiness() {
+        let mut view = readiness_explain_fixture();
+        view.source = "offline_snapshot".into();
+        view.live = false;
+        view.warning = Some(OFFLINE_WARNING.into());
+        view.snapshot_updated_unix = Some(321);
+        view.snapshot_age_ms = Some(999);
+
+        let rendered = render_readiness_explain(&view);
+        assert!(rendered.contains("Last known readiness: ready"));
+        assert!(rendered.contains("Source: offline snapshot"));
+        assert!(rendered.contains("Warning: daemon was not queried"));
+        assert!(!rendered.contains("Readiness: ready\n"));
+    }
+
+    #[test]
+    fn unreachable_live_readiness_explain_suggests_offline() {
+        let root = temp_root("readiness-explain-unreachable-daemon");
+        let config_path = root.join("forge.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:1\nbearer_token=test-token\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+
+        let err = run_readiness_explain(None, config_path, true, false, false).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("live readiness explain failed"));
+        assert!(rendered.contains("forge readiness explain --offline"));
+    }
+
+    #[test]
+    fn offline_readiness_explain_handles_missing_or_corrupt_snapshot_safely() {
+        let root = temp_root("offline-readiness-corrupt");
+        let config_path = root.join("forge.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:1\nbearer_token=test-token\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        std::fs::create_dir_all(env.checkpoint_file().parent().unwrap()).unwrap();
+        std::fs::write(env.checkpoint_file(), "{not-json").unwrap();
+
+        let loaded = load_offline_readiness_explain(&config_path, true).unwrap();
+        assert_eq!(loaded.source, "offline_snapshot");
+        assert!(!loaded.live);
+        assert_eq!(loaded.readiness_status, "unknown");
+        assert_eq!(loaded.confidence, "low");
+        assert_eq!(
+            loaded.active_failure_reason.as_deref(),
+            Some("checkpoint corrupt")
+        );
     }
 
     #[test]

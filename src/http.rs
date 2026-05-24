@@ -5708,6 +5708,8 @@ pub mod metrics_endpoint_exposes_cached_json {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let explanation: ReadinessExplainResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(explanation.source, "daemon_api");
+        assert!(explanation.live);
         assert_eq!(explanation.taxonomy, "ready_no_active_failure");
         assert_eq!(explanation.readiness_status, "ready");
         assert_eq!(explanation.safe_next_action, "no action required");

@@ -133,6 +133,8 @@ pub fn explain(readyz: &ReadyzResponse, metrics: &MetricsResponse) -> ReadinessE
         operator_text(&taxonomy, &active_failure_reason, metrics);
 
     ReadinessExplainResponse {
+        source: "daemon_api".into(),
+        live: true,
         taxonomy,
         readiness_status,
         startup_phase,
@@ -149,6 +151,10 @@ pub fn explain(readyz: &ReadyzResponse, metrics: &MetricsResponse) -> ReadinessE
         leadership_status,
         last_successful_convergence_unix: metrics.convergence_last_success_unix,
         last_historical_failure_unix,
+        snapshot_updated_unix: None,
+        snapshot_age_ms: None,
+        confidence: "high".into(),
+        warning: None,
         operator_interpretation,
         safe_next_action,
     }
