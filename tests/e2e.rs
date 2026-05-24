@@ -469,6 +469,10 @@ fn dogfood_redis_restore_recovers_backup_time_state() {
 
     let restore = harness.restore_backup(&backup_id);
     assert_eq!(restore["restored_generation"], 2);
+    common::wait_for_container_health_or_port("prod-api-redis-gen-2", 6379, Duration::from_secs(5))
+        .expect("restored redis should accept connections before verification");
+    common::wait_for_container_health_or_port("prod-api-api-gen-2", 3000, Duration::from_secs(5))
+        .expect("restored api should accept connections before verification");
     assert_eq!(
         harness
             .container_http_text("prod-api-api-gen-2", "counter")
@@ -1512,23 +1516,32 @@ impl E2eHarness {
     }
 
     fn container_http_text(&self, container_name: &str, path: &str) -> String {
-        let output = docker_output(&[
-            "exec",
-            container_name,
-            "python",
-            "-c",
-            &format!(
-                "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:3000/{}').read().decode(), end='')",
-                path.trim_start_matches('/')
-            ),
-        ])
-        .expect("container http request should succeed");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        common::wait_for_container_health_or_port(container_name, 3000, Duration::from_secs(5))
+            .expect("container http target should accept connections before request");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = docker_output(&[
+                "exec",
+                container_name,
+                "python",
+                "-c",
+                &format!(
+                    "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:3000/{}').read().decode(), end='')",
+                    path.trim_start_matches('/')
+                ),
+            ])
+            .expect("container http request should succeed");
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let connection_refused = stderr.contains("ConnectionRefusedError")
+                || stderr.contains("URLError: <urlopen error [Errno 111] Connection refused>");
+            if !connection_refused || std::time::Instant::now() >= deadline {
+                panic!("{stderr}");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn run_convergence_ticks(&mut self, ticks: &[u64]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1664,15 +1677,8 @@ impl E2eHarness {
     }
 
     fn wait_for_api_ready(&self) {
-        for _ in 0..40 {
-            if let Ok(response) = self.http_client.get(self.api_url("readyz")).send() {
-                if response.status().is_success() {
-                    return;
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        panic!("api readyz did not become ready");
+        common::wait_for_http_readyz(&self.api_url("readyz"), Duration::from_secs(4))
+            .expect("api readyz should accept requests before tests proceed");
     }
 
     fn wait_for_readyz_status(&self, expected: &str, timeout: Duration) -> ReadyzResponse {
@@ -2007,12 +2013,27 @@ fn docker_stdout(args: &[&str]) -> Result<String, String> {
 }
 
 fn docker_host_port(container_name: &str, container_port: u16) -> Result<u16, String> {
-    let output = docker_stdout(&["port", container_name, &container_port.to_string()])?;
-    output
-        .lines()
-        .find_map(|line| line.rsplit(':').next())
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| format!("unable to parse mapped host port from `{output}`"))
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last_error = "no docker port response".to_string();
+    loop {
+        match docker_stdout(&["port", container_name, &container_port.to_string()]) {
+            Ok(output) => {
+                if let Some(port) = output
+                    .lines()
+                    .find_map(|line| line.rsplit(':').next())
+                    .and_then(|value| value.parse::<u16>().ok())
+                {
+                    return Ok(port);
+                }
+                last_error = format!("unable to parse mapped host port from `{output}`");
+            }
+            Err(err) => last_error = err,
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(last_error);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn docker_container_ip(name: &str, network_name: &str) -> String {

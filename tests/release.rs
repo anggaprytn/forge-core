@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+#[path = "integration/common.rs"]
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -375,12 +379,15 @@ fn spawn_ok_server() -> (String, thread::JoinHandle<()>) {
             };
         }
     });
+    common::wait_for_http_readyz(&url, Duration::from_secs(1))
+        .expect("test ok server should accept http requests before use");
     (url, handle)
 }
 
 fn spawn_readyz_sequence_server(statuses: Vec<u16>) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    let port = listener.local_addr().unwrap().port();
     listener
         .set_nonblocking(true)
         .expect("listener should support nonblocking");
@@ -417,6 +424,8 @@ fn spawn_readyz_sequence_server(statuses: Vec<u16>) -> (String, thread::JoinHand
             }
         }
     });
+    common::wait_for_tcp_accept("127.0.0.1", port, Duration::from_secs(1))
+        .expect("test readyz server should accept tcp connections before use");
     (url, handle)
 }
 
