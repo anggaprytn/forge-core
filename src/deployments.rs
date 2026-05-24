@@ -5487,8 +5487,12 @@ pub mod deployment_fails_if_http_health_invalid {
         let root = test_root("http-invalid");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker =
-            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut outputs = success_outputs(1);
+        outputs.insert(
+            outputs.len() - 1,
+            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+        );
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(outputs));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: false,
@@ -5537,18 +5541,18 @@ pub mod progressive_promotion_guards {
         let root = test_root("promotion-requires-stable-uptime");
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queued_record(&queue);
-        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(vec![
-            format!("image_ref=forge/api:production-gen-1"),
-            "prod-api-gen-1".into(),
-            String::new(),
-            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
-            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
-            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
-            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
-            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
-            inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
-            String::new(),
-        ]));
+        // Keep this fixture aligned with the docker command sequence in `success_outputs()`.
+        // `create_container` and `start_container` do not return meaningful stdout; if an
+        // extra placeholder is inserted before the first inspect output, the test will start
+        // failing with `missing container name` from the production parser.
+        let mut outputs = success_outputs(1);
+        for _ in 0..8 {
+            outputs.insert(
+                outputs.len() - 1,
+                inspection_output(1, "running", true, 0, &[("forge-test", "172.18.0.2")]),
+            );
+        }
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(outputs));
         let mut probes = TestProbeRuntime {
             tcp_ok: true,
             http_ok: true,

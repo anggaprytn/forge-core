@@ -53,7 +53,8 @@ pub const READYZ_CACHE_STALE_AFTER_MS: u64 = 5_000;
 pub const READYZ_HANDLER_TIMEOUT_MS: u64 = 500;
 const READYZ_REFRESH_INTERVAL_MS: u64 = 250;
 const CONVERGENCE_STALLED_AFTER_MS: u64 = 15_000;
-const FILESYSTEM_SCAN_BUDGET_MS: u64 = 100;
+// This bounds the background readiness refresh loop, not the /readyz request path.
+const FILESYSTEM_SCAN_BUDGET_MS: u64 = 500;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_INITIAL_BACKOFF_MS: u64 = 250;
 const CIRCUIT_BREAKER_MAX_BACKOFF_MS: u64 = 5_000;
@@ -500,6 +501,7 @@ pub struct Daemon<D, R, A> {
     cluster_signals: ClusterSignalState,
     reconciliation: ReconciliationDiagnostics,
     startup_phase: StartupPhase,
+    startup_started_unix: u64,
     startup_recovery_duration_ms: u64,
     convergence_start_blocked: bool,
 }
@@ -557,6 +559,7 @@ where
             cluster_signals: ClusterSignalState::default(),
             reconciliation: ReconciliationDiagnostics::default(),
             startup_phase: StartupPhase::Booting,
+            startup_started_unix: current_unix_timestamp(),
             startup_recovery_duration_ms: 0,
             convergence_start_blocked: true,
         }
@@ -564,6 +567,7 @@ where
 
     pub fn start(&mut self) -> Result<(), DaemonError> {
         let startup_started = Instant::now();
+        self.startup_started_unix = current_unix_timestamp();
         let bootstrap = BootstrapContext::new(self.config.clone());
         match bootstrap.initialize()? {
             BootstrapState::WaitingForStorage(path) => {
@@ -1344,8 +1348,10 @@ where
         ) {
             return;
         }
-        self.refresh_leadership(current_unix_timestamp());
-        self.persist_local_cluster_node(current_unix_timestamp());
+        let now_unix = current_unix_timestamp();
+        self.refresh_leadership(now_unix);
+        self.refresh_runtime_startup_phase(now_unix);
+        self.persist_local_cluster_node(now_unix);
     }
 
     fn reconciliation_enabled(&self, now_unix: u64) -> bool {
@@ -1565,6 +1571,21 @@ where
                     }),
                 },
             );
+        }
+    }
+
+    fn refresh_runtime_startup_phase(&mut self, now_unix: u64) {
+        if self.state != DaemonState::Ready {
+            return;
+        }
+        if self.reconciliation_enabled(now_unix) && !self.convergence_start_blocked {
+            self.set_startup_phase(StartupPhase::LeaderActive);
+        } else if self.local_role(now_unix) == "follower" {
+            self.set_startup_phase(StartupPhase::Follower);
+        } else if self.convergence_start_blocked {
+            self.set_startup_phase(StartupPhase::Degraded);
+        } else {
+            self.set_startup_phase(StartupPhase::LeaderAcquiring);
         }
     }
 
@@ -2260,23 +2281,32 @@ where
                     return None;
                 }
                 if historical_startup_failure {
-                    let message = summary
-                        .as_ref()
-                        .and_then(|summary| summary.blocking_reason.clone())
-                        .unwrap_or_else(|| "route activation verification failed".into());
-                    return Some(ReadyzReason {
-                        project_id: project_id.into(),
-                        environment: environment.into(),
-                        generation: Some(generation),
-                        active: true,
-                        unresolved: true,
-                        source: "runtime_state_cache".into(),
-                        marker: "route_activation_verification_failed".into(),
-                        message,
-                        last_checked_unix: Some(now_unix),
-                        cache_age_ms: 0,
-                        diagnostics: None,
-                    });
+                    let current_startup_failure = runtime_state
+                        .degraded_since_unix
+                        .is_some_and(|value| value >= self.startup_started_unix.saturating_sub(1));
+                    if current_startup_failure {
+                        let message = summary
+                            .as_ref()
+                            .and_then(|summary| summary.blocking_reason.clone())
+                            .unwrap_or_else(|| "route activation verification failed".into());
+                        return Some(ReadyzReason {
+                            project_id: project_id.into(),
+                            environment: environment.into(),
+                            generation: Some(generation),
+                            active: true,
+                            unresolved: true,
+                            source: "runtime_state_cache".into(),
+                            marker: "route_activation_verification_failed".into(),
+                            message,
+                            last_checked_unix: Some(now_unix),
+                            cache_age_ms: 0,
+                            diagnostics: None,
+                        });
+                    }
+                    // A startup recovery failure is historical unless we can still confirm an
+                    // active route mismatch. Keep the marker on disk for diagnostics, but do not
+                    // let an unverified stale error pin `/readyz` degraded forever.
+                    return None;
                 }
                 let message = summary
                     .as_ref()
@@ -4037,6 +4067,59 @@ pub mod daemon_readyz_route_repair_resolution {
 
         assert_eq!(daemon.readyz_status(), "ready");
         assert!(daemon.readyz_response().reasons.is_empty());
+    }
+
+    #[test]
+    fn readyz_ignores_unverifiable_historical_startup_recovery_route_failure() {
+        let root =
+            test_root("readyz-ignores-unverifiable-historical-startup-recovery-route-failure");
+        seed_runtime_state(
+            &root,
+            RuntimeHealthState::Degraded,
+            "startup_route_repair_failed",
+            Some("route_activation_verification_failed"),
+        );
+        DiagnosticsStore::new(EnvironmentPaths::new(&root, "api", "production"), 1)
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some("dep-1".into()),
+                failure_stage: "startup_recovery".into(),
+                failure_reason: "route activation verification failed".into(),
+                blocking_reason: Some("route activation verification failed".into()),
+                container_name: "production-api-gen-1".into(),
+                failed_service_name: Some("default".into()),
+                blocking_service_name: Some("default".into()),
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_status(), "ready");
+        assert!(
+            !daemon
+                .readyz_response()
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "route_activation_verification_failed")
+        );
     }
 
     #[test]
@@ -6807,6 +6890,23 @@ mod daemon_control_plane_durability {
         assert_eq!(first.role, "follower");
         assert!(second.last_seen_unix > first.last_seen_unix);
         assert!(!second.active_reconciler);
+    }
+
+    #[test]
+    fn heartbeat_promotes_leader_acquiring_to_leader_active() {
+        let root = test_root("heartbeat-promotes-leader-acquiring-to-leader-active");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.startup_phase = StartupPhase::LeaderAcquiring;
+
+        daemon.heartbeat_tick();
+
+        assert_eq!(daemon.startup_phase(), StartupPhase::LeaderActive);
     }
 
     #[test]
