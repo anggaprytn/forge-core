@@ -31,14 +31,12 @@ use crate::api::{
 use crate::auth::{
     AuthSource, AuthenticatedPrincipal, CliTokenVerifier, TokenIssueRequest, TokenStoreError,
 };
-use crate::daemon::{
-    ControlPlaneSnapshot, Daemon, DaemonReadyzCache, DaemonState, READYZ_CACHE_STALE_AFTER_MS,
-};
+use crate::daemon::{ControlPlaneSnapshot, Daemon, DaemonReadyzCache, DaemonState};
 use crate::github::{
     GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
 };
 use crate::projects::{ProjectRegistryStore, project_registry_error_response};
-use crate::readiness::explain_snapshot;
+use crate::readiness::{effective_snapshot, explain_snapshot};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::status::ProjectEnvironmentStatus;
@@ -1701,21 +1699,7 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
     let started = Instant::now();
     let readiness = match state.control_plane_cache.read() {
-        Ok(cache) => {
-            if unix_now_ms().saturating_sub(cache.readyz.updated_at_unix_ms)
-                > READYZ_CACHE_STALE_AFTER_MS
-            {
-                ReadyzResponse {
-                    status: "degraded".into(),
-                    startup_phase: "degraded".into(),
-                    active_failure: true,
-                    reason: Some("readiness cache stale".into()),
-                    reasons: Vec::new(),
-                }
-            } else {
-                cache.readyz.response.clone()
-            }
-        }
+        Ok(cache) => effective_snapshot(&cache).readyz,
         Err(_) => ReadyzResponse {
             status: "degraded".into(),
             startup_phase: "degraded".into(),
@@ -1740,7 +1724,10 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
 async fn get_metrics(State(state): State<HttpState>) -> Response {
     let request_id = next_request_id();
     match state.control_plane_cache.read() {
-        Ok(cache) => json_response(StatusCode::OK, &request_id, Json(cache.metrics.clone())),
+        Ok(cache) => {
+            let effective = effective_snapshot(&cache);
+            json_response(StatusCode::OK, &request_id, Json(effective.metrics))
+        }
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &request_id,
@@ -5675,7 +5662,8 @@ pub mod http_error_response_is_machine_readable {
 #[cfg(test)]
 pub mod metrics_endpoint_exposes_cached_json {
     use super::*;
-    use crate::api::{MetricsResponse, ReadinessExplainResponse};
+    use crate::api::{ClusterDiagnostics, MetricsResponse, ReadinessExplainResponse};
+    use crate::daemon::READYZ_CACHE_STALE_AFTER_MS;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
@@ -5723,6 +5711,103 @@ pub mod metrics_endpoint_exposes_cached_json {
         assert_eq!(explanation.taxonomy, "ready_no_active_failure");
         assert_eq!(explanation.readiness_status, "ready");
         assert_eq!(explanation.safe_next_action, "no action required");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_uses_readyz_semantics_for_phase_and_history() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    startup_phase: "leader_active".into(),
+                    active_failure: false,
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                readiness_status: "ready".into(),
+                startup_phase: "degraded".into(),
+                leader: true,
+                convergence_last_failure_historical_unix: Some(123),
+                convergence_failures_total: 1,
+                cluster: ClusterDiagnostics {
+                    local_role: "leader".into(),
+                    ..ClusterDiagnostics::default()
+                },
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.readiness_status, "ready");
+        assert_eq!(metrics.startup_phase, "leader_active");
+        assert!(!metrics.convergence_active_failure);
+        assert_eq!(metrics.convergence_last_failure_historical_unix, Some(123));
+        assert_eq!(metrics.convergence_failures_total, 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_explain_endpoint_marks_stale_cache_consistently() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    startup_phase: "leader_active".into(),
+                    active_failure: false,
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms().saturating_sub(READYZ_CACHE_STALE_AFTER_MS + 1),
+            },
+            metrics: MetricsResponse {
+                readiness_status: "ready".into(),
+                startup_phase: "leader_active".into(),
+                cluster: ClusterDiagnostics {
+                    local_role: "leader".into(),
+                    ..ClusterDiagnostics::default()
+                },
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readiness/explain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let explanation: ReadinessExplainResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(explanation.readiness_status, "degraded");
+        assert_eq!(explanation.startup_phase, "degraded");
+        assert!(explanation.active_failure);
+        assert_eq!(
+            explanation.active_failure_reason.as_deref(),
+            Some("readiness cache stale")
+        );
     }
 
     #[tokio::test]

@@ -40,15 +40,14 @@ use forge_core::http::{
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
-use forge_core::readiness::explain;
 use forge_core::reconciliation::{
     ReconciliationIntentStatus, ReconciliationStore, ReplayOptions, intent_request_for_storage_root,
 };
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
 use forge_core::storage::{
-    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, ConvergenceCheckpointStore, LeaderLeaseStore,
-    NodeMetadataStore, PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
+    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, LeaderLeaseStore, NodeMetadataStore,
+    PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
 };
 use forge_core::upgrade::{
     MANIFEST_SCHEMA_VERSION, STORAGE_COMPATIBILITY_VERSION, UpgradeOptions, apply as apply_upgrade,
@@ -3667,147 +3666,11 @@ fn load_local_readiness_explain(
     }
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
-    let (local_node_id, lease, cluster) =
-        load_local_control_plane_state(config_path, config_path_explicit)?;
-    let reconciliation = ReconciliationStore::new(&config.storage_root).diagnostics();
-    let now_unix = now_unix();
-    let mut latest_checkpoint_unix = None;
-    let mut startup_phase = if lease.as_ref().is_some_and(|value| {
-        value.leader_node_id == local_node_id && value.expires_at_unix > now_unix
-    }) {
-        "leader_active".to_string()
-    } else if lease
-        .as_ref()
-        .is_some_and(|value| value.expires_at_unix > now_unix)
-    {
-        "follower".to_string()
-    } else {
-        "leader_acquiring".to_string()
-    };
-    let mut last_successful_convergence_unix = None;
-    let mut last_failure_historical_unix = None;
-    let mut active_failure_reason = None;
-    for (project_id, environment) in local_environment_pairs(&config.storage_root)? {
-        let env = forge_core::storage::EnvironmentPaths::new(
-            &config.storage_root,
-            &project_id,
-            &environment,
-        );
-        let Some(checkpoint) = ConvergenceCheckpointStore::new(env)
-            .load()
-            .map_err(|err| CliError::Usage(err.to_string()))?
-        else {
-            continue;
-        };
-        latest_checkpoint_unix = Some(
-            latest_checkpoint_unix
-                .unwrap_or(0)
-                .max(checkpoint.checkpointed_at_unix),
-        );
-        last_successful_convergence_unix =
-            last_successful_convergence_unix.max(checkpoint.last_successful_convergence_unix);
-        if let Some(value) = checkpoint
-            .extra
-            .get("startup_phase")
-            .and_then(|value| value.as_str())
-        {
-            startup_phase = value.to_string();
-        }
-        if checkpoint
-            .extra
-            .get("readyz_status")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| value == "degraded")
-            || !checkpoint.readyz_reasons.is_empty()
-        {
-            last_failure_historical_unix = Some(
-                last_failure_historical_unix
-                    .unwrap_or(0)
-                    .max(checkpoint.checkpointed_at_unix),
-            );
-        }
-        let checkpoint_age_ms = now_unix
-            .saturating_sub(checkpoint.checkpointed_at_unix)
-            .saturating_mul(1_000);
-        if checkpoint_age_ms > forge_core::daemon::READYZ_CACHE_STALE_AFTER_MS {
-            active_failure_reason.get_or_insert("readiness cache stale".into());
-        } else if active_failure_reason.is_none() {
-            active_failure_reason = checkpoint.readyz_reasons.first().cloned().or_else(|| {
-                checkpoint
-                    .extra
-                    .get("readyz_status")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| *value == "degraded")
-                    .map(|_| "cached readiness degraded".to_string())
-            });
-        }
-    }
-    let readiness_cache_age_ms = latest_checkpoint_unix
-        .map(|value| now_unix.saturating_sub(value).saturating_mul(1_000))
-        .unwrap_or(0);
-    let leader = lease.as_ref().is_some_and(|value| {
-        value.leader_node_id == local_node_id && value.expires_at_unix > now_unix
-    });
-    let follower_mode = lease.as_ref().is_some_and(|value| {
-        value.leader_node_id != local_node_id && value.expires_at_unix > now_unix
-    });
-    let convergence_start_blocked = reconciliation.replay_in_progress
-        || reconciliation.replay_paused
-        || reconciliation.replay_incomplete
-        || reconciliation.lease_fencing_failures > 0;
-    let readyz = ReadyzResponse {
-        status: if active_failure_reason.is_some() {
-            "degraded".into()
-        } else {
-            "ready".into()
-        },
-        startup_phase: startup_phase.clone(),
-        active_failure: active_failure_reason.is_some(),
-        reason: active_failure_reason.clone(),
-        reasons: Vec::new(),
-    };
-    let metrics = MetricsResponse {
-        readiness_status: if active_failure_reason.is_some() {
-            "degraded".into()
-        } else {
-            "ready".into()
-        },
-        readiness_reason: active_failure_reason.clone(),
-        startup_phase,
-        convergence_last_success_unix: last_successful_convergence_unix,
-        convergence_active_failure: active_failure_reason.is_some(),
-        convergence_active_failure_reason: active_failure_reason.clone(),
-        convergence_last_failure_historical_unix: last_failure_historical_unix,
-        readiness_cache_age_ms,
-        leader,
-        lease_epoch: lease.as_ref().map(|value| value.lease_epoch).unwrap_or(0),
-        lease_age_ms: lease_age_ms(lease.as_ref(), now_unix),
-        lease_expiry_ms: lease_expiry_ms(lease.as_ref(), now_unix),
-        convergence_owner: lease
-            .as_ref()
-            .map(|value| value.leader_node_id.clone())
-            .unwrap_or_default(),
-        reconciliation_enabled: leader,
-        follower_mode,
-        pending_intents: reconciliation.pending_intents,
-        replay_queue_depth: reconciliation.replay_queue_depth,
-        replay_in_progress: reconciliation.replay_in_progress,
-        replay_paused: reconciliation.replay_paused,
-        replay_duration_ms: reconciliation.replay_duration_ms,
-        replay_failures_total: reconciliation.replay_failures_total,
-        replay_quarantined_total: reconciliation.replay_quarantined_total,
-        replay_aborted_total: reconciliation.replay_aborted_total,
-        lease_fencing_failures: reconciliation.lease_fencing_failures,
-        unrecoverable_operations: reconciliation.unrecoverable_operations,
-        last_replayed_intent: reconciliation.last_replayed_intent,
-        reconciliation_log_size_bytes: reconciliation.reconciliation_log_size_bytes,
-        convergence_start_blocked,
-        cluster,
-        docker: Default::default(),
-        caddy: Default::default(),
-        ..MetricsResponse::default()
-    };
-    Ok(explain(&readyz, &metrics))
+    let client = ForgeClient::new(
+        format!("http://{}", config.api_bind.trim()),
+        config.bearer_token,
+    );
+    client.get_readiness_explain()
 }
 
 fn control_plane_leader_view_from_storage(
@@ -3998,8 +3861,9 @@ fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
     if let Some(reason) = view.active_failure_reason.as_deref() {
         output.push_str(&format!("Reason: {reason}\n"));
     }
+    output.push_str(&format!("Failure scope: {}\n", view.failure_scope));
     output.push_str(&format!(
-        "Historical failures: {}",
+        "Historical failures: {}\n",
         if view.historical_failures {
             "yes"
         } else {
@@ -4007,9 +3871,8 @@ fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
         }
     ));
     if let Some(timestamp) = view.last_historical_failure_unix {
-        output.push_str(&format!(", last at {timestamp}"));
+        output.push_str(&format!("Last historical failure: {timestamp}\n"));
     }
-    output.push('\n');
     output.push_str(&format!(
         "Convergence: {}\n",
         if view.convergence_blocked {
@@ -4039,6 +3902,9 @@ fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
             "complete"
         }
     ));
+    output.push_str(&format!("Leader: {}\n", view.leader));
+    output.push_str(&format!("Follower mode: {}\n", view.follower_mode));
+    output.push_str(&format!("Node role: {}\n", view.node_role));
     if let Some(timestamp) = view.last_successful_convergence_unix {
         output.push_str(&format!("Last successful convergence: {timestamp}\n"));
     }
@@ -4116,30 +3982,6 @@ fn load_local_control_plane_state(
             ..ClusterDiagnostics::default()
         },
     ))
-}
-
-fn local_environment_pairs(storage_root: &Path) -> Result<Vec<(String, String)>, CliError> {
-    let projects_root = storage_root.join("projects");
-    let Ok(projects) = fs::read_dir(projects_root) else {
-        return Ok(Vec::new());
-    };
-    let mut environments = Vec::new();
-    for project in projects {
-        let project = project.map_err(|err| CliError::Usage(err.to_string()))?;
-        let project_id = project.file_name().to_string_lossy().into_owned();
-        let envs_dir = project.path().join("environments");
-        let Ok(envs) = fs::read_dir(envs_dir) else {
-            continue;
-        };
-        for env in envs {
-            let env = env.map_err(|err| CliError::Usage(err.to_string()))?;
-            environments.push((
-                project_id.clone(),
-                env.file_name().to_string_lossy().into_owned(),
-            ));
-        }
-    }
-    Ok(environments)
 }
 
 fn now_unix() -> u64 {
@@ -4451,6 +4293,8 @@ impl ActiveDeploymentDecider for ResumeActiveDeployments {
 mod tests {
     use super::*;
     use forge_core::storage::LeaseAcquireOutcome;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -4518,6 +4362,31 @@ mod tests {
             domain_summaries: Vec::new(),
             node: None,
             cluster: ClusterDiagnostics::default(),
+        }
+    }
+
+    fn readiness_explain_fixture() -> ReadinessExplainResponse {
+        ReadinessExplainResponse {
+            taxonomy: "ready_no_active_failure".into(),
+            readiness_status: "ready".into(),
+            startup_phase: "leader_active".into(),
+            active_failure: false,
+            active_failure_reason: None,
+            failure_scope: "historical".into(),
+            historical_failures: true,
+            convergence_blocked: false,
+            replay_running: false,
+            leader: true,
+            follower_mode: false,
+            node_role: "leader".into(),
+            leadership_healthy: true,
+            leadership_status: "active_leader".into(),
+            last_successful_convergence_unix: Some(200),
+            last_historical_failure_unix: Some(150),
+            operator_interpretation:
+                "Control-plane readiness is healthy. Historical failures exist, but there is no active blocker."
+                    .into(),
+            safe_next_action: "no action required".into(),
         }
     }
 
@@ -4653,6 +4522,62 @@ mod tests {
                 json: true,
             }
         );
+    }
+
+    #[test]
+    fn local_readiness_explain_uses_daemon_endpoint() {
+        let response = readiness_explain_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response_json = serde_json::to_string(&response).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("GET /readiness/explain HTTP/1.1"));
+            let body = response_json;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let root = temp_root("readiness-explain-local-daemon");
+        let config_path = root.join("forge.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:{}\nbearer_token=test-token\n",
+                root.display(),
+                addr.port()
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_local_readiness_explain(&config_path, true).unwrap();
+        server.join().unwrap();
+        assert_eq!(loaded, response);
+    }
+
+    #[test]
+    fn human_readiness_render_matches_json_semantics() {
+        let rendered = render_readiness_explain(&readiness_explain_fixture());
+        assert!(rendered.contains("Readiness: ready"));
+        assert!(rendered.contains("Startup phase: leader_active"));
+        assert!(rendered.contains("Active failure: no"));
+        assert!(rendered.contains("Failure scope: historical"));
+        assert!(rendered.contains("Historical failures: yes"));
+        assert!(rendered.contains("Last historical failure: 150"));
+        assert!(rendered.contains("Leader: true"));
+        assert!(rendered.contains("Follower mode: false"));
+        assert!(rendered.contains("Operator action: no action required"));
     }
 
     #[test]

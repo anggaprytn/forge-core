@@ -1,8 +1,73 @@
 use crate::api::{MetricsResponse, ReadinessExplainResponse, ReadyzResponse};
 use crate::daemon::{ControlPlaneSnapshot, READYZ_CACHE_STALE_AFTER_MS};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveReadinessSnapshot {
+    pub readyz: ReadyzResponse,
+    pub metrics: MetricsResponse,
+}
 
 pub fn explain_snapshot(snapshot: &ControlPlaneSnapshot) -> ReadinessExplainResponse {
-    explain(&snapshot.readyz.response, &snapshot.metrics)
+    let effective = effective_snapshot(snapshot);
+    explain(&effective.readyz, &effective.metrics)
+}
+
+pub fn effective_snapshot(snapshot: &ControlPlaneSnapshot) -> EffectiveReadinessSnapshot {
+    let cache_age_ms = unix_now_ms().saturating_sub(snapshot.readyz.updated_at_unix_ms);
+    let mut readyz = if cache_age_ms > READYZ_CACHE_STALE_AFTER_MS {
+        ReadyzResponse {
+            status: "degraded".into(),
+            startup_phase: "degraded".into(),
+            active_failure: true,
+            reason: Some("readiness cache stale".into()),
+            reasons: Vec::new(),
+        }
+    } else {
+        snapshot.readyz.response.clone()
+    };
+    readyz.active_failure = readyz.status != "ready";
+
+    let mut metrics = snapshot.metrics.clone();
+    metrics.readiness_cache_age_ms = cache_age_ms;
+    metrics.startup_phase = readyz.startup_phase.clone();
+    metrics.readiness_status = if readyz.status == "ready" {
+        "ready".into()
+    } else {
+        "degraded".into()
+    };
+    let readiness_reason = readyz
+        .reason
+        .clone()
+        .or_else(|| readyz.reasons.first().map(|reason| reason.message.clone()));
+    metrics.readiness_reason = readiness_reason.clone();
+    metrics.convergence_active_failure = readyz.active_failure;
+    metrics.convergence_active_failure_reason = if readyz.active_failure {
+        readiness_reason
+    } else {
+        None
+    };
+
+    if metrics.readiness_status == "ready"
+        && !metrics.convergence_active_failure
+        && !metrics.replay_in_progress
+        && !metrics.follower_mode
+        && !metrics.convergence_start_blocked
+        && metrics.leader
+        && metrics.startup_phase == "degraded"
+    {
+        metrics.startup_phase = "leader_active".into();
+        readyz.startup_phase = metrics.startup_phase.clone();
+    }
+
+    EffectiveReadinessSnapshot { readyz, metrics }
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn explain(readyz: &ReadyzResponse, metrics: &MetricsResponse) -> ReadinessExplainResponse {
@@ -228,6 +293,7 @@ fn leadership_uncertain(metrics: &MetricsResponse) -> bool {
 mod tests {
     use super::*;
     use crate::api::{ClusterDiagnostics, MetricsDependencySnapshot};
+    use crate::daemon::DaemonReadyzCache;
 
     fn base_readyz() -> ReadyzResponse {
         ReadyzResponse {
@@ -339,5 +405,58 @@ mod tests {
         let response = explain(&readyz, &metrics);
         assert_eq!(response.taxonomy, "degraded_cache_stale");
         assert!(response.operator_interpretation.contains("stale"));
+    }
+
+    #[test]
+    fn effective_snapshot_normalizes_ready_phase() {
+        let snapshot = ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: base_readyz(),
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                readiness_status: "ready".into(),
+                startup_phase: "degraded".into(),
+                leader: true,
+                reconciliation_enabled: true,
+                cluster: ClusterDiagnostics {
+                    local_role: "leader".into(),
+                    ..ClusterDiagnostics::default()
+                },
+                docker: MetricsDependencySnapshot::default(),
+                caddy: MetricsDependencySnapshot::default(),
+                ..MetricsResponse::default()
+            },
+        };
+
+        let effective = effective_snapshot(&snapshot);
+        assert_eq!(effective.readyz.startup_phase, "leader_active");
+        assert_eq!(effective.metrics.startup_phase, "leader_active");
+    }
+
+    #[test]
+    fn effective_snapshot_marks_stale_cache_degraded_everywhere() {
+        let snapshot = ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: base_readyz(),
+                updated_at_unix_ms: unix_now_ms().saturating_sub(READYZ_CACHE_STALE_AFTER_MS + 1),
+            },
+            metrics: base_metrics(),
+        };
+
+        let effective = effective_snapshot(&snapshot);
+        assert_eq!(effective.readyz.status, "degraded");
+        assert_eq!(effective.readyz.startup_phase, "degraded");
+        assert!(effective.readyz.active_failure);
+        assert_eq!(effective.metrics.readiness_status, "degraded");
+        assert_eq!(effective.metrics.startup_phase, "degraded");
+        assert!(effective.metrics.convergence_active_failure);
+        assert_eq!(
+            effective
+                .metrics
+                .convergence_active_failure_reason
+                .as_deref(),
+            Some("readiness cache stale")
+        );
     }
 }

@@ -1146,6 +1146,9 @@ where
     }
 
     fn set_startup_phase(&mut self, next: StartupPhase) {
+        if self.startup_phase == next {
+            return;
+        }
         if self.startup_phase.can_transition_to(next) {
             self.startup_phase = next;
         } else {
@@ -1894,6 +1897,9 @@ where
         self.cluster_diagnostics = cluster_diagnostics.clone();
         annotate_readyz_reasons(&mut reasons, 0);
         let degraded = !reasons.is_empty();
+        if !degraded {
+            self.refresh_runtime_startup_phase(now_unix);
+        }
         let loop_duration_ms = started.elapsed().as_millis() as u64;
         self.convergence_loop_duration_ms = loop_duration_ms;
         if degraded {
@@ -2606,7 +2612,7 @@ where
             queue_depth,
             readiness_status: readiness.readiness_status,
             readiness_reason: readiness.readiness_reason.clone(),
-            startup_phase: self.startup_phase.as_str().into(),
+            startup_phase: readyz.response.startup_phase.clone(),
             startup_recovery_duration_ms: self.startup_recovery_duration_ms,
             convergence_loop_duration_ms: self.convergence_loop_duration_ms,
             convergence_last_success_unix: self.convergence_last_success_unix,
@@ -6685,6 +6691,36 @@ mod daemon_control_plane_durability {
             metrics.convergence_last_failure_unix
         );
         assert_eq!(metrics.convergence_failures_total, 3);
+    }
+
+    #[test]
+    fn ready_without_active_failure_never_reports_degraded_phase() {
+        let root = test_root("ready-without-active-failure-never-reports-degraded-phase");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.startup_phase = StartupPhase::Degraded;
+        let local_node = daemon.node_id().to_string();
+        write_leader_lease(
+            &root,
+            &local_node,
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+        );
+        daemon.refresh_readyz_cache();
+
+        let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(readyz.status, "ready");
+        assert!(!readyz.active_failure);
+        assert_eq!(readyz.startup_phase, "leader_active");
+        assert_eq!(metrics.readiness_status, "ready");
+        assert!(!metrics.convergence_active_failure);
+        assert_eq!(metrics.startup_phase, "leader_active");
     }
 
     #[test]
