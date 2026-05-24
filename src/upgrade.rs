@@ -118,6 +118,7 @@ pub struct UpgradeOptions {
     pub config_path: PathBuf,
     pub caddy_admin_url: String,
     pub artifact_path: PathBuf,
+    pub release_tag: Option<String>,
     pub manifest_path: Option<PathBuf>,
     pub signature_path: Option<PathBuf>,
     pub allow_unsigned: bool,
@@ -127,8 +128,9 @@ pub struct UpgradeOptions {
 
 pub fn plan(options: &UpgradeOptions) -> Result<UpgradePlanOutput, UpgradeError> {
     let config = load_config(&options.config_path)?;
+    let resolved = resolve_upgrade_options(options)?;
     let current_version = inspect_binary_version(&current_binary_path())?;
-    let artifact = inspect_artifact(&options.artifact_path, &config, options)?;
+    let artifact = inspect_artifact(&resolved.options.artifact_path, &config, &resolved.options)?;
     let mut checks = vec![
         check_file_readable(&options.config_path, "Config readable"),
         check_file_readable(
@@ -159,25 +161,58 @@ pub fn plan(options: &UpgradeOptions) -> Result<UpgradePlanOutput, UpgradeError>
     Ok(UpgradePlanOutput {
         current_version: current_version.version,
         target_version: artifact.version,
-        artifact_path: options.artifact_path.display().to_string(),
+        artifact_path: resolved.options.artifact_path.display().to_string(),
         artifact_checksum: artifact.checksum,
         checks,
     })
 }
 
 pub fn apply(options: &UpgradeOptions) -> Result<UpgradeApplyOutput, UpgradeError> {
-    let plan = plan(options)?;
+    let config = load_config(&options.config_path)?;
+    let resolved = resolve_upgrade_options(options)?;
+    let current_version = inspect_binary_version(&current_binary_path())?;
+    let artifact = inspect_artifact(&resolved.options.artifact_path, &config, &resolved.options)?;
+    let mut checks = vec![
+        check_file_readable(&resolved.options.config_path, "Config readable"),
+        check_file_readable(
+            &conventional_env_path(&resolved.options.config_path),
+            "forge.env readable",
+        ),
+        check_disk_space(&config.storage_root),
+    ];
+    let mut docker = DockerCliChecker;
+    let http = ReqwestHttpChecker::new();
+    let report = run_with_dependencies(
+        &config,
+        &resolved.options.caddy_admin_url,
+        None,
+        true,
+        Some(&resolved.options.config_path),
+        &mut docker,
+        &http,
+    );
+    checks.extend(report.checks.into_iter().map(map_doctor_check));
+    checks.push(check_systemd_unit_exists());
+    checks.extend(compatibility_checks(
+        &current_version.schema_versions,
+        &artifact.schema_versions,
+    ));
+    let plan = UpgradePlanOutput {
+        current_version: current_version.version,
+        target_version: artifact.version.clone(),
+        artifact_path: resolved.options.artifact_path.display().to_string(),
+        artifact_checksum: artifact.checksum.clone(),
+        checks,
+    };
     if plan.checks.iter().any(|check| check.status == "error") {
         return Err(UpgradeError::Usage(
             "upgrade plan failed; resolve checks before applying".into(),
         ));
     }
-    let config = load_config(&options.config_path)?;
-    let artifact = inspect_artifact(&options.artifact_path, &config, options)?;
 
     systemctl(&["stop", "forge.service"])?;
     backup_current_binary(&current_binary_path(), &previous_binary_path())?;
-    install_artifact_binary(&options.artifact_path, &current_binary_path())?;
+    install_artifact_binary(&resolved.options.artifact_path, &current_binary_path())?;
     systemctl(&["start", "forge.service"])?;
 
     let result = match wait_readyz(&config) {
@@ -461,6 +496,22 @@ struct ReleaseManifestSchemaVersions {
     storage_compatibility_version: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GitHubRelease {
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+struct ResolvedUpgradeOptions {
+    options: UpgradeOptions,
+    _temp_dir: Option<TempDirGuard>,
+}
+
 impl ReleaseManifestSchemaVersions {
     fn to_forge_schema_versions(&self) -> ForgeSchemaVersions {
         ForgeSchemaVersions {
@@ -470,6 +521,162 @@ impl ReleaseManifestSchemaVersions {
             reconciliation_log_schema: self.reconciliation_log_schema,
             storage_compatibility: self.storage_compatibility_version,
         }
+    }
+}
+
+fn resolve_upgrade_options(
+    options: &UpgradeOptions,
+) -> Result<ResolvedUpgradeOptions, UpgradeError> {
+    if let Some(tag) = options.release_tag.as_deref() {
+        let temp_root = unique_temp_dir("forge-upgrade-release");
+        fs::create_dir_all(&temp_root)?;
+        let artifact_path = fetch_release_asset(tag, &temp_root)?;
+        let mut resolved = options.clone();
+        resolved.artifact_path = artifact_path;
+        let manifest_path = temp_root.join("release-manifest.json");
+        if manifest_path.exists() {
+            resolved.manifest_path = Some(manifest_path);
+        }
+        let signature_path = temp_root.join("release-manifest.sig");
+        resolved.signature_path = if signature_path.exists() {
+            Some(signature_path)
+        } else {
+            None
+        };
+        return Ok(ResolvedUpgradeOptions {
+            options: resolved,
+            _temp_dir: Some(TempDirGuard::new(&temp_root)),
+        });
+    }
+
+    if options.artifact_path.as_os_str().is_empty() {
+        return Err(UpgradeError::Usage(
+            "upgrade requires --artifact <path> or --release <tag>".into(),
+        ));
+    }
+
+    Ok(ResolvedUpgradeOptions {
+        options: options.clone(),
+        _temp_dir: None,
+    })
+}
+
+fn fetch_release_asset(tag: &str, destination: &Path) -> Result<PathBuf, UpgradeError> {
+    let metadata = fetch_release_metadata(tag)?;
+    let platform = current_release_platform()?;
+    let artifact_name = metadata
+        .assets
+        .iter()
+        .find(|asset| {
+            asset.name.starts_with("forge-")
+                && asset.name.ends_with(&format!("-{}.tar.gz", platform))
+        })
+        .map(|asset| asset.name.clone())
+        .ok_or_else(|| {
+            UpgradeError::Usage(format!(
+                "release {tag} does not include a forge artifact for platform {platform}"
+            ))
+        })?;
+
+    let artifact_path = destination.join(&artifact_name);
+    download_release_file(
+        metadata
+            .assets
+            .iter()
+            .find(|asset| asset.name == artifact_name)
+            .map(|asset| asset.browser_download_url.as_str())
+            .unwrap_or_default(),
+        &artifact_path,
+    )?;
+    for asset_name in [
+        "release-manifest.json",
+        "release-manifest.sig",
+        "checksums.txt",
+    ] {
+        if let Some(asset) = metadata
+            .assets
+            .iter()
+            .find(|asset| asset.name == asset_name)
+        {
+            download_release_file(&asset.browser_download_url, &destination.join(asset_name))?;
+        }
+    }
+    Ok(artifact_path)
+}
+
+fn fetch_release_metadata(tag: &str) -> Result<GitHubRelease, UpgradeError> {
+    let api_base = std::env::var("FORGE_RELEASE_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.github.com".into());
+    let repository = std::env::var("FORGE_RELEASE_REPOSITORY")
+        .unwrap_or_else(|_| "anggaprytn/forge-core".into());
+    let url = format!(
+        "{}/repos/{}/releases/tags/{}",
+        api_base.trim_end_matches('/'),
+        repository,
+        tag
+    );
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|err| UpgradeError::Command(format!("failed to create HTTP client: {err}")))?;
+    let response = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "forge-upgrade")
+        .send()
+        .map_err(|err| {
+            UpgradeError::Command(format!("failed to fetch GitHub release metadata: {err}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(UpgradeError::Usage(format!(
+            "failed to fetch release metadata for tag {tag}: HTTP {}",
+            response.status()
+        )));
+    }
+    response
+        .json::<GitHubRelease>()
+        .map_err(|err| UpgradeError::Command(format!("failed to decode release metadata: {err}")))
+}
+
+fn download_release_file(url: &str, destination: &Path) -> Result<(), UpgradeError> {
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|err| UpgradeError::Command(format!("failed to create HTTP client: {err}")))?;
+    let response = client
+        .get(url)
+        .header("Accept", "application/octet-stream")
+        .header("User-Agent", "forge-upgrade")
+        .send()
+        .map_err(|err| UpgradeError::Command(format!("failed to download release asset: {err}")))?;
+    if !response.status().is_success() {
+        return Err(UpgradeError::Usage(format!(
+            "failed to download release asset {}: HTTP {}",
+            destination.display(),
+            response.status()
+        )));
+    }
+    let bytes = response.bytes().map_err(|err| {
+        UpgradeError::Command(format!("failed to read release asset body: {err}"))
+    })?;
+    fs::write(destination, &bytes)?;
+    Ok(())
+}
+
+fn current_release_platform() -> Result<&'static str, UpgradeError> {
+    if let Ok(value) = std::env::var("FORGE_RELEASE_PLATFORM") {
+        return match value.as_str() {
+            "linux-amd64" => Ok("linux-amd64"),
+            "darwin-arm64" => Ok("darwin-arm64"),
+            other => Err(UpgradeError::Usage(format!(
+                "unsupported release platform override {other}"
+            ))),
+        };
+    }
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("linux-amd64"),
+        ("macos", "aarch64") => Ok("darwin-arm64"),
+        (os, arch) => Err(UpgradeError::Usage(format!(
+            "unsupported release platform {os}/{arch}"
+        ))),
     }
 }
 

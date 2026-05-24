@@ -2,8 +2,9 @@
 set -euo pipefail
 
 FORCE=0
-VERSION=""
+RELEASE_TAG=""
 ARTIFACT=""
+ALLOW_UNSIGNED_RELEASE=0
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DEST="${FORGE_BIN_DEST:-/usr/local/bin/forge}"
@@ -20,17 +21,22 @@ SRV_ROOT="${FORGE_SRV_ROOT:-/srv/forge}"
 SAMPLE_ROOT="${FORGE_SAMPLE_ROOT:-/srv/forge/sample-http-app}"
 ALLOW_UNPRIVILEGED_INSTALL="${FORGE_ALLOW_UNPRIVILEGED_INSTALL:-0}"
 INSTALL_TIMEOUT_SECS="${FORGE_INSTALL_TIMEOUT_SECS:-300}"
+RELEASE_REPOSITORY="${FORGE_RELEASE_REPOSITORY:-anggaprytn/forge-core}"
+RELEASE_API_BASE_URL="${FORGE_RELEASE_API_BASE_URL:-https://api.github.com}"
+RELEASE_PUBLIC_KEY_PATH="${FORGE_RELEASE_PUBLIC_KEY:-$CONFIG_DIR/release-public-key.pem}"
+ARTIFACT_STAGE_DIR=""
 
 usage() {
   cat <<'EOF'
-usage: ./install.sh [--version <version>] [--artifact <path>] [--force]
+usage: ./install.sh [--version <tag>] [--release <tag>] [--artifact <path>] [--force] [--allow-unsigned-release]
 
-Installs Forge from a pinned release artifact when provided, otherwise from the local source tree.
+Installs Forge from a pinned GitHub release or a local artifact, otherwise from the local source tree.
 - Preserves /etc/forge/forge.conf and /etc/forge/forge.env unless --force is used.
 - Installs the binary atomically.
 - Keeps the previous binary as /usr/local/bin/forge.previous.
 - Never deletes /var/lib/forge.
 - Does not overwrite systemd drop-ins.
+- Release installs require signature verification when a public key is configured.
 EOF
 }
 
@@ -68,12 +74,20 @@ while [ $# -gt 0 ]; do
     --version)
       shift
       [ $# -gt 0 ] || die "--version requires a value"
-      VERSION="$1"
+      RELEASE_TAG="$1"
+      ;;
+    --release)
+      shift
+      [ $# -gt 0 ] || die "--release requires a value"
+      RELEASE_TAG="$1"
       ;;
     --artifact)
       shift
       [ $# -gt 0 ] || die "--artifact requires a value"
       ARTIFACT="$1"
+      ;;
+    --allow-unsigned-release)
+      ALLOW_UNSIGNED_RELEASE=1
       ;;
     -h|--help)
       usage
@@ -165,6 +179,10 @@ write_if_missing_or_forced() {
 }
 
 resolve_platform_artifact_name() {
+  if [ -n "${FORGE_RELEASE_PLATFORM:-}" ]; then
+    printf '%s\n' "$FORGE_RELEASE_PLATFORM"
+    return 0
+  fi
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
@@ -181,6 +199,144 @@ resolve_artifact_from_version() {
   local candidate="$REPO_ROOT/dist/forge-$version-$platform.tar.gz"
   [ -f "$candidate" ] || die "artifact not found for version $version at $candidate"
   printf '%s\n' "$candidate"
+}
+
+curl_download() {
+  local url="$1" destination="$2"
+  command -v curl >/dev/null 2>&1 || die "curl is required for release downloads"
+  curl -fsSL \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'User-Agent: forge-install' \
+    "$url" \
+    -o "$destination"
+}
+
+verify_checksum_entry() {
+  local path="$1" checksum_path="$2" expected actual file_name
+  file_name="$(basename "$path")"
+  actual="$(sha256_file "$path")"
+  expected="$(awk -v name="$file_name" '$2 == name || $2 == "*"name { print $1 }' "$checksum_path" | tail -n 1)"
+  [ -n "$expected" ] || return 0
+  [ "$expected" = "$actual" ] || die "checksum mismatch for $file_name"
+}
+
+manifest_artifact_checksum() {
+  local manifest_path="$1" artifact_name="$2"
+  python3 - "$manifest_path" "$artifact_name" <<'PY'
+import json
+import sys
+
+manifest_path, artifact_name = sys.argv[1:3]
+manifest = json.load(open(manifest_path, "r", encoding="utf-8"))
+for artifact in manifest.get("artifacts", []):
+    if artifact.get("name") == artifact_name:
+        print(artifact.get("sha256", ""))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+verify_manifest_signature() {
+  local manifest_path="$1" signature_path="$2" public_key_path="$3" decoded_signature
+  command -v openssl >/dev/null 2>&1 || die "openssl is required to verify signed releases"
+  [ -f "$public_key_path" ] || die "release public key not found at $public_key_path"
+  decoded_signature="$(mktemp)"
+  python3 - "$signature_path" "$decoded_signature" <<'PY'
+import base64
+import pathlib
+import sys
+
+signature_path = pathlib.Path(sys.argv[1])
+output_path = pathlib.Path(sys.argv[2])
+raw = "".join(signature_path.read_text(encoding="utf-8").split())
+output_path.write_bytes(base64.b64decode(raw))
+PY
+  openssl pkeyutl -verify -pubin -inkey "$public_key_path" \
+    -sigfile "$decoded_signature" \
+    -rawin \
+    -in "$manifest_path" >/dev/null 2>&1 || {
+      rm -f "$decoded_signature"
+      die "release manifest signature verification failed"
+    }
+  rm -f "$decoded_signature"
+}
+
+verify_release_bundle() {
+  local artifact="$1" manifest_path="$2" signature_path="$3" checksums_path="$4"
+  local artifact_name expected actual
+  artifact_name="$(basename "$artifact")"
+  [ -f "$manifest_path" ] || die "release manifest download missing"
+
+  if [ -f "$checksums_path" ]; then
+    verify_checksum_entry "$artifact" "$checksums_path"
+    verify_checksum_entry "$manifest_path" "$checksums_path"
+    [ -f "$signature_path" ] && verify_checksum_entry "$signature_path" "$checksums_path"
+  fi
+
+  if [ -f "$RELEASE_PUBLIC_KEY_PATH" ]; then
+    [ -f "$signature_path" ] || die "release signature download missing"
+    verify_manifest_signature "$manifest_path" "$signature_path" "$RELEASE_PUBLIC_KEY_PATH"
+  elif [ "$ALLOW_UNSIGNED_RELEASE" -ne 1 ]; then
+    die "release public key not configured; set FORGE_RELEASE_PUBLIC_KEY or place release-public-key.pem under $CONFIG_DIR, or rerun with --allow-unsigned-release"
+  fi
+
+  expected="$(manifest_artifact_checksum "$manifest_path" "$artifact_name")" || die "artifact $artifact_name not listed in release manifest"
+  actual="$(sha256_file "$artifact")"
+  [ "$expected" = "$actual" ] || die "artifact checksum mismatch against signed release manifest"
+}
+
+download_release_assets() {
+  local tag="$1" platform api_url release_json artifact_url manifest_url signature_url checksums_url
+  local artifact_name artifact_path manifest_path signature_path checksums_path release_fields_file
+  platform="$(resolve_platform_artifact_name)"
+  api_url="$RELEASE_API_BASE_URL/repos/$RELEASE_REPOSITORY/releases/tags/$tag"
+  ARTIFACT_STAGE_DIR="$(mktemp -d)"
+  release_json="$ARTIFACT_STAGE_DIR/release.json"
+  curl_download "$api_url" "$release_json" || die "failed to fetch GitHub release metadata for tag $tag from $RELEASE_REPOSITORY"
+
+  release_fields_file="$ARTIFACT_STAGE_DIR/release-fields.txt"
+  python3 - "$release_json" "$platform" >"$release_fields_file" <<'PY'
+import json
+import sys
+
+release = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+platform = sys.argv[2]
+assets = {asset["name"]: asset["browser_download_url"] for asset in release.get("assets", [])}
+artifact_name = next(
+    (name for name in assets if name.startswith("forge-") and name.endswith(f"-{platform}.tar.gz")),
+    None,
+)
+if not artifact_name:
+    raise SystemExit(1)
+for key in [
+    artifact_name,
+    "release-manifest.json",
+    "release-manifest.sig",
+    "checksums.txt",
+]:
+    print(assets.get(key, ""))
+print(artifact_name)
+PY
+  artifact_url="$(sed -n '1p' "$release_fields_file")"
+  manifest_url="$(sed -n '2p' "$release_fields_file")"
+  signature_url="$(sed -n '3p' "$release_fields_file")"
+  checksums_url="$(sed -n '4p' "$release_fields_file")"
+  artifact_name="$(sed -n '5p' "$release_fields_file")"
+
+  [ -n "$artifact_url" ] || die "release $tag is missing a forge artifact for platform $platform"
+  [ -n "$manifest_url" ] || die "release $tag is missing release-manifest.json"
+  [ -n "$checksums_url" ] || die "release $tag is missing checksums.txt"
+
+  artifact_path="$ARTIFACT_STAGE_DIR/$artifact_name"
+  manifest_path="$ARTIFACT_STAGE_DIR/release-manifest.json"
+  signature_path="$ARTIFACT_STAGE_DIR/release-manifest.sig"
+  checksums_path="$ARTIFACT_STAGE_DIR/checksums.txt"
+  curl_download "$artifact_url" "$artifact_path" || die "failed to download $artifact_name"
+  curl_download "$manifest_url" "$manifest_path" || die "failed to download release-manifest.json"
+  [ -n "$signature_url" ] && curl_download "$signature_url" "$signature_path" || true
+  curl_download "$checksums_url" "$checksums_path" || die "failed to download checksums.txt"
+  verify_release_bundle "$artifact_path" "$manifest_path" "$signature_path" "$checksums_path"
+  printf '%s\n' "$artifact_path"
 }
 
 stage_artifact() {
@@ -268,8 +424,12 @@ install_systemd_unit() {
 }
 
 resolve_binary_source() {
-  if [ -n "$VERSION" ] && [ -z "$ARTIFACT" ]; then
-    ARTIFACT="$(resolve_artifact_from_version "$VERSION")"
+  if [ -n "$RELEASE_TAG" ] && [ -n "$ARTIFACT" ]; then
+    die "cannot combine --artifact with --version/--release"
+  fi
+
+  if [ -n "$RELEASE_TAG" ] && [ -z "$ARTIFACT" ]; then
+    ARTIFACT="$(download_release_assets "$RELEASE_TAG")"
   fi
 
   if [ -n "$ARTIFACT" ]; then
@@ -318,6 +478,10 @@ Release install notes:
   - /var/lib/forge is preserved across installs and upgrades.
   - Existing forge.conf and forge.env stay in place unless --force is used.
 EOF
+
+  if [ -n "$ARTIFACT_STAGE_DIR" ] && [ -d "$ARTIFACT_STAGE_DIR" ]; then
+    rm -rf "$ARTIFACT_STAGE_DIR"
+  fi
 }
 
 main "$@"

@@ -4,8 +4,9 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::{collections::HashMap, time::Duration};
 
 use base64::Engine;
 use forge_core::upgrade::{UpgradeOptions, apply, plan, read_recent_events, rollback};
@@ -76,6 +77,11 @@ fn init_package_repo(name: &str) -> PathBuf {
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/package-release.sh"),
         root.join("scripts/package-release.sh"),
+    )
+    .unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/publish-release.sh"),
+        root.join("scripts/publish-release.sh"),
     )
     .unwrap();
     write_executable(
@@ -331,6 +337,7 @@ fn default_upgrade_options(
         config_path: root.join("forge.conf"),
         caddy_admin_url,
         artifact_path,
+        release_tag: None,
         manifest_path: None,
         signature_path: None,
         allow_unsigned: true,
@@ -445,6 +452,171 @@ fn default_signed_upgrade_options(
         allow_unsigned: true,
         ..default_upgrade_options(root, caddy_admin_url, artifact_path)
     }
+}
+
+fn write_checksums(paths: &[&Path], destination: &Path) {
+    let mut body = String::new();
+    for path in paths {
+        body.push_str(&format!(
+            "{}  {}\n",
+            sha256(path),
+            path.file_name().unwrap().to_string_lossy()
+        ));
+    }
+    fs::write(destination, body).unwrap();
+}
+
+fn release_routes(
+    base_url: &str,
+    tag: &str,
+    artifact: &Path,
+    manifest_path: &Path,
+    signature_path: Option<&Path>,
+    checksums_path: &Path,
+) -> HashMap<String, StaticHttpResponse> {
+    let artifact_name = artifact.file_name().unwrap().to_string_lossy().to_string();
+    let mut assets = vec![
+        json!({
+            "name": artifact_name,
+            "browser_download_url": format!("{base_url}/downloads/{tag}/artifact")
+        }),
+        json!({
+            "name": "release-manifest.json",
+            "browser_download_url": format!("{base_url}/downloads/{tag}/manifest")
+        }),
+        json!({
+            "name": "checksums.txt",
+            "browser_download_url": format!("{base_url}/downloads/{tag}/checksums")
+        }),
+    ];
+    if signature_path.is_some() {
+        assets.push(json!({
+            "name": "release-manifest.sig",
+            "browser_download_url": format!("{base_url}/downloads/{tag}/signature")
+        }));
+    }
+    let mut routes = HashMap::new();
+    routes.insert(
+        format!("/repos/test/forge/releases/tags/{tag}"),
+        StaticHttpResponse {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&json!({ "assets": assets })).unwrap(),
+        },
+    );
+    routes.insert(
+        format!("/downloads/{tag}/artifact"),
+        StaticHttpResponse {
+            status: 200,
+            content_type: "application/octet-stream",
+            body: fs::read(artifact).unwrap(),
+        },
+    );
+    routes.insert(
+        format!("/downloads/{tag}/manifest"),
+        StaticHttpResponse {
+            status: 200,
+            content_type: "application/json",
+            body: fs::read(manifest_path).unwrap(),
+        },
+    );
+    routes.insert(
+        format!("/downloads/{tag}/checksums"),
+        StaticHttpResponse {
+            status: 200,
+            content_type: "text/plain",
+            body: fs::read(checksums_path).unwrap(),
+        },
+    );
+    if let Some(signature_path) = signature_path {
+        routes.insert(
+            format!("/downloads/{tag}/signature"),
+            StaticHttpResponse {
+                status: 200,
+                content_type: "text/plain",
+                body: fs::read(signature_path).unwrap(),
+            },
+        );
+    }
+    routes
+}
+
+fn spawn_release_server(
+    tag: &str,
+    artifact: &Path,
+    manifest_path: &Path,
+    signature_path: Option<&Path>,
+    checksums_path: &Path,
+) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let routes = release_routes(
+        &base_url,
+        tag,
+        artifact,
+        manifest_path,
+        signature_path,
+        checksums_path,
+    );
+    listener
+        .set_nonblocking(true)
+        .expect("listener should support nonblocking");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let handle = thread::spawn(move || {
+        let started = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    if read == 0 {
+                        continue;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    captured.lock().unwrap().push(path.clone());
+                    let response = routes.get(&path).cloned().unwrap_or(StaticHttpResponse {
+                        status: 404,
+                        content_type: "text/plain",
+                        body: b"not found".to_vec(),
+                    });
+                    let status_line = match response.status {
+                        200 => "HTTP/1.1 200 OK",
+                        404 => "HTTP/1.1 404 Not Found",
+                        _ => "HTTP/1.1 500 Internal Server Error",
+                    };
+                    let headers = format!(
+                        "{status_line}\r\ncontent-length: {}\r\ncontent-type: {}\r\nconnection: close\r\n\r\n",
+                        response.body.len(),
+                        response.content_type
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    let _ = stream.write_all(&response.body);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_millis(750) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (base_url, requests, handle)
+}
+
+#[derive(Clone)]
+struct StaticHttpResponse {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
 }
 
 #[test]
@@ -567,6 +739,7 @@ fn package_release_injects_current_git_commit() {
             ),
         )
         .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
         .output()
         .unwrap();
 
@@ -596,6 +769,7 @@ fn package_release_refuses_dirty_tree_by_default() {
             ),
         )
         .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
         .output()
         .unwrap();
 
@@ -620,6 +794,7 @@ fn package_release_unsigned_requires_flag() {
             ),
         )
         .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
         .output()
         .unwrap();
 
@@ -650,6 +825,7 @@ fn package_release_allows_dirty_tree_with_flag() {
             ),
         )
         .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
         .output()
         .unwrap();
 
@@ -732,6 +908,124 @@ fn package_release_signed_emits_signature() {
 }
 
 #[test]
+fn publish_release_requires_clean_tree() {
+    let root = init_package_repo("publish-release-clean-tree");
+    let key_root = test_root("publish-release-clean-tree-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    git_ok(&root, &["tag", "alpha-core-loop-v5"]);
+    fs::write(root.join("README.md"), "dirty\n").unwrap();
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .arg("alpha-core-loop-v5")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("git tree must be clean"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn publish_release_requires_tag() {
+    let root = init_package_repo("publish-release-tag-required");
+    let key_root = test_root("publish-release-tag-required-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    let fake_bin = test_root("publish-release-tag-required-gh");
+    let fake_gh_log = fake_bin.join("gh.log");
+    write_executable(
+        &fake_bin.join("gh"),
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then exit 0; fi\nexit 0\n",
+            fake_gh_log.display()
+        ),
+    );
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tag argument required"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn release_notes_include_validation_and_upgrade_steps() {
+    let root = init_package_repo("publish-release-notes");
+    let key_root = test_root("publish-release-notes-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    git_ok(&root, &["tag", "alpha-core-loop-v5"]);
+    let fake_bin = test_root("publish-release-notes-gh");
+    let fake_gh_log = fake_bin.join("gh.log");
+    write_executable(
+        &fake_bin.join("gh"),
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then exit 0; fi\nif [ \"$1\" = \"release\" ] && [ \"$2\" = \"view\" ]; then exit 1; fi\nif [ \"$1\" = \"release\" ] && [ \"$2\" = \"create\" ]; then exit 0; fi\nif [ \"$1\" = \"release\" ] && [ \"$2\" = \"edit\" ]; then exit 0; fi\nif [ \"$1\" = \"release\" ] && [ \"$2\" = \"upload\" ]; then exit 0; fi\nexit 0\n",
+            fake_gh_log.display()
+        ),
+    );
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .arg("alpha-core-loop-v5")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:{}",
+                fake_bin.display(),
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let notes = fs::read_to_string(root.join("dist/RELEASE_NOTES.md")).unwrap();
+    assert!(notes.contains("## Validation Commands"));
+    assert!(notes.contains("forge upgrade plan --release alpha-core-loop-v5"));
+    assert!(notes.contains("forge upgrade apply --release alpha-core-loop-v5"));
+    assert!(notes.contains("Verify the release manifest signature"));
+    assert!(notes.contains("syncforge"));
+}
+
+#[test]
 fn install_preserves_existing_config() {
     let root = test_root("install-config");
     let artifact = make_artifact(&root, "1.2.3", 0o644);
@@ -760,6 +1054,72 @@ fn install_preserves_existing_config() {
     assert_eq!(
         fs::read_to_string(config_dir.join("forge.conf")).unwrap(),
         "sentinel-config\n"
+    );
+}
+
+#[test]
+fn install_release_download_preserves_config() {
+    let root = test_root("install-release-config");
+    let artifact = make_artifact(&root, "1.2.3", 0o644);
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "1.2.3");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    let signature_path = root.join("release-manifest.sig");
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(
+        &[&artifact, &manifest_path, &signature_path],
+        &checksums_path,
+    );
+    let tag = "alpha-core-loop-v5";
+    let config_dir = root.join("etc/forge");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("forge.conf"), "sentinel-config\n").unwrap();
+    fs::write(config_dir.join("forge.env"), "sentinel-env\n").unwrap();
+    fs::copy(&public_key, config_dir.join("release-public-key.pem")).unwrap();
+    let (base_url, requests, handle) = spawn_release_server(
+        tag,
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .arg("--release")
+        .arg(tag)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("FORGE_ALLOW_UNPRIVILEGED_INSTALL", "1")
+        .env("FORGE_BIN_DEST", root.join("bin/forge"))
+        .env("FORGE_PREVIOUS_BIN_DEST", root.join("bin/forge.previous"))
+        .env("FORGE_CONFIG_DIR", &config_dir)
+        .env("FORGE_STORAGE_ROOT", root.join("var/lib/forge"))
+        .env("FORGE_SRV_ROOT", root.join("srv/forge"))
+        .env("FORGE_SAMPLE_ROOT", root.join("srv/forge/sample-http-app"))
+        .env("FORGE_UNIT_PATH", root.join("forge.service"))
+        .env("FORGE_SERVICE_SRC", root.join("missing.service"))
+        .env("FORGE_RELEASE_API_BASE_URL", &base_url)
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .env("FORGE_RELEASE_PLATFORM", "linux-amd64")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(config_dir.join("forge.conf")).unwrap(),
+        "sentinel-config\n"
+    );
+    handle.join().unwrap();
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/repos/test/forge/releases/tags/alpha-core-loop-v5")
     );
 }
 
@@ -1339,6 +1699,135 @@ fn upgrade_plan_accepts_valid_signature() {
     );
 
     assert_eq!(output.target_version, "2.0.0");
+}
+
+#[test]
+fn upgrade_release_fetches_manifest_and_artifact() {
+    let root = test_root("upgrade-release-fetches-assets");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let signature_path = root.join("release-manifest.sig");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(
+        &[&artifact, &manifest_path, &signature_path],
+        &checksums_path,
+    );
+    let (release_base, requests, release_handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+    let options = UpgradeOptions {
+        artifact_path: PathBuf::new(),
+        release_tag: Some("alpha-core-loop-v5".into()),
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, caddy_url, artifact.clone())
+    };
+
+    let output = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_PUBLIC_KEY", public_key.display().to_string()),
+            ("FORGE_RELEASE_API_BASE_URL", release_base),
+            ("FORGE_RELEASE_REPOSITORY", "test/forge".into()),
+            ("FORGE_RELEASE_PLATFORM", "linux-amd64".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || plan(&options).unwrap(),
+    );
+
+    assert_eq!(output.target_version, "2.0.0");
+    release_handle.join().unwrap();
+    let captured = requests.lock().unwrap().clone();
+    assert!(
+        captured
+            .iter()
+            .any(|path| path == "/repos/test/forge/releases/tags/alpha-core-loop-v5")
+    );
+    assert!(
+        captured
+            .iter()
+            .any(|path| path == "/downloads/alpha-core-loop-v5/artifact")
+    );
+    assert!(
+        captured
+            .iter()
+            .any(|path| path == "/downloads/alpha-core-loop-v5/manifest")
+    );
+}
+
+#[test]
+fn upgrade_release_reuses_artifact_verification() {
+    let root = test_root("upgrade-release-verification");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["artifacts"][0]["sha256"] = serde_json::Value::String("deadbeef".into());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let signature_path = root.join("release-manifest.sig");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(
+        &[&artifact, &manifest_path, &signature_path],
+        &checksums_path,
+    );
+    let (release_base, _requests, release_handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+    let options = UpgradeOptions {
+        artifact_path: PathBuf::new(),
+        release_tag: Some("alpha-core-loop-v5".into()),
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, caddy_url, artifact.clone())
+    };
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_PUBLIC_KEY", public_key.display().to_string()),
+            ("FORGE_RELEASE_API_BASE_URL", release_base),
+            ("FORGE_RELEASE_REPOSITORY", "test/forge".into()),
+            ("FORGE_RELEASE_PLATFORM", "linux-amd64".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || {
+            let err = plan(&options).unwrap_err();
+            assert!(err.to_string().contains("artifact checksum mismatch"));
+        },
+    );
+    release_handle.join().unwrap();
 }
 
 #[test]

@@ -134,6 +134,7 @@ where
             config_path,
             caddy_admin_url,
             artifact_path,
+            release_tag,
             manifest_path,
             signature_path,
             allow_unsigned,
@@ -143,6 +144,7 @@ where
                 config_path,
                 caddy_admin_url,
                 artifact_path,
+                release_tag,
                 manifest_path,
                 signature_path,
                 allow_unsigned,
@@ -155,6 +157,7 @@ where
             config_path,
             caddy_admin_url,
             artifact_path,
+            release_tag,
             manifest_path,
             signature_path,
             allow_unsigned,
@@ -165,6 +168,7 @@ where
                 config_path,
                 caddy_admin_url,
                 artifact_path,
+                release_tag,
                 manifest_path,
                 signature_path,
                 allow_unsigned,
@@ -1005,6 +1009,7 @@ enum Command {
         config_path: PathBuf,
         caddy_admin_url: String,
         artifact_path: PathBuf,
+        release_tag: Option<String>,
         manifest_path: Option<PathBuf>,
         signature_path: Option<PathBuf>,
         allow_unsigned: bool,
@@ -1014,6 +1019,7 @@ enum Command {
         config_path: PathBuf,
         caddy_admin_url: String,
         artifact_path: PathBuf,
+        release_tag: Option<String>,
         manifest_path: Option<PathBuf>,
         signature_path: Option<PathBuf>,
         allow_unsigned: bool,
@@ -1320,6 +1326,7 @@ fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) 
             config_path: _,
             caddy_admin_url,
             artifact_path,
+            release_tag,
             manifest_path,
             signature_path,
             allow_unsigned,
@@ -1328,6 +1335,7 @@ fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) 
             config_path: default_server_config_path(),
             caddy_admin_url,
             artifact_path,
+            release_tag,
             manifest_path,
             signature_path,
             allow_unsigned,
@@ -1337,6 +1345,7 @@ fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) 
             config_path: _,
             caddy_admin_url,
             artifact_path,
+            release_tag,
             manifest_path,
             signature_path,
             allow_unsigned,
@@ -1346,6 +1355,7 @@ fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) 
             config_path: default_server_config_path(),
             caddy_admin_url,
             artifact_path,
+            release_tag,
             manifest_path,
             signature_path,
             allow_unsigned,
@@ -1531,8 +1541,8 @@ fn usage() -> String {
         "  forge logout",
         "  forge whoami",
         "  forge version",
-        "  forge [--config PATH] [--caddy-admin-url URL] upgrade plan --artifact <path> [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact]",
-        "  forge [--config PATH] [--caddy-admin-url URL] upgrade apply --artifact <path> [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact] [--no-auto-rollback]",
+        "  forge [--config PATH] [--caddy-admin-url URL] upgrade plan (--artifact <path> | --release <tag>) [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact]",
+        "  forge [--config PATH] [--caddy-admin-url URL] upgrade apply (--artifact <path> | --release <tag>) [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact] [--no-auto-rollback]",
         "  forge [--config PATH] upgrade rollback",
         "  forge [--url URL] [--token TOKEN] token list",
         "  forge [--url URL] [--token TOKEN] token create --name <name>",
@@ -1580,6 +1590,7 @@ fn parse_upgrade_plan_command(
         config_path,
         caddy_admin_url,
         artifact_path: parsed.artifact_path,
+        release_tag: parsed.release_tag,
         manifest_path: parsed.manifest_path,
         signature_path: parsed.signature_path,
         allow_unsigned: parsed.allow_unsigned,
@@ -1597,6 +1608,7 @@ fn parse_upgrade_apply_command(
         config_path,
         caddy_admin_url,
         artifact_path: parsed.artifact_path,
+        release_tag: parsed.release_tag,
         manifest_path: parsed.manifest_path,
         signature_path: parsed.signature_path,
         allow_unsigned: parsed.allow_unsigned,
@@ -1608,6 +1620,7 @@ fn parse_upgrade_apply_command(
 #[derive(Debug)]
 struct ParsedUpgradeArgs {
     artifact_path: PathBuf,
+    release_tag: Option<String>,
     manifest_path: Option<PathBuf>,
     signature_path: Option<PathBuf>,
     allow_unsigned: bool,
@@ -1620,6 +1633,7 @@ fn parse_upgrade_args(
     allow_no_auto_rollback: bool,
 ) -> Result<ParsedUpgradeArgs, CliError> {
     let mut artifact_path = None;
+    let mut release_tag = None;
     let mut manifest_path = None;
     let mut signature_path = None;
     let mut allow_unsigned = false;
@@ -1635,6 +1649,13 @@ fn parse_upgrade_args(
                     return Err(CliError::Usage("upgrade requires --artifact <path>".into()));
                 };
                 artifact_path = Some(PathBuf::from(value));
+            }
+            "--release" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage("upgrade requires --release <tag>".into()));
+                };
+                release_tag = Some(value.clone());
             }
             "--manifest" => {
                 index += 1;
@@ -1661,17 +1682,25 @@ fn parse_upgrade_args(
         index += 1;
     }
 
-    let Some(artifact_path) = artifact_path else {
-        return Err(CliError::Usage("upgrade requires --artifact <path>".into()));
-    };
-    if signature_path.is_some() && manifest_path.is_none() {
+    if artifact_path.is_some() && release_tag.is_some() {
+        return Err(CliError::Usage(
+            "upgrade accepts either --artifact <path> or --release <tag>, not both".into(),
+        ));
+    }
+    if signature_path.is_some() && manifest_path.is_none() && release_tag.is_none() {
         return Err(CliError::Usage(
             "upgrade requires --manifest <path> when --signature is provided".into(),
         ));
     }
-
+    let artifact_path = artifact_path.unwrap_or_default();
+    if artifact_path.as_os_str().is_empty() && release_tag.is_none() {
+        return Err(CliError::Usage(
+            "upgrade requires --artifact <path> or --release <tag>".into(),
+        ));
+    }
     Ok(ParsedUpgradeArgs {
         artifact_path,
+        release_tag,
         manifest_path,
         signature_path,
         allow_unsigned,
@@ -4277,6 +4306,7 @@ mod tests {
                 config_path: PathBuf::from("/tmp/forge.conf"),
                 caddy_admin_url: "http://127.0.0.1:2019".into(),
                 artifact_path: PathBuf::from("/tmp/forge.tar.gz"),
+                release_tag: None,
                 manifest_path: Some(PathBuf::from("/tmp/release-manifest.json")),
                 signature_path: Some(PathBuf::from("/tmp/release-manifest.sig")),
                 allow_unsigned: false,
@@ -4305,11 +4335,37 @@ mod tests {
                 config_path: default_server_config_path(),
                 caddy_admin_url: "http://127.0.0.1:2019".into(),
                 artifact_path: PathBuf::from("/tmp/forge.tar.gz"),
+                release_tag: None,
                 manifest_path: Some(PathBuf::from("/tmp/release-manifest.json")),
                 signature_path: None,
                 allow_unsigned: true,
                 allow_dirty_artifact: false,
                 no_auto_rollback: true,
+            }
+        );
+    }
+
+    #[test]
+    fn upgrade_plan_command_parses_release_flag() {
+        let parsed = ParsedArgs::parse(vec![
+            "upgrade".into(),
+            "plan".into(),
+            "--release".into(),
+            "alpha-core-loop-v5".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::UpgradePlan {
+                config_path: default_server_config_path(),
+                caddy_admin_url: "http://127.0.0.1:2019".into(),
+                artifact_path: PathBuf::new(),
+                release_tag: Some("alpha-core-loop-v5".into()),
+                manifest_path: None,
+                signature_path: None,
+                allow_unsigned: false,
+                allow_dirty_artifact: false,
             }
         );
     }

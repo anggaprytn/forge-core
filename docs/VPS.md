@@ -138,7 +138,7 @@ Restart Caddy: `systemctl restart caddy`.
 For Linux hosts with systemd, use the provided conservative installer:
 
 ```bash
-./install.sh --artifact dist/forge-<version>-linux-amd64.tar.gz
+./install.sh --release <tag>
 ```
 
 The installer is **idempotent** and safe:
@@ -435,11 +435,15 @@ Probe guidance:
 - Use `forge version` to capture runtime build identity, target triple, and schema/storage compatibility versions.
 - Use `forge doctor upgrade` before upgrades. It is read-only and checks storage readability, schema compatibility, Docker, Caddy, write access, and Linux `systemd` sanity.
 - Build release artifacts with `scripts/package-release.sh --sign --signing-key <path>` whenever a signing key is available. Development-only packages must use `scripts/package-release.sh --unsigned`.
+- Publish a tagged GitHub release with `scripts/publish-release.sh <tag> --signing-key <path>`. It requires a clean tree, verifies the tag, writes `dist/RELEASE_NOTES.md`, and uploads the signed bundle through `gh`.
 - Signed packaging emits `dist/release-manifest.json`, `dist/release-manifest.sig`, and `dist/release-public-key.pem`. Configure the operator node with `release_public_key_path=/etc/forge/release-public-key.pem` or `FORGE_RELEASE_PUBLIC_KEY=/path/to/release-public-key.pem`.
-- Use `forge upgrade plan --artifact dist/forge-<version>-linux-amd64.tar.gz --manifest dist/release-manifest.json --signature dist/release-manifest.sig` before swapping binaries.
-- Use `forge upgrade apply --artifact dist/forge-<version>-linux-amd64.tar.gz --manifest dist/release-manifest.json --signature dist/release-manifest.sig` for the actual upgrade.
+- Install a pinned release with `./install.sh --release <tag>` after the public key is in place.
+- Use `forge upgrade plan --release <tag>` before swapping binaries.
+- Use `forge upgrade apply --release <tag>` for the actual upgrade.
+- If you need an offline path, keep the local artifact form: `forge upgrade plan --artifact dist/forge-<version>-linux-amd64.tar.gz --manifest dist/release-manifest.json --signature dist/release-manifest.sig`.
 - If no public key is configured, Forge fails closed unless `--allow-unsigned` is passed explicitly. Keep `--allow-unsigned` for development-only or emergency testing paths.
+- `install.sh` also fails closed for release downloads unless `--allow-unsigned-release` is passed explicitly.
 - If a release was built from a dirty worktree, Forge rejects it unless `--allow-dirty-artifact` is passed explicitly.
 - Use `forge upgrade rollback` for emergency binary restore from `/usr/local/bin/forge.previous`.
-- Treat `syncforge` as development-only; release artifacts are the preferred production path.
+- Verify the manifest signature, use `forge upgrade plan/apply`, and treat `syncforge` as development-only; release artifacts are the preferred production path.
 - Threat model: signatures provide tamper evidence for the manifest and release tarballs listed in it. They do not sandbox the artifact binary.

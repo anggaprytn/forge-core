@@ -433,14 +433,19 @@ The `install.sh` script is designed to be safe and non-destructive:
 ## Release Upgrades
 
 - Package releases with `scripts/package-release.sh --sign --signing-key <path>`. Use `--unsigned` only for development artifacts.
+- Publish tagged operator releases with `scripts/publish-release.sh <tag> --signing-key <path>`. The script requires a clean tree, checks that the tag points at `HEAD` unless explicitly overridden, generates `dist/RELEASE_NOTES.md`, and uploads the signed bundle with `gh`.
 - Signed packages emit `dist/release-manifest.json`, `dist/release-manifest.sig`, and `dist/release-public-key.pem` alongside the tarballs and `checksums.txt`.
 - Configure verification with `release_public_key_path=/etc/forge/release-public-key.pem` in `forge.conf` or `FORGE_RELEASE_PUBLIC_KEY=/path/to/release-public-key.pem`.
-- Prefer `forge upgrade plan --artifact ... --manifest dist/release-manifest.json --signature dist/release-manifest.sig` before every operator upgrade.
-- Use `forge upgrade apply --artifact ... --manifest dist/release-manifest.json --signature dist/release-manifest.sig` for the actual swap; the binary replacement is atomic and gated on `/readyz`.
+- Install pinned releases with `./install.sh --release <tag>` or `./install.sh --version <tag>`. Existing config/env are preserved unless `--force` is used.
+- Prefer `forge upgrade plan --release <tag>` before every operator upgrade.
+- Use `forge upgrade apply --release <tag>` for the actual swap; the binary replacement is atomic and gated on `/readyz`.
+- Local artifact upgrades remain available with `--artifact ... --manifest ... --signature ...` for offline or staged rollouts.
 - If no public key is configured, Forge refuses unsigned upgrades unless `--allow-unsigned` is passed explicitly.
+- `install.sh` also fails closed for release downloads unless a public key is configured or `--allow-unsigned-release` is passed explicitly.
 - `--allow-dirty-artifact` is an emergency override for manifests built from dirty worktrees and should not be part of normal release operations.
 - Use `forge upgrade rollback` for emergency recovery from the preserved `forge.previous` binary.
 - `syncforge` remains a development-only workflow and should not be the production upgrade path.
+- Security note: verify the manifest signature, use `forge upgrade plan/apply`, and treat `syncforge` as dev-only.
 - Threat model: signatures provide tamper evidence for the manifest and listed artifacts. They do not sandbox the unpacked binary or replace host integrity controls.
 
 ## Required Environment & Config

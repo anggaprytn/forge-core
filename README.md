@@ -111,7 +111,7 @@ Architectural principle: `Convergence computes truth. APIs serve cached truth.`
 For quick evaluation:
 
 ```bash
-./install.sh --artifact dist/forge-<version>-linux-amd64.tar.gz
+./install.sh --release <tag>
 ```
 
 For deterministic production builds:
@@ -252,8 +252,11 @@ MIT License. Built for the era of agentic software.
 - Release artifacts live under `dist/` with `forge-<version>-<platform>.tar.gz`, `release-manifest.json`, optional `release-manifest.sig`, optional `release-public-key.pem`, and `checksums.txt`.
 - `release-manifest.json` binds artifact hashes, target triples, build identity, and schema/storage compatibility into one tamper-evident record when signed.
 - Build production artifacts with `scripts/package-release.sh --sign --signing-key <path>`. Development-only unsigned packaging requires `scripts/package-release.sh --unsigned`.
-- Prefer `forge upgrade plan --artifact ... --manifest ... [--signature ...]` and `forge upgrade apply --artifact ... --manifest ... [--signature ...]` for production/self-hosted operators. `syncforge` remains development-only.
+- Publish tagged releases with `scripts/publish-release.sh <tag> --signing-key <path>` after the tag is at `HEAD`; it regenerates the signed bundle, writes `dist/RELEASE_NOTES.md`, and uploads the release assets through `gh`.
+- Prefer `./install.sh --release <tag>`, `forge upgrade plan --release <tag>`, and `forge upgrade apply --release <tag>` for production/self-hosted operators. Local artifact flags remain available for staged or offline rollouts. `syncforge` remains development-only.
 - Unsigned upgrades are rejected unless `--allow-unsigned` is passed explicitly. Dirty manifests are rejected unless `--allow-dirty-artifact` is passed explicitly.
+- Release installs verify the signed manifest when `release_public_key_path` or `FORGE_RELEASE_PUBLIC_KEY` is configured; otherwise they fail closed unless `--allow-unsigned-release` is passed explicitly.
+- Operators should verify manifest signatures, validate with `forge upgrade plan`, and keep `forge upgrade rollback` as the rollback path for the preserved `forge.previous` binary.
 - Signatures provide tamper evidence for release artifacts and manifests. They do not sandbox the extracted binary or replace normal host hardening.
 
 ## Backup Safety

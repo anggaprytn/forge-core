@@ -344,16 +344,21 @@ main() {
     stage_target "$target"
   done
 
-  : >"$DIST_DIR/checksums.txt"
-  for archive in "$DIST_DIR"/*.tar.gz; do
-    sha256_file "$archive" >>"$DIST_DIR/checksums.txt"
-  done
-  log "wrote $DIST_DIR/checksums.txt"
-
   write_manifest
   if [ "$SIGN_MODE" = "signed" ]; then
     sign_manifest
   fi
+  : >"$DIST_DIR/checksums.txt"
+  for path in "$DIST_DIR"/*; do
+    [ -f "$path" ] || continue
+    case "$(basename "$path")" in
+      .artifacts.tsv|checksums.txt)
+        continue
+        ;;
+    esac
+    sha256_file "$path" >>"$DIST_DIR/checksums.txt"
+  done
+  log "wrote $DIST_DIR/checksums.txt"
   rm -f "$ARTIFACTS_TSV"
 }
 

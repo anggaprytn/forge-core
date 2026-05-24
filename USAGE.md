@@ -243,7 +243,7 @@ Minimum runtime requirements:
 For Linux hosts with systemd, use the provided conservative installer:
 
 ```bash
-./install.sh --artifact dist/forge-<version>-linux-amd64.tar.gz
+./install.sh --release <tag>
 ```
 
 The installer is **idempotent** and performs the following:
@@ -1164,17 +1164,22 @@ forge token revoke tok-1234abcd
 ```bash
 forge version
 forge doctor upgrade
-forge upgrade plan --artifact dist/forge-<version>-linux-amd64.tar.gz --manifest dist/release-manifest.json --signature dist/release-manifest.sig
-forge upgrade apply --artifact dist/forge-<version>-linux-amd64.tar.gz --manifest dist/release-manifest.json --signature dist/release-manifest.sig
+./install.sh --release <tag>
+forge upgrade plan --release <tag>
+forge upgrade apply --release <tag>
 forge upgrade rollback
 ```
 
 - `forge version` prints the runtime version, git commit, build timestamp, target triple, schema versions, and storage compatibility version. Missing git/build metadata is rendered as `unknown`.
 - `forge doctor upgrade` is read-only and checks storage readability, checkpoint compatibility, reconciliation log compatibility, backup metadata compatibility, Docker, Caddy, write permissions, and Linux `systemd` unit sanity.
 - `scripts/package-release.sh --sign --signing-key <path>` emits `release-manifest.json`, `release-manifest.sig`, `release-public-key.pem`, release tarballs, and `checksums.txt`. Use `--unsigned` only for development artifacts.
+- `scripts/publish-release.sh <tag> --signing-key <path>` regenerates the signed bundle from a clean tree, writes `dist/RELEASE_NOTES.md`, and publishes the tagged GitHub release with `gh`.
 - `release-manifest.json` records `version`, `git_commit`, `git_dirty`, `build_timestamp`, every packaged artifact hash/size/target, and the manifest/snapshot/checkpoint/reconciliation/storage compatibility versions.
+- `./install.sh --release <tag>` and `./install.sh --version <tag>` download the GitHub release artifact plus manifest/signature/checksums, preserve config/env, and reuse the same atomic binary install path. They fail closed unless a public key is configured or `--allow-unsigned-release` is passed explicitly.
+- `forge upgrade plan --release <tag>` downloads the GitHub release metadata, fetches the platform artifact plus manifest/signature, and runs the same verification path used for local artifact upgrades.
 - `forge upgrade plan --artifact <path> --manifest <path> [--signature <path>]` validates the artifact hash, artifact membership in the manifest, world-writable inputs, current/target schema compatibility, and artifact build metadata without touching the running binary.
 - If `release_public_key_path` or `FORGE_RELEASE_PUBLIC_KEY` is configured, `forge upgrade plan/apply` require a valid manifest signature. If no public key is configured, upgrades fail unless `--allow-unsigned` is passed explicitly.
 - `forge upgrade apply` runs the same verification as `plan`, stops the service, saves `/usr/local/bin/forge.previous`, swaps the binary atomically, waits for `/readyz`, and auto-rolls back unless `--no-auto-rollback` is set.
+- Verify the manifest signature, prefer `forge upgrade plan/apply`, and treat `syncforge` as development-only.
 - `--allow-dirty-artifact` is an emergency-only override for manifests built from dirty worktrees.
 - `forge upgrade rollback` restores `/usr/local/bin/forge.previous` and restarts the service.
