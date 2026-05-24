@@ -563,7 +563,12 @@ fn dogfood_bad_app_diagnostics_are_visible() {
     let summary = fs::read_to_string(diagnostics_dir.join("summary.json"))
         .expect("diagnostic summary should be persisted");
     assert!(summary.contains("\"failure_stage\":"));
-    assert!(summary.contains("\"failure_reason\": \"http health probe failed\""));
+    let summary_json: Value = serde_json::from_str(&summary).expect("summary should be valid json");
+    assert_eq!(
+        summary_json["failure_reason"].as_str(),
+        Some(reason.trim()),
+        "summary should reflect the persisted failure reason"
+    );
 }
 
 #[test]
