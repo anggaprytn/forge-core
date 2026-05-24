@@ -1677,8 +1677,13 @@ impl E2eHarness {
     }
 
     fn wait_for_api_ready(&self) {
-        common::wait_for_http_readyz(&self.api_url("readyz"), Duration::from_secs(4))
-            .expect("api readyz should accept requests before tests proceed");
+        common::wait_for_daemon_http_ready(
+            &format!("http://127.0.0.1:{}", self.api_port),
+            Duration::from_secs(4),
+        )
+        .expect(
+            "api control plane should pass healthz and readyz startup gating before tests proceed",
+        );
     }
 
     fn wait_for_readyz_status(&self, expected: &str, timeout: Duration) -> ReadyzResponse {

@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Url;
+use reqwest::blocking::Response;
+use serde::Deserialize;
 use serde_json::Value;
 
 pub fn integration_enabled() -> bool {
@@ -197,6 +199,112 @@ pub fn wait_for_http_readyz(url: &str, timeout: Duration) -> Result<(), String> 
 }
 
 #[allow(dead_code)]
+pub fn wait_for_daemon_http_ready(base_url: &str, timeout: Duration) -> Result<(), String> {
+    let base = base_url.trim_end_matches('/');
+    let healthz_url = format!("{base}/healthz");
+    let readyz_url = format!("{base}/readyz");
+    let parsed =
+        Url::parse(&readyz_url).map_err(|err| format!("invalid url `{readyz_url}`: {err}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("url `{readyz_url}` is missing a host"))?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| format!("url `{readyz_url}` is missing a port"))?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_millis(200))
+        .timeout(Duration::from_millis(500))
+        .build()
+        .map_err(|err| format!("failed to build http client: {err}"))?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut last_connection_error = "no connection attempts".to_string();
+    let mut last_http_observation = "no http responses".to_string();
+    loop {
+        match wait_for_tcp_accept(&host, port, Duration::from_millis(200)) {
+            Ok(()) => {}
+            Err(err) => {
+                last_connection_error = err;
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "daemon readiness wait timed out after {:?}: healthz_url={} readyz_url={} last_connection_error={} last_http={}",
+                        started.elapsed(),
+                        healthz_url,
+                        readyz_url,
+                        last_connection_error,
+                        last_http_observation
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+        }
+        match client.get(&healthz_url).send() {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                last_http_observation = describe_http_observation(&healthz_url, response);
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "daemon readiness wait timed out after {:?}: healthz_url={} readyz_url={} last_connection_error={} last_http={}",
+                        started.elapsed(),
+                        healthz_url,
+                        readyz_url,
+                        last_connection_error,
+                        last_http_observation
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(err) => {
+                last_connection_error = format!("{healthz_url}: {err}");
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "daemon readiness wait timed out after {:?}: healthz_url={} readyz_url={} last_connection_error={} last_http={}",
+                        started.elapsed(),
+                        healthz_url,
+                        readyz_url,
+                        last_connection_error,
+                        last_http_observation
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+        }
+        match client.get(&readyz_url).send() {
+            Ok(response) => match parse_readyz_observation(&readyz_url, response) {
+                Ok(readyz)
+                    if readyz.startup_phase != "booting" && readyz.startup_phase != "replaying" =>
+                {
+                    return Ok(());
+                }
+                Ok(readyz) => {
+                    last_http_observation = format!(
+                        "url={} status_field={} startup_phase={}",
+                        readyz_url, readyz.status, readyz.startup_phase
+                    );
+                }
+                Err(observation) => last_http_observation = observation,
+            },
+            Err(err) => last_connection_error = format!("{readyz_url}: {err}"),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "daemon readiness wait timed out after {:?}: healthz_url={} readyz_url={} last_connection_error={} last_http={}",
+                started.elapsed(),
+                healthz_url,
+                readyz_url,
+                last_connection_error,
+                last_http_observation
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[allow(dead_code)]
 pub fn wait_for_container_health_or_port(
     container_name: &str,
     port: u16,
@@ -246,6 +354,54 @@ pub fn wait_for_container_health_or_port(
             ));
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadyzObservation {
+    status: String,
+    startup_phase: String,
+}
+
+fn parse_readyz_observation(url: &str, response: Response) -> Result<ReadyzObservation, String> {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "url={} http_status={} body={}",
+            url,
+            status,
+            truncate_debug_text(&body)
+        ));
+    }
+    serde_json::from_str::<ReadyzObservation>(&body).map_err(|err| {
+        format!(
+            "url={} http_status={} parse_error={} body={}",
+            url,
+            status,
+            err,
+            truncate_debug_text(&body)
+        )
+    })
+}
+
+fn describe_http_observation(url: &str, response: Response) -> String {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    format!(
+        "url={} http_status={} body={}",
+        url,
+        status,
+        truncate_debug_text(&body)
+    )
+}
+
+fn truncate_debug_text(text: &str) -> String {
+    const LIMIT: usize = 400;
+    if text.len() <= LIMIT {
+        text.to_string()
+    } else {
+        format!("{}...", &text[..LIMIT])
     }
 }
 
