@@ -1164,14 +1164,17 @@ forge token revoke tok-1234abcd
 ```bash
 forge version
 forge doctor upgrade
-forge upgrade plan --artifact dist/forge-<version>-linux-amd64.tar.gz
-forge upgrade apply --artifact dist/forge-<version>-linux-amd64.tar.gz
+forge upgrade plan --artifact dist/forge-<version>-linux-amd64.tar.gz --manifest dist/release-manifest.json --signature dist/release-manifest.sig
+forge upgrade apply --artifact dist/forge-<version>-linux-amd64.tar.gz --manifest dist/release-manifest.json --signature dist/release-manifest.sig
 forge upgrade rollback
 ```
 
 - `forge version` prints the runtime version, git commit, build timestamp, target triple, schema versions, and storage compatibility version. Missing git/build metadata is rendered as `unknown`.
 - `forge doctor upgrade` is read-only and checks storage readability, checkpoint compatibility, reconciliation log compatibility, backup metadata compatibility, Docker, Caddy, write permissions, and Linux `systemd` unit sanity.
-- `forge upgrade plan` validates the current binary version, target artifact version, config/env readability, Docker, Caddy, systemd presence, schema compatibility, checksum availability, artifact permissions, and disk space without touching the running binary.
-- `forge upgrade apply` stops the service, saves `/usr/local/bin/forge.previous`, swaps the binary atomically, waits for `/readyz`, and auto-rolls back unless `--no-auto-rollback` is set.
+- `scripts/package-release.sh --sign --signing-key <path>` emits `release-manifest.json`, `release-manifest.sig`, `release-public-key.pem`, release tarballs, and `checksums.txt`. Use `--unsigned` only for development artifacts.
+- `release-manifest.json` records `version`, `git_commit`, `git_dirty`, `build_timestamp`, every packaged artifact hash/size/target, and the manifest/snapshot/checkpoint/reconciliation/storage compatibility versions.
+- `forge upgrade plan --artifact <path> --manifest <path> [--signature <path>]` validates the artifact hash, artifact membership in the manifest, world-writable inputs, current/target schema compatibility, and artifact build metadata without touching the running binary.
+- If `release_public_key_path` or `FORGE_RELEASE_PUBLIC_KEY` is configured, `forge upgrade plan/apply` require a valid manifest signature. If no public key is configured, upgrades fail unless `--allow-unsigned` is passed explicitly.
+- `forge upgrade apply` runs the same verification as `plan`, stops the service, saves `/usr/local/bin/forge.previous`, swaps the binary atomically, waits for `/readyz`, and auto-rolls back unless `--no-auto-rollback` is set.
+- `--allow-dirty-artifact` is an emergency-only override for manifests built from dirty worktrees.
 - `forge upgrade rollback` restores `/usr/local/bin/forge.previous` and restarts the service.
-- `scripts/package-release.sh` produces release tarballs and `checksums.txt`.

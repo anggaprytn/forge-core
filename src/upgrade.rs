@@ -7,6 +7,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -29,6 +30,7 @@ const TAR_TIMEOUT: Duration = Duration::from_secs(30);
 const VERSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 const SUDO_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENSSL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 pub enum UpgradeError {
@@ -92,6 +94,14 @@ pub struct UpgradePlanOutput {
 struct BinaryVersionInfo {
     version: String,
     #[serde(default)]
+    git_commit: Option<String>,
+    #[serde(default)]
+    git_dirty: Option<String>,
+    #[serde(default)]
+    build_timestamp: Option<String>,
+    #[serde(default)]
+    target_triple: Option<String>,
+    #[serde(default)]
     schema_versions: Option<ForgeSchemaVersions>,
 }
 
@@ -108,13 +118,17 @@ pub struct UpgradeOptions {
     pub config_path: PathBuf,
     pub caddy_admin_url: String,
     pub artifact_path: PathBuf,
+    pub manifest_path: Option<PathBuf>,
+    pub signature_path: Option<PathBuf>,
+    pub allow_unsigned: bool,
+    pub allow_dirty_artifact: bool,
     pub auto_rollback: bool,
 }
 
 pub fn plan(options: &UpgradeOptions) -> Result<UpgradePlanOutput, UpgradeError> {
     let config = load_config(&options.config_path)?;
     let current_version = inspect_binary_version(&current_binary_path())?;
-    let artifact = inspect_artifact(&options.artifact_path)?;
+    let artifact = inspect_artifact(&options.artifact_path, &config, options)?;
     let mut checks = vec![
         check_file_readable(&options.config_path, "Config readable"),
         check_file_readable(
@@ -159,7 +173,7 @@ pub fn apply(options: &UpgradeOptions) -> Result<UpgradeApplyOutput, UpgradeErro
         ));
     }
     let config = load_config(&options.config_path)?;
-    let artifact = inspect_artifact(&options.artifact_path)?;
+    let artifact = inspect_artifact(&options.artifact_path, &config, options)?;
 
     systemctl(&["stop", "forge.service"])?;
     backup_current_binary(&current_binary_path(), &previous_binary_path())?;
@@ -419,10 +433,54 @@ struct InspectedArtifact {
     schema_versions: Option<ForgeSchemaVersions>,
 }
 
-fn inspect_artifact(path: &Path) -> Result<InspectedArtifact, UpgradeError> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseManifest {
+    version: String,
+    git_commit: String,
+    git_dirty: bool,
+    build_timestamp: String,
+    artifacts: Vec<ReleaseManifestArtifact>,
+    schema_versions: ReleaseManifestSchemaVersions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseManifestArtifact {
+    name: String,
+    target_triple: String,
+    sha256: String,
+    size_bytes: u64,
+    created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseManifestSchemaVersions {
+    manifest_schema: u64,
+    snapshot_schema: u64,
+    checkpoint_schema: u64,
+    reconciliation_log_schema: u64,
+    storage_compatibility_version: u64,
+}
+
+impl ReleaseManifestSchemaVersions {
+    fn to_forge_schema_versions(&self) -> ForgeSchemaVersions {
+        ForgeSchemaVersions {
+            manifest_schema: self.manifest_schema,
+            snapshot_schema: self.snapshot_schema,
+            checkpoint_schema: self.checkpoint_schema,
+            reconciliation_log_schema: self.reconciliation_log_schema,
+            storage_compatibility: self.storage_compatibility_version,
+        }
+    }
+}
+
+fn inspect_artifact(
+    path: &Path,
+    config: &DaemonConfig,
+    options: &UpgradeOptions,
+) -> Result<InspectedArtifact, UpgradeError> {
     reject_world_writable(path)?;
     let checksum = sha256_file(path)?;
-    verify_checksum_if_available(path, &checksum)?;
+    let artifact_size = fs::metadata(path)?.len();
     let temp_root = unique_temp_dir("forge-upgrade-artifact");
     let _cleanup = TempDirGuard::new(&temp_root);
     fs::create_dir_all(&temp_root)?;
@@ -434,10 +492,23 @@ fn inspect_artifact(path: &Path) -> Result<InspectedArtifact, UpgradeError> {
         ));
     }
     let version = inspect_binary_version(&binary_path)?;
+    let release_manifest = load_release_manifest(config, options)?;
+    if let Some(release_manifest) = release_manifest.as_ref() {
+        verify_manifest_for_artifact(
+            release_manifest,
+            path,
+            artifact_size,
+            &checksum,
+            &version,
+            options.allow_dirty_artifact,
+        )?;
+    }
     Ok(InspectedArtifact {
         version: version.version,
         checksum,
-        schema_versions: version.schema_versions,
+        schema_versions: release_manifest
+            .map(|manifest| manifest.schema_versions.to_forge_schema_versions())
+            .or(version.schema_versions),
     })
 }
 
@@ -452,33 +523,195 @@ fn reject_world_writable(path: &Path) -> Result<(), UpgradeError> {
     Ok(())
 }
 
-fn verify_checksum_if_available(path: &Path, actual_checksum: &str) -> Result<(), UpgradeError> {
-    let checksum_path = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("checksums.txt");
-    if !checksum_path.exists() {
-        return Ok(());
+fn load_release_manifest(
+    config: &DaemonConfig,
+    options: &UpgradeOptions,
+) -> Result<Option<ReleaseManifest>, UpgradeError> {
+    let public_key_path = release_public_key_path(config);
+    let Some(manifest_path) = options.manifest_path.as_ref() else {
+        if options.allow_unsigned {
+            return Ok(None);
+        }
+        return Err(UpgradeError::Usage(
+            "release manifest required; pass --manifest <path> or --allow-unsigned for development artifacts".into(),
+        ));
+    };
+
+    reject_world_writable_named(manifest_path, "manifest")?;
+    let manifest_raw = fs::read_to_string(manifest_path)?;
+    let manifest = serde_json::from_str::<ReleaseManifest>(&manifest_raw).map_err(|err| {
+        UpgradeError::InvalidArtifact(format!(
+            "failed to parse release manifest {}: {err}",
+            manifest_path.display()
+        ))
+    })?;
+
+    if public_key_path.is_some() {
+        let Some(signature_path) = options.signature_path.as_ref() else {
+            return Err(UpgradeError::Usage(
+                "release signature required when release public key is configured; pass --signature <path>".into(),
+            ));
+        };
+        let public_key_path = public_key_path.unwrap();
+        reject_world_writable_named(signature_path, "signature")?;
+        verify_manifest_signature(manifest_path, signature_path, &public_key_path)?;
+    } else if !options.allow_unsigned {
+        return Err(UpgradeError::Usage(
+            "release public key not configured; set release_public_key_path or FORGE_RELEASE_PUBLIC_KEY, or pass --allow-unsigned for development artifacts".into(),
+        ));
     }
-    let raw = fs::read_to_string(&checksum_path)?;
-    let file_name = path
+
+    Ok(Some(manifest))
+}
+
+fn release_public_key_path(config: &DaemonConfig) -> Option<PathBuf> {
+    std::env::var_os("FORGE_RELEASE_PUBLIC_KEY")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| config.release_public_key_path.clone())
+}
+
+fn reject_world_writable_named(path: &Path, label: &str) -> Result<(), UpgradeError> {
+    let mode = fs::metadata(path)?.permissions().mode();
+    if mode & 0o002 != 0 {
+        return Err(UpgradeError::InvalidArtifact(format!(
+            "refusing world-writable {label}: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_manifest_signature(
+    manifest_path: &Path,
+    signature_path: &Path,
+    public_key_path: &Path,
+) -> Result<(), UpgradeError> {
+    let signature_raw = fs::read_to_string(signature_path)?;
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(signature_raw.split_whitespace().collect::<String>())
+        .map_err(|err| {
+            UpgradeError::InvalidArtifact(format!(
+                "invalid release manifest signature {}: {err}",
+                signature_path.display()
+            ))
+        })?;
+    let temp_root = unique_temp_dir("forge-upgrade-signature");
+    let _cleanup = TempDirGuard::new(&temp_root);
+    fs::create_dir_all(&temp_root)?;
+    let decoded_signature_path = temp_root.join("release-manifest.sig.bin");
+    fs::write(&decoded_signature_path, signature)?;
+    let output = run_command_with_timeout(
+        Command::new("openssl")
+            .args(["pkeyutl", "-verify", "-pubin", "-inkey"])
+            .arg(public_key_path)
+            .args(["-sigfile"])
+            .arg(&decoded_signature_path)
+            .args(["-rawin", "-in"])
+            .arg(manifest_path),
+        OPENSSL_TIMEOUT,
+    )
+    .map_err(|err| {
+        command_error(
+            err,
+            format!(
+                "failed to verify release manifest signature with {}",
+                public_key_path.display()
+            ),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(UpgradeError::InvalidArtifact(format!(
+            "release manifest signature verification failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_manifest_for_artifact(
+    manifest: &ReleaseManifest,
+    artifact_path: &Path,
+    artifact_size: u64,
+    actual_checksum: &str,
+    artifact_version: &BinaryVersionInfo,
+    allow_dirty_artifact: bool,
+) -> Result<(), UpgradeError> {
+    if manifest.git_dirty && !allow_dirty_artifact {
+        return Err(UpgradeError::InvalidArtifact(
+            "refusing dirty release manifest; rerun with --allow-dirty-artifact only for emergency development overrides".into(),
+        ));
+    }
+
+    let artifact_name = artifact_path
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| {
-            UpgradeError::InvalidArtifact(format!("invalid artifact path: {}", path.display()))
+            UpgradeError::InvalidArtifact(format!(
+                "invalid artifact path: {}",
+                artifact_path.display()
+            ))
         })?;
-    let expected = raw.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let checksum = parts.next()?;
-        let name = parts.next()?;
-        (name.trim_start_matches('*') == file_name).then(|| checksum.to_string())
-    });
-    if let Some(expected) = expected
-        && expected != actual_checksum
-    {
+    let manifest_artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == artifact_name)
+        .ok_or_else(|| {
+            UpgradeError::InvalidArtifact(format!(
+                "artifact not listed in release manifest: {}",
+                artifact_path.display()
+            ))
+        })?;
+
+    if manifest_artifact.sha256 != actual_checksum {
         return Err(UpgradeError::InvalidArtifact(format!(
             "artifact checksum mismatch for {}",
-            path.display()
+            artifact_path.display()
+        )));
+    }
+    if manifest_artifact.size_bytes != artifact_size {
+        return Err(UpgradeError::InvalidArtifact(format!(
+            "artifact size mismatch for {}",
+            artifact_path.display()
+        )));
+    }
+    if artifact_version.version != manifest.version {
+        return Err(UpgradeError::InvalidArtifact(format!(
+            "artifact version mismatch: manifest={} artifact={}",
+            manifest.version, artifact_version.version
+        )));
+    }
+    if let Some(git_commit) = artifact_version
+        .git_commit
+        .as_deref()
+        .filter(|value| *value != "unknown")
+        && git_commit != manifest.git_commit
+    {
+        return Err(UpgradeError::InvalidArtifact(format!(
+            "artifact git_commit mismatch: manifest={} artifact={git_commit}",
+            manifest.git_commit
+        )));
+    }
+    let manifest_git_dirty = if manifest.git_dirty { "true" } else { "false" };
+    if let Some(git_dirty) = artifact_version
+        .git_dirty
+        .as_deref()
+        .filter(|value| *value != "unknown")
+        && git_dirty != manifest_git_dirty
+    {
+        return Err(UpgradeError::InvalidArtifact(format!(
+            "artifact git_dirty mismatch: manifest={manifest_git_dirty} artifact={git_dirty}"
+        )));
+    }
+    if let Some(target_triple) = artifact_version
+        .target_triple
+        .as_deref()
+        .filter(|value| *value != "unknown")
+        && target_triple != manifest_artifact.target_triple
+    {
+        return Err(UpgradeError::InvalidArtifact(format!(
+            "artifact target_triple mismatch: manifest={} artifact={target_triple}",
+            manifest_artifact.target_triple
         )));
     }
     Ok(())

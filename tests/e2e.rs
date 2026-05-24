@@ -963,6 +963,7 @@ impl E2eHarness {
             storage_root: runtime_root.clone(),
             api_bind: format!("127.0.0.1:{api_port}"),
             bearer_token: token.clone(),
+            release_public_key_path: None,
             heartbeat_interval_ms: 1_000,
             startup_replay_max_duration_ms: 5_000,
             startup_replay_max_entries: 256,

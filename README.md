@@ -246,10 +246,15 @@ MIT License. Built for the era of agentic software.
 
 - `bearer_token` in `forge.conf` remains the bootstrap/admin credential. Prefer CLI tokens for routine remote operation.
 - Do not paste the bootstrap bearer token into shell history; use env injection or a protected config file.
+- Configure signed upgrade verification with `release_public_key_path=/etc/forge/release-public-key.pem` or `FORGE_RELEASE_PUBLIC_KEY=/path/to/release-public-key.pem`.
 - `forge version` reports the runtime version, git commit, build timestamp, target triple, manifest/snapshot/checkpoint/reconciliation schema versions, and storage compatibility version. Missing build metadata is rendered as `unknown`.
 - `forge doctor upgrade` is read-only and checks storage readability, checkpoint compatibility, reconciliation log compatibility, backup metadata compatibility, Docker, Caddy, write access, and Linux `systemd` sanity.
-- Release artifacts live under `dist/` with `forge-<version>-<platform>.tar.gz` plus `checksums.txt`.
-- Prefer `forge upgrade plan --artifact ...` and `forge upgrade apply --artifact ...` for production/self-hosted operators. `syncforge` remains development-only.
+- Release artifacts live under `dist/` with `forge-<version>-<platform>.tar.gz`, `release-manifest.json`, optional `release-manifest.sig`, optional `release-public-key.pem`, and `checksums.txt`.
+- `release-manifest.json` binds artifact hashes, target triples, build identity, and schema/storage compatibility into one tamper-evident record when signed.
+- Build production artifacts with `scripts/package-release.sh --sign --signing-key <path>`. Development-only unsigned packaging requires `scripts/package-release.sh --unsigned`.
+- Prefer `forge upgrade plan --artifact ... --manifest ... [--signature ...]` and `forge upgrade apply --artifact ... --manifest ... [--signature ...]` for production/self-hosted operators. `syncforge` remains development-only.
+- Unsigned upgrades are rejected unless `--allow-unsigned` is passed explicitly. Dirty manifests are rejected unless `--allow-dirty-artifact` is passed explicitly.
+- Signatures provide tamper evidence for release artifacts and manifests. They do not sandbox the extracted binary or replace normal host hardening.
 
 ## Backup Safety
 

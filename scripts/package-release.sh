@@ -14,9 +14,21 @@ INSTALLER_SRC="$REPO_ROOT/install.sh"
 PACKAGE_TIMEOUT_SECS="${FORGE_PACKAGE_TIMEOUT_SECS:-1800}"
 ALLOW_DIRTY=0
 BUILD_TIMESTAMP="${FORGE_BUILD_TIMESTAMP:-}"
+SIGN_MODE=""
+SIGNING_KEY=""
+ARTIFACTS_TSV=""
+MANIFEST_SCHEMA_VERSION="${FORGE_PACKAGE_MANIFEST_SCHEMA_VERSION:-1}"
+SNAPSHOT_SCHEMA_VERSION="${FORGE_PACKAGE_SNAPSHOT_SCHEMA_VERSION:-1}"
+CHECKPOINT_SCHEMA_VERSION="${FORGE_PACKAGE_CHECKPOINT_SCHEMA_VERSION:-1}"
+RECONCILIATION_LOG_SCHEMA_VERSION="${FORGE_PACKAGE_RECONCILIATION_LOG_SCHEMA_VERSION:-1}"
+STORAGE_COMPATIBILITY_VERSION="${FORGE_PACKAGE_STORAGE_COMPATIBILITY_VERSION:-1}"
 
 log() {
   printf '[INFO] %s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
 }
 
 die() {
@@ -26,7 +38,9 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/package-release.sh [--allow-dirty]
+Usage:
+  scripts/package-release.sh --sign --signing-key <path> [--allow-dirty]
+  scripts/package-release.sh --unsigned [--allow-dirty]
 EOF
 }
 
@@ -48,6 +62,19 @@ parse_args() {
     case "$1" in
       --allow-dirty)
         ALLOW_DIRTY=1
+        ;;
+      --sign)
+        [ "$SIGN_MODE" != "unsigned" ] || die "cannot combine --sign with --unsigned"
+        SIGN_MODE="signed"
+        ;;
+      --signing-key)
+        shift
+        [ "$#" -gt 0 ] || die "--signing-key requires a path"
+        SIGNING_KEY="$1"
+        ;;
+      --unsigned)
+        [ "$SIGN_MODE" != "signed" ] || die "cannot combine --unsigned with --sign"
+        SIGN_MODE="unsigned"
         ;;
       -h|--help)
         usage
@@ -137,13 +164,30 @@ binary_path_for_target() {
   printf '%s\n' "$REPO_ROOT/target/$triple/release/forge"
 }
 
+record_artifact_metadata() {
+  local archive_path="$1"
+  local target="$2"
+  local created_at="$3"
+  local archive_name checksum size_bytes
+  archive_name="$(basename "$archive_path")"
+  checksum="$(sha256_file "$archive_path" | awk '{print $1}')"
+  size_bytes="$(wc -c <"$archive_path" | tr -d '[:space:]')"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$archive_name" \
+    "$(target_triple "$target")" \
+    "$checksum" \
+    "$size_bytes" \
+    "$created_at" >>"$ARTIFACTS_TSV"
+}
+
 stage_target() {
   local target="$1"
-  local bin_path archive_name stage_dir
+  local bin_path archive_name archive_path stage_dir created_at
   bin_path="$(binary_path_for_target "$target")"
   [ -x "$bin_path" ] || die "missing forge binary for $target at $bin_path"
 
   archive_name="forge-$VERSION-$target.tar.gz"
+  archive_path="$DIST_DIR/$archive_name"
   stage_dir="$(mktemp -d)"
   install -m 0755 "$bin_path" "$stage_dir/forge"
   install -m 0755 "$INSTALLER_SRC" "$stage_dir/install.sh"
@@ -157,7 +201,7 @@ stage_target() {
   mkdir -p "$DIST_DIR"
   (
     cd "$stage_dir"
-    run_with_timeout "$PACKAGE_TIMEOUT_SECS" tar -czf "$DIST_DIR/$archive_name" \
+    run_with_timeout "$PACKAGE_TIMEOUT_SECS" tar -czf "$archive_path" \
       forge \
       install.sh \
       README.md \
@@ -166,7 +210,88 @@ stage_target() {
       $( [ -f "$stage_dir/LICENSE" ] && printf '%s' "LICENSE" )
   )
   rm -rf "$stage_dir"
-  log "packaged $DIST_DIR/$archive_name"
+  created_at="$(date -u '+%s')"
+  record_artifact_metadata "$archive_path" "$target" "$created_at"
+  log "packaged $archive_path"
+}
+
+write_manifest() {
+  local manifest_path="$DIST_DIR/release-manifest.json"
+  python3 - "$ARTIFACTS_TSV" "$manifest_path" \
+    "$VERSION" \
+    "${FORGE_GIT_COMMIT:-unknown}" \
+    "${FORGE_GIT_DIRTY:-unknown}" \
+    "$(build_timestamp)" \
+    "$MANIFEST_SCHEMA_VERSION" \
+    "$SNAPSHOT_SCHEMA_VERSION" \
+    "$CHECKPOINT_SCHEMA_VERSION" \
+    "$RECONCILIATION_LOG_SCHEMA_VERSION" \
+    "$STORAGE_COMPATIBILITY_VERSION" <<'PY'
+import json
+import pathlib
+import sys
+
+artifacts_tsv = pathlib.Path(sys.argv[1])
+manifest_path = pathlib.Path(sys.argv[2])
+version = sys.argv[3]
+git_commit = sys.argv[4]
+git_dirty = sys.argv[5].lower() == "true"
+build_timestamp = sys.argv[6]
+manifest_schema = int(sys.argv[7])
+snapshot_schema = int(sys.argv[8])
+checkpoint_schema = int(sys.argv[9])
+reconciliation_log_schema = int(sys.argv[10])
+storage_compatibility_version = int(sys.argv[11])
+artifacts = []
+for line in artifacts_tsv.read_text().splitlines():
+    if not line.strip():
+        continue
+    name, target_triple, sha256, size_bytes, created_at_unix = line.split("\t")
+    artifacts.append(
+        {
+            "name": name,
+            "target_triple": target_triple,
+            "sha256": sha256,
+            "size_bytes": int(size_bytes),
+            "created_at_unix": int(created_at_unix),
+        }
+    )
+
+manifest = {
+    "version": version,
+    "git_commit": git_commit,
+    "git_dirty": git_dirty,
+    "build_timestamp": build_timestamp,
+    "artifacts": artifacts,
+    "schema_versions": {
+        "manifest_schema": manifest_schema,
+        "snapshot_schema": snapshot_schema,
+        "checkpoint_schema": checkpoint_schema,
+        "reconciliation_log_schema": reconciliation_log_schema,
+        "storage_compatibility_version": storage_compatibility_version,
+    },
+}
+
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+PY
+  log "wrote $manifest_path"
+}
+
+sign_manifest() {
+  local manifest_path="$DIST_DIR/release-manifest.json"
+  local public_key_path="$DIST_DIR/release-public-key.pem"
+  local signature_bin="$DIST_DIR/.release-manifest.sig.bin"
+  local signature_path="$DIST_DIR/release-manifest.sig"
+
+  command -v openssl >/dev/null 2>&1 || die "openssl is required for --sign"
+  [ -f "$SIGNING_KEY" ] || die "missing signing key: $SIGNING_KEY"
+  openssl pkey -in "$SIGNING_KEY" -pubout -out "$public_key_path" >/dev/null 2>&1
+  openssl pkeyutl -sign -rawin -inkey "$SIGNING_KEY" -in "$manifest_path" -out "$signature_bin"
+  base64 <"$signature_bin" >"$signature_path"
+  rm -f "$signature_bin"
+  chmod 0644 "$public_key_path" "$signature_path"
+  log "signed $manifest_path"
+  log "public key written to $public_key_path"
 }
 
 main() {
@@ -177,6 +302,19 @@ main() {
   [ -f "$README_SRC" ] || die "missing README/RELEASE_NOTES: $README_SRC"
   [ -f "$CONFIG_SRC" ] || die "missing config example: $CONFIG_SRC"
   [ -f "$ENV_SRC" ] || die "missing env example: $ENV_SRC"
+
+  case "$SIGN_MODE" in
+    signed)
+      [ -n "$SIGNING_KEY" ] || die "--sign requires --signing-key <path>"
+      ;;
+    unsigned)
+      [ -z "$SIGNING_KEY" ] || die "--signing-key cannot be used with --unsigned"
+      warn "building unsigned development artifacts"
+      ;;
+    *)
+      die "signing mode required; use --sign --signing-key <path> for release packaging or --unsigned for development"
+      ;;
+  esac
 
   if git rev-parse --git-dir >/dev/null 2>&1; then
     local_dirty="$(git_dirty || printf '%s' "unknown")"
@@ -189,6 +327,9 @@ main() {
     export FORGE_GIT_DIRTY
   fi
   [ -n "${FORGE_GIT_COMMIT:-}" ] || die "could not determine git commit"
+  if [ -z "$BUILD_TIMESTAMP" ]; then
+    BUILD_TIMESTAMP="$(build_timestamp)"
+  fi
 
   if [ -z "$TARGETS" ]; then
     TARGETS="$(host_targets | paste -sd, -)"
@@ -196,6 +337,8 @@ main() {
 
   rm -rf "$DIST_DIR"
   mkdir -p "$DIST_DIR"
+  ARTIFACTS_TSV="$DIST_DIR/.artifacts.tsv"
+  : >"$ARTIFACTS_TSV"
   IFS=',' read -r -a target_list <<<"$TARGETS"
   for target in "${target_list[@]}"; do
     stage_target "$target"
@@ -206,6 +349,12 @@ main() {
     sha256_file "$archive" >>"$DIST_DIR/checksums.txt"
   done
   log "wrote $DIST_DIR/checksums.txt"
+
+  write_manifest
+  if [ "$SIGN_MODE" = "signed" ]; then
+    sign_manifest
+  fi
+  rm -f "$ARTIFACTS_TSV"
 }
 
 main "$@"

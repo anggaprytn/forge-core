@@ -432,12 +432,16 @@ The `install.sh` script is designed to be safe and non-destructive:
 
 ## Release Upgrades
 
-- Package releases with `scripts/package-release.sh`.
-- Verify artifacts with `dist/checksums.txt`.
-- Prefer `forge upgrade plan --artifact ...` before every operator upgrade.
-- Use `forge upgrade apply --artifact ...` for the actual swap; the binary replacement is atomic and gated on `/readyz`.
+- Package releases with `scripts/package-release.sh --sign --signing-key <path>`. Use `--unsigned` only for development artifacts.
+- Signed packages emit `dist/release-manifest.json`, `dist/release-manifest.sig`, and `dist/release-public-key.pem` alongside the tarballs and `checksums.txt`.
+- Configure verification with `release_public_key_path=/etc/forge/release-public-key.pem` in `forge.conf` or `FORGE_RELEASE_PUBLIC_KEY=/path/to/release-public-key.pem`.
+- Prefer `forge upgrade plan --artifact ... --manifest dist/release-manifest.json --signature dist/release-manifest.sig` before every operator upgrade.
+- Use `forge upgrade apply --artifact ... --manifest dist/release-manifest.json --signature dist/release-manifest.sig` for the actual swap; the binary replacement is atomic and gated on `/readyz`.
+- If no public key is configured, Forge refuses unsigned upgrades unless `--allow-unsigned` is passed explicitly.
+- `--allow-dirty-artifact` is an emergency override for manifests built from dirty worktrees and should not be part of normal release operations.
 - Use `forge upgrade rollback` for emergency recovery from the preserved `forge.previous` binary.
 - `syncforge` remains a development-only workflow and should not be the production upgrade path.
+- Threat model: signatures provide tamper evidence for the manifest and listed artifacts. They do not sandbox the unpacked binary or replace host integrity controls.
 
 ## Required Environment & Config
 

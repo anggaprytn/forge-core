@@ -134,11 +134,19 @@ where
             config_path,
             caddy_admin_url,
             artifact_path,
+            manifest_path,
+            signature_path,
+            allow_unsigned,
+            allow_dirty_artifact,
         } => print_json(
             &plan_upgrade(&UpgradeOptions {
                 config_path,
                 caddy_admin_url,
                 artifact_path,
+                manifest_path,
+                signature_path,
+                allow_unsigned,
+                allow_dirty_artifact,
                 auto_rollback: true,
             })
             .map_err(|err| CliError::Usage(err.to_string()))?,
@@ -147,12 +155,20 @@ where
             config_path,
             caddy_admin_url,
             artifact_path,
+            manifest_path,
+            signature_path,
+            allow_unsigned,
+            allow_dirty_artifact,
             no_auto_rollback,
         } => print_json(
             &apply_upgrade(&UpgradeOptions {
                 config_path,
                 caddy_admin_url,
                 artifact_path,
+                manifest_path,
+                signature_path,
+                allow_unsigned,
+                allow_dirty_artifact,
                 auto_rollback: !no_auto_rollback,
             })
             .map_err(|err| CliError::Usage(err.to_string()))?,
@@ -989,11 +1005,19 @@ enum Command {
         config_path: PathBuf,
         caddy_admin_url: String,
         artifact_path: PathBuf,
+        manifest_path: Option<PathBuf>,
+        signature_path: Option<PathBuf>,
+        allow_unsigned: bool,
+        allow_dirty_artifact: bool,
     },
     UpgradeApply {
         config_path: PathBuf,
         caddy_admin_url: String,
         artifact_path: PathBuf,
+        manifest_path: Option<PathBuf>,
+        signature_path: Option<PathBuf>,
+        allow_unsigned: bool,
+        allow_dirty_artifact: bool,
         no_auto_rollback: bool,
     },
     UpgradeRollback {
@@ -1296,20 +1320,36 @@ fn resolve_local_command_defaults(command: Command, config_path_explicit: bool) 
             config_path: _,
             caddy_admin_url,
             artifact_path,
+            manifest_path,
+            signature_path,
+            allow_unsigned,
+            allow_dirty_artifact,
         } if !config_path_explicit => Command::UpgradePlan {
             config_path: default_server_config_path(),
             caddy_admin_url,
             artifact_path,
+            manifest_path,
+            signature_path,
+            allow_unsigned,
+            allow_dirty_artifact,
         },
         Command::UpgradeApply {
             config_path: _,
             caddy_admin_url,
             artifact_path,
+            manifest_path,
+            signature_path,
+            allow_unsigned,
+            allow_dirty_artifact,
             no_auto_rollback,
         } if !config_path_explicit => Command::UpgradeApply {
             config_path: default_server_config_path(),
             caddy_admin_url,
             artifact_path,
+            manifest_path,
+            signature_path,
+            allow_unsigned,
+            allow_dirty_artifact,
             no_auto_rollback,
         },
         Command::UpgradeRollback { config_path: _ } if !config_path_explicit => {
@@ -1365,37 +1405,11 @@ fn parse_command(
         [cmd] if cmd == "logout" => Ok(Command::Logout),
         [cmd] if cmd == "whoami" => Ok(Command::WhoAmI),
         [cmd] if cmd == "version" => Ok(Command::Version),
-        [group, action, flag, artifact]
-            if group == "upgrade" && action == "plan" && flag == "--artifact" =>
-        {
-            Ok(Command::UpgradePlan {
-                config_path,
-                caddy_admin_url,
-                artifact_path: PathBuf::from(artifact),
-            })
+        [group, action, rest @ ..] if group == "upgrade" && action == "plan" => {
+            parse_upgrade_plan_command(rest, config_path, caddy_admin_url)
         }
-        [group, action, flag, artifact]
-            if group == "upgrade" && action == "apply" && flag == "--artifact" =>
-        {
-            Ok(Command::UpgradeApply {
-                config_path,
-                caddy_admin_url,
-                artifact_path: PathBuf::from(artifact),
-                no_auto_rollback: false,
-            })
-        }
-        [group, action, flag, artifact, extra]
-            if group == "upgrade"
-                && action == "apply"
-                && flag == "--artifact"
-                && extra == "--no-auto-rollback" =>
-        {
-            Ok(Command::UpgradeApply {
-                config_path,
-                caddy_admin_url,
-                artifact_path: PathBuf::from(artifact),
-                no_auto_rollback: true,
-            })
+        [group, action, rest @ ..] if group == "upgrade" && action == "apply" => {
+            parse_upgrade_apply_command(rest, config_path, caddy_admin_url)
         }
         [group, action] if group == "upgrade" && action == "rollback" => {
             Ok(Command::UpgradeRollback { config_path })
@@ -1517,8 +1531,8 @@ fn usage() -> String {
         "  forge logout",
         "  forge whoami",
         "  forge version",
-        "  forge [--config PATH] [--caddy-admin-url URL] upgrade plan --artifact <path>",
-        "  forge [--config PATH] [--caddy-admin-url URL] upgrade apply --artifact <path> [--no-auto-rollback]",
+        "  forge [--config PATH] [--caddy-admin-url URL] upgrade plan --artifact <path> [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact]",
+        "  forge [--config PATH] [--caddy-admin-url URL] upgrade apply --artifact <path> [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact] [--no-auto-rollback]",
         "  forge [--config PATH] upgrade rollback",
         "  forge [--url URL] [--token TOKEN] token list",
         "  forge [--url URL] [--token TOKEN] token create --name <name>",
@@ -1554,6 +1568,116 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] secrets unset <project_id> <environment> <key>",
     ]
     .join("\n")
+}
+
+fn parse_upgrade_plan_command(
+    args: &[String],
+    config_path: PathBuf,
+    caddy_admin_url: String,
+) -> Result<Command, CliError> {
+    let parsed = parse_upgrade_args(args, false)?;
+    Ok(Command::UpgradePlan {
+        config_path,
+        caddy_admin_url,
+        artifact_path: parsed.artifact_path,
+        manifest_path: parsed.manifest_path,
+        signature_path: parsed.signature_path,
+        allow_unsigned: parsed.allow_unsigned,
+        allow_dirty_artifact: parsed.allow_dirty_artifact,
+    })
+}
+
+fn parse_upgrade_apply_command(
+    args: &[String],
+    config_path: PathBuf,
+    caddy_admin_url: String,
+) -> Result<Command, CliError> {
+    let parsed = parse_upgrade_args(args, true)?;
+    Ok(Command::UpgradeApply {
+        config_path,
+        caddy_admin_url,
+        artifact_path: parsed.artifact_path,
+        manifest_path: parsed.manifest_path,
+        signature_path: parsed.signature_path,
+        allow_unsigned: parsed.allow_unsigned,
+        allow_dirty_artifact: parsed.allow_dirty_artifact,
+        no_auto_rollback: parsed.no_auto_rollback,
+    })
+}
+
+#[derive(Debug)]
+struct ParsedUpgradeArgs {
+    artifact_path: PathBuf,
+    manifest_path: Option<PathBuf>,
+    signature_path: Option<PathBuf>,
+    allow_unsigned: bool,
+    allow_dirty_artifact: bool,
+    no_auto_rollback: bool,
+}
+
+fn parse_upgrade_args(
+    args: &[String],
+    allow_no_auto_rollback: bool,
+) -> Result<ParsedUpgradeArgs, CliError> {
+    let mut artifact_path = None;
+    let mut manifest_path = None;
+    let mut signature_path = None;
+    let mut allow_unsigned = false;
+    let mut allow_dirty_artifact = false;
+    let mut no_auto_rollback = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--artifact" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage("upgrade requires --artifact <path>".into()));
+                };
+                artifact_path = Some(PathBuf::from(value));
+            }
+            "--manifest" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage("upgrade requires --manifest <path>".into()));
+                };
+                manifest_path = Some(PathBuf::from(value));
+            }
+            "--signature" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "upgrade requires --signature <path>".into(),
+                    ));
+                };
+                signature_path = Some(PathBuf::from(value));
+            }
+            "--allow-unsigned" => allow_unsigned = true,
+            "--allow-dirty-artifact" => allow_dirty_artifact = true,
+            "--no-auto-rollback" if allow_no_auto_rollback => no_auto_rollback = true,
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            _ => return Err(CliError::Usage(usage())),
+        }
+        index += 1;
+    }
+
+    let Some(artifact_path) = artifact_path else {
+        return Err(CliError::Usage("upgrade requires --artifact <path>".into()));
+    };
+    if signature_path.is_some() && manifest_path.is_none() {
+        return Err(CliError::Usage(
+            "upgrade requires --manifest <path> when --signature is provided".into(),
+        ));
+    }
+
+    Ok(ParsedUpgradeArgs {
+        artifact_path,
+        manifest_path,
+        signature_path,
+        allow_unsigned,
+        allow_dirty_artifact,
+        no_auto_rollback,
+    })
 }
 
 fn parse_history_command(args: &[String]) -> Result<Command, CliError> {
@@ -4126,6 +4250,66 @@ mod tests {
             parsed.command,
             Command::ControlPlaneLease {
                 config_path: PathBuf::from("/tmp/forge.conf"),
+            }
+        );
+    }
+
+    #[test]
+    fn upgrade_plan_command_parses_manifest_flags() {
+        let parsed = ParsedArgs::parse(vec![
+            "--config".into(),
+            "/tmp/forge.conf".into(),
+            "upgrade".into(),
+            "plan".into(),
+            "--artifact".into(),
+            "/tmp/forge.tar.gz".into(),
+            "--manifest".into(),
+            "/tmp/release-manifest.json".into(),
+            "--signature".into(),
+            "/tmp/release-manifest.sig".into(),
+            "--allow-dirty-artifact".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::UpgradePlan {
+                config_path: PathBuf::from("/tmp/forge.conf"),
+                caddy_admin_url: "http://127.0.0.1:2019".into(),
+                artifact_path: PathBuf::from("/tmp/forge.tar.gz"),
+                manifest_path: Some(PathBuf::from("/tmp/release-manifest.json")),
+                signature_path: Some(PathBuf::from("/tmp/release-manifest.sig")),
+                allow_unsigned: false,
+                allow_dirty_artifact: true,
+            }
+        );
+    }
+
+    #[test]
+    fn upgrade_apply_command_parses_allow_unsigned() {
+        let parsed = ParsedArgs::parse(vec![
+            "upgrade".into(),
+            "apply".into(),
+            "--artifact".into(),
+            "/tmp/forge.tar.gz".into(),
+            "--manifest".into(),
+            "/tmp/release-manifest.json".into(),
+            "--allow-unsigned".into(),
+            "--no-auto-rollback".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::UpgradeApply {
+                config_path: default_server_config_path(),
+                caddy_admin_url: "http://127.0.0.1:2019".into(),
+                artifact_path: PathBuf::from("/tmp/forge.tar.gz"),
+                manifest_path: Some(PathBuf::from("/tmp/release-manifest.json")),
+                signature_path: None,
+                allow_unsigned: true,
+                allow_dirty_artifact: false,
+                no_auto_rollback: true,
             }
         );
     }

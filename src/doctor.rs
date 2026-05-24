@@ -583,6 +583,7 @@ mod tests {
             storage_root: root.to_path_buf(),
             api_bind: "127.0.0.1:8080".into(),
             bearer_token: "test-token".into(),
+            release_public_key_path: None,
             heartbeat_interval_ms: 1_000,
             startup_replay_max_duration_ms: 5_000,
             startup_replay_max_entries: 256,

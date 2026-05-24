@@ -7,7 +7,13 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
+use base64::Engine;
 use forge_core::upgrade::{UpgradeOptions, apply, plan, read_recent_events, rollback};
+use serde_json::json;
+
+const ARTIFACT_GIT_COMMIT: &str = "artifact-commit";
+const ARTIFACT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+const ARTIFACT_BUILD_TIMESTAMP: &str = "1712345678";
 
 fn test_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -96,7 +102,7 @@ fn init_package_repo(name: &str) -> PathBuf {
     fs::write(root.join(".gitignore"), "dist/\ntarget/\ncargo-env.log\n").unwrap();
     write_executable(
         &root.join("fake-bin/cargo"),
-        "#!/usr/bin/env bash\nset -euo pipefail\ntriple=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--target\" ]; then\n    triple=\"$2\"\n    shift 2\n    continue\n  fi\n  shift\ndone\n[ -n \"$triple\" ] || { echo \"missing --target\" >&2; exit 1; }\nprintf '%s|%s|%s|%s\\n' \"${FORGE_GIT_COMMIT:-}\" \"${FORGE_GIT_DIRTY:-}\" \"${FORGE_BUILD_TIMESTAMP:-}\" \"${FORGE_TARGET_TRIPLE:-}\" >> cargo-env.log\nmkdir -p \"target/$triple/release\"\ncat > \"target/$triple/release/forge\" <<EOF\n#!/usr/bin/env bash\nif [ \"${1:-}\" = \"version\" ]; then\n  printf '%s\\n' '{\"version\":\"0.1.0\",\"git_commit\":\"${FORGE_GIT_COMMIT:-unknown}\",\"git_dirty\":\"${FORGE_GIT_DIRTY:-unknown}\",\"build_timestamp\":\"${FORGE_BUILD_TIMESTAMP:-unknown}\",\"target_triple\":\"${FORGE_TARGET_TRIPLE:-unknown}\",\"schema_versions\":{\"manifest_schema\":1,\"snapshot_schema\":1,\"checkpoint_schema\":1,\"reconciliation_log_schema\":1,\"storage_compatibility\":1}}'\nfi\nEOF\nchmod +x \"target/$triple/release/forge\"\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\ntriple=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--target\" ]; then\n    triple=\"$2\"\n    shift 2\n    continue\n  fi\n  shift\ndone\n[ -n \"$triple\" ] || { echo \"missing --target\" >&2; exit 1; }\nprintf '%s|%s|%s|%s\\n' \"${FORGE_GIT_COMMIT:-}\" \"${FORGE_GIT_DIRTY:-}\" \"${FORGE_BUILD_TIMESTAMP:-}\" \"${FORGE_TARGET_TRIPLE:-}\" >> cargo-env.log\nmkdir -p \"target/$triple/release\"\ncat > \"target/$triple/release/forge\" <<EOF\n#!/usr/bin/env bash\nprintf '%s\\n' '{\"version\":\"0.1.0\",\"git_commit\":\"${FORGE_GIT_COMMIT:-unknown}\",\"git_dirty\":\"${FORGE_GIT_DIRTY:-unknown}\",\"build_timestamp\":\"${FORGE_BUILD_TIMESTAMP:-unknown}\",\"target_triple\":\"${FORGE_TARGET_TRIPLE:-unknown}\",\"schema_versions\":{\"manifest_schema\":1,\"snapshot_schema\":1,\"checkpoint_schema\":1,\"reconciliation_log_schema\":1,\"storage_compatibility\":1}}'\nEOF\nchmod +x \"target/$triple/release/forge\"\n",
     );
 
     git_ok(&root, &["init"]);
@@ -108,7 +114,19 @@ fn init_package_repo(name: &str) -> PathBuf {
 }
 
 fn make_fake_binary(path: &Path, version: &str) {
-    make_fake_binary_with_schema(path, version, 1, 1, 1, 1, 1);
+    make_fake_binary_with_schema_and_metadata(
+        path,
+        version,
+        ARTIFACT_GIT_COMMIT,
+        "false",
+        ARTIFACT_BUILD_TIMESTAMP,
+        ARTIFACT_TARGET_TRIPLE,
+        1,
+        1,
+        1,
+        1,
+        1,
+    );
 }
 
 fn make_fake_binary_with_schema(
@@ -120,10 +138,38 @@ fn make_fake_binary_with_schema(
     reconciliation_log_schema: u64,
     storage_compatibility: u64,
 ) {
+    make_fake_binary_with_schema_and_metadata(
+        path,
+        version,
+        ARTIFACT_GIT_COMMIT,
+        "false",
+        ARTIFACT_BUILD_TIMESTAMP,
+        ARTIFACT_TARGET_TRIPLE,
+        manifest_schema,
+        snapshot_schema,
+        checkpoint_schema,
+        reconciliation_log_schema,
+        storage_compatibility,
+    );
+}
+
+fn make_fake_binary_with_schema_and_metadata(
+    path: &Path,
+    version: &str,
+    git_commit: &str,
+    git_dirty: &str,
+    build_timestamp: &str,
+    target_triple: &str,
+    manifest_schema: u64,
+    snapshot_schema: u64,
+    checkpoint_schema: u64,
+    reconciliation_log_schema: u64,
+    storage_compatibility: u64,
+) {
     write_executable(
         path,
         &format!(
-            "#!/usr/bin/env bash\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '{{\"version\":\"{version}\",\"schema_versions\":{{\"manifest_schema\":{manifest_schema},\"snapshot_schema\":{snapshot_schema},\"checkpoint_schema\":{checkpoint_schema},\"reconciliation_log_schema\":{reconciliation_log_schema},\"storage_compatibility\":{storage_compatibility}}}}}'\nelse\n  exit 0\nfi\n"
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '{{\"version\":\"{version}\",\"git_commit\":\"{git_commit}\",\"git_dirty\":\"{git_dirty}\",\"build_timestamp\":\"{build_timestamp}\",\"target_triple\":\"{target_triple}\",\"schema_versions\":{{\"manifest_schema\":{manifest_schema},\"snapshot_schema\":{snapshot_schema},\"checkpoint_schema\":{checkpoint_schema},\"reconciliation_log_schema\":{reconciliation_log_schema},\"storage_compatibility\":{storage_compatibility}}}}}'\nelse\n  exit 0\nfi\n"
         ),
     );
 }
@@ -186,6 +232,111 @@ fn sha256(path: &Path) -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+fn artifact_size(path: &Path) -> u64 {
+    fs::metadata(path).unwrap().len()
+}
+
+fn write_release_manifest(
+    manifest_path: &Path,
+    artifact: &Path,
+    version: &str,
+    git_commit: &str,
+    git_dirty: bool,
+    target_triple: &str,
+) {
+    let manifest = json!({
+        "version": version,
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "build_timestamp": ARTIFACT_BUILD_TIMESTAMP,
+        "artifacts": [
+            {
+                "name": artifact.file_name().unwrap().to_string_lossy(),
+                "target_triple": target_triple,
+                "sha256": sha256(artifact),
+                "size_bytes": artifact_size(artifact),
+                "created_at_unix": 1712345678_u64
+            }
+        ],
+        "schema_versions": {
+            "manifest_schema": 1,
+            "snapshot_schema": 1,
+            "checkpoint_schema": 1,
+            "reconciliation_log_schema": 1,
+            "storage_compatibility_version": 1
+        }
+    });
+    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn write_unsigned_release_manifest(root: &Path, artifact: &Path, version: &str) -> PathBuf {
+    let manifest_path = root.join("release-manifest.json");
+    write_release_manifest(
+        &manifest_path,
+        artifact,
+        version,
+        ARTIFACT_GIT_COMMIT,
+        false,
+        ARTIFACT_TARGET_TRIPLE,
+    );
+    manifest_path
+}
+
+fn generate_signing_keypair(root: &Path) -> (PathBuf, PathBuf) {
+    let private_key = root.join("release-signing-key.pem");
+    let public_key = root.join("release-public-key.pem");
+    let status = Command::new("openssl")
+        .args(["genpkey", "-algorithm", "Ed25519", "-out"])
+        .arg(&private_key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("openssl")
+        .args(["pkey", "-in"])
+        .arg(&private_key)
+        .args(["-pubout", "-out"])
+        .arg(&public_key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (private_key, public_key)
+}
+
+fn sign_manifest(manifest_path: &Path, private_key: &Path, signature_path: &Path) {
+    let signature_bin = signature_path.with_extension("sig.bin");
+    let status = Command::new("openssl")
+        .args(["pkeyutl", "-sign", "-rawin", "-inkey"])
+        .arg(private_key)
+        .args(["-in"])
+        .arg(manifest_path)
+        .args(["-out"])
+        .arg(&signature_bin)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(fs::read(&signature_bin).unwrap());
+    fs::write(signature_path, format!("{encoded}\n")).unwrap();
+    fs::remove_file(signature_bin).unwrap();
+}
+
+fn default_upgrade_options(
+    root: &Path,
+    caddy_admin_url: String,
+    artifact_path: PathBuf,
+) -> UpgradeOptions {
+    UpgradeOptions {
+        config_path: root.join("forge.conf"),
+        caddy_admin_url,
+        artifact_path,
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: true,
+        allow_dirty_artifact: false,
+        auto_rollback: true,
+    }
 }
 
 fn spawn_ok_server() -> (String, thread::JoinHandle<()>) {
@@ -283,8 +434,21 @@ fn prepare_upgrade_root(
     (current, artifact)
 }
 
+fn default_signed_upgrade_options(
+    root: &Path,
+    caddy_admin_url: String,
+    artifact_path: PathBuf,
+) -> UpgradeOptions {
+    let manifest_path = write_unsigned_release_manifest(root, &artifact_path, "2.0.0");
+    UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        allow_unsigned: true,
+        ..default_upgrade_options(root, caddy_admin_url, artifact_path)
+    }
+}
+
 #[test]
-fn package_release_creates_tarball() {
+fn package_release_emits_manifest() {
     let root = test_root("package-tarball");
     let bin_dir = root.join("bin/linux-amd64");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -293,6 +457,7 @@ fn package_release_creates_tarball() {
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
         .arg("--allow-dirty")
+        .arg("--unsigned")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("FORGE_PACKAGE_OUTPUT_DIR", root.join("dist"))
         .env("FORGE_PACKAGE_VERSION", "9.9.9")
@@ -300,12 +465,18 @@ fn package_release_creates_tarball() {
         .env("FORGE_PACKAGE_BIN_DIR", root.join("bin"))
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(root.join("dist/forge-9.9.9-linux-amd64.tar.gz").exists());
+    assert!(root.join("dist/release-manifest.json").exists());
 }
 
 #[test]
-fn package_release_creates_checksums() {
+fn package_release_manifest_contains_artifact_hash() {
     let root = test_root("package-checksums");
     let bin_dir = root.join("bin/linux-amd64");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -314,6 +485,7 @@ fn package_release_creates_checksums() {
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
         .arg("--allow-dirty")
+        .arg("--unsigned")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("FORGE_PACKAGE_OUTPUT_DIR", root.join("dist"))
         .env("FORGE_PACKAGE_VERSION", "9.9.9")
@@ -321,9 +493,19 @@ fn package_release_creates_checksums() {
         .env("FORGE_PACKAGE_BIN_DIR", root.join("bin"))
         .output()
         .unwrap();
-    assert!(output.status.success());
-    let checksums = fs::read_to_string(root.join("dist/checksums.txt")).unwrap();
-    assert!(checksums.contains("forge-9.9.9-linux-amd64.tar.gz"));
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("dist/release-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["artifacts"][0]["sha256"],
+        serde_json::Value::String(sha256(&root.join("dist/forge-9.9.9-linux-amd64.tar.gz")))
+    );
 }
 
 #[test]
@@ -336,6 +518,7 @@ fn package_release_includes_required_files() {
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
         .arg("--allow-dirty")
+        .arg("--unsigned")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("FORGE_PACKAGE_OUTPUT_DIR", root.join("dist"))
         .env("FORGE_PACKAGE_VERSION", "9.9.9")
@@ -343,7 +526,12 @@ fn package_release_includes_required_files() {
         .env("FORGE_PACKAGE_BIN_DIR", root.join("bin"))
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let extract = root.join("extract");
     fs::create_dir_all(&extract).unwrap();
@@ -368,6 +556,7 @@ fn package_release_injects_current_git_commit() {
     let expected_commit = git_stdout(&root, &["rev-parse", "HEAD"]);
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
+        .arg("--unsigned")
         .current_dir(&root)
         .env(
             "PATH",
@@ -411,8 +600,32 @@ fn package_release_refuses_dirty_tree_by_default() {
         .unwrap();
 
     assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("signing mode required"), "{stderr}");
+}
+
+#[test]
+fn package_release_unsigned_requires_flag() {
+    let root = init_package_repo("package-unsigned-requires-flag");
+
+    let output = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("workspace is dirty"),
+        String::from_utf8_lossy(&output.stderr).contains("signing mode required"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -426,6 +639,7 @@ fn package_release_allows_dirty_tree_with_flag() {
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
         .arg("--allow-dirty")
+        .arg("--unsigned")
         .current_dir(&root)
         .env(
             "PATH",
@@ -458,6 +672,7 @@ fn package_release_does_not_reuse_stale_git_commit() {
     let first_commit = git_stdout(&root, &["rev-parse", "HEAD"]);
     let first = Command::new("bash")
         .arg("scripts/package-release.sh")
+        .arg("--unsigned")
         .current_dir(&root)
         .env("PATH", &path_env)
         .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
@@ -472,6 +687,7 @@ fn package_release_does_not_reuse_stale_git_commit() {
 
     let second = Command::new("bash")
         .arg("scripts/package-release.sh")
+        .arg("--unsigned")
         .current_dir(&root)
         .env("PATH", &path_env)
         .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
@@ -486,6 +702,33 @@ fn package_release_does_not_reuse_stale_git_commit() {
         .collect::<Vec<_>>();
     assert_eq!(commits, vec![first_commit, second_commit.clone()]);
     assert_ne!(commits[0], second_commit);
+}
+
+#[test]
+fn package_release_signed_emits_signature() {
+    let root = init_package_repo("package-signed-emits-signature");
+    let (private_key, _) = generate_signing_keypair(&root);
+    let output = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .arg("--allow-dirty")
+        .args(["--sign", "--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(root.join("dist/release-manifest.sig").exists());
+    assert!(root.join("dist/release-public-key.pem").exists());
 }
 
 #[test]
@@ -631,6 +874,7 @@ fn upgrade_plan_reports_current_and_target_version() {
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
 
     let plan_output = with_env(
         &[
@@ -640,15 +884,7 @@ fn upgrade_plan_reports_current_and_target_version() {
                 format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
             ),
         ],
-        || {
-            plan(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap()
-        },
+        || plan(&options).unwrap(),
     );
     assert_eq!(plan_output.current_version, "1.0.0");
     assert_eq!(plan_output.target_version, "2.0.0");
@@ -662,6 +898,7 @@ fn upgrade_plan_does_not_mutate_state() {
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
 
     let plan_output = with_env(
         &[
@@ -671,15 +908,7 @@ fn upgrade_plan_does_not_mutate_state() {
                 format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
             ),
         ],
-        || {
-            plan(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap()
-        },
+        || plan(&options).unwrap(),
     );
 
     assert_eq!(plan_output.current_version, "1.0.0");
@@ -743,6 +972,20 @@ fn upgrade_plan_rejects_storage_compatibility_mismatch() {
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["schema_versions"]["storage_compatibility_version"] = serde_json::Value::from(2_u64);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        allow_unsigned: true,
+        ..default_upgrade_options(&root, url.clone(), artifact.clone())
+    };
 
     let plan_output = with_env(
         &[
@@ -752,15 +995,7 @@ fn upgrade_plan_rejects_storage_compatibility_mismatch() {
                 format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
             ),
         ],
-        || {
-            plan(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap()
-        },
+        || plan(&options).unwrap(),
     );
     assert!(plan_output.checks.iter().any(|check| {
         check.message.contains("Storage compatibility mismatch") && check.status == "error"
@@ -768,15 +1003,27 @@ fn upgrade_plan_rejects_storage_compatibility_mismatch() {
 }
 
 #[test]
-fn artifact_checksum_mismatch_blocks_upgrade() {
+fn upgrade_plan_rejects_checksum_mismatch() {
     let root = test_root("upgrade-checksum");
     let current = root.join("bin/forge");
     fs::create_dir_all(current.parent().unwrap()).unwrap();
     make_fake_binary(&current, "1.0.0");
     let artifact = make_artifact(&root, "2.0.0", 0o644);
+    let manifest_path = root.join("release-manifest.json");
+    write_release_manifest(
+        &manifest_path,
+        &artifact,
+        "2.0.0",
+        ARTIFACT_GIT_COMMIT,
+        false,
+        ARTIFACT_TARGET_TRIPLE,
+    );
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["artifacts"][0]["sha256"] = serde_json::Value::String("deadbeef".into());
     fs::write(
-        root.join("checksums.txt"),
-        "deadbeef  forge-2.0.0-linux-amd64.tar.gz\n",
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
     fs::write(
@@ -793,6 +1040,11 @@ fn artifact_checksum_mismatch_blocks_upgrade() {
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        allow_unsigned: true,
+        ..default_upgrade_options(&root, url, artifact)
+    };
 
     with_env(
         &[
@@ -803,13 +1055,7 @@ fn artifact_checksum_mismatch_blocks_upgrade() {
             ),
         ],
         || {
-            let err = plan(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap_err();
+            let err = plan(&options).unwrap_err();
             assert!(err.to_string().contains("checksum mismatch"));
         },
     );
@@ -836,6 +1082,7 @@ fn world_writable_artifact_rejected() {
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url, artifact);
 
     with_env(
         &[
@@ -846,25 +1093,273 @@ fn world_writable_artifact_rejected() {
             ),
         ],
         || {
-            let err = plan(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap_err();
+            let err = plan(&options).unwrap_err();
             assert!(err.to_string().contains("world-writable"));
         },
     );
 }
 
 #[test]
-fn upgrade_apply_runs_plan_first() {
+fn upgrade_plan_rejects_missing_manifest_without_allow_unsigned() {
+    let root = test_root("upgrade-missing-manifest");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let mut options = default_upgrade_options(&root, url, artifact);
+    options.allow_unsigned = false;
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || {
+            let err = plan(&options).unwrap_err();
+            assert!(err.to_string().contains("release manifest required"));
+        },
+    );
+}
+
+#[test]
+fn upgrade_plan_accepts_unsigned_with_allow_unsigned() {
+    let root = test_root("upgrade-allow-unsigned");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let options = default_upgrade_options(&root, url, artifact);
+
+    let output = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || plan(&options).unwrap(),
+    );
+
+    assert_eq!(output.target_version, "2.0.0");
+}
+
+#[test]
+fn upgrade_plan_rejects_artifact_not_in_manifest() {
+    let root = test_root("upgrade-artifact-not-in-manifest");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let manifest_path = root.join("release-manifest.json");
+    write_release_manifest(
+        &manifest_path,
+        &artifact,
+        "2.0.0",
+        ARTIFACT_GIT_COMMIT,
+        false,
+        ARTIFACT_TARGET_TRIPLE,
+    );
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["artifacts"][0]["name"] =
+        serde_json::Value::String("forge-other-linux-amd64.tar.gz".into());
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        allow_unsigned: true,
+        ..default_upgrade_options(&root, url, artifact)
+    };
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || {
+            let err = plan(&options).unwrap_err();
+            assert!(err.to_string().contains("artifact not listed"));
+        },
+    );
+}
+
+#[test]
+fn upgrade_plan_rejects_dirty_manifest_without_allow_dirty() {
+    let root = test_root("upgrade-dirty-manifest");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let manifest_path = root.join("release-manifest.json");
+    write_release_manifest(
+        &manifest_path,
+        &artifact,
+        "2.0.0",
+        ARTIFACT_GIT_COMMIT,
+        true,
+        ARTIFACT_TARGET_TRIPLE,
+    );
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        allow_unsigned: true,
+        ..default_upgrade_options(&root, url, artifact)
+    };
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || {
+            let err = plan(&options).unwrap_err();
+            assert!(err.to_string().contains("dirty release manifest"));
+        },
+    );
+}
+
+#[test]
+fn upgrade_plan_rejects_world_writable_manifest() {
+    let root = test_root("upgrade-world-writable-manifest");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let mut permissions = fs::metadata(&manifest_path).unwrap().permissions();
+    permissions.set_mode(0o666);
+    fs::set_permissions(&manifest_path, permissions).unwrap();
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        allow_unsigned: true,
+        ..default_upgrade_options(&root, url, artifact)
+    };
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || {
+            let err = plan(&options).unwrap_err();
+            assert!(err.to_string().contains("world-writable manifest"));
+        },
+    );
+}
+
+#[test]
+fn upgrade_plan_rejects_invalid_signature() {
+    let root = test_root("upgrade-invalid-signature");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let signature_path = root.join("release-manifest.sig");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    fs::write(&signature_path, "invalid-signature\n").unwrap();
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        signature_path: Some(signature_path),
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, url, artifact)
+    };
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_PUBLIC_KEY", public_key.display().to_string()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || {
+            let err = plan(&options).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("invalid release manifest signature")
+                    || err.to_string().contains("signature verification failed")
+            );
+        },
+    );
+}
+
+#[test]
+fn upgrade_plan_accepts_valid_signature() {
+    let root = test_root("upgrade-valid-signature");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let signature_path = root.join("release-manifest.sig");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        signature_path: Some(signature_path),
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, url, artifact)
+    };
+
+    let output = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_PUBLIC_KEY", public_key.display().to_string()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || plan(&options).unwrap(),
+    );
+
+    assert_eq!(output.target_version, "2.0.0");
+}
+
+#[test]
+fn upgrade_apply_runs_same_verification_as_plan() {
     let root = test_root("upgrade-apply-plan-first");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let manifest_path = root.join("release-manifest.json");
+    write_release_manifest(
+        &manifest_path,
+        &artifact,
+        "2.0.0",
+        ARTIFACT_GIT_COMMIT,
+        false,
+        ARTIFACT_TARGET_TRIPLE,
+    );
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["artifacts"][0]["sha256"] = serde_json::Value::String("deadbeef".into());
     fs::write(
-        root.join("checksums.txt"),
-        "deadbeef  forge-2.0.0-linux-amd64.tar.gz\n",
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
     let fake_bin = root.join("fake-bin");
@@ -879,6 +1374,11 @@ fn upgrade_apply_runs_plan_first() {
         ),
     );
     let (url, _handle) = spawn_ok_server();
+    let options = UpgradeOptions {
+        manifest_path: Some(manifest_path),
+        allow_unsigned: true,
+        ..default_upgrade_options(&root, url, artifact)
+    };
 
     let err = with_env(
         &[
@@ -892,15 +1392,7 @@ fn upgrade_apply_runs_plan_first() {
                 format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
             ),
         ],
-        || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap_err()
-        },
+        || apply(&options).unwrap_err(),
     );
 
     assert!(err.to_string().contains("checksum mismatch"));
@@ -912,20 +1404,12 @@ fn upgrade_apply_backs_up_current_binary() {
     let root = test_root("upgrade-apply-backup");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
     let previous = root.join("bin/forge.previous");
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     let fake_bin = root.join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
 
     with_env(
         &[
@@ -946,13 +1430,7 @@ fn upgrade_apply_backs_up_current_binary() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
         ],
         || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap();
+            apply(&options).unwrap();
         },
     );
 
@@ -964,15 +1442,6 @@ fn upgrade_apply_uses_sudo_for_system_paths() {
     let root = test_root("upgrade-apply-sudo");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
     let previous = root.join("bin/forge.previous");
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     let fake_bin = root.join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
@@ -986,6 +1455,7 @@ fn upgrade_apply_uses_sudo_for_system_paths() {
         ),
     );
     let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
 
     with_env(
         &[
@@ -1007,13 +1477,7 @@ fn upgrade_apply_uses_sudo_for_system_paths() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
         ],
         || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap();
+            apply(&options).unwrap();
         },
     );
 
@@ -1029,20 +1493,12 @@ fn upgrade_apply_installs_binary_atomically() {
     let root = test_root("upgrade-apply-atomic");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
     let previous = root.join("bin/forge.previous");
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     let fake_bin = root.join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
 
     with_env(
         &[
@@ -1063,13 +1519,7 @@ fn upgrade_apply_installs_binary_atomically() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
         ],
         || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap();
+            apply(&options).unwrap();
         },
     );
 
@@ -1087,21 +1537,13 @@ fn upgrade_apply_rolls_back_when_readyz_fails() {
     let root = test_root("upgrade-apply-auto-rollback");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
     let previous = root.join("bin/forge.previous");
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     let fake_bin = root.join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (caddy_url, _caddy_handle) = spawn_ok_server();
     let (url, _handle) = spawn_readyz_sequence_server(vec![503, 503, 503, 503, 200, 200, 200]);
+    let options = default_signed_upgrade_options(&root, caddy_url.clone(), artifact.clone());
 
     let output = with_env(
         &[
@@ -1122,15 +1564,7 @@ fn upgrade_apply_rolls_back_when_readyz_fails() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "150".into()),
             ("FORGE_UPGRADE_READYZ_POLL_MS", "50".into()),
         ],
-        || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: caddy_url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap()
-        },
+        || apply(&options).unwrap(),
     );
 
     assert_eq!(output.result, "auto_rolled_back");
@@ -1142,20 +1576,13 @@ fn upgrade_apply_no_auto_rollback_preserves_failed_binary() {
     let root = test_root("upgrade-apply-no-auto-rollback");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
     let previous = root.join("bin/forge.previous");
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     let fake_bin = root.join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let mut options = default_signed_upgrade_options(&root, caddy_url.clone(), artifact.clone());
+    options.auto_rollback = false;
 
     let err = with_env(
         &[
@@ -1176,15 +1603,7 @@ fn upgrade_apply_no_auto_rollback_preserves_failed_binary() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "150".into()),
             ("FORGE_UPGRADE_READYZ_POLL_MS", "50".into()),
         ],
-        || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: caddy_url,
-                artifact_path: artifact,
-                auto_rollback: false,
-            })
-            .unwrap_err()
-        },
+        || apply(&options).unwrap_err(),
     );
 
     assert!(
@@ -1199,20 +1618,13 @@ fn upgrade_readyz_wait_times_out_with_context() {
     let root = test_root("upgrade-readyz-timeout");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
     let previous = root.join("bin/forge.previous");
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     let fake_bin = root.join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let mut options = default_signed_upgrade_options(&root, caddy_url.clone(), artifact.clone());
+    options.auto_rollback = false;
 
     let err = with_env(
         &[
@@ -1233,15 +1645,7 @@ fn upgrade_readyz_wait_times_out_with_context() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "150".into()),
             ("FORGE_UPGRADE_READYZ_POLL_MS", "50".into()),
         ],
-        || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: caddy_url,
-                artifact_path: artifact,
-                auto_rollback: false,
-            })
-            .unwrap_err()
-        },
+        || apply(&options).unwrap_err(),
     );
 
     let message = err.to_string();
@@ -1259,15 +1663,6 @@ fn upgrade_apply_writes_journal() {
     let previous = root.join("bin/forge.previous");
     let artifact = make_artifact(&root, "2.0.0", 0o644);
     fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
-    fs::write(
         root.join("forge.conf"),
         format!(
             "storage_root={}\napi_bind=127.0.0.1:18080\nbearer_token=test-token\n",
@@ -1282,6 +1677,7 @@ fn upgrade_apply_writes_journal() {
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
 
     with_env(
         &[
@@ -1302,13 +1698,7 @@ fn upgrade_apply_writes_journal() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
         ],
         || {
-            let output = apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap();
+            let output = apply(&options).unwrap();
             assert_eq!(output.result, "ok");
             let events = read_recent_events(&root.join("storage"), 5);
             assert!(events.iter().any(|event| event.action == "apply"));
@@ -1469,15 +1859,6 @@ fn upgrade_journal_records_apply_and_rollback() {
     let root = test_root("upgrade-apply-rollback-journal");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
     let previous = root.join("bin/forge.previous");
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     write_upgrade_config(&root, "bearer-secret-token");
     write_upgrade_env(&root, "master-secret-value");
     let fake_bin = root.join("fake-bin");
@@ -1486,6 +1867,7 @@ fn upgrade_journal_records_apply_and_rollback() {
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (apply_url, _handle1) = spawn_ok_server();
     let (rollback_url, _handle2) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, apply_url.clone(), artifact.clone());
 
     with_env(
         &[
@@ -1506,13 +1888,7 @@ fn upgrade_journal_records_apply_and_rollback() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
         ],
         || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: apply_url,
-                artifact_path: artifact,
-                auto_rollback: true,
-            })
-            .unwrap();
+            apply(&options).unwrap();
         },
     );
 
@@ -1550,20 +1926,13 @@ fn upgrade_does_not_log_env_secrets() {
     let master_key = "master-key-should-not-leak";
     write_upgrade_config(&root, bearer_token);
     write_upgrade_env(&root, master_key);
-    fs::write(
-        root.join("checksums.txt"),
-        format!(
-            "{}  {}\n",
-            sha256(&artifact),
-            artifact.file_name().unwrap().to_string_lossy()
-        ),
-    )
-    .unwrap();
     let fake_bin = root.join("fake-bin");
     fs::create_dir_all(&fake_bin).unwrap();
     write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
     write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
     let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let mut options = default_signed_upgrade_options(&root, caddy_url.clone(), artifact.clone());
+    options.auto_rollback = false;
 
     let err = with_env(
         &[
@@ -1584,15 +1953,7 @@ fn upgrade_does_not_log_env_secrets() {
             ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "150".into()),
             ("FORGE_UPGRADE_READYZ_POLL_MS", "50".into()),
         ],
-        || {
-            apply(&UpgradeOptions {
-                config_path: root.join("forge.conf"),
-                caddy_admin_url: caddy_url,
-                artifact_path: artifact,
-                auto_rollback: false,
-            })
-            .unwrap_err()
-        },
+        || apply(&options).unwrap_err(),
     );
 
     let message = err.to_string();
@@ -1616,6 +1977,7 @@ fn package_release_child_process_timeout() {
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
         .arg("--allow-dirty")
+        .arg("--unsigned")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env(
             "PATH",

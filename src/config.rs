@@ -8,6 +8,7 @@ pub struct DaemonConfig {
     pub storage_root: PathBuf,
     pub api_bind: String,
     pub bearer_token: String,
+    pub release_public_key_path: Option<PathBuf>,
     pub heartbeat_interval_ms: u64,
     pub startup_replay_max_duration_ms: u64,
     pub startup_replay_max_entries: usize,
@@ -69,6 +70,7 @@ impl DaemonConfig {
         let bearer_token = values
             .get("bearer_token")
             .ok_or(ConfigError::MissingKey("bearer_token"))?;
+        let release_public_key_path = values.get("release_public_key_path").map(PathBuf::from);
         let heartbeat_interval_ms = values
             .get("heartbeat_interval_ms")
             .and_then(|value| value.parse::<u64>().ok())
@@ -89,6 +91,7 @@ impl DaemonConfig {
             storage_root: PathBuf::from(storage_root),
             api_bind: api_bind.clone(),
             bearer_token: bearer_token.clone(),
+            release_public_key_path,
             heartbeat_interval_ms,
             startup_replay_max_duration_ms,
             startup_replay_max_entries,
@@ -113,11 +116,25 @@ mod tests {
         assert_eq!(config.storage_root, PathBuf::from("/tmp/forge"));
         assert_eq!(config.api_bind, "127.0.0.1:8080");
         assert_eq!(config.bearer_token, "test-token");
+        assert_eq!(config.release_public_key_path, None);
         assert_eq!(config.heartbeat_interval_ms, 1_000);
         assert_eq!(config.startup_replay_max_duration_ms, 5_000);
         assert_eq!(config.startup_replay_max_entries, 256);
         assert_eq!(config.github_webhook_secret, None);
         assert_eq!(config.repository_cache_root, None);
         assert_eq!(config.sqlite_path, None);
+    }
+
+    #[test]
+    fn loads_release_public_key_path() {
+        let config = DaemonConfig::load_from_str(
+            "storage_root=/tmp/forge\napi_bind=127.0.0.1:8080\nbearer_token=test-token\nrelease_public_key_path=/etc/forge/release-public-key.pem\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.release_public_key_path,
+            Some(PathBuf::from("/etc/forge/release-public-key.pem"))
+        );
     }
 }
