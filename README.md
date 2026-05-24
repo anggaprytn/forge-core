@@ -148,7 +148,7 @@ Isolation and tenancy notes:
 
 Forge Alpha Core Loop v5 freezes the durable single-writer control plane for the current single-node stateful runtime.
 
-- **Durable Control-Plane Checkpoints:** `control_plane/convergence_checkpoint.json` restores cached readiness, breaker state, queue depth, and control-plane freshness on warm startup. Checkpoints are schema-versioned; stale or corrupt files degrade readiness and are ignored rather than trusted.
+- **Durable Control-Plane Checkpoints:** `control_plane/convergence_checkpoint.json` restores cached readiness, breaker state, queue depth, and control-plane freshness on warm startup. `readyz_status` and degraded reasons are restored only as cached initial state; after restart, upgrade apply, or upgrade rollback, a fresh healthy leader convergence refresh must overwrite stale `convergence_stalled` state before stall detection runs again. Checkpoints are schema-versioned; stale or corrupt files degrade readiness and are ignored rather than trusted.
 - **Immutable Runtime And Route Snapshots:** `control_plane/control_plane_snapshots/` stores `runtime_snapshot.json`, `route_snapshot.json`, and `dependency_snapshot.json` with bounded retention and GC. Operators can use them for diagnostics when live dependencies are unavailable, and corrupted snapshots are skipped and rebuilt later.
 - **Persistent Node Identity:** `control_plane/node.json` stores stable `node_id`, node metadata, boot timestamp, and capability hints. Node identity survives daemon restart and is used for leadership attribution and diagnostics only.
 - **Operational Journal:** `control_plane/operations.jsonl` is an append-only JSONL journal for leadership changes, convergence degradation, route changes, deployment and restore events, and GC activity. Rotation is bounded and malformed entries are skipped rather than blocking startup.
@@ -158,6 +158,8 @@ Forge Alpha Core Loop v5 freezes the durable single-writer control plane for the
 - **Deterministic Startup And Replay Recovery:** Startup phases are explicit: `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, `degraded`. Replay never runs without valid lease ownership, followers never replay, convergence waits for replay stabilization, lease loss aborts replay, and request paths stay cache-backed while recovery remains bounded and resumable.
 - **Cache-Backed Readiness And Metrics:** `/healthz` is process liveness, `/readyz` is cache-backed control-plane readiness, `/metrics` is cache-backed control-plane telemetry, and `forge diagnose` plus `forge status` remain the deep/runtime inspection surfaces. Request paths never perform fleet scans.
 - **Validated Restart Recovery:** After daemon restart Forge returns to `ready`, `startup_phase=leader_active`, `replay_in_progress=false`, `leader=true`, `follower_mode=false`, and `reconciliation_enabled=true` without reopening synchronous inspection on the request path.
+
+v5.1 note: stale checkpointed readiness no longer self-locks healthy recovery. A degraded cached `/readyz` response may appear briefly during warm startup, but the first healthy leader refresh recomputes readiness from fresh convergence, clears stale `convergence_stalled`, and does not increment `convergence_failures_total` on recovery alone.
 
 Measured live checks for this milestone:
 

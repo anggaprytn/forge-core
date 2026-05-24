@@ -16,7 +16,7 @@ The Forge Alpha Core Loop v5 milestone freezes the durable single-writer control
 
 ### Validated Capabilities (v5)
 
-- **Durable Checkpoints**: `convergence_checkpoint.json` restores cache-backed readiness after restart.
+- **Durable Checkpoints**: `convergence_checkpoint.json` restores cache-backed readiness after restart. `readyz_status` and degraded reasons are restored only as cached initial state; the first healthy leader convergence refresh must replace stale recovered readiness before stall detection can degrade again.
 - **Control-Plane Snapshots**: `runtime_snapshot.json`, `route_snapshot.json`, and `dependency_snapshot.json` support diagnostics with bounded retention.
 - **Persistent Node Identity**: Stable `node_id`, metadata, boot timestamp, and capabilities survive daemon restart.
 - **Operational Journal**: `operations.jsonl` records leadership, degradation, route, deploy/restore, and GC events.
@@ -26,6 +26,8 @@ The Forge Alpha Core Loop v5 milestone freezes the durable single-writer control
 - **Deterministic Replay Recovery**: Startup phases are explicit and replay is bounded, resumable, leader-only, and quarantine-aware.
 - **Cache-Backed Request Paths**: `/readyz` and `/metrics` remain bounded and do not perform fleet scans.
 - **Validated Live Checks**: local `/readyz` around `8ms`; `forge bench leader` and `forge bench convergence` around `0.23ms` p95; daemon restart returns to `leader_active`.
+
+v5.1 note: stale checkpointed `convergence_stalled` readiness no longer survives healthy restart, upgrade apply, or upgrade rollback handoff. Healthy leader recovery refreshes `convergence_last_success_unix`, clears stale degraded cache, and keeps `convergence_failures_total` at `0` when no fresh failure occurred.
 
 ## Alpha Core Loop v2 Validated (May 2026)
 
@@ -290,6 +292,8 @@ Semantics:
 - `forge diagnose`: deep diagnostics for operators
 
 `/readyz` serves cached convergence state. It must not perform synchronous Docker scans, Caddy scans, route reconciliation, generation reconciliation, or environment-wide diagnostics on the request path.
+
+Checkpoint-restored `/readyz` is cached startup context, not final truth. Operators may briefly see restored degraded reasons such as `convergence_stalled`, but once startup reaches `leader_active` with replay complete and healthy convergence domains, the next cache refresh must recompute readiness from fresh leader state and clear the stale marker.
 
 Readiness derives from cached control-plane inputs such as storage accessibility, queue health, Docker reachability, Caddy admin reachability, unresolved fatal markers, and convergence freshness. Environment-level health belongs to diagnostics, not readiness.
 

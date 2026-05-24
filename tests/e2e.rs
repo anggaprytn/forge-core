@@ -35,7 +35,10 @@ use forge_core::runtime::{
 };
 use forge_core::secrets::SecretStore;
 use forge_core::status::derive_environment_domain;
-use forge_core::storage::{EnvironmentPaths, EventStore, PointerStore};
+use forge_core::storage::{
+    ConvergenceCheckpointStore, EnvironmentPaths, EventStore, PersistedEnvironmentCheckpoint,
+    PointerStore, current_unix_timestamp,
+};
 use hmac::{Hmac, Mac};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -44,6 +47,31 @@ use sha2::Sha256;
 use tokio::net::TcpListener;
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn poison_checkpoint_with_stale_convergence_stalled(runtime_root: &Path) -> u64 {
+    let env = EnvironmentPaths::new(runtime_root, "api", "production");
+    let store = ConvergenceCheckpointStore::new(env);
+    let mut checkpoint: PersistedEnvironmentCheckpoint = store
+        .load()
+        .unwrap()
+        .expect("checkpoint should exist before restart handoff");
+    let stale_success = current_unix_timestamp().saturating_sub(60);
+    checkpoint.checkpointed_at_unix = current_unix_timestamp();
+    checkpoint.last_successful_convergence_unix = Some(stale_success);
+    checkpoint.readyz_reasons = vec!["convergence stalled".into()];
+    checkpoint
+        .extra
+        .insert("readyz_status".into(), Value::String("degraded".into()));
+    checkpoint.extra.insert(
+        "readyz_reason_details".into(),
+        serde_json::json!([{
+            "marker": "convergence_stalled",
+            "message": "convergence stalled"
+        }]),
+    );
+    store.save(&checkpoint).unwrap();
+    stale_success
+}
 
 #[test]
 fn dogfood_sample_app_deploys_public_route() {
@@ -267,16 +295,19 @@ fn upgrade_apply_readyz_ready_after_restart_handoff() {
     harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
     harness.execute_next_deployment().unwrap();
     harness.wait_for_readyz_status("ready", Duration::from_secs(5));
+    let stale_success = poison_checkpoint_with_stale_convergence_stalled(&harness.runtime_root);
 
     harness.restart_api_server(AllowAllDecider(true));
 
     let readyz = harness.wait_for_readyz_status("ready", Duration::from_secs(5));
     let (metrics, _) = harness.get_metrics();
     assert_eq!(readyz.status, "ready");
+    assert_eq!(readyz.reason, None);
     assert!(metrics.leader);
     assert!(!metrics.follower_mode);
     assert_eq!(metrics.startup_phase, "leader_active");
-    assert!(metrics.convergence_last_success_unix.is_some());
+    assert_eq!(metrics.convergence_failures_total, 0);
+    assert!(metrics.convergence_last_success_unix.unwrap() >= stale_success + 1);
 }
 
 #[test]
@@ -304,14 +335,18 @@ fn upgrade_rollback_readyz_ready_after_restart_handoff() {
         .run_convergence_ticks(&[100, 101, 102, 133])
         .unwrap();
     harness.wait_for_readyz_status("ready", Duration::from_secs(5));
+    let stale_success = poison_checkpoint_with_stale_convergence_stalled(&harness.runtime_root);
 
     harness.restart_api_server(AllowAllDecider(true));
 
     let readyz = harness.wait_for_readyz_status("ready", Duration::from_secs(5));
     let (metrics, _) = harness.get_metrics();
     assert_eq!(readyz.status, "ready");
+    assert_eq!(readyz.reason, None);
     assert!(metrics.leader);
     assert_eq!(metrics.startup_phase, "leader_active");
+    assert_eq!(metrics.convergence_failures_total, 0);
+    assert!(metrics.convergence_last_success_unix.unwrap() >= stale_success + 1);
     assert_eq!(
         PointerStore::new(EnvironmentPaths::new(
             &harness.runtime_root,

@@ -46,6 +46,7 @@ use crate::storage::{
     PersistedLeaderLease, PersistedNodeMetadata, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
     RuntimeHealthState, RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const READYZ_CACHE_STALE_AFTER_MS: u64 = 5_000;
@@ -58,6 +59,7 @@ const CIRCUIT_BREAKER_INITIAL_BACKOFF_MS: u64 = 250;
 const CIRCUIT_BREAKER_MAX_BACKOFF_MS: u64 = 5_000;
 const LEADER_LEASE_TTL_SECONDS: u64 = 5;
 const HEARTBEAT_STALE_AFTER_SECONDS: u64 = LEADER_LEASE_TTL_SECONDS * 3;
+const READYZ_REASON_DETAILS_KEY: &str = "readyz_reason_details";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupPhase {
@@ -1220,21 +1222,12 @@ where
                 });
                 continue;
             }
-            for message in checkpoint.readyz_reasons {
-                reasons.push(ReadyzReason {
-                    project_id: project_id.clone(),
-                    environment: environment.clone(),
-                    generation: checkpoint.active_generation,
-                    active: checkpoint.active_generation.is_some(),
-                    unresolved: checkpoint.health_state != RuntimeHealthState::Healthy,
-                    source: "convergence_checkpoint".into(),
-                    marker: "checkpoint".into(),
-                    message,
-                    last_checked_unix: Some(checkpoint.checkpointed_at_unix),
-                    cache_age_ms: age_ms,
-                    diagnostics: None,
-                });
-            }
+            reasons.extend(restored_readyz_reasons_from_checkpoint(
+                &checkpoint,
+                &project_id,
+                &environment,
+                age_ms,
+            ));
         }
         self.convergence_last_success_unix = last_success;
         self.convergence_last_success_restored = last_success.is_some();
@@ -1636,6 +1629,22 @@ where
                 .map(|reason| reason.message.clone())
                 .collect(),
             extra: BTreeMap::from([
+                (
+                    READYZ_REASON_DETAILS_KEY.into(),
+                    serde_json::to_value(
+                        reasons
+                            .iter()
+                            .filter(|reason| {
+                                reason.project_id == project_id && reason.environment == environment
+                            })
+                            .map(|reason| PersistedReadyzReasonDetail {
+                                marker: reason.marker.clone(),
+                                message: reason.message.clone(),
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or(Value::Array(Vec::new())),
+                ),
                 (
                     "convergence_domains".into(),
                     serde_json::to_value(&self.convergence_domains)
@@ -2668,6 +2677,66 @@ fn control_plane_reason(marker: &str, message: String) -> ReadyzReason {
         last_checked_unix: Some(current_unix_timestamp()),
         cache_age_ms: 0,
         diagnostics: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedReadyzReasonDetail {
+    marker: String,
+    message: String,
+}
+
+fn restored_readyz_reasons_from_checkpoint(
+    checkpoint: &PersistedEnvironmentCheckpoint,
+    project_id: &str,
+    environment: &str,
+    age_ms: u64,
+) -> Vec<ReadyzReason> {
+    let restored = checkpoint
+        .extra
+        .get(READYZ_REASON_DETAILS_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<PersistedReadyzReasonDetail>>(value).ok())
+        .filter(|reasons| !reasons.is_empty())
+        .unwrap_or_else(|| {
+            checkpoint
+                .readyz_reasons
+                .iter()
+                .map(|message| PersistedReadyzReasonDetail {
+                    marker: restored_checkpoint_reason_marker(message).into(),
+                    message: message.clone(),
+                })
+                .collect()
+        });
+    restored
+        .into_iter()
+        .map(|reason| ReadyzReason {
+            project_id: project_id.into(),
+            environment: environment.into(),
+            generation: checkpoint.active_generation,
+            active: checkpoint.active_generation.is_some(),
+            unresolved: checkpoint.health_state != RuntimeHealthState::Healthy,
+            source: "convergence_checkpoint".into(),
+            marker: reason.marker,
+            message: reason.message,
+            last_checked_unix: Some(checkpoint.checkpointed_at_unix),
+            cache_age_ms: age_ms,
+            diagnostics: None,
+        })
+        .collect()
+}
+
+fn restored_checkpoint_reason_marker(message: &str) -> &'static str {
+    match message {
+        "convergence stalled" => "convergence_stalled",
+        "reconciliation replay incomplete" => "replay_incomplete",
+        "convergence disabled while following active leader" => "follower_mode",
+        "convergence disabled pending stable startup"
+        | "convergence disabled until leadership is established" => "convergence_disabled",
+        "convergence ownership lost" => "convergence_ownership_lost",
+        "leader lease stale" => "lease_stale",
+        _ if message.contains("leadership uncertain") => "leadership_uncertain",
+        _ => "checkpoint",
     }
 }
 
@@ -5738,7 +5807,7 @@ mod daemon_control_plane_durability {
                 schema_version: 1,
                 project_id: "api".into(),
                 environment: "production".into(),
-                checkpointed_at_unix: stale_success,
+                checkpointed_at_unix: current_unix_timestamp(),
                 last_successful_convergence_unix: Some(stale_success),
                 last_convergence_duration_ms: 10,
                 last_convergence_generation: None,
@@ -5752,7 +5821,16 @@ mod daemon_control_plane_durability {
                 lease_epoch: 1,
                 convergence_owner: node_id,
                 readyz_reasons: vec!["convergence stalled".into()],
-                extra: BTreeMap::new(),
+                extra: BTreeMap::from([
+                    ("readyz_status".into(), Value::String("degraded".into())),
+                    (
+                        READYZ_REASON_DETAILS_KEY.into(),
+                        serde_json::json!([{
+                            "marker": "convergence_stalled",
+                            "message": "convergence stalled"
+                        }]),
+                    ),
+                ]),
             })
             .unwrap();
 
@@ -5762,11 +5840,27 @@ mod daemon_control_plane_durability {
             NoopRoutingRuntime,
             StaticDecider(true),
         );
+        daemon.restore_readyz_cache_from_checkpoints();
+        let restored = daemon.cached_readyz_response();
+        assert_eq!(restored.status, "degraded");
+        assert_eq!(restored.reason.as_deref(), Some("convergence stalled"));
+        assert!(
+            restored
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "convergence_stalled")
+        );
+        assert_eq!(daemon.convergence_failures_total, 0);
+        assert_eq!(daemon.convergence_last_success_unix, Some(stale_success));
+
         daemon.start().unwrap();
 
         let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
         assert_eq!(readyz.status, "ready");
+        assert_eq!(readyz.reason, None);
         assert!(readyz.reasons.is_empty());
+        assert_eq!(metrics.convergence_failures_total, 0);
         assert!(daemon.convergence_last_success_unix.unwrap() >= stale_success + 1);
     }
 
@@ -5784,7 +5878,7 @@ mod daemon_control_plane_durability {
                 schema_version: 1,
                 project_id: "api".into(),
                 environment: "production".into(),
-                checkpointed_at_unix: stale_success,
+                checkpointed_at_unix: current_unix_timestamp(),
                 last_successful_convergence_unix: Some(stale_success),
                 last_convergence_duration_ms: 10,
                 last_convergence_generation: None,
@@ -5845,7 +5939,16 @@ mod daemon_control_plane_durability {
                 lease_epoch: 1,
                 convergence_owner: node_id,
                 readyz_reasons: vec!["convergence stalled".into()],
-                extra: BTreeMap::new(),
+                extra: BTreeMap::from([
+                    ("readyz_status".into(), Value::String("degraded".into())),
+                    (
+                        READYZ_REASON_DETAILS_KEY.into(),
+                        serde_json::json!([{
+                            "marker": "convergence_stalled",
+                            "message": "convergence stalled"
+                        }]),
+                    ),
+                ]),
             })
             .unwrap();
 
@@ -5857,14 +5960,19 @@ mod daemon_control_plane_durability {
         );
         daemon.start().unwrap();
 
-        assert_eq!(daemon.readyz_response().status, "ready");
+        let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(readyz.status, "ready");
+        assert_eq!(readyz.reason, None);
         assert!(
-            !daemon
-                .readyz_response()
+            !readyz
                 .reasons
                 .iter()
                 .any(|reason| reason.marker == "convergence_stalled")
         );
+        assert_eq!(metrics.startup_phase, "leader_active");
+        assert_eq!(metrics.convergence_failures_total, 0);
+        assert!(metrics.convergence_last_success_unix.unwrap() >= stale_success + 1);
     }
 
     #[test]
