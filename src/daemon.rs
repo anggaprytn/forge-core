@@ -1777,6 +1777,7 @@ where
         let (mut cluster_diagnostics, mut cluster_signals) =
             self.load_cluster_diagnostics(now_unix);
         self.reconciliation = ReconciliationStore::new(&self.config.storage_root).diagnostics();
+        self.convergence_start_blocked = self.startup_convergence_blocked();
         let queue_depth = self.queue_depth().unwrap_or_default();
         self.convergence_domains.clear();
         let dependency_started = Instant::now();
@@ -6670,8 +6671,8 @@ mod daemon_control_plane_durability {
     }
 
     #[test]
-    fn leader_true_but_convergence_disabled_reports_specific_reason() {
-        let root = test_root("leader-true-but-convergence-disabled-reports-specific-reason");
+    fn stale_in_memory_convergence_block_does_not_survive_refresh() {
+        let root = test_root("stale-in-memory-convergence-block-does-not-survive-refresh");
         let mut daemon = Daemon::new(
             config_with_root(root),
             NoopDockerRuntime,
@@ -6686,9 +6687,9 @@ mod daemon_control_plane_durability {
         let readiness = daemon.readyz_response();
         let metrics = daemon.control_plane_snapshot().metrics;
         assert!(metrics.leader);
-        assert_eq!(readiness.status, "degraded");
+        assert_eq!(readiness.status, "ready");
         assert!(
-            readiness
+            !readiness
                 .reasons
                 .iter()
                 .any(|reason| reason.marker == "convergence_disabled")
