@@ -1132,6 +1132,60 @@ fn control_plane_lease_renders_lease_epoch_and_owner() {
     assert!(body.contains(&format!("leader_node_id: {}", lease.leader_node_id)));
 }
 
+#[test]
+fn cli_read_only_control_plane_commands_do_not_take_exclusive_lease_lock() {
+    let root = test_root("cli-read-only-control-plane-commands-do-not-take-exclusive-lease-lock");
+    let storage_root = root.join("storage");
+    std::fs::create_dir_all(&storage_root).unwrap();
+    let node = NodeMetadataStore::new(&storage_root)
+        .load_or_create()
+        .unwrap();
+    let lease = match LeaderLeaseStore::new(&storage_root)
+        .try_acquire_or_renew(&node.node_id, 100, 60)
+        .unwrap()
+    {
+        forge_core::storage::LeaseAcquireOutcome::Leader(lease) => lease,
+        forge_core::storage::LeaseAcquireOutcome::Follower(_) => {
+            panic!("expected local node to hold the lease")
+        }
+    };
+    let lock_path = storage_root.join("control_plane/leader_lease.lock");
+    std::fs::create_dir_all(&lock_path).unwrap();
+    let config_path = root.join("forge.conf");
+    std::fs::write(
+        &config_path,
+        format!(
+            "storage_root={}\napi_bind=127.0.0.1:8080\nbearer_token=test-token\n",
+            storage_root.display()
+        ),
+    )
+    .unwrap();
+
+    let leader = run_cli_in_dir(
+        &root,
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "control-plane",
+            "leader",
+        ],
+    );
+    let lease_output = run_cli_in_dir(
+        &root,
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "control-plane",
+            "lease",
+        ],
+    );
+
+    assert!(leader.status.success(), "{leader:?}");
+    assert!(lease_output.status.success(), "{lease_output:?}");
+    assert!(String::from_utf8_lossy(&leader.stdout).contains(&lease.leader_node_id));
+    assert!(String::from_utf8_lossy(&lease_output.stdout).contains("lease_epoch"));
+}
+
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)

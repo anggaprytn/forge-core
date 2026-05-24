@@ -17,7 +17,9 @@ use crate::doctor::{
     DockerCliChecker, DoctorCheck, DoctorStatus, ReqwestHttpChecker, run_with_dependencies,
 };
 use crate::process::{CommandError, run_command_with_timeout};
-use crate::storage::{atomic_write, current_unix_timestamp};
+use crate::storage::{
+    atomic_write, clear_stale_lock_file, current_unix_timestamp, inspect_lock_file,
+};
 
 pub const MANIFEST_SCHEMA_VERSION: u64 = 1;
 pub const STORAGE_COMPATIBILITY_VERSION: u64 = 1;
@@ -32,6 +34,8 @@ const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 const SUDO_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENSSL_TIMEOUT: Duration = Duration::from_secs(15);
 const RELEASE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub enum UpgradeError {
@@ -211,7 +215,7 @@ pub fn apply(options: &UpgradeOptions) -> Result<UpgradeApplyOutput, UpgradeErro
         ));
     }
 
-    systemctl(&["stop", "forge.service"])?;
+    stop_service_and_wait(&config)?;
     backup_current_binary(&current_binary_path(), &previous_binary_path())?;
     install_artifact_binary(&resolved.options.artifact_path, &current_binary_path())?;
     systemctl(&["start", "forge.service"])?;
@@ -219,8 +223,9 @@ pub fn apply(options: &UpgradeOptions) -> Result<UpgradeApplyOutput, UpgradeErro
     let result = match wait_readyz(&config) {
         Ok(()) => "ok".to_string(),
         Err(err) if options.auto_rollback => {
+            stop_service_and_wait(&config)?;
             restore_previous_binary(Path::new(&previous_binary_path()), &current_binary_path())?;
-            systemctl(&["restart", "forge.service"])?;
+            systemctl(&["start", "forge.service"])?;
             wait_readyz(&config).map_err(|rollback_err| {
                 UpgradeError::Readyz(format!(
                     "upgrade failed readiness check ({err}); automatic rollback also failed ({rollback_err})"
@@ -257,8 +262,9 @@ pub fn rollback(config_path: &Path) -> Result<UpgradeApplyOutput, UpgradeError> 
     let config = load_config(config_path)?;
     let from_version = inspect_binary_version(&current_binary_path())?.version;
     let to_version = inspect_binary_version(Path::new(&previous_binary_path()))?.version;
+    stop_service_and_wait(&config)?;
     restore_previous_binary(Path::new(&previous_binary_path()), &current_binary_path())?;
-    systemctl(&["restart", "forge.service"])?;
+    systemctl(&["start", "forge.service"])?;
     wait_readyz(&config).map_err(UpgradeError::Readyz)?;
     write_journal(
         &config.storage_root,
@@ -1077,15 +1083,86 @@ fn readyz_url(config: &DaemonConfig) -> String {
     format!("http://127.0.0.1:{port}/readyz")
 }
 
+fn stop_service_and_wait(config: &DaemonConfig) -> Result<(), UpgradeError> {
+    let pre_stop_pid = systemctl_main_pid()?;
+    systemctl(&["stop", "forge.service"])?;
+    wait_for_service_inactive(pre_stop_pid, config)
+}
+
+fn wait_for_service_inactive(
+    pre_stop_pid: Option<u32>,
+    config: &DaemonConfig,
+) -> Result<(), UpgradeError> {
+    let timeout = std::env::var("FORGE_UPGRADE_STOP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|value| !value.is_zero())
+        .unwrap_or(SERVICE_STOP_TIMEOUT);
+    let poll_interval = std::env::var("FORGE_UPGRADE_STOP_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|value| !value.is_zero())
+        .unwrap_or(SERVICE_POLL_INTERVAL);
+    let started = Instant::now();
+    let lock_path = config
+        .storage_root
+        .join("control_plane")
+        .join("leader_lease.lock");
+    let mut last_state = String::from("unknown");
+    while started.elapsed() < timeout {
+        let active = systemctl_is_active()?;
+        let current_pid = systemctl_main_pid()?;
+        let pid_stopped = pre_stop_pid.is_none_or(|pid| current_pid != Some(pid));
+        let lock_cleared = match inspect_lock_file(&lock_path) {
+            Ok(None) => true,
+            Ok(Some(inspection)) if inspection.recoverable => {
+                clear_stale_lock_file(&lock_path)
+                    .map_err(|err| UpgradeError::Command(err.to_string()))?;
+                true
+            }
+            Ok(Some(_)) => false,
+            Err(_) => false,
+        };
+        last_state = format!(
+            "active={active}, current_pid={:?}, lock_path={}, lock_cleared={lock_cleared}",
+            current_pid,
+            lock_path.display()
+        );
+        if !active && pid_stopped && lock_cleared {
+            return Ok(());
+        }
+        thread::sleep(poll_interval);
+    }
+    Err(UpgradeError::Command(format!(
+        "forge service did not stop cleanly within {}ms: {last_state}",
+        started.elapsed().as_millis()
+    )))
+}
+
+fn systemctl_is_active() -> Result<bool, UpgradeError> {
+    let output = systemctl_output(&["is-active", "forge.service"])?;
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(matches!(
+        state.as_str(),
+        "active" | "activating" | "reloading"
+    ))
+}
+
+fn systemctl_main_pid() -> Result<Option<u32>, UpgradeError> {
+    let output = systemctl_output(&["show", "--property", "MainPID", "--value", "forge.service"])?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() || value == "0" {
+        return Ok(None);
+    }
+    value.parse::<u32>().map(Some).map_err(|err| {
+        UpgradeError::Command(format!("failed to parse forge MainPID `{value}`: {err}"))
+    })
+}
+
 fn systemctl(args: &[&str]) -> Result<(), UpgradeError> {
-    let binary = std::env::var("FORGE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into());
-    let mut command = if std::env::var("FORGE_SYSTEMCTL_BIN").is_ok() || running_as_root() {
-        Command::new(&binary)
-    } else {
-        privileged_command(&binary)
-    };
-    let output = run_command_with_timeout(command.args(args), SYSTEMCTL_TIMEOUT)
-        .map_err(|err| command_error(err, format!("systemctl {} failed", args.join(" "))))?;
+    let output = systemctl_output(args)?;
     if output.status.success() {
         return Ok(());
     }
@@ -1094,6 +1171,17 @@ fn systemctl(args: &[&str]) -> Result<(), UpgradeError> {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr).trim()
     )))
+}
+
+fn systemctl_output(args: &[&str]) -> Result<std::process::Output, UpgradeError> {
+    let binary = std::env::var("FORGE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into());
+    let mut command = if std::env::var("FORGE_SYSTEMCTL_BIN").is_ok() || running_as_root() {
+        Command::new(&binary)
+    } else {
+        privileged_command(&binary)
+    };
+    run_command_with_timeout(command.args(args), SYSTEMCTL_TIMEOUT)
+        .map_err(|err| command_error(err, format!("systemctl {} failed", args.join(" "))))
 }
 
 fn current_binary_path() -> PathBuf {

@@ -232,6 +232,7 @@ dependencies = [
  "base64",
  "hex",
  "hmac",
+ "libc",
  "rand",
  "reqwest",
  "serde",

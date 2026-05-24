@@ -4626,6 +4626,24 @@ pub mod daemon_drains_shutdown_safely {
             first_lease.lease_epoch.saturating_add(1)
         );
     }
+
+    #[test]
+    fn lease_lock_released_on_daemon_shutdown() {
+        let root = test_root("lease-lock-released-on-daemon-shutdown");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
+        daemon.graceful_shutdown();
+
+        assert!(!lock_path.exists());
+    }
 }
 
 #[cfg(test)]
@@ -5861,6 +5879,37 @@ mod daemon_control_plane_durability {
                 .iter()
                 .any(|reason| reason.marker == "leadership_uncertain")
         );
+    }
+
+    #[test]
+    fn stale_leader_lock_file_does_not_degrade_readyz() {
+        let root = test_root("stale-leader-lock-file-does-not-degrade-readyz");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
+        fs::write(
+            &lock_path,
+            format!(
+                "{{\"pid\":{},\"acquired_at_unix\":1}}\n",
+                u32::MAX.saturating_sub(1)
+            ),
+        )
+        .unwrap();
+
+        daemon.refresh_readyz_cache();
+
+        let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(readyz.status, "ready");
+        assert!(readyz.reasons.is_empty());
+        assert!(metrics.leader);
+        assert!(!metrics.follower_mode);
+        assert!(metrics.lease_epoch >= 1);
     }
 
     #[test]

@@ -492,6 +492,61 @@ fn prepare_upgrade_root(
     (current, artifact)
 }
 
+fn write_handoff_systemctl(
+    path: &Path,
+    state_path: &Path,
+    pid_path: &Path,
+    log_path: &Path,
+    lock_path: &Path,
+    stop_delay_ms: u64,
+) {
+    write_executable(
+        path,
+        &format!(
+            "#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' \"$*\" >> '{log}'
+cmd=\"${{1:-}}\"
+case \"$cmd\" in
+  stop)
+    (
+      sleep {delay}
+      printf 'inactive\\n' > '{state}'
+      rm -f '{pid}'
+      rm -f '{lock}'
+    ) &
+    ;;
+  start)
+    printf 'active\\n' > '{state}'
+    printf '424242\\n' > '{pid}'
+    ;;
+  restart)
+    printf 'active\\n' > '{state}'
+    printf '424242\\n' > '{pid}'
+    ;;
+  is-active)
+    current=\"$(cat '{state}' 2>/dev/null || printf 'inactive')\"
+    printf '%s\\n' \"$current\"
+    [ \"$current\" = 'active' ]
+    ;;
+  show)
+    if [ \"${{2:-}}\" = '--property' ] && [ \"${{3:-}}\" = 'MainPID' ]; then
+      cat '{pid}' 2>/dev/null || printf '0\\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 0
+",
+            log = log_path.display(),
+            delay = stop_delay_ms as f64 / 1000.0,
+            state = state_path.display(),
+            pid = pid_path.display(),
+            lock = lock_path.display()
+        ),
+    );
+}
+
 fn default_signed_upgrade_options(
     root: &Path,
     caddy_admin_url: String,
@@ -2973,6 +3028,67 @@ fn upgrade_apply_writes_journal() {
 }
 
 #[test]
+fn upgrade_apply_waits_for_old_daemon_exit_before_restart() {
+    let root = test_root("upgrade-apply-waits-for-old-daemon-exit-before-restart");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let previous = root.join("bin/forge.previous");
+    let fake_bin = root.join("fake-bin");
+    let state_path = root.join("service.state");
+    let pid_path = root.join("service.pid");
+    let log_path = root.join("systemctl.log");
+    let lock_path = root.join("storage/control_plane/leader_lease.lock");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    fs::write(&state_path, "active\n").unwrap();
+    fs::write(&pid_path, "2222\n").unwrap();
+    fs::write(&lock_path, "{\"pid\":2222,\"acquired_at_unix\":1}\n").unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    write_handoff_systemctl(
+        &fake_bin.join("systemctl"),
+        &state_path,
+        &pid_path,
+        &log_path,
+        &lock_path,
+        200,
+    );
+    let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
+
+    let started = std::time::Instant::now();
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "FORGE_UPGRADE_PREVIOUS_BINARY_PATH",
+                previous.display().to_string(),
+            ),
+            (
+                "FORGE_SYSTEMCTL_BIN",
+                fake_bin.join("systemctl").display().to_string(),
+            ),
+            ("FORGE_UPGRADE_READYZ_URL", url),
+            ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
+            ("FORGE_UPGRADE_STOP_TIMEOUT_MS", "3000".into()),
+            ("FORGE_UPGRADE_STOP_POLL_MS", "25".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || apply(&options).unwrap(),
+    );
+
+    assert!(started.elapsed() >= Duration::from_millis(175));
+    assert!(fs::read_to_string(&current).unwrap().contains("2.0.0"));
+    assert!(!lock_path.exists());
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("stop forge.service"));
+    assert!(log.contains("show --property MainPID --value forge.service"));
+    assert!(log.contains("is-active forge.service"));
+    assert!(log.contains("start forge.service"));
+}
+
+#[test]
 fn upgrade_rollback_restores_previous_binary() {
     let root = test_root("upgrade-rollback");
     let current = root.join("bin/forge");
@@ -3017,6 +3133,102 @@ fn upgrade_rollback_restores_previous_binary() {
             assert!(events.iter().any(|event| event.action == "rollback"));
         },
     );
+}
+
+#[test]
+fn upgrade_rollback_waits_for_old_daemon_exit_before_restart() {
+    let root = test_root("upgrade-rollback-waits-for-old-daemon-exit-before-restart");
+    let current = root.join("bin/forge");
+    let previous = root.join("bin/forge.previous");
+    let fake_bin = root.join("fake-bin");
+    let state_path = root.join("service.state");
+    let pid_path = root.join("service.pid");
+    let log_path = root.join("systemctl.log");
+    let lock_path = root.join("storage/control_plane/leader_lease.lock");
+    fs::create_dir_all(current.parent().unwrap()).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    make_fake_binary(&current, "2.0.0");
+    make_fake_binary(&previous, "1.0.0");
+    write_upgrade_config(&root, "temp-token");
+    write_upgrade_env(&root, "temp-master-key");
+    fs::create_dir_all(root.join("storage/projects")).unwrap();
+    fs::write(&state_path, "active\n").unwrap();
+    fs::write(&pid_path, "3333\n").unwrap();
+    fs::write(&lock_path, "{\"pid\":3333,\"acquired_at_unix\":1}\n").unwrap();
+    write_handoff_systemctl(
+        &fake_bin.join("systemctl"),
+        &state_path,
+        &pid_path,
+        &log_path,
+        &lock_path,
+        200,
+    );
+    let (url, _handle) = spawn_ok_server();
+
+    let started = std::time::Instant::now();
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "FORGE_UPGRADE_PREVIOUS_BINARY_PATH",
+                previous.display().to_string(),
+            ),
+            (
+                "FORGE_SYSTEMCTL_BIN",
+                fake_bin.join("systemctl").display().to_string(),
+            ),
+            ("FORGE_UPGRADE_READYZ_URL", url),
+            ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
+            ("FORGE_UPGRADE_STOP_TIMEOUT_MS", "3000".into()),
+            ("FORGE_UPGRADE_STOP_POLL_MS", "25".into()),
+        ],
+        || rollback(&root.join("forge.conf")).unwrap(),
+    );
+
+    assert!(started.elapsed() >= Duration::from_millis(175));
+    assert!(fs::read_to_string(&current).unwrap().contains("1.0.0"));
+    assert!(!lock_path.exists());
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("stop forge.service"));
+    assert!(log.contains("start forge.service"));
+}
+
+#[test]
+fn upgrade_does_not_create_root_owned_leader_lock() {
+    let root = test_root("upgrade-does-not-create-root-owned-leader-lock");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let previous = root.join("bin/forge.previous");
+    let fake_bin = root.join("fake-bin");
+    let lock_path = root.join("storage/control_plane/leader_lease.lock");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
+    let (url, _handle) = spawn_ok_server();
+    let options = default_signed_upgrade_options(&root, url.clone(), artifact.clone());
+
+    with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "FORGE_UPGRADE_PREVIOUS_BINARY_PATH",
+                previous.display().to_string(),
+            ),
+            (
+                "FORGE_SYSTEMCTL_BIN",
+                fake_bin.join("systemctl").display().to_string(),
+            ),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+            ("FORGE_UPGRADE_READYZ_URL", url),
+            ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "3000".into()),
+        ],
+        || apply(&options).unwrap(),
+    );
+
+    assert!(!lock_path.exists());
 }
 
 #[test]
@@ -3068,7 +3280,8 @@ fn upgrade_rollback_uses_sudo_for_system_paths() {
     let log = fs::read_to_string(sudo_log).unwrap();
     assert!(log.contains("install -m 0755"));
     assert!(log.contains("mv"));
-    assert!(log.contains("systemctl restart forge.service"));
+    assert!(log.contains("systemctl stop forge.service"));
+    assert!(log.contains("systemctl start forge.service"));
 }
 
 #[test]
@@ -3114,7 +3327,7 @@ fn upgrade_rollback_test_does_not_touch_real_system_paths() {
     assert!(
         fs::read_to_string(log_path)
             .unwrap()
-            .contains("restart forge.service")
+            .contains("start forge.service")
     );
     assert!(fs::read_to_string(&current).unwrap().contains("1.0.0"));
     assert!(!current.starts_with("/usr/local/bin"));

@@ -1,5 +1,6 @@
 use crate::events::{EventRecord, redact_text};
 use crate::secrets::SealedValueRecord;
+use libc::{EPERM, ESRCH, kill};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,11 +9,13 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCK_RETRY_LIMIT: usize = 200;
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_LOG_MAX_LINES: usize = 64;
 const DIAGNOSTIC_LOG_MAX_BYTES: usize = 4096;
 pub const CONTROL_PLANE_SCHEMA_VERSION: u64 = 1;
@@ -47,7 +50,10 @@ impl SnapshotState {
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),
-    LockTimeout(PathBuf),
+    LockTimeout {
+        path: PathBuf,
+        holder_pid: Option<u32>,
+    },
     InvalidPointer(PathBuf),
 }
 
@@ -55,7 +61,13 @@ impl Display for StorageError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
-            Self::LockTimeout(path) => write!(f, "timed out acquiring lock at {}", path.display()),
+            Self::LockTimeout { path, holder_pid } => {
+                write!(f, "timed out acquiring lock at {}", path.display())?;
+                if let Some(holder_pid) = holder_pid {
+                    write!(f, " (holder_pid={holder_pid})")?;
+                }
+                Ok(())
+            }
             Self::InvalidPointer(path) => write!(f, "invalid pointer at {}", path.display()),
         }
     }
@@ -2264,32 +2276,150 @@ impl PointerStore {
     }
 }
 
+#[derive(Debug)]
 struct FileLock {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LockFileRecord {
+    pid: u32,
+    acquired_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockInspection {
+    pub holder_pid: Option<u32>,
+    pub recoverable: bool,
+    pub details: String,
+}
+
 impl FileLock {
     fn acquire(path: PathBuf) -> StorageResult<Self> {
+        let mut last_holder_pid = None;
         for _ in 0..LOCK_RETRY_LIMIT {
             match OpenOptions::new().create_new(true).write(true).open(&path) {
                 Ok(mut file) => {
-                    file.write_all(b"locked\n")?;
+                    let record = LockFileRecord {
+                        pid: std::process::id(),
+                        acquired_at_unix: current_unix_timestamp(),
+                    };
+                    let bytes = serde_json::to_vec(&record).map_err(json_io_error)?;
+                    file.write_all(&bytes)?;
+                    file.write_all(b"\n")?;
                     file.sync_all()?;
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(inspection) = inspect_lock_file(&path)? {
+                        last_holder_pid = inspection.holder_pid.or(last_holder_pid);
+                        if inspection.recoverable {
+                            match fs::remove_file(&path) {
+                                Ok(()) => continue,
+                                Err(remove_err)
+                                    if remove_err.kind() == std::io::ErrorKind::NotFound =>
+                                {
+                                    continue;
+                                }
+                                Err(remove_err) => return Err(StorageError::Io(remove_err)),
+                            }
+                        }
+                    }
                     thread::sleep(LOCK_RETRY_DELAY);
                 }
                 Err(err) => return Err(StorageError::Io(err)),
             }
         }
-        Err(StorageError::LockTimeout(path))
+        Err(StorageError::LockTimeout {
+            path,
+            holder_pid: last_holder_pid,
+        })
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub(crate) fn inspect_lock_file(path: &Path) -> StorageResult<Option<LockInspection>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(StorageError::Io(err)),
+    };
+    if metadata.is_dir() {
+        return Ok(Some(LockInspection {
+            holder_pid: None,
+            recoverable: false,
+            details: "lock path is a directory".into(),
+        }));
+    }
+
+    let raw = fs::read(path)?;
+    let record = serde_json::from_slice::<LockFileRecord>(&raw).ok();
+    if let Some(record) = record {
+        if process_is_alive(record.pid) {
+            return Ok(Some(LockInspection {
+                holder_pid: Some(record.pid),
+                recoverable: false,
+                details: format!("lock held by pid {}", record.pid),
+            }));
+        }
+        return Ok(Some(LockInspection {
+            holder_pid: Some(record.pid),
+            recoverable: true,
+            details: format!("stale lock from dead pid {}", record.pid),
+        }));
+    }
+
+    let age = lock_file_age(&metadata).unwrap_or(LOCK_STALE_AFTER);
+    Ok(Some(LockInspection {
+        holder_pid: None,
+        recoverable: age >= LOCK_STALE_AFTER,
+        details: if age >= LOCK_STALE_AFTER {
+            format!(
+                "stale legacy lock older than {}ms",
+                LOCK_STALE_AFTER.as_millis()
+            )
+        } else {
+            "legacy lock file is still fresh".into()
+        },
+    }))
+}
+
+pub(crate) fn clear_stale_lock_file(path: &Path) -> StorageResult<Option<LockInspection>> {
+    let Some(inspection) = inspect_lock_file(path)? else {
+        return Ok(None);
+    };
+    if !inspection.recoverable {
+        return Ok(Some(inspection));
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(Some(inspection)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(StorageError::Io(err)),
+    }
+}
+
+fn lock_file_age(metadata: &fs::Metadata) -> Option<Duration> {
+    metadata.modified().ok()?.elapsed().ok()
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let result = unsafe { kill(pid as i32, 0) };
+    if result == 0 {
+        return true;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(ESRCH) => false,
+        Some(EPERM) => true,
+        _ => Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
     }
 }
 
@@ -2759,6 +2889,36 @@ pub mod leader_lease_semantics {
 
         let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
         let _guard = FileLock::acquire(lock_path).expect("lease lock should be released");
+    }
+
+    #[test]
+    fn active_lock_holder_diagnostics_include_pid() {
+        let root = test_root("active-lock-holder-diagnostics-include-pid");
+        let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let _guard = FileLock::acquire(lock_path.clone()).unwrap();
+
+        let err = FileLock::acquire(lock_path).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("timed out acquiring lock"));
+        assert!(message.contains(&format!("holder_pid={}", std::process::id())));
+    }
+
+    #[test]
+    fn stale_legacy_lock_file_is_reclaimed() {
+        let root = test_root("stale-legacy-lock-file-is-reclaimed");
+        let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, "locked\n").unwrap();
+        thread::sleep(LOCK_STALE_AFTER + Duration::from_millis(50));
+
+        match LeaderLeaseStore::new(&root)
+            .try_acquire_or_renew("node-a", 100, 5)
+            .unwrap()
+        {
+            LeaseAcquireOutcome::Leader(lease) => assert_eq!(lease.leader_node_id, "node-a"),
+            LeaseAcquireOutcome::Follower(_) => panic!("expected stale legacy lock takeover"),
+        }
     }
 
     #[test]

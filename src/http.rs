@@ -5182,6 +5182,36 @@ pub mod http_readyz_cache_latency {
     }
 
     #[tokio::test]
+    async fn readyz_does_not_touch_leader_lease_lock_on_request_path() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    startup_phase: "leader_active".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: Default::default(),
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn readyz_does_not_read_checkpoint_files_on_request_path() {
         let state = build_cached_only_state(ControlPlaneSnapshot {
             readyz: DaemonReadyzCache {
@@ -5675,6 +5705,39 @@ pub mod metrics_endpoint_exposes_cached_json {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let metrics: MetricsResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(metrics.queue_depth, 7);
+    }
+
+    #[tokio::test]
+    async fn metrics_does_not_touch_leader_lease_lock_on_request_path() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "ready".into(),
+                    startup_phase: "leader_active".into(),
+                    reason: None,
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse {
+                queue_depth: 9,
+                ..MetricsResponse::default()
+            },
+        });
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
