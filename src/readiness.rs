@@ -1,5 +1,10 @@
-use crate::api::{MetricsResponse, ReadinessExplainResponse, ReadyzResponse};
+use crate::api::{
+    MetricsResponse, ReadinessExplainResponse, ReadinessTimelineEntry,
+    ReadinessTimelineRelatedFields, ReadinessTimelineResponse, ReadyzResponse,
+};
 use crate::daemon::{ControlPlaneSnapshot, READYZ_CACHE_STALE_AFTER_MS};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +16,38 @@ pub struct EffectiveReadinessSnapshot {
 pub fn explain_snapshot(snapshot: &ControlPlaneSnapshot) -> ReadinessExplainResponse {
     let effective = effective_snapshot(snapshot);
     explain(&effective.readyz, &effective.metrics)
+}
+
+pub fn timeline_snapshot(snapshot: &ControlPlaneSnapshot) -> ReadinessTimelineResponse {
+    if unix_now_ms().saturating_sub(snapshot.readyz.updated_at_unix_ms)
+        <= READYZ_CACHE_STALE_AFTER_MS
+    {
+        return snapshot.timeline.clone();
+    }
+    let mut timeline = snapshot.timeline.clone();
+    let cache_stale = ReadinessTimelineEntry {
+        timestamp_unix: unix_now_ms() / 1_000,
+        status: "active".into(),
+        blocker_type: "cache".into(),
+        reason: "readiness cache stale".into(),
+        startup_phase: "degraded".into(),
+        source: "daemon_api".into(),
+        active_failure: true,
+        suggested_action:
+            "wait for the next cache refresh or inspect the daemon if cache staleness persists"
+                .into(),
+        related_fields: Some(timeline_related_fields(&snapshot.metrics, None)),
+    };
+    timeline.source = "daemon_api".into();
+    timeline.live = true;
+    timeline.generated_at_unix = cache_stale.timestamp_unix;
+    timeline.entries.retain(|entry| {
+        !(entry.status == "active"
+            && entry.blocker_type == "cache"
+            && entry.reason == "readiness cache stale")
+    });
+    timeline.entries.insert(0, cache_stale);
+    timeline
 }
 
 pub fn effective_snapshot(snapshot: &ControlPlaneSnapshot) -> EffectiveReadinessSnapshot {
@@ -266,6 +303,259 @@ fn next_action_for_reason(active_failure_reason: &Option<String>) -> String {
     }
 }
 
+pub fn build_timeline(
+    readyz: &ReadyzResponse,
+    metrics: &MetricsResponse,
+    previous: Option<&ReadinessTimelineResponse>,
+    now_unix: u64,
+    source: &str,
+    live: bool,
+    warning: Option<String>,
+) -> ReadinessTimelineResponse {
+    let startup_phase = if readyz.startup_phase.is_empty() {
+        metrics.startup_phase.clone()
+    } else {
+        readyz.startup_phase.clone()
+    };
+    let active_entries = readyz
+        .reasons
+        .iter()
+        .map(|reason| {
+            let timestamp_unix = reason.last_checked_unix.unwrap_or(now_unix);
+            ReadinessTimelineEntry {
+                timestamp_unix,
+                status: "active".into(),
+                blocker_type: blocker_type_for_marker(&reason.marker, &reason.message).into(),
+                reason: timeline_reason(
+                    reason.project_id.as_str(),
+                    reason.environment.as_str(),
+                    &reason.message,
+                ),
+                startup_phase: startup_phase.clone(),
+                source: if source == "offline_snapshot" {
+                    source.into()
+                } else {
+                    reason.source.clone()
+                },
+                active_failure: true,
+                suggested_action: timeline_suggested_action(&reason.marker, &reason.message),
+                related_fields: Some(timeline_related_fields(
+                    metrics,
+                    reason.diagnostics.as_ref(),
+                )),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut entries = active_entries.clone();
+    if let Some(previous) = previous {
+        for prior in &previous.entries {
+            if prior.status != "active" {
+                if entries
+                    .iter()
+                    .all(|entry| !same_timeline_identity(entry, prior))
+                {
+                    let mut entry = prior.clone();
+                    if source == "offline_snapshot" {
+                        entry.source = "offline_snapshot".into();
+                    }
+                    entries.push(entry);
+                }
+                continue;
+            }
+            if active_entries
+                .iter()
+                .any(|entry| same_timeline_identity(entry, prior))
+            {
+                continue;
+            }
+            let mut cleared = prior.clone();
+            cleared.timestamp_unix = now_unix;
+            cleared.status = "cleared".into();
+            cleared.startup_phase = startup_phase.clone();
+            cleared.source = source.into();
+            cleared.active_failure = false;
+            if cleared.suggested_action.is_empty() {
+                cleared.suggested_action =
+                    "issue cleared; inspect historical diagnostics only if it recurs".into();
+            }
+            if cleared.related_fields.is_none() {
+                cleared.related_fields = Some(timeline_related_fields(metrics, None));
+            }
+            entries.push(cleared);
+        }
+    }
+
+    if metrics.convergence_failures_total > 0
+        || metrics.convergence_last_failure_historical_unix.is_some()
+    {
+        let historical = ReadinessTimelineEntry {
+            timestamp_unix: metrics
+                .convergence_last_failure_historical_unix
+                .or(metrics.convergence_last_failure_unix)
+                .unwrap_or(now_unix),
+            status: "historical".into(),
+            blocker_type: "convergence".into(),
+            reason: "convergence failure counter incremented".into(),
+            startup_phase: startup_phase.clone(),
+            source: source.into(),
+            active_failure: false,
+            suggested_action: "not an active readiness blocker".into(),
+            related_fields: Some(timeline_related_fields(metrics, None)),
+        };
+        if entries
+            .iter()
+            .all(|entry| !(entry.status == "historical" && entry.reason == historical.reason))
+        {
+            entries.push(historical);
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        timeline_status_rank(left.status.as_str())
+            .cmp(&timeline_status_rank(right.status.as_str()))
+            .then_with(|| right.timestamp_unix.cmp(&left.timestamp_unix))
+            .then_with(|| left.blocker_type.cmp(&right.blocker_type))
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    entries.truncate(8);
+
+    ReadinessTimelineResponse {
+        source: source.into(),
+        live,
+        generated_at_unix: now_unix,
+        warning,
+        entries,
+    }
+}
+
+pub fn load_persisted_timeline(
+    storage_root: &Path,
+) -> Result<Option<ReadinessTimelineResponse>, String> {
+    let path = timeline_snapshot_path(storage_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read(&path).map_err(|err| err.to_string())?;
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|err| format!("{}: {}", path.display(), err))
+}
+
+pub fn persist_timeline(
+    storage_root: &Path,
+    timeline: &ReadinessTimelineResponse,
+) -> Result<(), String> {
+    let path = timeline_snapshot_path(storage_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let body = serde_json::to_vec_pretty(timeline).map_err(|err| err.to_string())?;
+    fs::write(path, body).map_err(|err| err.to_string())
+}
+
+pub fn unknown_offline_timeline(reason: &str) -> ReadinessTimelineResponse {
+    ReadinessTimelineResponse {
+        source: "offline_snapshot".into(),
+        live: false,
+        generated_at_unix: unix_now_ms() / 1_000,
+        warning: Some("offline snapshot may be stale".into()),
+        entries: vec![ReadinessTimelineEntry {
+            timestamp_unix: unix_now_ms() / 1_000,
+            status: "historical".into(),
+            blocker_type: "unknown".into(),
+            reason: reason.into(),
+            startup_phase: "unknown".into(),
+            source: "offline_snapshot".into(),
+            active_failure: false,
+            suggested_action: "query the live daemon when available".into(),
+            related_fields: None,
+        }],
+    }
+}
+
+fn timeline_snapshot_path(storage_root: &Path) -> PathBuf {
+    storage_root
+        .join("control_plane")
+        .join("readiness_timeline.json")
+}
+
+fn timeline_reason(project_id: &str, environment: &str, message: &str) -> String {
+    if project_id.is_empty() || project_id == "_control_plane" || environment.is_empty() {
+        return message.into();
+    }
+    format!("{project_id}/{environment}: {message}")
+}
+
+fn blocker_type_for_marker(marker: &str, message: &str) -> &'static str {
+    if marker.contains("route") || marker.contains("caddy") || message.contains("route") {
+        "routing"
+    } else if marker.contains("docker") {
+        "dependency"
+    } else if marker.contains("replay") {
+        "replay"
+    } else if marker.contains("lease")
+        || marker.contains("leader")
+        || marker.contains("follower")
+        || marker.contains("ownership")
+        || message.contains("leadership")
+    {
+        "leadership"
+    } else if marker.contains("checkpoint") {
+        "checkpoint"
+    } else if marker.contains("cache") {
+        "cache"
+    } else {
+        "convergence"
+    }
+}
+
+fn timeline_suggested_action(marker: &str, message: &str) -> String {
+    if message == "convergence failure counter incremented" {
+        return "not an active readiness blocker".into();
+    }
+    next_action_for_reason(&Some(if message.is_empty() {
+        marker.into()
+    } else {
+        message.into()
+    }))
+}
+
+fn timeline_related_fields(
+    metrics: &MetricsResponse,
+    diagnostics: Option<&crate::api::ReadyzReasonDiagnostics>,
+) -> ReadinessTimelineRelatedFields {
+    let route_verification_state = diagnostics
+        .and_then(|value| value.last_convergence_error.clone())
+        .filter(|value| value.contains("route") || value.contains("verification"));
+    let related = ReadinessTimelineRelatedFields {
+        convergence_start_blocked: Some(metrics.convergence_start_blocked),
+        replay_in_progress: Some(metrics.replay_in_progress),
+        follower_mode: Some(metrics.follower_mode),
+        leader: Some(metrics.leader),
+        lease_epoch: Some(metrics.lease_epoch),
+        route_verification_state,
+        filesystem_scan_state: None,
+    };
+    if related == ReadinessTimelineRelatedFields::default() {
+        ReadinessTimelineRelatedFields::default()
+    } else {
+        related
+    }
+}
+
+fn same_timeline_identity(left: &ReadinessTimelineEntry, right: &ReadinessTimelineEntry) -> bool {
+    left.blocker_type == right.blocker_type && left.reason == right.reason
+}
+
+fn timeline_status_rank(status: &str) -> u8 {
+    match status {
+        "active" => 0,
+        "cleared" => 1,
+        _ => 2,
+    }
+}
+
 fn node_role(metrics: &MetricsResponse) -> String {
     if !metrics.cluster.local_role.is_empty() {
         return metrics.cluster.local_role.clone();
@@ -433,6 +723,7 @@ mod tests {
                 caddy: MetricsDependencySnapshot::default(),
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         };
 
         let effective = effective_snapshot(&snapshot);
@@ -448,6 +739,7 @@ mod tests {
                 updated_at_unix_ms: unix_now_ms().saturating_sub(READYZ_CACHE_STALE_AFTER_MS + 1),
             },
             metrics: base_metrics(),
+            ..ControlPlaneSnapshot::default()
         };
 
         let effective = effective_snapshot(&snapshot);
@@ -464,5 +756,95 @@ mod tests {
                 .as_deref(),
             Some("readiness cache stale")
         );
+    }
+
+    #[test]
+    fn active_blocker_appears_as_active_timeline_entry() {
+        let mut readyz = base_readyz();
+        readyz.status = "degraded".into();
+        readyz.active_failure = true;
+        readyz.reasons = vec![crate::api::ReadyzReason {
+            project_id: "api".into(),
+            environment: "production".into(),
+            generation: Some(7),
+            active: true,
+            unresolved: true,
+            source: "runtime_state_cache".into(),
+            marker: "route_activation_verification_failed".into(),
+            message: "route activation verification failed".into(),
+            last_checked_unix: Some(200),
+            cache_age_ms: 0,
+            diagnostics: None,
+        }];
+        let mut metrics = base_metrics();
+        metrics.readiness_status = "degraded".into();
+        metrics.convergence_start_blocked = true;
+        let timeline = build_timeline(&readyz, &metrics, None, 200, "daemon_api", true, None);
+        assert_eq!(timeline.entries[0].status, "active");
+        assert_eq!(timeline.entries[0].blocker_type, "routing");
+        assert!(timeline.entries[0].active_failure);
+    }
+
+    #[test]
+    fn cleared_blocker_does_not_remain_active_in_timeline() {
+        let previous = ReadinessTimelineResponse {
+            source: "daemon_api".into(),
+            live: true,
+            generated_at_unix: 100,
+            warning: None,
+            entries: vec![ReadinessTimelineEntry {
+                timestamp_unix: 100,
+                status: "active".into(),
+                blocker_type: "routing".into(),
+                reason: "api/production: route activation verification failed".into(),
+                startup_phase: "leader_active".into(),
+                source: "runtime_state_cache".into(),
+                active_failure: true,
+                suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                related_fields: None,
+            }],
+        };
+        let timeline = build_timeline(
+            &base_readyz(),
+            &base_metrics(),
+            Some(&previous),
+            200,
+            "daemon_api",
+            true,
+            None,
+        );
+        assert!(
+            timeline
+                .entries
+                .iter()
+                .any(|entry| entry.status == "cleared")
+        );
+        assert!(!timeline.entries.iter().any(|entry| {
+            entry.status == "active"
+                && entry.reason == "api/production: route activation verification failed"
+        }));
+    }
+
+    #[test]
+    fn historical_convergence_counters_do_not_become_active_timeline_entries() {
+        let mut metrics = base_metrics();
+        metrics.convergence_failures_total = 3;
+        metrics.convergence_last_failure_historical_unix = Some(150);
+        let timeline = build_timeline(
+            &base_readyz(),
+            &metrics,
+            None,
+            200,
+            "daemon_api",
+            true,
+            None,
+        );
+        assert!(timeline.entries.iter().any(|entry| {
+            entry.status == "historical"
+                && entry.reason == "convergence failure counter incremented"
+        }));
+        assert!(!timeline.entries.iter().any(|entry| {
+            entry.status == "active" && entry.reason == "convergence failure counter incremented"
+        }));
     }
 }

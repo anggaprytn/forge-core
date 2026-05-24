@@ -13,8 +13,9 @@ use crate::api::{
     ConvergenceDomainSummary, DependencyBreakerDiagnostics, DeploymentAccepted,
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, MetricsDependencySnapshot, MetricsResponse, NodeInfo, ReadyzReason,
-    ReadyzReasonDiagnostics, ReadyzResponse, ServiceLogGroup, validate_deployment_request,
+    EventList, MetricsDependencySnapshot, MetricsResponse, NodeInfo, ReadinessTimelineResponse,
+    ReadyzReason, ReadyzReasonDiagnostics, ReadyzResponse, ServiceLogGroup,
+    validate_deployment_request,
 };
 use crate::backups::{create_backup, inspect_backup, list_backups, restore_backup};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
@@ -28,6 +29,7 @@ use crate::deployments::{
 use crate::events::EventRecord;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue, QueueError};
+use crate::readiness::{build_timeline, load_persisted_timeline, persist_timeline};
 use crate::reconciliation::{ReconciliationDiagnostics, ReconciliationStore, ReplayOptions};
 use crate::route_truth::expected_route_for_runtime;
 use crate::runtime::{DockerRuntime, ProbeRuntime, RoutingRuntime};
@@ -441,6 +443,7 @@ impl DependencyCircuitBreaker {
 pub struct ControlPlaneSnapshot {
     pub readyz: DaemonReadyzCache,
     pub metrics: MetricsResponse,
+    pub timeline: ReadinessTimelineResponse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1935,10 +1938,34 @@ where
             updated_at_unix_ms,
         };
         self.readyz_cache = readyz.clone();
+        let metrics = self.build_metrics_snapshot(queue_depth, &readyz);
+        let persisted_timeline = if self.control_plane_snapshot.timeline.entries.is_empty() {
+            load_persisted_timeline(&self.config.storage_root)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let previous_timeline = if self.control_plane_snapshot.timeline.entries.is_empty() {
+            persisted_timeline.as_ref()
+        } else {
+            Some(&self.control_plane_snapshot.timeline)
+        };
+        let timeline = build_timeline(
+            &readyz.response,
+            &metrics,
+            previous_timeline,
+            now_unix,
+            "daemon_api",
+            true,
+            None,
+        );
         self.control_plane_snapshot = ControlPlaneSnapshot {
             readyz: readyz.clone(),
-            metrics: self.build_metrics_snapshot(queue_depth, &readyz),
+            metrics,
+            timeline: timeline.clone(),
         };
+        let _ = persist_timeline(&self.config.storage_root, &timeline);
         for (project_id, environment, env) in self.environment_paths() {
             self.persist_environment_checkpoint(
                 env,

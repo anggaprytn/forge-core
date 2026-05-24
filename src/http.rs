@@ -24,9 +24,9 @@ use crate::api::{
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
     EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectUpsertRequest, ReadinessExplainResponse, ReadyzResponse, SecretListResponse,
-    SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata,
-    TokenRevokeResponse,
+    ProjectUpsertRequest, ReadinessExplainResponse, ReadinessTimelineResponse, ReadyzResponse,
+    SecretListResponse, SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse,
+    TokenListResponse, TokenMetadata, TokenRevokeResponse,
 };
 use crate::auth::{
     AuthSource, AuthenticatedPrincipal, CliTokenVerifier, TokenIssueRequest, TokenStoreError,
@@ -36,7 +36,7 @@ use crate::github::{
     GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
 };
 use crate::projects::{ProjectRegistryStore, project_registry_error_response};
-use crate::readiness::{effective_snapshot, explain_snapshot};
+use crate::readiness::{effective_snapshot, explain_snapshot, timeline_snapshot};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::status::ProjectEnvironmentStatus;
@@ -976,6 +976,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
         .route("/readiness/explain", get(get_readiness_explain))
+        .route("/readiness/timeline", get(get_readiness_timeline))
         .route("/metrics", get(get_metrics))
         .route("/deployments", post(post_deployments))
         .route("/api/projects", post(post_projects).get(get_projects))
@@ -1752,6 +1753,24 @@ async fn get_readiness_explain(State(state): State<HttpState>) -> Response {
             ErrorResponse {
                 code: "readiness_explain_unavailable".into(),
                 message: "readiness explain cache unavailable".into(),
+            },
+        ),
+    }
+}
+
+async fn get_readiness_timeline(State(state): State<HttpState>) -> Response {
+    let request_id = next_request_id();
+    match state.control_plane_cache.read() {
+        Ok(cache) => {
+            let timeline: ReadinessTimelineResponse = timeline_snapshot(&cache);
+            json_response(StatusCode::OK, &request_id, Json(timeline))
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "readiness_timeline_unavailable".into(),
+                message: "readiness timeline cache unavailable".into(),
             },
         ),
     }
@@ -5178,6 +5197,7 @@ pub mod http_readyz_cache_latency {
                 updated_at_unix_ms: unix_now_ms(),
             },
             metrics: Default::default(),
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 
@@ -5209,6 +5229,7 @@ pub mod http_readyz_cache_latency {
                 updated_at_unix_ms: unix_now_ms(),
             },
             metrics: Default::default(),
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 
@@ -5240,6 +5261,7 @@ pub mod http_readyz_cache_latency {
                 updated_at_unix_ms: unix_now_ms(),
             },
             metrics: Default::default(),
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 
@@ -5277,6 +5299,7 @@ pub mod http_readyz_cache_latency {
                 follower_mode: true,
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
         let readyz_started = Instant::now();
@@ -5352,6 +5375,7 @@ pub mod http_readyz_cache_latency {
                 replay_queue_depth: 3,
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
         let readyz_started = Instant::now();
@@ -5407,6 +5431,7 @@ pub mod http_readyz_cache_latency {
                 follower_mode: true,
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
         let started = Instant::now();
@@ -5450,6 +5475,7 @@ pub mod http_readyz_cache_latency {
                 follower_mode: true,
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
         let readyz_started = Instant::now();
@@ -5497,6 +5523,7 @@ pub mod http_readyz_cache_latency {
                 updated_at_unix_ms: unix_now_ms(),
             },
             metrics: Default::default(),
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
         let started = Instant::now();
@@ -5716,6 +5743,56 @@ pub mod metrics_endpoint_exposes_cached_json {
     }
 
     #[tokio::test]
+    async fn readiness_timeline_endpoint_exposes_cached_json() {
+        let state = build_cached_only_state(ControlPlaneSnapshot {
+            readyz: DaemonReadyzCache {
+                response: ReadyzResponse {
+                    status: "degraded".into(),
+                    startup_phase: "leader_active".into(),
+                    active_failure: true,
+                    reason: Some("route activation verification failed".into()),
+                    reasons: Vec::new(),
+                },
+                updated_at_unix_ms: unix_now_ms(),
+            },
+            metrics: MetricsResponse::default(),
+            timeline: ReadinessTimelineResponse {
+                source: "daemon_api".into(),
+                live: true,
+                generated_at_unix: 1779320528,
+                warning: None,
+                entries: vec![crate::api::ReadinessTimelineEntry {
+                    timestamp_unix: 1779320528,
+                    status: "active".into(),
+                    blocker_type: "routing".into(),
+                    reason: "route activation verification failed".into(),
+                    startup_phase: "leader_active".into(),
+                    source: "runtime_state_cache".into(),
+                    active_failure: true,
+                    suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                    related_fields: None,
+                }],
+            },
+        });
+        let app = router(state);
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/readiness/timeline")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let timeline: ReadinessTimelineResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(timeline.source, "daemon_api");
+        assert!(timeline.live);
+        assert_eq!(timeline.entries[0].status, "active");
+        assert_eq!(timeline.entries[0].blocker_type, "routing");
+    }
+
+    #[tokio::test]
     async fn metrics_endpoint_uses_readyz_semantics_for_phase_and_history() {
         let state = build_cached_only_state(ControlPlaneSnapshot {
             readyz: DaemonReadyzCache {
@@ -5740,6 +5817,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 },
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 
@@ -5786,6 +5864,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 },
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 
@@ -5829,6 +5908,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 queue_depth: 7,
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 
@@ -5866,6 +5946,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 queue_depth: 9,
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 
@@ -5900,6 +5981,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 queue_depth: 11,
                 ..MetricsResponse::default()
             },
+            ..ControlPlaneSnapshot::default()
         });
         let app = router(state);
 

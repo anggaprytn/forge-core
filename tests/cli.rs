@@ -1086,6 +1086,47 @@ fn readiness_explain_json_is_machine_readable() {
 }
 
 #[test]
+fn readiness_timeline_uses_remote_api_when_logged_in() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"source":"daemon_api","live":true,"generated_at_unix":1779320528,"entries":[{"timestamp_unix":1779320528,"status":"active","blocker_type":"routing","reason":"route activation verification failed","startup_phase":"leader_active","source":"runtime_state_cache","active_failure":true,"suggested_action":"inspect route diagnostics and Caddy admin health"},{"timestamp_unix":1779320400,"status":"historical","blocker_type":"convergence","reason":"convergence failure counter incremented","startup_phase":"leader_active","source":"daemon_api","active_failure":false,"suggested_action":"not an active readiness blocker"}]}"#,
+    );
+
+    let output = run_cli(&url, &["readiness", "timeline"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Readiness timeline:"));
+    assert!(body.contains("ACTIVE: route activation verification failed"));
+    assert!(body.contains("Scope: routing"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/readiness/timeline");
+}
+
+#[test]
+fn readiness_timeline_json_is_machine_readable() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"source":"daemon_api","live":true,"generated_at_unix":1779320528,"entries":[{"timestamp_unix":1779320528,"status":"active","blocker_type":"routing","reason":"route activation verification failed","startup_phase":"leader_active","source":"runtime_state_cache","active_failure":true,"suggested_action":"inspect route diagnostics and Caddy admin health","related_fields":{"convergence_start_blocked":true,"replay_in_progress":false,"follower_mode":false,"leader":true,"lease_epoch":7}}]}"#,
+    );
+
+    let output = run_cli(&url, &["readiness", "timeline", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["source"], "daemon_api");
+    assert_eq!(json["live"], true);
+    assert_eq!(json["entries"][0]["status"], "active");
+    assert_eq!(json["entries"][0]["blocker_type"], "routing");
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.path, "/readiness/timeline");
+}
+
+#[test]
 fn readiness_explain_output_does_not_expose_cli_token() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
@@ -1188,6 +1229,112 @@ fn readiness_explain_remote_mode_does_not_require_local_config() {
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.path, "/readiness/explain");
     assert_eq!(request.authorization, "Bearer remote-token");
+}
+
+#[test]
+fn readiness_timeline_remote_mode_does_not_require_local_config() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"source":"daemon_api","live":true,"generated_at_unix":1779320528,"entries":[{"timestamp_unix":1779320528,"status":"historical","blocker_type":"convergence","reason":"convergence failure counter incremented","startup_phase":"leader_active","source":"daemon_api","active_failure":false,"suggested_action":"not an active readiness blocker"}]}"#,
+    );
+    let root = test_root("readiness-timeline-remote-without-local-config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(["readiness", "timeline", "--json"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("FORGE_URL", &url)
+        .env("FORGE_TOKEN", "remote-token")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("\"source\": \"daemon_api\""));
+    assert!(!body.contains("remote-token"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.path, "/readiness/timeline");
+    assert_eq!(request.authorization, "Bearer remote-token");
+}
+
+#[test]
+fn readiness_timeline_offline_labels_snapshot_and_non_live() {
+    let root = test_root("readiness-timeline-offline-labels-snapshot");
+    let (config_path, _leader) = create_control_plane_fixture(&root, "storage");
+    forge_core::readiness::persist_timeline(
+        &root.join("storage"),
+        &forge_core::api::ReadinessTimelineResponse {
+            source: "daemon_api".into(),
+            live: true,
+            generated_at_unix: 1779320528,
+            warning: None,
+            entries: vec![forge_core::api::ReadinessTimelineEntry {
+                timestamp_unix: 1779320528,
+                status: "active".into(),
+                blocker_type: "routing".into(),
+                reason: "route activation verification failed".into(),
+                startup_phase: "leader_active".into(),
+                source: "runtime_state_cache".into(),
+                active_failure: true,
+                suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                related_fields: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "readiness",
+            "timeline",
+            "--offline",
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["source"], "offline_snapshot");
+    assert_eq!(json["live"], false);
+}
+
+#[test]
+fn readiness_timeline_server_local_bare_command_uses_discovered_config() {
+    let root = test_root("readiness-timeline-server-local-bare-command");
+    let (_config_path, _leader) = create_control_plane_fixture(&root, "storage");
+    forge_core::readiness::persist_timeline(
+        &root.join("storage"),
+        &forge_core::api::ReadinessTimelineResponse {
+            source: "offline_snapshot".into(),
+            live: false,
+            generated_at_unix: 1779320528,
+            warning: Some("offline snapshot may be stale".into()),
+            entries: vec![forge_core::api::ReadinessTimelineEntry {
+                timestamp_unix: 1779320400,
+                status: "historical".into(),
+                blocker_type: "convergence".into(),
+                reason: "convergence failure counter incremented".into(),
+                startup_phase: "leader_active".into(),
+                source: "offline_snapshot".into(),
+                active_failure: false,
+                suggested_action: "not an active readiness blocker".into(),
+                related_fields: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(&root, &["readiness", "timeline", "--offline"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Readiness timeline:"));
+    assert!(body.contains("HISTORICAL: convergence failure counter incremented"));
 }
 
 #[test]

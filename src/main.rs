@@ -14,9 +14,10 @@ use forge_core::api::{
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
     EventList, ForgeSchemaVersions, ForgeVersionOutput, MetricsResponse, ProjectList,
-    ProjectRecord, ProjectUpsertRequest, ReadinessExplainResponse, ReadyzResponse, RestoreLineage,
-    RetentionRole, SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus,
-    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenRevokeResponse,
+    ProjectRecord, ProjectUpsertRequest, ReadinessExplainResponse, ReadinessTimelineResponse,
+    ReadyzResponse, RestoreLineage, RetentionRole, SecretListResponse, SecretUnsetResponse,
+    ServiceRuntimeStatus, TokenCreateRequest, TokenCreateResponse, TokenListResponse,
+    TokenRevokeResponse,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -40,6 +41,7 @@ use forge_core::http::{
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
+use forge_core::readiness::{load_persisted_timeline, unknown_offline_timeline};
 use forge_core::reconciliation::{
     ReconciliationIntentStatus, ReconciliationStore, ReplayOptions, intent_request_for_storage_root,
 };
@@ -97,6 +99,7 @@ where
             | Command::ControlPlaneLeader { .. }
             | Command::ControlPlaneLease { .. }
             | Command::ReadinessExplain { .. }
+            | Command::ReadinessTimeline { .. }
             | Command::ControlPlaneReplayStatus { .. }
             | Command::ControlPlaneIntents { .. }
             | Command::ControlPlaneReplay { .. }
@@ -224,6 +227,17 @@ where
             json,
             offline,
         } => run_readiness_explain(
+            control_plane_remote_client,
+            config_path,
+            parsed.local_config_found,
+            json,
+            offline,
+        )?,
+        Command::ReadinessTimeline {
+            config_path,
+            json,
+            offline,
+        } => run_readiness_timeline(
             control_plane_remote_client,
             config_path,
             parsed.local_config_found,
@@ -797,6 +811,22 @@ impl ForgeClient {
         )
     }
 
+    fn get_readiness_timeline(&self) -> Result<ReadinessTimelineResponse, CliError> {
+        let request = self
+            .http
+            .get(format!("{}/readiness/timeline", self.base_url));
+        let request = if self.token.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.token)
+        };
+        decode_raw_json(
+            request
+                .send()
+                .map_err(|err| CliError::Http(err.to_string()))?,
+        )
+    }
+
     fn send_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, CliError> {
         self.decode_response(
             request
@@ -1098,6 +1128,11 @@ enum Command {
         config_path: PathBuf,
     },
     ReadinessExplain {
+        config_path: PathBuf,
+        json: bool,
+        offline: bool,
+    },
+    ReadinessTimeline {
         config_path: PathBuf,
         json: bool,
         offline: bool,
@@ -1477,6 +1512,9 @@ fn parse_command(
         [group, action, rest @ ..] if group == "readiness" && action == "explain" => {
             parse_readiness_explain_command(rest, config_path)
         }
+        [group, action, rest @ ..] if group == "readiness" && action == "timeline" => {
+            parse_readiness_timeline_command(rest, config_path)
+        }
         [group, action] if group == "control-plane" && action == "replay-status" => {
             Ok(Command::ControlPlaneReplayStatus { config_path })
         }
@@ -1586,6 +1624,7 @@ fn usage() -> String {
         "  forge [--config PATH] control-plane leader",
         "  forge [--config PATH] control-plane lease",
         "  forge [--config PATH] [--url URL] [--token TOKEN] readiness explain [--json] [--offline]",
+        "  forge [--config PATH] [--url URL] [--token TOKEN] readiness timeline [--json] [--offline]",
         "  forge [--config PATH] control-plane replay-status",
         "  forge [--config PATH] control-plane intents",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] control-plane replay --dry-run",
@@ -1672,6 +1711,30 @@ fn parse_readiness_explain_command(
         }
     }
     Ok(Command::ReadinessExplain {
+        config_path,
+        json,
+        offline,
+    })
+}
+
+fn parse_readiness_timeline_command(
+    args: &[String],
+    config_path: PathBuf,
+) -> Result<Command, CliError> {
+    let mut json = false;
+    let mut offline = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--offline" => offline = true,
+            _ => {
+                return Err(CliError::Usage(
+                    "readiness timeline accepts only --json and --offline".into(),
+                ));
+            }
+        }
+    }
+    Ok(Command::ReadinessTimeline {
         config_path,
         json,
         offline,
@@ -3601,6 +3664,31 @@ fn run_readiness_explain(
     Ok(())
 }
 
+fn run_readiness_timeline(
+    remote_client: Option<ForgeClient>,
+    config_path: PathBuf,
+    config_path_available: bool,
+    json: bool,
+    offline: bool,
+) -> Result<(), CliError> {
+    let timeline = if offline {
+        load_offline_readiness_timeline(&config_path, config_path_available)?
+    } else if let Some(client) = remote_client {
+        client
+            .get_readiness_timeline()
+            .map_err(offline_timeline_suggestion)?
+    } else {
+        load_live_readiness_timeline(&config_path, config_path_available)
+            .map_err(offline_timeline_suggestion)?
+    };
+    if json {
+        print_json(&timeline)?;
+    } else {
+        print!("{}", render_readiness_timeline(&timeline));
+    }
+    Ok(())
+}
+
 fn run_control_plane_replay_status(
     config_path: PathBuf,
     config_path_available: bool,
@@ -3726,6 +3814,15 @@ fn offline_suggestion(err: CliError) -> CliError {
     }
 }
 
+fn offline_timeline_suggestion(err: CliError) -> CliError {
+    match err {
+        CliError::Http(message) => CliError::Usage(format!(
+            "live readiness timeline failed: {message}\ntry `forge readiness timeline --offline` for a persisted postmortem snapshot"
+        )),
+        other => other,
+    }
+}
+
 fn load_offline_readiness_explain(
     config_path: &Path,
     config_path_available: bool,
@@ -3734,6 +3831,42 @@ fn load_offline_readiness_explain(
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
     Ok(build_offline_readiness_explain(&config.storage_root))
+}
+
+fn load_live_readiness_timeline(
+    config_path: &Path,
+    config_path_available: bool,
+) -> Result<ReadinessTimelineResponse, CliError> {
+    ensure_local_config_available(config_path_available, "readiness timeline")?;
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let client = ForgeClient::new(
+        format!("http://{}", config.api_bind.trim()),
+        config.bearer_token,
+    );
+    client.get_readiness_timeline()
+}
+
+fn load_offline_readiness_timeline(
+    config_path: &Path,
+    config_path_available: bool,
+) -> Result<ReadinessTimelineResponse, CliError> {
+    ensure_local_config_available(config_path_available, "readiness timeline")?;
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let mut timeline = match load_persisted_timeline(&config.storage_root) {
+        Ok(Some(value)) => value,
+        Ok(None) => unknown_offline_timeline("no usable offline readiness timeline"),
+        Err(_) => unknown_offline_timeline("corrupt offline readiness timeline"),
+    };
+    timeline.source = "offline_snapshot".into();
+    timeline.live = false;
+    timeline.warning = Some(OFFLINE_WARNING.into());
+    for entry in &mut timeline.entries {
+        entry.source = "offline_snapshot".into();
+        entry.active_failure = entry.status == "active";
+    }
+    Ok(timeline)
 }
 
 fn build_offline_readiness_explain(storage_root: &Path) -> ReadinessExplainResponse {
@@ -4355,6 +4488,40 @@ fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
     output
 }
 
+fn render_readiness_timeline(view: &ReadinessTimelineResponse) -> String {
+    let mut output = String::new();
+    output.push_str("Readiness timeline:\n");
+    if !view.live {
+        output
+            .push_str("Warning: offline snapshot may be stale and is not current live readiness\n");
+    }
+    if view.entries.is_empty() {
+        output.push_str("- HISTORICAL: no timeline entries available\n");
+        output.push_str("  Not an active readiness blocker\n");
+        return output;
+    }
+    for entry in &view.entries {
+        output.push_str(&format!(
+            "- {}: {}\n",
+            entry.status.to_uppercase(),
+            entry.reason
+        ));
+        output.push_str(&format!("  Scope: {}\n", entry.blocker_type));
+        match entry.status.as_str() {
+            "active" => {
+                output.push_str(&format!("  Suggested action: {}\n", entry.suggested_action));
+            }
+            "cleared" => {
+                output.push_str("  Cleared after fresh readiness refresh\n");
+            }
+            _ => {
+                output.push_str("  Not an active readiness blocker\n");
+            }
+        }
+    }
+    output
+}
+
 fn load_local_control_plane_state(
     config_path: &Path,
 ) -> Result<(String, Option<PersistedLeaderLease>, ClusterDiagnostics), CliError> {
@@ -4872,6 +5039,39 @@ mod tests {
         }
     }
 
+    fn readiness_timeline_fixture() -> ReadinessTimelineResponse {
+        ReadinessTimelineResponse {
+            source: "daemon_api".into(),
+            live: true,
+            generated_at_unix: 200,
+            warning: None,
+            entries: vec![
+                forge_core::api::ReadinessTimelineEntry {
+                    timestamp_unix: 200,
+                    status: "active".into(),
+                    blocker_type: "routing".into(),
+                    reason: "route activation verification failed".into(),
+                    startup_phase: "leader_active".into(),
+                    source: "runtime_state_cache".into(),
+                    active_failure: true,
+                    suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                    related_fields: None,
+                },
+                forge_core::api::ReadinessTimelineEntry {
+                    timestamp_unix: 150,
+                    status: "historical".into(),
+                    blocker_type: "convergence".into(),
+                    reason: "convergence failure counter incremented".into(),
+                    startup_phase: "leader_active".into(),
+                    source: "daemon_api".into(),
+                    active_failure: false,
+                    suggested_action: "not an active readiness blocker".into(),
+                    related_fields: None,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn version_reports_injected_git_commit() {
         let output = forge_version_output_with_metadata(
@@ -5057,6 +5257,58 @@ mod tests {
     }
 
     #[test]
+    fn readiness_timeline_command_parses() {
+        let parsed = ParsedArgs::parse(vec![
+            "--config".into(),
+            "/tmp/forge.conf".into(),
+            "readiness".into(),
+            "timeline".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::ReadinessTimeline {
+                config_path: PathBuf::from("/tmp/forge.conf"),
+                json: false,
+                offline: false,
+            }
+        );
+    }
+
+    #[test]
+    fn readiness_timeline_offline_json_command_parses_in_any_order() {
+        let root = temp_root("readiness-timeline-offline-json-parses");
+        let missing_installed = root.join("missing-etc-forge.conf");
+
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(missing_installed.as_os_str().to_os_string()),
+                || {
+                    let parsed = ParsedArgs::parse(vec![
+                        "readiness".into(),
+                        "timeline".into(),
+                        "--offline".into(),
+                        "--json".into(),
+                    ])
+                    .unwrap();
+
+                    assert_eq!(
+                        parsed.command,
+                        Command::ReadinessTimeline {
+                            config_path: PathBuf::from("forge.conf"),
+                            json: true,
+                            offline: true,
+                        }
+                    );
+                    assert!(!parsed.local_config_found);
+                },
+            )
+        });
+    }
+
+    #[test]
     fn live_readiness_explain_uses_daemon_endpoint() {
         let response = readiness_explain_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5094,6 +5346,48 @@ mod tests {
         .unwrap();
 
         let loaded = load_live_readiness_explain(&config_path, true).unwrap();
+        server.join().unwrap();
+        assert_eq!(loaded, response);
+    }
+
+    #[test]
+    fn live_readiness_timeline_uses_daemon_endpoint() {
+        let response = readiness_timeline_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response_json = serde_json::to_string(&response).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("GET /readiness/timeline HTTP/1.1"));
+            let body = response_json;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let root = temp_root("readiness-timeline-local-daemon");
+        let config_path = root.join("forge.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:{}\nbearer_token=test-token\n",
+                root.display(),
+                addr.port()
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_live_readiness_timeline(&config_path, true).unwrap();
         server.join().unwrap();
         assert_eq!(loaded, response);
     }
@@ -5162,6 +5456,60 @@ mod tests {
     }
 
     #[test]
+    fn offline_readiness_timeline_reads_persisted_snapshot() {
+        let root = temp_root("offline-readiness-timeline");
+        let config_path = root.join("forge.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:1\nbearer_token=test-token\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let timeline = readiness_timeline_fixture();
+        forge_core::readiness::persist_timeline(&root, &timeline).unwrap();
+
+        let loaded = load_offline_readiness_timeline(&config_path, true).unwrap();
+        assert_eq!(loaded.source, "offline_snapshot");
+        assert!(!loaded.live);
+        assert_eq!(loaded.warning.as_deref(), Some(OFFLINE_WARNING));
+        assert_eq!(loaded.entries[0].source, "offline_snapshot");
+        assert!(loaded.entries[0].active_failure);
+    }
+
+    #[test]
+    fn offline_readiness_timeline_handles_missing_or_corrupt_snapshot_safely() {
+        let root = temp_root("offline-readiness-timeline-corrupt");
+        let config_path = root.join("forge.conf");
+        std::fs::write(
+            &config_path,
+            format!(
+                "storage_root={}\napi_bind=127.0.0.1:1\nbearer_token=test-token\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+
+        let missing = load_offline_readiness_timeline(&config_path, true).unwrap();
+        assert_eq!(missing.source, "offline_snapshot");
+        assert!(!missing.live);
+        assert_eq!(missing.entries[0].blocker_type, "unknown");
+
+        let timeline_path = root.join("control_plane").join("readiness_timeline.json");
+        std::fs::create_dir_all(timeline_path.parent().unwrap()).unwrap();
+        std::fs::write(&timeline_path, "{not-json").unwrap();
+
+        let corrupt = load_offline_readiness_timeline(&config_path, true).unwrap();
+        assert_eq!(corrupt.source, "offline_snapshot");
+        assert!(!corrupt.live);
+        assert_eq!(
+            corrupt.entries[0].reason,
+            "corrupt offline readiness timeline"
+        );
+    }
+
+    #[test]
     fn unreachable_live_readiness_explain_suggests_offline() {
         let root = temp_root("readiness-explain-unreachable-daemon");
         let config_path = root.join("forge.conf");
@@ -5219,6 +5567,20 @@ mod tests {
         assert!(rendered.contains("Leader: true"));
         assert!(rendered.contains("Follower mode: false"));
         assert!(rendered.contains("Operator action: no action required"));
+    }
+
+    #[test]
+    fn human_readiness_timeline_render_is_terse() {
+        let mut view = readiness_timeline_fixture();
+        view.source = "offline_snapshot".into();
+        view.live = false;
+        view.warning = Some(OFFLINE_WARNING.into());
+
+        let rendered = render_readiness_timeline(&view);
+        assert!(rendered.contains("Readiness timeline:"));
+        assert!(rendered.contains("ACTIVE: route activation verification failed"));
+        assert!(rendered.contains("Scope: routing"));
+        assert!(rendered.contains("Warning: offline snapshot may be stale"));
     }
 
     #[test]

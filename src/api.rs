@@ -912,6 +912,60 @@ pub struct ReadinessExplainResponse {
     pub safe_next_action: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReadinessTimelineRelatedFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_start_blocked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_in_progress: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_verification_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_scan_state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReadinessTimelineEntry {
+    #[serde(default)]
+    pub timestamp_unix: u64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub blocker_type: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub startup_phase: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub active_failure: bool,
+    #[serde(default)]
+    pub suggested_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_fields: Option<ReadinessTimelineRelatedFields>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReadinessTimelineResponse {
+    #[serde(default = "default_readiness_explain_source")]
+    pub source: String,
+    #[serde(default = "default_readiness_explain_live")]
+    pub live: bool,
+    #[serde(default)]
+    pub generated_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ReadinessTimelineEntry>,
+}
+
 fn default_readiness_explain_source() -> String {
     "daemon_api".into()
 }
