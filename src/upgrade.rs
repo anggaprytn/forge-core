@@ -31,6 +31,7 @@ const VERSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 const SUDO_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENSSL_TIMEOUT: Duration = Duration::from_secs(15);
+const RELEASE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 pub enum UpgradeError {
@@ -616,6 +617,8 @@ fn fetch_release_metadata(tag: &str) -> Result<GitHubRelease, UpgradeError> {
         tag
     );
     let client = reqwest::blocking::Client::builder()
+        .timeout(release_http_timeout())
+        .connect_timeout(release_http_timeout())
         .build()
         .map_err(|err| UpgradeError::Command(format!("failed to create HTTP client: {err}")))?;
     let response = client
@@ -624,7 +627,9 @@ fn fetch_release_metadata(tag: &str) -> Result<GitHubRelease, UpgradeError> {
         .header("User-Agent", "forge-upgrade")
         .send()
         .map_err(|err| {
-            UpgradeError::Command(format!("failed to fetch GitHub release metadata: {err}"))
+            UpgradeError::Command(format!(
+                "failed to fetch GitHub release metadata for tag {tag} from {url}: {err}"
+            ))
         })?;
     if !response.status().is_success() {
         return Err(UpgradeError::Usage(format!(
@@ -639,6 +644,8 @@ fn fetch_release_metadata(tag: &str) -> Result<GitHubRelease, UpgradeError> {
 
 fn download_release_file(url: &str, destination: &Path) -> Result<(), UpgradeError> {
     let client = reqwest::blocking::Client::builder()
+        .timeout(release_http_timeout())
+        .connect_timeout(release_http_timeout())
         .build()
         .map_err(|err| UpgradeError::Command(format!("failed to create HTTP client: {err}")))?;
     let response = client
@@ -646,7 +653,12 @@ fn download_release_file(url: &str, destination: &Path) -> Result<(), UpgradeErr
         .header("Accept", "application/octet-stream")
         .header("User-Agent", "forge-upgrade")
         .send()
-        .map_err(|err| UpgradeError::Command(format!("failed to download release asset: {err}")))?;
+        .map_err(|err| {
+            UpgradeError::Command(format!(
+                "failed to download release asset from {url} to {}: {err}",
+                destination.display()
+            ))
+        })?;
     if !response.status().is_success() {
         return Err(UpgradeError::Usage(format!(
             "failed to download release asset {}: HTTP {}",
@@ -659,6 +671,15 @@ fn download_release_file(url: &str, destination: &Path) -> Result<(), UpgradeErr
     })?;
     fs::write(destination, &bytes)?;
     Ok(())
+}
+
+fn release_http_timeout() -> Duration {
+    std::env::var("FORGE_RELEASE_HTTP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|timeout| !timeout.is_zero())
+        .unwrap_or(RELEASE_HTTP_TIMEOUT)
 }
 
 fn current_release_platform() -> Result<&'static str, UpgradeError> {

@@ -5,6 +5,7 @@ FORCE=0
 RELEASE_TAG=""
 ARTIFACT=""
 ALLOW_UNSIGNED_RELEASE=0
+PUBLIC_KEY_PATH=""
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DEST="${FORGE_BIN_DEST:-/usr/local/bin/forge}"
@@ -28,7 +29,7 @@ ARTIFACT_STAGE_DIR=""
 
 usage() {
   cat <<'EOF'
-usage: ./install.sh [--version <tag>] [--release <tag>] [--artifact <path>] [--force] [--allow-unsigned-release]
+usage: ./install.sh [--version <tag>] [--release <tag>] [--artifact <path>] [--public-key <path>] [--force] [--allow-unsigned-release]
 
 Installs Forge from a pinned GitHub release or a local artifact, otherwise from the local source tree.
 - Preserves /etc/forge/forge.conf and /etc/forge/forge.env unless --force is used.
@@ -86,6 +87,11 @@ while [ $# -gt 0 ]; do
       [ $# -gt 0 ] || die "--artifact requires a value"
       ARTIFACT="$1"
       ;;
+    --public-key)
+      shift
+      [ $# -gt 0 ] || die "--public-key requires a value"
+      PUBLIC_KEY_PATH="$1"
+      ;;
     --allow-unsigned-release)
       ALLOW_UNSIGNED_RELEASE=1
       ;;
@@ -99,6 +105,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+if [ -n "$PUBLIC_KEY_PATH" ]; then
+  RELEASE_PUBLIC_KEY_PATH="$PUBLIC_KEY_PATH"
+fi
 
 if [ "$(id -u)" -eq 0 ] || [ "$ALLOW_UNPRIVILEGED_INSTALL" = "1" ]; then
   USE_SUDO=0

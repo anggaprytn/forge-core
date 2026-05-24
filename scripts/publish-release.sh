@@ -8,6 +8,7 @@ REPOSITORY="${FORGE_RELEASE_REPOSITORY:-}"
 ALLOW_NON_HEAD=0
 UPLOAD_PUBLIC_KEY=1
 TAG=""
+GH_TIMEOUT_SECS="${FORGE_PUBLISH_GH_TIMEOUT_SECS:-30}"
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -16,6 +17,19 @@ log() {
 die() {
   printf '[ERROR] %s\n' "$*" >&2
   exit 1
+}
+
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+  set +e
+  perl -e 'alarm shift @ARGV; exec @ARGV' "$timeout_secs" "$@"
+  local status=$?
+  set -e
+  if [ "$status" -eq 142 ]; then
+    die "$1 timed out after ${timeout_secs}s"
+  fi
+  return "$status"
 }
 
 usage() {
@@ -97,7 +111,17 @@ verify_tag() {
 
 require_gh() {
   command -v gh >/dev/null 2>&1 || die "gh CLI is required to publish GitHub releases"
-  gh auth status >/dev/null 2>&1 || die "gh CLI is not authenticated; run 'gh auth login' and retry"
+  run_with_timeout "$GH_TIMEOUT_SECS" gh auth status >/dev/null \
+    || die "gh CLI is not authenticated; run 'gh auth login' and retry"
+}
+
+require_signed_bundle() {
+  [ -f "$DIST_DIR/release-manifest.json" ] || die "missing release-manifest.json; signed packaging did not complete"
+  [ -f "$DIST_DIR/release-manifest.sig" ] || die "missing release-manifest.sig; refusing unsigned publish"
+  [ -f "$DIST_DIR/checksums.txt" ] || die "missing checksums.txt; signed packaging did not complete"
+  [ -f "$DIST_DIR/release-public-key.pem" ] || die "missing release-public-key.pem; signed packaging did not complete"
+  local artifacts=("$DIST_DIR"/forge-*.tar.gz)
+  [ -e "${artifacts[0]}" ] || die "missing packaged forge artifact under $DIST_DIR"
 }
 
 generate_release_notes() {
@@ -182,12 +206,12 @@ publish_release() {
     assets+=("$DIST_DIR/release-public-key.pem")
   fi
 
-  if gh release view "$TAG" --repo "$repository" >/dev/null 2>&1; then
-    gh release edit "$TAG" --repo "$repository" --notes-file "$notes_path" >/dev/null
+  if run_with_timeout "$GH_TIMEOUT_SECS" gh release view "$TAG" --repo "$repository" >/dev/null; then
+    run_with_timeout "$GH_TIMEOUT_SECS" gh release edit "$TAG" --repo "$repository" --notes-file "$notes_path" >/dev/null
   else
-    gh release create "$TAG" --repo "$repository" --title "$TAG" --notes-file "$notes_path" >/dev/null
+    run_with_timeout "$GH_TIMEOUT_SECS" gh release create "$TAG" --repo "$repository" --title "$TAG" --notes-file "$notes_path" >/dev/null
   fi
-  gh release upload "$TAG" --repo "$repository" --clobber "${assets[@]}" >/dev/null
+  run_with_timeout "$GH_TIMEOUT_SECS" gh release upload "$TAG" --repo "$repository" --clobber "${assets[@]}" >/dev/null
   log "published GitHub release $TAG to $repository"
 }
 
@@ -205,6 +229,7 @@ main() {
     cd "$REPO_ROOT"
     scripts/package-release.sh --sign --signing-key "$SIGNING_KEY"
   )
+  require_signed_bundle
   generate_release_notes
   publish_release "$repository"
 }

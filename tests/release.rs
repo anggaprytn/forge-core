@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::{collections::HashMap, time::Duration};
 
@@ -349,15 +349,30 @@ fn default_upgrade_options(
 fn spawn_ok_server() -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    listener
+        .set_nonblocking(true)
+        .expect("listener should support nonblocking");
     let handle = thread::spawn(move || {
-        for _ in 0..32 {
-            let Ok((mut stream, _)) = listener.accept() else {
-                break;
+        let mut last_activity = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    last_activity = std::time::Instant::now();
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let mut buffer = [0_u8; 1024];
+                    let _ = read_http_request(&mut stream, &mut buffer);
+                    let response =
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+                    let _ = stream.write_all(response);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_activity.elapsed() > Duration::from_secs(5) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
             };
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer);
-            let response = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
-            let _ = stream.write_all(response);
         }
     });
     (url, handle)
@@ -366,45 +381,81 @@ fn spawn_ok_server() -> (String, thread::JoinHandle<()>) {
 fn spawn_readyz_sequence_server(statuses: Vec<u16>) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    listener
+        .set_nonblocking(true)
+        .expect("listener should support nonblocking");
     let handle = thread::spawn(move || {
-        for status in statuses {
-            let Ok((mut stream, _)) = listener.accept() else {
-                break;
-            };
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer);
-            let response = match status {
-                200 => {
-                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
-                        .as_slice()
+        let mut last_activity = std::time::Instant::now();
+        let mut statuses = statuses.into_iter();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    last_activity = std::time::Instant::now();
+                    let Some(status) = statuses.next() else {
+                        break;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let mut buffer = [0_u8; 1024];
+                    let _ = read_http_request(&mut stream, &mut buffer);
+                    let response = match status {
+                        200 => {
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                                .as_slice()
+                        }
+                        _ => b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nfail"
+                            .as_slice(),
+                    };
+                    let _ = stream.write_all(response);
                 }
-                _ => b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nfail"
-                    .as_slice(),
-            };
-            let _ = stream.write_all(response);
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_activity.elapsed() > Duration::from_secs(5) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
         }
     });
     (url, handle)
 }
 
-fn with_env<R>(vars: &[(&str, String)], f: impl FnOnce() -> R) -> R {
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-    let saved = vars
-        .iter()
-        .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-        .collect::<Vec<_>>();
-    for (key, value) in vars {
-        unsafe { std::env::set_var(key, value) };
+struct EnvGuard {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn set(vars: &[(&str, String)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self { saved }
     }
-    let result = f();
-    for (key, previous) in saved {
-        match previous {
-            Some(value) => unsafe { std::env::set_var(key, value) },
-            None => unsafe { std::env::remove_var(key) },
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in self.saved.drain(..) {
+            match previous {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
         }
     }
-    result
+}
+
+fn with_env<R>(vars: &[(&str, String)], f: impl FnOnce() -> R) -> R {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _env = EnvGuard::set(vars);
+    f()
 }
 
 fn write_upgrade_config(root: &Path, bearer_token: &str) {
@@ -558,19 +609,26 @@ fn spawn_release_server(
         signature_path,
         checksums_path,
     );
+    let expected_requests = routes.len();
     listener
         .set_nonblocking(true)
         .expect("listener should support nonblocking");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
     let handle = thread::spawn(move || {
-        let started = std::time::Instant::now();
+        let mut last_activity = std::time::Instant::now();
+        let mut served = 0_usize;
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    last_activity = std::time::Instant::now();
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
                     let mut buffer = [0_u8; 4096];
-                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    let read = read_http_request(&mut stream, &mut buffer).unwrap_or(0);
                     if read == 0 {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 400 Bad Request\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad request",
+                        );
                         continue;
                     }
                     let request = String::from_utf8_lossy(&buffer[..read]);
@@ -598,9 +656,13 @@ fn spawn_release_server(
                     );
                     let _ = stream.write_all(headers.as_bytes());
                     let _ = stream.write_all(&response.body);
+                    served += 1;
+                    if served >= expected_requests {
+                        break;
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() > Duration::from_millis(750) {
+                    if last_activity.elapsed() > Duration::from_secs(15) {
                         break;
                     }
                     thread::sleep(Duration::from_millis(10));
@@ -612,11 +674,54 @@ fn spawn_release_server(
     (base_url, requests, handle)
 }
 
+fn read_http_request(stream: &mut std::net::TcpStream, buffer: &mut [u8]) -> Option<usize> {
+    for _ in 0..10 {
+        match stream.read(buffer) {
+            Ok(0) => thread::sleep(Duration::from_millis(10)),
+            Ok(read) => return Some(read),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 struct StaticHttpResponse {
     status: u16,
     content_type: &'static str,
     body: Vec<u8>,
+}
+
+fn spawn_stalled_http_server() -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener
+        .set_nonblocking(true)
+        .expect("listener should support nonblocking");
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let handle = thread::spawn(move || {
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((_stream, _)) => thread::sleep(Duration::from_millis(500)),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (url, shutdown_tx, handle)
 }
 
 #[test]
@@ -941,6 +1046,65 @@ fn publish_release_requires_clean_tree() {
 }
 
 #[test]
+fn publish_release_requires_gh() {
+    let root = init_package_repo("publish-release-gh-required");
+    let key_root = test_root("publish-release-gh-required-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    git_ok(&root, &["tag", "alpha-core-loop-v5"]);
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .arg("alpha-core-loop-v5")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("gh CLI is required"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn publish_release_requires_gh_auth() {
+    let root = init_package_repo("publish-release-gh-auth");
+    let key_root = test_root("publish-release-gh-auth-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    git_ok(&root, &["tag", "alpha-core-loop-v5"]);
+    let fake_bin = test_root("publish-release-gh-auth-bin");
+    write_executable(
+        &fake_bin.join("gh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then exit 1; fi\nexit 0\n",
+    );
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .arg("alpha-core-loop-v5")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("gh CLI is not authenticated"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn publish_release_requires_tag() {
     let root = init_package_repo("publish-release-tag-required");
     let key_root = test_root("publish-release-tag-required-keys");
@@ -964,12 +1128,137 @@ fn publish_release_requires_tag() {
             "PATH",
             format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
         )
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
         .output()
         .unwrap();
 
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("tag argument required"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn publish_release_rejects_non_head_tag() {
+    let root = init_package_repo("publish-release-non-head-tag");
+    let key_root = test_root("publish-release-non-head-tag-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    git_ok(&root, &["tag", "alpha-core-loop-v5"]);
+    fs::write(root.join("README.md"), "updated\n").unwrap();
+    git_ok(&root, &["add", "README.md"]);
+    git_ok(&root, &["commit", "-m", "advance head"]);
+    let fake_bin = test_root("publish-release-non-head-gh");
+    write_executable(
+        &fake_bin.join("gh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then exit 0; fi\nexit 0\n",
+    );
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .arg("alpha-core-loop-v5")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:{}",
+                fake_bin.display(),
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not point to HEAD"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn publish_release_requires_signed_bundle() {
+    let root = init_package_repo("publish-release-signed-bundle");
+    let key_root = test_root("publish-release-signed-bundle-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    git_ok(&root, &["tag", "alpha-core-loop-v5"]);
+    let fake_bin = test_root("publish-release-signed-bundle-gh");
+    write_executable(
+        &fake_bin.join("gh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then exit 0; fi\nif [ \"$1\" = \"release\" ] && [ \"$2\" = \"view\" ]; then exit 1; fi\nexit 0\n",
+    );
+    write_executable(
+        &root.join("scripts/package-release.sh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nrepo_root=\"$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")/..\" && pwd)\"\nmkdir -p \"$repo_root/dist\"\nprintf test > \"$repo_root/dist/forge-0.1.0-linux-amd64.tar.gz\"\nprintf '{}' > \"$repo_root/dist/release-manifest.json\"\nprintf x > \"$repo_root/dist/checksums.txt\"\n",
+    );
+    git_ok(&root, &["add", "scripts/package-release.sh"]);
+    git_ok(&root, &["commit", "-m", "stub package script"]);
+    git_ok(&root, &["tag", "-f", "alpha-core-loop-v5"]);
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .arg("alpha-core-loop-v5")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("missing release-manifest.sig"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn publish_release_gh_child_timeout() {
+    let root = init_package_repo("publish-release-gh-timeout");
+    let key_root = test_root("publish-release-gh-timeout-keys");
+    let (private_key, _) = generate_signing_keypair(&key_root);
+    git_ok(&root, &["tag", "alpha-core-loop-v5"]);
+    let fake_bin = test_root("publish-release-gh-timeout-bin");
+    write_executable(
+        &fake_bin.join("gh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then exit 0; fi\nsleep 2\n",
+    );
+
+    let output = Command::new("bash")
+        .arg("scripts/publish-release.sh")
+        .arg("alpha-core-loop-v5")
+        .args(["--signing-key"])
+        .arg(&private_key)
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:{}",
+                fake_bin.display(),
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .env("FORGE_PUBLISH_GH_TIMEOUT_SECS", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("gh timed out after 1s"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1124,6 +1413,82 @@ fn install_release_download_preserves_config() {
 }
 
 #[test]
+fn install_release_requires_verification_by_default() {
+    let root = test_root("install-release-verification-default");
+    let artifact = make_artifact(&root, "1.2.3", 0o644);
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "1.2.3");
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(&[&artifact, &manifest_path], &checksums_path);
+    let tag = "alpha-core-loop-v5";
+    let config_dir = root.join("etc/forge");
+    fs::create_dir_all(&config_dir).unwrap();
+    let (base_url, _requests, handle) =
+        spawn_release_server(tag, &artifact, &manifest_path, None, &checksums_path);
+
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .arg("--release")
+        .arg(tag)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("FORGE_ALLOW_UNPRIVILEGED_INSTALL", "1")
+        .env("FORGE_BIN_DEST", root.join("bin/forge"))
+        .env("FORGE_PREVIOUS_BIN_DEST", root.join("bin/forge.previous"))
+        .env("FORGE_CONFIG_DIR", &config_dir)
+        .env("FORGE_STORAGE_ROOT", root.join("var/lib/forge"))
+        .env("FORGE_SRV_ROOT", root.join("srv/forge"))
+        .env("FORGE_SAMPLE_ROOT", root.join("srv/forge/sample-http-app"))
+        .env("FORGE_UNIT_PATH", root.join("forge.service"))
+        .env("FORGE_SERVICE_SRC", root.join("missing.service"))
+        .env("FORGE_RELEASE_API_BASE_URL", &base_url)
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .env("FORGE_RELEASE_PLATFORM", "linux-amd64")
+        .output()
+        .unwrap();
+
+    handle.join().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("release public key not configured"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn install_release_allow_unsigned_is_explicit() {
+    let root = test_root("install-release-allow-unsigned");
+    let artifact = make_artifact(&root, "1.2.3", 0o644);
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "1.2.3");
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(&[&artifact, &manifest_path], &checksums_path);
+    let tag = "alpha-core-loop-v5";
+    let (base_url, _requests, handle) =
+        spawn_release_server(tag, &artifact, &manifest_path, None, &checksums_path);
+
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .args(["--release", tag, "--allow-unsigned-release"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("FORGE_ALLOW_UNPRIVILEGED_INSTALL", "1")
+        .env("FORGE_BIN_DEST", root.join("bin/forge"))
+        .env("FORGE_PREVIOUS_BIN_DEST", root.join("bin/forge.previous"))
+        .env("FORGE_CONFIG_DIR", root.join("etc/forge"))
+        .env("FORGE_STORAGE_ROOT", root.join("var/lib/forge"))
+        .env("FORGE_SRV_ROOT", root.join("srv/forge"))
+        .env("FORGE_SAMPLE_ROOT", root.join("srv/forge/sample-http-app"))
+        .env("FORGE_UNIT_PATH", root.join("forge.service"))
+        .env("FORGE_SERVICE_SRC", root.join("missing.service"))
+        .env("FORGE_RELEASE_API_BASE_URL", &base_url)
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .env("FORGE_RELEASE_PLATFORM", "linux-amd64")
+        .output()
+        .unwrap();
+
+    handle.join().unwrap();
+    assert!(output.status.success());
+}
+
+#[test]
 fn install_preserves_existing_env() {
     let root = test_root("install-env");
     let artifact = make_artifact(&root, "1.2.3", 0o644);
@@ -1155,7 +1520,7 @@ fn install_preserves_existing_env() {
 }
 
 #[test]
-fn install_writes_previous_binary() {
+fn install_release_writes_previous_binary() {
     let root = test_root("install-previous");
     let artifact = make_artifact(&root, "1.2.3", 0o644);
     fs::create_dir_all(root.join("bin")).unwrap();
@@ -1179,6 +1544,119 @@ fn install_writes_previous_binary() {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(fs::read(root.join("bin/forge.previous")).unwrap(), b"old");
+}
+
+#[test]
+fn install_release_rejects_checksum_mismatch() {
+    let root = test_root("install-release-checksum-mismatch");
+    let artifact = make_artifact(&root, "1.2.3", 0o644);
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "1.2.3");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    let signature_path = root.join("release-manifest.sig");
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let checksums_path = root.join("checksums.txt");
+    fs::write(
+        &checksums_path,
+        format!(
+            "deadbeef  {}\n{}  {}\n{}  {}\n",
+            artifact.file_name().unwrap().to_string_lossy(),
+            sha256(&manifest_path),
+            manifest_path.file_name().unwrap().to_string_lossy(),
+            sha256(&signature_path),
+            signature_path.file_name().unwrap().to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    let config_dir = root.join("etc/forge");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::copy(&public_key, config_dir.join("release-public-key.pem")).unwrap();
+    let (base_url, _requests, handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .args(["--release", "alpha-core-loop-v5"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("FORGE_ALLOW_UNPRIVILEGED_INSTALL", "1")
+        .env("FORGE_BIN_DEST", root.join("bin/forge"))
+        .env("FORGE_PREVIOUS_BIN_DEST", root.join("bin/forge.previous"))
+        .env("FORGE_CONFIG_DIR", &config_dir)
+        .env("FORGE_STORAGE_ROOT", root.join("var/lib/forge"))
+        .env("FORGE_SRV_ROOT", root.join("srv/forge"))
+        .env("FORGE_SAMPLE_ROOT", root.join("srv/forge/sample-http-app"))
+        .env("FORGE_UNIT_PATH", root.join("forge.service"))
+        .env("FORGE_SERVICE_SRC", root.join("missing.service"))
+        .env("FORGE_RELEASE_API_BASE_URL", &base_url)
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .env("FORGE_RELEASE_PLATFORM", "linux-amd64")
+        .output()
+        .unwrap();
+
+    handle.join().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("checksum mismatch"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn install_release_rejects_signature_mismatch() {
+    let root = test_root("install-release-signature-mismatch");
+    let artifact = make_artifact(&root, "1.2.3", 0o644);
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "1.2.3");
+    let (_private_key, public_key) = generate_signing_keypair(&root);
+    let signature_path = root.join("release-manifest.sig");
+    fs::write(&signature_path, "invalid-signature\n").unwrap();
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(
+        &[&artifact, &manifest_path, &signature_path],
+        &checksums_path,
+    );
+    let config_dir = root.join("etc/forge");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::copy(&public_key, config_dir.join("release-public-key.pem")).unwrap();
+    let (base_url, _requests, handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .args(["--release", "alpha-core-loop-v5"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("FORGE_ALLOW_UNPRIVILEGED_INSTALL", "1")
+        .env("FORGE_BIN_DEST", root.join("bin/forge"))
+        .env("FORGE_PREVIOUS_BIN_DEST", root.join("bin/forge.previous"))
+        .env("FORGE_CONFIG_DIR", &config_dir)
+        .env("FORGE_STORAGE_ROOT", root.join("var/lib/forge"))
+        .env("FORGE_SRV_ROOT", root.join("srv/forge"))
+        .env("FORGE_SAMPLE_ROOT", root.join("srv/forge/sample-http-app"))
+        .env("FORGE_UNIT_PATH", root.join("forge.service"))
+        .env("FORGE_SERVICE_SRC", root.join("missing.service"))
+        .env("FORGE_RELEASE_API_BASE_URL", &base_url)
+        .env("FORGE_RELEASE_REPOSITORY", "test/forge")
+        .env("FORGE_RELEASE_PLATFORM", "linux-amd64")
+        .output()
+        .unwrap();
+
+    handle.join().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("signature verification failed")
+            || String::from_utf8_lossy(&output.stderr).contains("invalid-signature"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1770,6 +2248,65 @@ fn upgrade_release_fetches_manifest_and_artifact() {
 }
 
 #[test]
+fn release_download_uses_mock_server_not_github() {
+    let root = test_root("release-download-mock-server");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let signature_path = root.join("release-manifest.sig");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(
+        &[&artifact, &manifest_path, &signature_path],
+        &checksums_path,
+    );
+    let (release_base, requests, release_handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+    let options = UpgradeOptions {
+        artifact_path: PathBuf::new(),
+        release_tag: Some("alpha-core-loop-v5".into()),
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, caddy_url, artifact.clone())
+    };
+
+    let output = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_PUBLIC_KEY", public_key.display().to_string()),
+            ("FORGE_RELEASE_API_BASE_URL", release_base),
+            ("FORGE_RELEASE_REPOSITORY", "test/forge".into()),
+            ("FORGE_RELEASE_PLATFORM", "linux-amd64".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || plan(&options).unwrap(),
+    );
+
+    assert_eq!(output.target_version, "2.0.0");
+    release_handle.join().unwrap();
+    let captured = requests.lock().unwrap().clone();
+    assert!(captured.iter().all(|path| path.starts_with('/')));
+    assert!(
+        captured
+            .iter()
+            .any(|path| path == "/repos/test/forge/releases/tags/alpha-core-loop-v5")
+    );
+}
+
+#[test]
 fn upgrade_release_reuses_artifact_verification() {
     let root = test_root("upgrade-release-verification");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
@@ -1831,6 +2368,223 @@ fn upgrade_release_reuses_artifact_verification() {
 }
 
 #[test]
+fn upgrade_release_download_timeout_has_context() {
+    let root = test_root("upgrade-release-download-timeout");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let (release_base, shutdown_tx, release_handle) = spawn_stalled_http_server();
+    let options = UpgradeOptions {
+        artifact_path: PathBuf::new(),
+        release_tag: Some("alpha-core-loop-v5".into()),
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, caddy_url, artifact)
+    };
+
+    let err = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_API_BASE_URL", release_base.clone()),
+            ("FORGE_RELEASE_REPOSITORY", "test/forge".into()),
+            ("FORGE_RELEASE_PLATFORM", "linux-amd64".into()),
+            ("FORGE_RELEASE_HTTP_TIMEOUT_MS", "100".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || plan(&options).unwrap_err(),
+    );
+
+    let _ = shutdown_tx.send(());
+    release_handle.join().unwrap();
+    let message = err.to_string();
+    assert!(message.contains("failed to fetch GitHub release metadata"));
+    assert!(message.contains("alpha-core-loop-v5"));
+    assert!(message.contains(&release_base));
+}
+
+#[test]
+fn upgrade_release_plan_does_not_mutate_state() {
+    upgrade_plan_does_not_mutate_state();
+}
+
+#[test]
+fn upgrade_release_apply_rolls_back_on_readyz_failure() {
+    let root = test_root("upgrade-release-apply-auto-rollback");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let previous = root.join("bin/forge.previous");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(&fake_bin.join("systemctl"), "#!/usr/bin/env bash\nexit 0\n");
+    let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let signature_path = root.join("release-manifest.sig");
+    let (private_key, public_key) = generate_signing_keypair(&root);
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(
+        &[&artifact, &manifest_path, &signature_path],
+        &checksums_path,
+    );
+    let (release_base, _requests, release_handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+    let (readyz_url, _readyz_handle) =
+        spawn_readyz_sequence_server(vec![503, 503, 503, 503, 200, 200, 200]);
+    let options = UpgradeOptions {
+        artifact_path: PathBuf::new(),
+        release_tag: Some("alpha-core-loop-v5".into()),
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, caddy_url, artifact.clone())
+    };
+
+    let output = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            (
+                "FORGE_UPGRADE_PREVIOUS_BINARY_PATH",
+                previous.display().to_string(),
+            ),
+            (
+                "FORGE_SYSTEMCTL_BIN",
+                fake_bin.join("systemctl").display().to_string(),
+            ),
+            ("FORGE_RELEASE_PUBLIC_KEY", public_key.display().to_string()),
+            ("FORGE_RELEASE_API_BASE_URL", release_base),
+            ("FORGE_RELEASE_REPOSITORY", "test/forge".into()),
+            ("FORGE_RELEASE_PLATFORM", "linux-amd64".into()),
+            ("FORGE_UPGRADE_READYZ_URL", readyz_url),
+            ("FORGE_UPGRADE_READYZ_TIMEOUT_MS", "150".into()),
+            ("FORGE_UPGRADE_READYZ_POLL_MS", "50".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || apply(&options).unwrap(),
+    );
+
+    release_handle.join().unwrap();
+    assert_eq!(output.result, "auto_rolled_back");
+    assert!(fs::read_to_string(&current).unwrap().contains("1.0.0"));
+}
+
+#[test]
+fn upgrade_release_rejects_missing_public_key() {
+    let root = test_root("upgrade-release-missing-public-key");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let signature_path = root.join("release-manifest.sig");
+    let (private_key, _public_key) = generate_signing_keypair(&root);
+    sign_manifest(&manifest_path, &private_key, &signature_path);
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(
+        &[&artifact, &manifest_path, &signature_path],
+        &checksums_path,
+    );
+    let (release_base, _requests, release_handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        Some(&signature_path),
+        &checksums_path,
+    );
+    let options = UpgradeOptions {
+        artifact_path: PathBuf::new(),
+        release_tag: Some("alpha-core-loop-v5".into()),
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, caddy_url, artifact.clone())
+    };
+
+    let err = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_API_BASE_URL", release_base),
+            ("FORGE_RELEASE_REPOSITORY", "test/forge".into()),
+            ("FORGE_RELEASE_PLATFORM", "linux-amd64".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || plan(&options).unwrap_err(),
+    );
+
+    release_handle.join().unwrap();
+    assert!(
+        err.to_string()
+            .contains("release public key not configured")
+    );
+}
+
+#[test]
+fn upgrade_release_rejects_unsigned_without_override() {
+    let root = test_root("upgrade-release-unsigned-rejected");
+    let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
+    let fake_bin = root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 0\n");
+    let (caddy_url, _caddy_handle) = spawn_ok_server();
+    let manifest_path = write_unsigned_release_manifest(&root, &artifact, "2.0.0");
+    let checksums_path = root.join("checksums.txt");
+    write_checksums(&[&artifact, &manifest_path], &checksums_path);
+    let (release_base, _requests, release_handle) = spawn_release_server(
+        "alpha-core-loop-v5",
+        &artifact,
+        &manifest_path,
+        None,
+        &checksums_path,
+    );
+    let options = UpgradeOptions {
+        artifact_path: PathBuf::new(),
+        release_tag: Some("alpha-core-loop-v5".into()),
+        manifest_path: None,
+        signature_path: None,
+        allow_unsigned: false,
+        ..default_upgrade_options(&root, caddy_url, artifact.clone())
+    };
+
+    let err = with_env(
+        &[
+            ("FORGE_UPGRADE_BINARY_PATH", current.display().to_string()),
+            ("FORGE_RELEASE_API_BASE_URL", release_base),
+            ("FORGE_RELEASE_REPOSITORY", "test/forge".into()),
+            ("FORGE_RELEASE_PLATFORM", "linux-amd64".into()),
+            (
+                "PATH",
+                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+            ),
+        ],
+        || plan(&options).unwrap_err(),
+    );
+
+    release_handle.join().unwrap();
+    assert!(
+        err.to_string()
+            .contains("release public key not configured")
+            || err.to_string().contains("release signature required")
+    );
+}
+
+#[test]
 fn upgrade_apply_runs_same_verification_as_plan() {
     let root = test_root("upgrade-apply-plan-first");
     let (current, artifact) = prepare_upgrade_root(&root, "1.0.0", "2.0.0");
@@ -1886,6 +2640,29 @@ fn upgrade_apply_runs_same_verification_as_plan() {
 
     assert!(err.to_string().contains("checksum mismatch"));
     assert!(!systemctl_log.exists());
+}
+
+#[test]
+fn release_env_tests_are_serialized() {
+    let var = "FORGE_RELEASE_SERIALIZATION_TEST";
+    let first = thread::spawn(move || {
+        with_env(&[(var, "first".into())], || {
+            thread::sleep(Duration::from_millis(100));
+            std::env::var(var).unwrap()
+        })
+    });
+    let second = thread::spawn(move || {
+        with_env(&[(var, "second".into())], || {
+            thread::sleep(Duration::from_millis(100));
+            std::env::var(var).unwrap()
+        })
+    });
+
+    let a = first.join().unwrap();
+    let b = second.join().unwrap();
+    assert_eq!(a, "first");
+    assert_eq!(b, "second");
+    assert!(std::env::var(var).is_err());
 }
 
 #[test]
