@@ -1066,7 +1066,7 @@ fn readiness_explain_uses_remote_api_when_logged_in() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"taxonomy":"ready_no_active_failure","readiness_status":"ready","startup_phase":"leader_active","active_failure":false,"failure_scope":"historical","historical_failures":true,"convergence_blocked":false,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","last_successful_convergence_unix":1779320528,"last_historical_failure_unix":1779320400,"operator_interpretation":"Control-plane readiness is healthy. Historical failures exist, but there is no active blocker.","safe_next_action":"no action required"}"#,
+        r#"{"taxonomy":"ready_no_active_failure","readiness_status":"ready","startup_phase":"leader_active","active_failure":false,"failure_scope":"historical","historical_failures":true,"convergence_blocked":false,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","last_successful_convergence_unix":1779320528,"last_historical_failure_unix":1779320400,"operator_interpretation":"Control-plane readiness is healthy. Historical failures exist, but there is no active blocker.","safe_next_action":"no action required","recommendations":[{"action_id":"historical_convergence_failure","severity":"info","title":"No action required","description":"Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.","command_hint":"forge readiness timeline","safe_to_run":true,"scope":"convergence"}]}"#,
     );
 
     let output = run_cli(&url, &["readiness", "explain"]);
@@ -1075,6 +1075,8 @@ fn readiness_explain_uses_remote_api_when_logged_in() {
     assert!(body.contains("Readiness: ready"));
     assert!(body.contains("Historical failures: yes"));
     assert!(body.contains("Operator action: no action required"));
+    assert!(body.contains("Recommended action:"));
+    assert!(body.contains("No action required [convergence]"));
 
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.method, "GET");
@@ -1086,7 +1088,7 @@ fn readiness_explain_json_is_machine_readable() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"taxonomy":"degraded_active_convergence_failure","readiness_status":"degraded","startup_phase":"leader_active","active_failure":true,"active_failure_reason":"route_activation_verification_failed","failure_scope":"active","historical_failures":false,"convergence_blocked":true,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","last_successful_convergence_unix":1779320528,"operator_interpretation":"Control-plane readiness is degraded by an active convergence blocker: route_activation_verification_failed.","safe_next_action":"inspect route diagnostics and Caddy admin health"}"#,
+        r#"{"taxonomy":"degraded_active_convergence_failure","readiness_status":"degraded","startup_phase":"leader_active","active_failure":true,"active_failure_reason":"route_activation_verification_failed","failure_scope":"active","historical_failures":false,"convergence_blocked":true,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","last_successful_convergence_unix":1779320528,"operator_interpretation":"Control-plane readiness is degraded by an active convergence blocker: route_activation_verification_failed.","safe_next_action":"inspect route diagnostics and Caddy admin health","recommendations":[{"action_id":"route_activation_verification_failed","severity":"warning","title":"Inspect active route target","description":"Cached readiness reports that route activation verification failed for the active environment target.","command_hint":"forge diagnose <project> <environment>","safe_to_run":true,"scope":"routing"}]}"#,
     );
 
     let output = run_cli(&url, &["readiness", "explain", "--json"]);
@@ -1103,6 +1105,11 @@ fn readiness_explain_json_is_machine_readable() {
         json["safe_next_action"],
         "inspect route diagnostics and Caddy admin health"
     );
+    assert_eq!(
+        json["recommendations"][0]["action_id"],
+        "route_activation_verification_failed"
+    );
+    assert_eq!(json["recommendations"][0]["scope"], "routing");
 
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.path, "/readiness/explain");
@@ -1113,7 +1120,7 @@ fn readiness_timeline_uses_remote_api_when_logged_in() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"source":"daemon_api","live":true,"generated_at_unix":1779320528,"entries":[{"timestamp_unix":1779320528,"status":"active","blocker_type":"routing","reason":"route activation verification failed","startup_phase":"leader_active","source":"runtime_state_cache","active_failure":true,"suggested_action":"inspect route diagnostics and Caddy admin health"},{"timestamp_unix":1779320400,"status":"historical","blocker_type":"convergence","reason":"convergence failure counter incremented","startup_phase":"leader_active","source":"daemon_api","active_failure":false,"suggested_action":"not an active readiness blocker"}]}"#,
+        r#"{"source":"daemon_api","live":true,"generated_at_unix":1779320528,"entries":[{"timestamp_unix":1779320528,"status":"active","blocker_type":"routing","reason":"route activation verification failed","startup_phase":"leader_active","source":"runtime_state_cache","active_failure":true,"suggested_action":"inspect route diagnostics and Caddy admin health","recommendation":{"action_id":"route_activation_verification_failed","severity":"warning","title":"Inspect active route target","description":"Cached readiness reports that route activation verification failed for the active environment target.","command_hint":"forge diagnose <project> <environment>","safe_to_run":true,"scope":"routing"}},{"timestamp_unix":1779320400,"status":"historical","blocker_type":"convergence","reason":"convergence failure counter incremented","startup_phase":"leader_active","source":"daemon_api","active_failure":false,"suggested_action":"not an active readiness blocker","recommendation":{"action_id":"historical_convergence_failure","severity":"info","title":"No action required","description":"Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.","command_hint":"forge readiness timeline","safe_to_run":true,"scope":"convergence"}}]}"#,
     );
 
     let output = run_cli(&url, &["readiness", "timeline"]);
@@ -1122,6 +1129,8 @@ fn readiness_timeline_uses_remote_api_when_logged_in() {
     assert!(body.contains("Readiness timeline:"));
     assert!(body.contains("ACTIVE: route activation verification failed"));
     assert!(body.contains("Scope: routing"));
+    assert!(body.contains("Action: Inspect active route target [routing]"));
+    assert!(body.contains("Command: forge diagnose <project> <environment>"));
 
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.method, "GET");
@@ -1133,7 +1142,7 @@ fn readiness_timeline_json_is_machine_readable() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
         requests.clone(),
-        r#"{"source":"daemon_api","live":true,"generated_at_unix":1779320528,"entries":[{"timestamp_unix":1779320528,"status":"active","blocker_type":"routing","reason":"route activation verification failed","startup_phase":"leader_active","source":"runtime_state_cache","active_failure":true,"suggested_action":"inspect route diagnostics and Caddy admin health","related_fields":{"convergence_start_blocked":true,"replay_in_progress":false,"follower_mode":false,"leader":true,"lease_epoch":7}}]}"#,
+        r#"{"source":"daemon_api","live":true,"generated_at_unix":1779320528,"entries":[{"timestamp_unix":1779320528,"status":"active","blocker_type":"routing","reason":"route activation verification failed","startup_phase":"leader_active","source":"runtime_state_cache","active_failure":true,"suggested_action":"inspect route diagnostics and Caddy admin health","recommendation":{"action_id":"route_activation_verification_failed","severity":"warning","title":"Inspect active route target","description":"Cached readiness reports that route activation verification failed for the active environment target.","command_hint":"forge diagnose <project> <environment>","safe_to_run":true,"scope":"routing"},"related_fields":{"convergence_start_blocked":true,"replay_in_progress":false,"follower_mode":false,"leader":true,"lease_epoch":7}}]}"#,
     );
 
     let output = run_cli(&url, &["readiness", "timeline", "--json"]);
@@ -1144,6 +1153,10 @@ fn readiness_timeline_json_is_machine_readable() {
     assert_eq!(json["live"], true);
     assert_eq!(json["entries"][0]["status"], "active");
     assert_eq!(json["entries"][0]["blocker_type"], "routing");
+    assert_eq!(
+        json["entries"][0]["recommendation"]["command_hint"],
+        "forge diagnose <project> <environment>"
+    );
 
     let request = requests.lock().unwrap().remove(0);
     assert_eq!(request.path, "/readiness/timeline");
@@ -1303,6 +1316,15 @@ fn readiness_timeline_offline_labels_snapshot_and_non_live() {
                 source: "runtime_state_cache".into(),
                 active_failure: true,
                 suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                recommendation: Some(forge_core::api::ReadinessRecommendation {
+                    action_id: "route_activation_verification_failed".into(),
+                    severity: "warning".into(),
+                    title: "Inspect active route target".into(),
+                    description: "Cached readiness reports that route activation verification failed for the active environment target.".into(),
+                    command_hint: "forge diagnose <project> <environment>".into(),
+                    safe_to_run: true,
+                    scope: "routing".into(),
+                }),
                 related_fields: None,
             }],
         },
@@ -1325,6 +1347,12 @@ fn readiness_timeline_offline_labels_snapshot_and_non_live() {
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["source"], "offline_snapshot");
     assert_eq!(json["live"], false);
+    assert_eq!(
+        json["entries"][0]["recommendation"]["description"]
+            .as_str()
+            .unwrap(),
+        "Cached readiness reports that route activation verification failed for the active environment target. Recommendation is based on an offline snapshot and may be stale."
+    );
 }
 
 #[test]
@@ -1347,6 +1375,15 @@ fn readiness_timeline_server_local_bare_command_uses_discovered_config() {
                 source: "offline_snapshot".into(),
                 active_failure: false,
                 suggested_action: "not an active readiness blocker".into(),
+                recommendation: Some(forge_core::api::ReadinessRecommendation {
+                    action_id: "historical_convergence_failure".into(),
+                    severity: "info".into(),
+                    title: "No action required".into(),
+                    description: "Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.".into(),
+                    command_hint: "forge readiness timeline".into(),
+                    safe_to_run: true,
+                    scope: "convergence".into(),
+                }),
                 related_fields: None,
             }],
         },

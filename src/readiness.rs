@@ -1,5 +1,5 @@
 use crate::api::{
-    MetricsResponse, ReadinessExplainResponse, ReadinessTimelineEntry,
+    MetricsResponse, ReadinessExplainResponse, ReadinessRecommendation, ReadinessTimelineEntry,
     ReadinessTimelineRelatedFields, ReadinessTimelineResponse, ReadyzResponse,
 };
 use crate::daemon::{ControlPlaneSnapshot, READYZ_CACHE_STALE_AFTER_MS};
@@ -25,6 +25,7 @@ pub fn timeline_snapshot(snapshot: &ControlPlaneSnapshot) -> ReadinessTimelineRe
         return snapshot.timeline.clone();
     }
     let mut timeline = snapshot.timeline.clone();
+    let recommendation = recommendation_for_cache_stale(false);
     let cache_stale = ReadinessTimelineEntry {
         timestamp_unix: unix_now_ms() / 1_000,
         status: "active".into(),
@@ -33,9 +34,8 @@ pub fn timeline_snapshot(snapshot: &ControlPlaneSnapshot) -> ReadinessTimelineRe
         startup_phase: "degraded".into(),
         source: "daemon_api".into(),
         active_failure: true,
-        suggested_action:
-            "wait for the next cache refresh or inspect the daemon if cache staleness persists"
-                .into(),
+        suggested_action: recommendation.title.clone(),
+        recommendation: Some(recommendation),
         related_fields: Some(timeline_related_fields(&snapshot.metrics, None)),
     };
     timeline.source = "daemon_api".into();
@@ -168,6 +168,13 @@ pub fn explain(readyz: &ReadyzResponse, metrics: &MetricsResponse) -> ReadinessE
     };
     let (operator_interpretation, safe_next_action) =
         operator_text(&taxonomy, &active_failure_reason, metrics);
+    let recommendations = explain_recommendations(
+        &taxonomy,
+        active_failure,
+        &active_failure_reason,
+        metrics,
+        false,
+    );
 
     ReadinessExplainResponse {
         source: "daemon_api".into(),
@@ -194,6 +201,7 @@ pub fn explain(readyz: &ReadyzResponse, metrics: &MetricsResponse) -> ReadinessE
         warning: None,
         operator_interpretation,
         safe_next_action,
+        recommendations,
     }
 }
 
@@ -303,6 +311,240 @@ fn next_action_for_reason(active_failure_reason: &Option<String>) -> String {
     }
 }
 
+fn recommendation_for_cache_stale(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "readiness_cache_stale".into(),
+        severity: "warning".into(),
+        title: "Check daemon convergence loop freshness".into(),
+        description: recommendation_description(
+            "The cached readiness view is stale, so operator guidance may lag behind the current daemon state.",
+            snapshot_based,
+        ),
+        command_hint: "forge readiness explain && forge readiness timeline".into(),
+        safe_to_run: true,
+        scope: "convergence".into(),
+    }
+}
+
+fn recommendation_for_replay(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "replay_incomplete".into(),
+        severity: "warning".into(),
+        title: "Wait for replay or inspect replay status".into(),
+        description: recommendation_description(
+            "Startup replay is still blocking convergence, so mutating control-plane work should wait until replay completes or is inspected.",
+            snapshot_based,
+        ),
+        command_hint: "forge control-plane replay-status".into(),
+        safe_to_run: true,
+        scope: "replay".into(),
+    }
+}
+
+fn recommendation_for_follower(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "follower_mode".into(),
+        severity: "info".into(),
+        title: "Run mutating operation on the leader".into(),
+        description: recommendation_description(
+            "This node is in follower mode and is not expected to run mutating convergence locally.",
+            snapshot_based,
+        ),
+        command_hint: "forge control-plane leader".into(),
+        safe_to_run: true,
+        scope: "leadership".into(),
+    }
+}
+
+fn recommendation_for_leadership_uncertain(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "leadership_uncertain".into(),
+        severity: "critical".into(),
+        title: "Inspect lease ownership".into(),
+        description: recommendation_description(
+            "Leadership is uncertain or stale, so the active reconciler cannot be trusted until lease ownership is confirmed.",
+            snapshot_based,
+        ),
+        command_hint: "forge control-plane lease".into(),
+        safe_to_run: true,
+        scope: "leadership".into(),
+    }
+}
+
+fn recommendation_for_route(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "route_activation_verification_failed".into(),
+        severity: "warning".into(),
+        title: "Inspect active route target".into(),
+        description: recommendation_description(
+            "Cached readiness reports that route activation verification failed for the active environment target.",
+            snapshot_based,
+        ),
+        command_hint: "forge diagnose <project> <environment>".into(),
+        safe_to_run: true,
+        scope: "routing".into(),
+    }
+}
+
+fn recommendation_for_storage(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "filesystem_scan_timeout".into(),
+        severity: "warning".into(),
+        title: "Inspect storage pressure and control-plane filesystem latency".into(),
+        description: recommendation_description(
+            "Cached readiness indicates storage or filesystem scan latency is delaying convergence health checks.",
+            snapshot_based,
+        ),
+        command_hint: "forge doctor".into(),
+        safe_to_run: true,
+        scope: "storage".into(),
+    }
+}
+
+fn recommendation_for_docker(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "docker_dependency_health".into(),
+        severity: "warning".into(),
+        title: "Inspect cached Docker dependency health".into(),
+        description: recommendation_description(
+            "Cached readiness reports a Docker-related blocker, so the next step is to inspect dependency health without mutating runtime state.",
+            snapshot_based,
+        ),
+        command_hint: "forge doctor".into(),
+        safe_to_run: true,
+        scope: "docker".into(),
+    }
+}
+
+fn recommendation_for_caddy(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "caddy_dependency_health".into(),
+        severity: "warning".into(),
+        title: "Inspect cached Caddy routing health".into(),
+        description: recommendation_description(
+            "Cached readiness reports a Caddy-related routing blocker, so inspect routing health before taking recovery action.",
+            snapshot_based,
+        ),
+        command_hint: "forge doctor".into(),
+        safe_to_run: true,
+        scope: "caddy".into(),
+    }
+}
+
+fn recommendation_for_historical_only(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "historical_convergence_failure".into(),
+        severity: "info".into(),
+        title: "No action required".into(),
+        description: recommendation_description(
+            "Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.",
+            snapshot_based,
+        ),
+        command_hint: "forge readiness timeline".into(),
+        safe_to_run: true,
+        scope: "convergence".into(),
+    }
+}
+
+fn recommendation_for_unknown(snapshot_based: bool) -> ReadinessRecommendation {
+    ReadinessRecommendation {
+        action_id: "unknown_readiness_blocker".into(),
+        severity: "warning".into(),
+        title: "Inspect cached readiness details".into(),
+        description: recommendation_description(
+            "The cached readiness state does not map cleanly to a known blocker class, so inspect the cached explanation and timeline next.",
+            snapshot_based,
+        ),
+        command_hint: "forge readiness explain && forge readiness timeline".into(),
+        safe_to_run: true,
+        scope: "unknown".into(),
+    }
+}
+
+fn recommendation_description(base: &str, snapshot_based: bool) -> String {
+    if snapshot_based {
+        format!("{base} Recommendation is based on an offline snapshot and may be stale.")
+    } else {
+        base.into()
+    }
+}
+
+fn explain_recommendations(
+    taxonomy: &str,
+    active_failure: bool,
+    active_failure_reason: &Option<String>,
+    metrics: &MetricsResponse,
+    snapshot_based: bool,
+) -> Vec<ReadinessRecommendation> {
+    if !active_failure && metrics.convergence_last_failure_historical_unix.is_some() {
+        return vec![recommendation_for_historical_only(snapshot_based)];
+    }
+    if !active_failure && taxonomy == "ready_no_active_failure" {
+        return Vec::new();
+    }
+    vec![recommendation_for_state(
+        taxonomy,
+        active_failure_reason.as_deref(),
+        metrics,
+        snapshot_based,
+    )]
+}
+
+pub fn offline_recommendations(
+    taxonomy: &str,
+    active_failure: bool,
+    active_failure_reason: &Option<String>,
+    metrics: &MetricsResponse,
+) -> Vec<ReadinessRecommendation> {
+    explain_recommendations(
+        taxonomy,
+        active_failure,
+        active_failure_reason,
+        metrics,
+        true,
+    )
+}
+
+fn recommendation_for_state(
+    taxonomy: &str,
+    active_failure_reason: Option<&str>,
+    metrics: &MetricsResponse,
+    snapshot_based: bool,
+) -> ReadinessRecommendation {
+    if taxonomy == "degraded_cache_stale" {
+        return recommendation_for_cache_stale(snapshot_based);
+    }
+    if taxonomy == "degraded_replay_incomplete" {
+        return recommendation_for_replay(snapshot_based);
+    }
+    if taxonomy == "degraded_follower_mode" {
+        return recommendation_for_follower(snapshot_based);
+    }
+    if taxonomy == "degraded_leadership_uncertain" || leadership_uncertain(metrics) {
+        return recommendation_for_leadership_uncertain(snapshot_based);
+    }
+
+    let reason = active_failure_reason
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if reason.contains("route") || reason.contains("verification") {
+        return recommendation_for_route(snapshot_based);
+    }
+    if reason.contains("filesystem") || reason.contains("storage") {
+        return recommendation_for_storage(snapshot_based);
+    }
+    if reason.contains("docker") {
+        return recommendation_for_docker(snapshot_based);
+    }
+    if reason.contains("caddy") {
+        return recommendation_for_caddy(snapshot_based);
+    }
+    if reason.contains("lease") || reason.contains("leader") || reason.contains("leadership") {
+        return recommendation_for_leadership_uncertain(snapshot_based);
+    }
+    recommendation_for_unknown(snapshot_based)
+}
+
 pub fn build_timeline(
     readyz: &ReadyzResponse,
     metrics: &MetricsResponse,
@@ -339,6 +581,12 @@ pub fn build_timeline(
                 },
                 active_failure: true,
                 suggested_action: timeline_suggested_action(&reason.marker, &reason.message),
+                recommendation: Some(timeline_recommendation(
+                    &reason.marker,
+                    &reason.message,
+                    metrics,
+                    source == "offline_snapshot",
+                )),
                 related_fields: Some(timeline_related_fields(
                     metrics,
                     reason.diagnostics.as_ref(),
@@ -401,6 +649,9 @@ pub fn build_timeline(
             source: source.into(),
             active_failure: false,
             suggested_action: "not an active readiness blocker".into(),
+            recommendation: Some(recommendation_for_historical_only(
+                source == "offline_snapshot",
+            )),
             related_fields: Some(timeline_related_fields(metrics, None)),
         };
         if entries
@@ -469,6 +720,7 @@ pub fn unknown_offline_timeline(reason: &str) -> ReadinessTimelineResponse {
             source: "offline_snapshot".into(),
             active_failure: false,
             suggested_action: "query the live daemon when available".into(),
+            recommendation: Some(recommendation_for_unknown(true)),
             related_fields: None,
         }],
     }
@@ -514,11 +766,41 @@ fn timeline_suggested_action(marker: &str, message: &str) -> String {
     if message == "convergence failure counter incremented" {
         return "not an active readiness blocker".into();
     }
-    next_action_for_reason(&Some(if message.is_empty() {
-        marker.into()
-    } else {
-        message.into()
-    }))
+    timeline_recommendation(marker, message, &MetricsResponse::default(), false).title
+}
+
+fn timeline_recommendation(
+    marker: &str,
+    message: &str,
+    metrics: &MetricsResponse,
+    snapshot_based: bool,
+) -> ReadinessRecommendation {
+    let blocker_type = blocker_type_for_marker(marker, message);
+    if message == "convergence failure counter incremented" {
+        return recommendation_for_historical_only(snapshot_based);
+    }
+    match blocker_type {
+        "routing" => recommendation_for_route(snapshot_based),
+        "replay" => recommendation_for_replay(snapshot_based),
+        "leadership" => {
+            if marker.contains("follower") || message.contains("follower") {
+                recommendation_for_follower(snapshot_based)
+            } else {
+                recommendation_for_leadership_uncertain(snapshot_based)
+            }
+        }
+        "cache" => recommendation_for_cache_stale(snapshot_based),
+        "dependency" => {
+            let lower = format!("{marker} {message}").to_ascii_lowercase();
+            if lower.contains("caddy") {
+                recommendation_for_caddy(snapshot_based)
+            } else {
+                recommendation_for_docker(snapshot_based)
+            }
+        }
+        "checkpoint" => recommendation_for_storage(snapshot_based),
+        _ => recommendation_for_state("degraded_unknown", Some(message), metrics, snapshot_based),
+    }
 }
 
 fn timeline_related_fields(
@@ -631,6 +913,8 @@ mod tests {
         assert!(response.historical_failures);
         assert_eq!(response.failure_scope, "historical");
         assert_eq!(response.safe_next_action, "no action required");
+        assert_eq!(response.recommendations[0].title, "No action required");
+        assert_eq!(response.recommendations[0].scope, "convergence");
     }
 
     #[test]
@@ -652,6 +936,11 @@ mod tests {
                 .operator_interpretation
                 .contains("active convergence blocker")
         );
+        assert_eq!(
+            response.recommendations[0].action_id,
+            "route_activation_verification_failed"
+        );
+        assert_eq!(response.recommendations[0].scope, "routing");
     }
 
     #[test]
@@ -668,6 +957,8 @@ mod tests {
         let response = explain(&readyz, &metrics);
         assert_eq!(response.taxonomy, "degraded_replay_incomplete");
         assert!(response.replay_running);
+        assert_eq!(response.recommendations[0].action_id, "replay_incomplete");
+        assert_eq!(response.recommendations[0].scope, "replay");
     }
 
     #[test]
@@ -685,6 +976,8 @@ mod tests {
         let response = explain(&readyz, &metrics);
         assert_eq!(response.taxonomy, "degraded_follower_mode");
         assert!(response.safe_next_action.contains("active leader"));
+        assert_eq!(response.recommendations[0].action_id, "follower_mode");
+        assert_eq!(response.recommendations[0].scope, "leadership");
     }
 
     #[test]
@@ -701,6 +994,30 @@ mod tests {
         let response = explain(&readyz, &metrics);
         assert_eq!(response.taxonomy, "degraded_cache_stale");
         assert!(response.operator_interpretation.contains("stale"));
+        assert_eq!(
+            response.recommendations[0].action_id,
+            "readiness_cache_stale"
+        );
+        assert_eq!(response.recommendations[0].scope, "convergence");
+    }
+
+    #[test]
+    fn leadership_uncertain_returns_lease_recommendation() {
+        let mut readyz = base_readyz();
+        readyz.status = "degraded".into();
+        readyz.active_failure = true;
+        readyz.reason = Some("leadership uncertain".into());
+        let mut metrics = base_metrics();
+        metrics.readiness_status = "degraded".into();
+        metrics.leader = false;
+        metrics.convergence_owner = String::new();
+        metrics.cluster.local_role = "candidate".into();
+        let response = explain(&readyz, &metrics);
+        assert_eq!(
+            response.recommendations[0].action_id,
+            "leadership_uncertain"
+        );
+        assert_eq!(response.recommendations[0].scope, "leadership");
     }
 
     #[test]
@@ -783,6 +1100,13 @@ mod tests {
         assert_eq!(timeline.entries[0].status, "active");
         assert_eq!(timeline.entries[0].blocker_type, "routing");
         assert!(timeline.entries[0].active_failure);
+        assert_eq!(
+            timeline.entries[0]
+                .recommendation
+                .as_ref()
+                .map(|value| value.scope.as_str()),
+            Some("routing")
+        );
     }
 
     #[test]
@@ -801,6 +1125,7 @@ mod tests {
                 source: "runtime_state_cache".into(),
                 active_failure: true,
                 suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                recommendation: None,
                 related_fields: None,
             }],
         };

@@ -41,7 +41,9 @@ use forge_core::http::{
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
-use forge_core::readiness::{load_persisted_timeline, unknown_offline_timeline};
+use forge_core::readiness::{
+    load_persisted_timeline, offline_recommendations, unknown_offline_timeline,
+};
 use forge_core::reconciliation::{
     ReconciliationIntentStatus, ReconciliationStore, ReplayOptions, intent_request_for_storage_root,
 };
@@ -3865,6 +3867,13 @@ fn load_offline_readiness_timeline(
     for entry in &mut timeline.entries {
         entry.source = "offline_snapshot".into();
         entry.active_failure = entry.status == "active";
+        if let Some(recommendation) = entry.recommendation.as_mut() {
+            if !recommendation.description.contains("offline snapshot") {
+                recommendation
+                    .description
+                    .push_str(" Recommendation is based on an offline snapshot and may be stale.");
+            }
+        }
     }
     Ok(timeline)
 }
@@ -4012,6 +4021,28 @@ fn build_offline_readiness_explain(storage_root: &Path) -> ReadinessExplainRespo
         .filter_map(|record| record.checkpoint.last_successful_convergence_unix)
         .max();
     let convergence_blocked = readiness_status != "ready";
+    let recommendation_metrics = MetricsResponse {
+        readiness_status: readiness_status.clone(),
+        startup_phase: startup_phase.clone(),
+        leader: lease_view.leader,
+        follower_mode: lease_view.follower_mode,
+        convergence_owner: if lease_view.leadership_status == "uncertain" {
+            String::new()
+        } else {
+            "offline_snapshot".into()
+        },
+        cluster: ClusterDiagnostics {
+            local_role: lease_view.node_role.clone(),
+            ..ClusterDiagnostics::default()
+        },
+        ..MetricsResponse::default()
+    };
+    let recommendations = offline_recommendations(
+        &taxonomy,
+        active_failure,
+        &active_failure_reason,
+        &recommendation_metrics,
+    );
 
     ReadinessExplainResponse {
         source: "offline_snapshot".into(),
@@ -4038,6 +4069,7 @@ fn build_offline_readiness_explain(storage_root: &Path) -> ReadinessExplainRespo
         warning: Some(OFFLINE_WARNING.into()),
         operator_interpretation,
         safe_next_action,
+        recommendations,
     }
 }
 
@@ -4485,6 +4517,17 @@ fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
         view.operator_interpretation
     ));
     output.push_str(&format!("Operator action: {}\n", view.safe_next_action));
+    if let Some(recommendation) = view.recommendations.first() {
+        output.push_str("Recommended action:\n");
+        output.push_str(&format!(
+            "  {} [{}]\n",
+            recommendation.title, recommendation.scope
+        ));
+        output.push_str(&format!("  Command: {}\n", recommendation.command_hint));
+        if !view.live {
+            output.push_str("  Basis: offline snapshot\n");
+        }
+    }
     output
 }
 
@@ -4509,7 +4552,18 @@ fn render_readiness_timeline(view: &ReadinessTimelineResponse) -> String {
         output.push_str(&format!("  Scope: {}\n", entry.blocker_type));
         match entry.status.as_str() {
             "active" => {
-                output.push_str(&format!("  Suggested action: {}\n", entry.suggested_action));
+                if let Some(recommendation) = entry.recommendation.as_ref() {
+                    output.push_str(&format!(
+                        "  Action: {} [{}]\n",
+                        recommendation.title, recommendation.scope
+                    ));
+                    output.push_str(&format!("  Command: {}\n", recommendation.command_hint));
+                    if !view.live {
+                        output.push_str("  Basis: offline snapshot\n");
+                    }
+                } else {
+                    output.push_str(&format!("  Suggested action: {}\n", entry.suggested_action));
+                }
             }
             "cleared" => {
                 output.push_str("  Cleared after fresh readiness refresh\n");
@@ -5036,6 +5090,15 @@ mod tests {
                 "Control-plane readiness is healthy. Historical failures exist, but there is no active blocker."
                     .into(),
             safe_next_action: "no action required".into(),
+            recommendations: vec![forge_core::api::ReadinessRecommendation {
+                action_id: "historical_convergence_failure".into(),
+                severity: "info".into(),
+                title: "No action required".into(),
+                description: "Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.".into(),
+                command_hint: "forge readiness timeline".into(),
+                safe_to_run: true,
+                scope: "convergence".into(),
+            }],
         }
     }
 
@@ -5055,6 +5118,15 @@ mod tests {
                     source: "runtime_state_cache".into(),
                     active_failure: true,
                     suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                    recommendation: Some(forge_core::api::ReadinessRecommendation {
+                        action_id: "route_activation_verification_failed".into(),
+                        severity: "warning".into(),
+                        title: "Inspect active route target".into(),
+                        description: "Cached readiness reports that route activation verification failed for the active environment target.".into(),
+                        command_hint: "forge diagnose <project> <environment>".into(),
+                        safe_to_run: true,
+                        scope: "routing".into(),
+                    }),
                     related_fields: None,
                 },
                 forge_core::api::ReadinessTimelineEntry {
@@ -5066,6 +5138,15 @@ mod tests {
                     source: "daemon_api".into(),
                     active_failure: false,
                     suggested_action: "not an active readiness blocker".into(),
+                    recommendation: Some(forge_core::api::ReadinessRecommendation {
+                        action_id: "historical_convergence_failure".into(),
+                        severity: "info".into(),
+                        title: "No action required".into(),
+                        description: "Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.".into(),
+                        command_hint: "forge readiness timeline".into(),
+                        safe_to_run: true,
+                        scope: "convergence".into(),
+                    }),
                     related_fields: None,
                 },
             ],
@@ -5437,6 +5518,12 @@ mod tests {
         );
         assert_eq!(loaded.last_successful_convergence_unix, Some(777));
         assert_eq!(loaded.warning.as_deref(), Some(OFFLINE_WARNING));
+        assert_eq!(loaded.recommendations.len(), 1);
+        assert!(
+            loaded.recommendations[0]
+                .description
+                .contains("offline snapshot")
+        );
     }
 
     #[test]
@@ -5452,6 +5539,7 @@ mod tests {
         assert!(rendered.contains("Last known readiness: ready"));
         assert!(rendered.contains("Source: offline snapshot"));
         assert!(rendered.contains("Warning: daemon was not queried"));
+        assert!(rendered.contains("Basis: offline snapshot"));
         assert!(!rendered.contains("Readiness: ready\n"));
     }
 
@@ -5567,6 +5655,8 @@ mod tests {
         assert!(rendered.contains("Leader: true"));
         assert!(rendered.contains("Follower mode: false"));
         assert!(rendered.contains("Operator action: no action required"));
+        assert!(rendered.contains("Recommended action:"));
+        assert!(rendered.contains("No action required [convergence]"));
     }
 
     #[test]
@@ -5580,7 +5670,10 @@ mod tests {
         assert!(rendered.contains("Readiness timeline:"));
         assert!(rendered.contains("ACTIVE: route activation verification failed"));
         assert!(rendered.contains("Scope: routing"));
+        assert!(rendered.contains("Action: Inspect active route target [routing]"));
+        assert!(rendered.contains("Command: forge diagnose <project> <environment>"));
         assert!(rendered.contains("Warning: offline snapshot may be stale"));
+        assert!(rendered.contains("Basis: offline snapshot"));
     }
 
     #[test]

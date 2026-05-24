@@ -5770,6 +5770,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                     source: "runtime_state_cache".into(),
                     active_failure: true,
                     suggested_action: "inspect route diagnostics and Caddy admin health".into(),
+                    recommendation: None,
                     related_fields: None,
                 }],
             },
