@@ -579,6 +579,9 @@ components:
           type: string
           example: leader_active
           description: Current daemon startup phase. Values are booting, replaying, leader_acquiring, follower, leader_active, or degraded.
+        active_failure:
+          type: boolean
+          description: True when the current cached readiness state has an active unresolved blocker.
         reason:
           type:
             - string
@@ -643,6 +646,7 @@ components:
     MetricsSnapshot:
       type: object
       required:
+        - readiness_status
         - startup_phase
         - leader
         - follower_mode
@@ -651,8 +655,27 @@ components:
         - lease_epoch
         - readiness_cache_age_ms
       properties:
+        readiness_status:
+          type: string
+          description: Active control-plane readiness state. Historical convergence counters do not change this field without an unresolved current blocker.
+        readiness_reason:
+          type:
+            - string
+            - 'null'
+          description: Summary reason for the current active readiness state when degraded.
         startup_phase:
           type: string
+        convergence_active_failure:
+          type: boolean
+        convergence_active_failure_reason:
+          type:
+            - string
+            - 'null'
+        convergence_last_failure_historical_unix:
+          type:
+            - integer
+            - 'null'
+          format: int64
         leader:
           type: boolean
         follower_mode:

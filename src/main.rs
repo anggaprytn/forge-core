@@ -3456,6 +3456,9 @@ struct ControlPlaneLeaderView {
     local_node_id: String,
     leader_node_id: Option<String>,
     leader: bool,
+    readiness_status: Option<String>,
+    readiness_reason: Option<String>,
+    convergence_active_failure: Option<bool>,
     lease_epoch: u64,
     lease_age_ms: u64,
     lease_expiry_ms: u64,
@@ -3470,6 +3473,9 @@ struct ControlPlaneLeaderView {
 #[derive(Debug, Serialize)]
 struct ControlPlaneLeaseView {
     leader_node_id: Option<String>,
+    readiness_status: Option<String>,
+    readiness_reason: Option<String>,
+    convergence_active_failure: Option<bool>,
     lease_epoch: u64,
     lease_age_ms: u64,
     lease_expiry_ms: u64,
@@ -3573,6 +3579,9 @@ fn control_plane_leader_view_from_metrics(metrics: &MetricsResponse) -> ControlP
         leader_node_id: (!metrics.convergence_owner.is_empty())
             .then(|| metrics.convergence_owner.clone()),
         leader: metrics.leader,
+        readiness_status: Some(metrics.readiness_status.clone()),
+        readiness_reason: metrics.readiness_reason.clone(),
+        convergence_active_failure: Some(metrics.convergence_active_failure),
         lease_epoch: metrics.lease_epoch,
         lease_age_ms: metrics.lease_age_ms,
         lease_expiry_ms: metrics.lease_expiry_ms,
@@ -3595,6 +3604,9 @@ fn control_plane_leader_view_from_storage(
         local_node_id: local_node_id.into(),
         leader_node_id: lease.map(|value| value.leader_node_id.clone()),
         leader: lease.is_some_and(|value| value.leader_node_id == local_node_id),
+        readiness_status: None,
+        readiness_reason: None,
+        convergence_active_failure: None,
         lease_epoch: lease.map(|value| value.lease_epoch).unwrap_or(0),
         lease_age_ms: lease_age_ms(lease, now_unix),
         lease_expiry_ms: lease_expiry_ms(lease, now_unix),
@@ -3615,6 +3627,9 @@ fn control_plane_lease_view_from_metrics(metrics: &MetricsResponse) -> ControlPl
     ControlPlaneLeaseView {
         leader_node_id: (!metrics.convergence_owner.is_empty())
             .then(|| metrics.convergence_owner.clone()),
+        readiness_status: Some(metrics.readiness_status.clone()),
+        readiness_reason: metrics.readiness_reason.clone(),
+        convergence_active_failure: Some(metrics.convergence_active_failure),
         lease_epoch: metrics.lease_epoch,
         lease_age_ms: metrics.lease_age_ms,
         lease_expiry_ms: metrics.lease_expiry_ms,
@@ -3632,6 +3647,9 @@ fn control_plane_lease_view_from_storage(
     let now_unix = now_unix();
     ControlPlaneLeaseView {
         leader_node_id: lease.map(|value| value.leader_node_id.clone()),
+        readiness_status: None,
+        readiness_reason: None,
+        convergence_active_failure: None,
         lease_epoch: lease.map(|value| value.lease_epoch).unwrap_or(0),
         lease_age_ms: lease_age_ms(lease, now_unix),
         lease_expiry_ms: lease_expiry_ms(lease, now_unix),
@@ -3650,6 +3668,15 @@ fn render_control_plane_leader(view: &ControlPlaneLeaderView) -> String {
         view.leader_node_id.as_deref().unwrap_or("none")
     ));
     output.push_str(&format!("leader: {}\n", view.leader));
+    if let Some(value) = view.readiness_status.as_deref() {
+        output.push_str(&format!("readiness_status: {value}\n"));
+    }
+    if let Some(value) = view.convergence_active_failure {
+        output.push_str(&format!("convergence_active_failure: {value}\n"));
+    }
+    if let Some(value) = view.readiness_reason.as_deref() {
+        output.push_str(&format!("readiness_reason: {value}\n"));
+    }
     output.push_str(&format!("lease_epoch: {}\n", view.lease_epoch));
     output.push_str(&format!("lease_age_ms: {}\n", view.lease_age_ms));
     output.push_str(&format!("lease_expiry_ms: {}\n", view.lease_expiry_ms));
@@ -3698,6 +3725,15 @@ fn render_control_plane_lease(view: &ControlPlaneLeaseView) -> String {
         "leader_node_id: {}\n",
         view.leader_node_id.as_deref().unwrap_or("none")
     ));
+    if let Some(value) = view.readiness_status.as_deref() {
+        output.push_str(&format!("readiness_status: {value}\n"));
+    }
+    if let Some(value) = view.convergence_active_failure {
+        output.push_str(&format!("convergence_active_failure: {value}\n"));
+    }
+    if let Some(value) = view.readiness_reason.as_deref() {
+        output.push_str(&format!("readiness_reason: {value}\n"));
+    }
     output.push_str(&format!("lease_epoch: {}\n", view.lease_epoch));
     output.push_str(&format!("lease_age_ms: {}\n", view.lease_age_ms));
     output.push_str(&format!("lease_expiry_ms: {}\n", view.lease_expiry_ms));

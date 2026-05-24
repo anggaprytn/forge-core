@@ -293,6 +293,8 @@ Semantics:
 
 `/readyz` serves cached convergence state. It must not perform synchronous Docker scans, Caddy scans, route reconciliation, generation reconciliation, or environment-wide diagnostics on the request path.
 
+`/metrics` separates active readiness from historical convergence observability. Historical counters such as `convergence_failures_total` remain monotonic, while active blockers are exposed through `readiness_status`, `readiness_reason`, `convergence_active_failure`, and `convergence_active_failure_reason`.
+
 Checkpoint-restored `/readyz` is cached startup context, not final truth. Operators may briefly see restored degraded reasons such as `convergence_stalled`, but once startup reaches `leader_active` with replay complete and healthy convergence domains, the next cache refresh must recompute readiness from fresh leader state and clear the stale marker.
 
 Readiness derives from cached control-plane inputs such as storage accessibility, queue health, Docker reachability, Caddy admin reachability, unresolved fatal markers, and convergence freshness. Environment-level health belongs to diagnostics, not readiness.

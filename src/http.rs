@@ -90,6 +90,7 @@ pub trait ControlPlane: Send {
             } else {
                 "booting".into()
             },
+            active_failure: !self.is_ready(),
             reason: None,
             reasons: Vec::new(),
         }
@@ -108,6 +109,7 @@ pub trait ControlPlane: Send {
                 } else {
                     "booting".into()
                 },
+                active_failure: !self.is_ready(),
                 reason: None,
                 reasons: Vec::new(),
             },
@@ -1391,6 +1393,7 @@ async fn get_healthz() -> impl IntoResponse {
         Json(ReadyzResponse {
             status: "ok".into(),
             startup_phase: "leader_active".into(),
+            active_failure: false,
             reason: None,
             reasons: Vec::new(),
         }),
@@ -1702,6 +1705,7 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
                 ReadyzResponse {
                     status: "degraded".into(),
                     startup_phase: "degraded".into(),
+                    active_failure: true,
                     reason: Some("readiness cache stale".into()),
                     reasons: Vec::new(),
                 }
@@ -1712,6 +1716,7 @@ async fn get_readyz(State(state): State<HttpState>) -> Response {
         Err(_) => ReadyzResponse {
             status: "degraded".into(),
             startup_phase: "degraded".into(),
+            active_failure: true,
             reason: Some("readiness cache unavailable".into()),
             reasons: Vec::new(),
         },
@@ -5158,6 +5163,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "leader_active".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5188,6 +5194,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "leader_active".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5218,6 +5225,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "leader_active".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5247,6 +5255,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "follower".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5311,6 +5320,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "degraded".into(),
                     startup_phase: "replaying".into(),
+                    active_failure: true,
                     reason: Some("reconciliation replay incomplete".into()),
                     reasons: vec![ReadyzReason {
                         project_id: "_control_plane".into(),
@@ -5375,6 +5385,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "follower".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5417,6 +5428,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "follower".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5470,6 +5482,7 @@ pub mod http_readyz_cache_latency {
                 response: ReadyzResponse {
                     status: "degraded".into(),
                     startup_phase: "degraded".into(),
+                    active_failure: true,
                     reason: Some("convergence stalled".into()),
                     reasons: Vec::new(),
                 },
@@ -5679,6 +5692,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "leader_active".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5715,6 +5729,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "leader_active".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },
@@ -5748,6 +5763,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 response: ReadyzResponse {
                     status: "ready".into(),
                     startup_phase: "leader_active".into(),
+                    active_failure: false,
                     reason: None,
                     reasons: Vec::new(),
                 },

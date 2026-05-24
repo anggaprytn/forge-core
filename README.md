@@ -95,8 +95,8 @@ Forge follows a rigid lifecycle: `Candidate → Validated → Finalized → Acti
 Forge exposes four distinct operator surfaces:
 
 - **`/healthz`**: process liveness only. Verifies the daemon is running and responding. Keep it lightweight.
-- **`/readyz`**: control-plane readiness only. Serves cached readiness state derived from asynchronous convergence. It is not fleet health inspection.
-- **`/metrics`**: cache-backed control-plane metrics and dependency breaker diagnostics in lightweight JSON.
+- **`/readyz`**: control-plane readiness only. Serves cached readiness state derived from asynchronous convergence, including explicit `active_failure` when an unresolved current blocker exists. It is not fleet health inspection.
+- **`/metrics`**: cache-backed control-plane metrics and dependency breaker diagnostics in lightweight JSON. Historical convergence counters remain monotonic observability fields; active readiness blockers are exposed separately through `readiness_status`, `readiness_reason`, and `convergence_active_failure`.
 - **`forge status`**: lightweight runtime and environment summary for operators.
 - **`forge diagnose`**: deep runtime truth inspection for debugging and incident response.
 
@@ -157,6 +157,7 @@ Forge Alpha Core Loop v5 freezes the durable single-writer control plane for the
 - **Reconciliation Intent Log:** `control_plane/reconciliation_log.jsonl` is the intent-first mutation boundary and `control_plane/reconciliation_cursor.json` tracks replay progress. Intents are classified as `replay_safe`, `idempotent`, `destructive`, or `requires_operator_intervention`; corrupted entries are quarantined.
 - **Deterministic Startup And Replay Recovery:** Startup phases are explicit: `booting`, `replaying`, `leader_acquiring`, `follower`, `leader_active`, `degraded`. Replay never runs without valid lease ownership, followers never replay, convergence waits for replay stabilization, lease loss aborts replay, and request paths stay cache-backed while recovery remains bounded and resumable.
 - **Cache-Backed Readiness And Metrics:** `/healthz` is process liveness, `/readyz` is cache-backed control-plane readiness, `/metrics` is cache-backed control-plane telemetry, and `forge diagnose` plus `forge status` remain the deep/runtime inspection surfaces. Request paths never perform fleet scans.
+- **Operator Readiness Semantics:** Historical convergence counters are monotonic observability fields. Active readiness blockers are represented separately and must not be inferred from stale non-zero `convergence_failures_total` or historical failure timestamps alone.
 - **Validated Restart Recovery:** After daemon restart Forge returns to `ready`, `startup_phase=leader_active`, `replay_in_progress=false`, `leader=true`, `follower_mode=false`, and `reconciliation_enabled=true` without reopening synchronous inspection on the request path.
 
 v5.1 note: stale checkpointed readiness no longer self-locks healthy recovery. A degraded cached `/readyz` response may appear briefly during warm startup, but the first healthy leader refresh recomputes readiness from fresh convergence, clears stale `convergence_stalled`, and does not increment `convergence_failures_total` on recovery alone.

@@ -459,15 +459,23 @@ pub struct DaemonReadyzCache {
     pub updated_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveReadinessState {
+    readiness_status: String,
+    readiness_reason: Option<String>,
+    active_failure: bool,
+}
+
 impl Default for DaemonReadyzCache {
     fn default() -> Self {
         Self {
-            response: ReadyzResponse {
+            response: annotate_readyz_response(ReadyzResponse {
                 status: "not_ready".into(),
                 startup_phase: StartupPhase::Booting.as_str().into(),
+                active_failure: true,
                 reason: None,
                 reasons: Vec::new(),
-            },
+            }),
             updated_at_unix_ms: now_unix_ms(),
         }
     }
@@ -1179,18 +1187,19 @@ where
         if now.saturating_sub(self.control_plane_snapshot.readyz.updated_at_unix_ms)
             > READYZ_CACHE_STALE_AFTER_MS
         {
-            return ReadyzResponse {
+            return annotate_readyz_response(ReadyzResponse {
                 status: "degraded".into(),
                 startup_phase: self.startup_phase.as_str().into(),
+                active_failure: true,
                 reason: Some("readiness cache stale".into()),
                 reasons: Vec::new(),
-            };
+            });
         }
         let mut response = self.control_plane_snapshot.readyz.response.clone();
         let cache_age_ms =
             now.saturating_sub(self.control_plane_snapshot.readyz.updated_at_unix_ms);
         annotate_readyz_reasons(&mut response.reasons, cache_age_ms);
-        response
+        annotate_readyz_response(response)
     }
 
     fn restore_readyz_cache_from_checkpoints(&mut self) {
@@ -1231,16 +1240,17 @@ where
         self.convergence_last_success_unix = last_success;
         self.convergence_last_success_restored = last_success.is_some();
         self.control_plane_snapshot.readyz = DaemonReadyzCache {
-            response: ReadyzResponse {
+            response: annotate_readyz_response(ReadyzResponse {
                 status: if reasons.is_empty() {
                     "ready".into()
                 } else {
                     "degraded".into()
                 },
                 startup_phase: self.startup_phase.as_str().into(),
+                active_failure: !reasons.is_empty(),
                 reason: reasons.first().map(|value| value.message.clone()),
                 reasons,
-            },
+            }),
             updated_at_unix_ms: now_unix_ms(),
         };
     }
@@ -1903,7 +1913,7 @@ where
                 })
             });
         let readyz = DaemonReadyzCache {
-            response: ReadyzResponse {
+            response: annotate_readyz_response(ReadyzResponse {
                 status: if self.state() != &DaemonState::Ready {
                     "not_ready".into()
                 } else if degraded {
@@ -1912,9 +1922,10 @@ where
                     "ready".into()
                 },
                 startup_phase: self.startup_phase.as_str().into(),
+                active_failure: self.state() != &DaemonState::Ready || degraded,
                 reason,
                 reasons: reasons.clone(),
-            },
+            }),
             updated_at_unix_ms,
         };
         self.readyz_cache = readyz.clone();
@@ -2590,12 +2601,18 @@ where
         let leader = self.reconciliation_enabled(current_unix_timestamp());
         let lease = self.leadership.lease.as_ref();
         let replay = &self.reconciliation;
+        let readiness = active_readiness_state(&readyz.response);
         MetricsResponse {
             queue_depth,
+            readiness_status: readiness.readiness_status,
+            readiness_reason: readiness.readiness_reason.clone(),
             startup_phase: self.startup_phase.as_str().into(),
             startup_recovery_duration_ms: self.startup_recovery_duration_ms,
             convergence_loop_duration_ms: self.convergence_loop_duration_ms,
             convergence_last_success_unix: self.convergence_last_success_unix,
+            convergence_active_failure: readiness.active_failure,
+            convergence_active_failure_reason: readiness.readiness_reason,
+            convergence_last_failure_historical_unix: self.convergence_last_failure_unix,
             convergence_last_failure_unix: self.convergence_last_failure_unix,
             convergence_failures_total: self.convergence_failures_total,
             readiness_cache_age_ms: now.saturating_sub(readyz.updated_at_unix_ms),
@@ -2639,6 +2656,29 @@ where
             convergence_domains: self.convergence_domains.clone(),
             node: Some(self.node_info()),
         }
+    }
+}
+
+fn annotate_readyz_response(mut response: ReadyzResponse) -> ReadyzResponse {
+    response.active_failure = response.status != "ready";
+    response
+}
+
+fn active_readiness_state(response: &ReadyzResponse) -> ActiveReadinessState {
+    let readiness_reason = response.reason.clone().or_else(|| {
+        response
+            .reasons
+            .first()
+            .map(|reason| reason.message.clone())
+    });
+    ActiveReadinessState {
+        readiness_status: if response.status == "ready" {
+            "ready".into()
+        } else {
+            "degraded".into()
+        },
+        readiness_reason,
+        active_failure: response.status != "ready",
     }
 }
 
@@ -4029,7 +4069,13 @@ pub mod daemon_readyz_route_repair_resolution {
         );
         daemon.start().unwrap();
 
-        assert_eq!(daemon.readyz_status(), "ready");
+        let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(readyz.status, "ready");
+        assert!(!readyz.active_failure);
+        assert_eq!(metrics.readiness_status, "ready");
+        assert!(!metrics.convergence_active_failure);
+        assert_eq!(metrics.readiness_reason, None);
     }
 
     #[test]
@@ -4124,6 +4170,9 @@ pub mod daemon_readyz_route_repair_resolution {
                 .iter()
                 .any(|reason| reason.marker == "route_activation_verification_failed")
         );
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(metrics.readiness_status, "ready");
+        assert!(!metrics.convergence_active_failure);
     }
 
     #[test]
@@ -6603,6 +6652,66 @@ mod daemon_control_plane_durability {
         assert!(metrics.reconciliation_enabled);
         assert!(!metrics.follower_mode);
         assert!(metrics.lease_epoch >= 1);
+        assert_eq!(metrics.startup_phase, "leader_active");
+        assert_eq!(metrics.readiness_status, "ready");
+        assert!(!metrics.convergence_active_failure);
+        assert!(!metrics.convergence_start_blocked);
+    }
+
+    #[test]
+    fn metrics_keep_historical_failures_separate_from_active_readiness() {
+        let root = test_root("metrics-keep-historical-failures-separate-from-active-readiness");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.convergence_last_failure_unix = Some(current_unix_timestamp().saturating_sub(10));
+        daemon.convergence_failures_total = 3;
+        daemon.refresh_readyz_cache();
+
+        let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(readyz.status, "ready");
+        assert!(!readyz.active_failure);
+        assert_eq!(metrics.readiness_status, "ready");
+        assert_eq!(metrics.readiness_reason, None);
+        assert!(!metrics.convergence_active_failure);
+        assert_eq!(metrics.convergence_active_failure_reason, None);
+        assert_eq!(
+            metrics.convergence_last_failure_historical_unix,
+            metrics.convergence_last_failure_unix
+        );
+        assert_eq!(metrics.convergence_failures_total, 3);
+    }
+
+    #[test]
+    fn metrics_report_active_failure_when_readyz_degraded() {
+        let root = test_root("metrics-report-active-failure-when-readyz-degraded");
+        let mut daemon = Daemon::new(
+            config_with_root(root.clone()),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        let lock_path = EnvironmentPaths::leader_lease_file(&root).with_extension("lock");
+        fs::create_dir_all(&lock_path).unwrap();
+        daemon.refresh_readyz_cache();
+
+        let readyz = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(readyz.status, "degraded");
+        assert!(readyz.active_failure);
+        assert_eq!(metrics.readiness_status, "degraded");
+        assert!(metrics.convergence_active_failure);
+        assert!(metrics.readiness_reason.is_some());
+        assert_eq!(
+            metrics.convergence_active_failure_reason,
+            metrics.readiness_reason
+        );
     }
 
     #[test]

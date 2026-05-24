@@ -709,6 +709,8 @@ pub struct ReadyzResponse {
     pub status: String,
     #[serde(default)]
     pub startup_phase: String,
+    #[serde(default)]
+    pub active_failure: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -792,12 +794,22 @@ pub struct ClusterDiagnostics {
 pub struct MetricsResponse {
     pub queue_depth: usize,
     #[serde(default)]
+    pub readiness_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_reason: Option<String>,
+    #[serde(default)]
     pub startup_phase: String,
     #[serde(default)]
     pub startup_recovery_duration_ms: u64,
     pub convergence_loop_duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convergence_last_success_unix: Option<u64>,
+    #[serde(default)]
+    pub convergence_active_failure: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_active_failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_last_failure_historical_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convergence_last_failure_unix: Option<u64>,
     pub convergence_failures_total: u64,
