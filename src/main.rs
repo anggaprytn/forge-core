@@ -4996,37 +4996,65 @@ mod tests {
 
     #[test]
     fn readiness_explain_json_command_parses() {
-        let parsed =
-            ParsedArgs::parse(vec!["readiness".into(), "explain".into(), "--json".into()]).unwrap();
+        let root = temp_root("readiness-explain-json-parses");
+        let missing_installed = root.join("missing-etc-forge.conf");
 
-        assert_eq!(
-            parsed.command,
-            Command::ReadinessExplain {
-                config_path: PathBuf::from("forge.conf"),
-                json: true,
-                offline: false,
-            }
-        );
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(missing_installed.as_os_str().to_os_string()),
+                || {
+                    let parsed = ParsedArgs::parse(vec![
+                        "readiness".into(),
+                        "explain".into(),
+                        "--json".into(),
+                    ])
+                    .unwrap();
+
+                    assert_eq!(
+                        parsed.command,
+                        Command::ReadinessExplain {
+                            config_path: PathBuf::from("forge.conf"),
+                            json: true,
+                            offline: false,
+                        }
+                    );
+                    assert!(!parsed.local_config_found);
+                },
+            )
+        });
     }
 
     #[test]
     fn readiness_explain_offline_json_command_parses_in_any_order() {
-        let parsed = ParsedArgs::parse(vec![
-            "readiness".into(),
-            "explain".into(),
-            "--offline".into(),
-            "--json".into(),
-        ])
-        .unwrap();
+        let root = temp_root("readiness-explain-offline-json-parses");
+        let missing_installed = root.join("missing-etc-forge.conf");
 
-        assert_eq!(
-            parsed.command,
-            Command::ReadinessExplain {
-                config_path: PathBuf::from("forge.conf"),
-                json: true,
-                offline: true,
-            }
-        );
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(missing_installed.as_os_str().to_os_string()),
+                || {
+                    let parsed = ParsedArgs::parse(vec![
+                        "readiness".into(),
+                        "explain".into(),
+                        "--offline".into(),
+                        "--json".into(),
+                    ])
+                    .unwrap();
+
+                    assert_eq!(
+                        parsed.command,
+                        Command::ReadinessExplain {
+                            config_path: PathBuf::from("forge.conf"),
+                            json: true,
+                            offline: true,
+                        }
+                    );
+                    assert!(!parsed.local_config_found);
+                },
+            )
+        });
     }
 
     #[test]
@@ -5228,78 +5256,111 @@ mod tests {
 
     #[test]
     fn upgrade_apply_command_parses_allow_unsigned() {
-        let parsed = ParsedArgs::parse(vec![
-            "upgrade".into(),
-            "apply".into(),
-            "--artifact".into(),
-            "/tmp/forge.tar.gz".into(),
-            "--manifest".into(),
-            "/tmp/release-manifest.json".into(),
-            "--allow-unsigned".into(),
-            "--no-auto-rollback".into(),
-        ])
-        .unwrap();
+        let root = temp_root("upgrade-apply-parses-allow-unsigned");
+        let missing_installed = root.join("missing-etc-forge.conf");
 
-        assert_eq!(
-            parsed.command,
-            Command::UpgradeApply {
-                config_path: PathBuf::from("forge.conf"),
-                caddy_admin_url: "http://127.0.0.1:2019".into(),
-                artifact_path: PathBuf::from("/tmp/forge.tar.gz"),
-                release_tag: None,
-                manifest_path: Some(PathBuf::from("/tmp/release-manifest.json")),
-                signature_path: None,
-                allow_unsigned: true,
-                allow_dirty_artifact: false,
-                no_auto_rollback: true,
-            }
-        );
-        assert!(!parsed.local_config_found);
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(missing_installed.as_os_str().to_os_string()),
+                || {
+                    let parsed = ParsedArgs::parse(vec![
+                        "upgrade".into(),
+                        "apply".into(),
+                        "--artifact".into(),
+                        "/tmp/forge.tar.gz".into(),
+                        "--manifest".into(),
+                        "/tmp/release-manifest.json".into(),
+                        "--allow-unsigned".into(),
+                        "--no-auto-rollback".into(),
+                    ])
+                    .unwrap();
+
+                    assert_eq!(
+                        parsed.command,
+                        Command::UpgradeApply {
+                            config_path: PathBuf::from("forge.conf"),
+                            caddy_admin_url: "http://127.0.0.1:2019".into(),
+                            artifact_path: PathBuf::from("/tmp/forge.tar.gz"),
+                            release_tag: None,
+                            manifest_path: Some(PathBuf::from("/tmp/release-manifest.json")),
+                            signature_path: None,
+                            allow_unsigned: true,
+                            allow_dirty_artifact: false,
+                            no_auto_rollback: true,
+                        }
+                    );
+                    assert!(!parsed.local_config_found);
+                },
+            )
+        });
     }
 
     #[test]
     fn upgrade_plan_command_parses_release_flag() {
-        let parsed = ParsedArgs::parse(vec![
-            "upgrade".into(),
-            "plan".into(),
-            "--release".into(),
-            "alpha-core-loop-v5".into(),
-        ])
-        .unwrap();
+        let root = temp_root("upgrade-plan-parses-release-flag");
+        let missing_installed = root.join("missing-etc-forge.conf");
 
-        assert_eq!(
-            parsed.command,
-            Command::UpgradePlan {
-                config_path: PathBuf::from("forge.conf"),
-                caddy_admin_url: "http://127.0.0.1:2019".into(),
-                artifact_path: PathBuf::new(),
-                release_tag: Some("alpha-core-loop-v5".into()),
-                manifest_path: None,
-                signature_path: None,
-                allow_unsigned: false,
-                allow_dirty_artifact: false,
-            }
-        );
-        assert!(!parsed.local_config_found);
+        with_current_dir(&root, || {
+            with_optional_env_var(
+                "FORGE_TEST_ETC_FORGE_CONF",
+                Some(missing_installed.as_os_str().to_os_string()),
+                || {
+                    let parsed = ParsedArgs::parse(vec![
+                        "upgrade".into(),
+                        "plan".into(),
+                        "--release".into(),
+                        "alpha-core-loop-v5".into(),
+                    ])
+                    .unwrap();
+
+                    assert_eq!(
+                        parsed.command,
+                        Command::UpgradePlan {
+                            config_path: PathBuf::from("forge.conf"),
+                            caddy_admin_url: "http://127.0.0.1:2019".into(),
+                            artifact_path: PathBuf::new(),
+                            release_tag: Some("alpha-core-loop-v5".into()),
+                            manifest_path: None,
+                            signature_path: None,
+                            allow_unsigned: false,
+                            allow_dirty_artifact: false,
+                        }
+                    );
+                    assert!(!parsed.local_config_found);
+                },
+            )
+        });
     }
 
     #[test]
     fn doctor_upgrade_uses_cwd_forge_conf_placeholder_when_no_config_is_found() {
-        unsafe {
-            env::remove_var("FORGE_CONFIG");
-        }
-        let parsed = ParsedArgs::parse(vec!["doctor".into(), "upgrade".into()]).unwrap();
+        let root = temp_root("doctor-upgrade-placeholder");
+        let missing_installed = root.join("missing-etc-forge.conf");
 
-        assert!(!parsed.local_config_found);
-        assert_eq!(
-            parsed.command,
-            Command::Doctor {
-                config_path: PathBuf::from("forge.conf"),
-                caddy_admin_url: "http://127.0.0.1:2019".into(),
-                metrics_url: None,
-                upgrade: true,
-            }
-        );
+        with_current_dir(&root, || {
+            with_optional_env_var("FORGE_CONFIG", None, || {
+                with_optional_env_var(
+                    "FORGE_TEST_ETC_FORGE_CONF",
+                    Some(missing_installed.as_os_str().to_os_string()),
+                    || {
+                        let parsed =
+                            ParsedArgs::parse(vec!["doctor".into(), "upgrade".into()]).unwrap();
+
+                        assert!(!parsed.local_config_found);
+                        assert_eq!(
+                            parsed.command,
+                            Command::Doctor {
+                                config_path: PathBuf::from("forge.conf"),
+                                caddy_admin_url: "http://127.0.0.1:2019".into(),
+                                metrics_url: None,
+                                upgrade: true,
+                            }
+                        );
+                    },
+                )
+            })
+        });
     }
 
     #[test]
