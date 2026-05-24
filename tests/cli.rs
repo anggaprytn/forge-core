@@ -700,6 +700,21 @@ fn cli_doctor_reports_local_diagnostics() {
     let root = test_root("cli-doctor");
     fs::create_dir_all(root.join("queue")).unwrap();
     fs::create_dir_all(root.join("projects")).unwrap();
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let docker_path = bin_dir.join("docker");
+    fs::write(
+        &docker_path,
+        "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '28.0.0'\n  exit 0\nfi\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&docker_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&docker_path, permissions).unwrap();
+    }
     let config_path = root.join("forge.conf");
     fs::write(
         &config_path,
@@ -718,6 +733,14 @@ fn cli_doctor_reports_local_diagnostics() {
     }
 
     let output = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                env::var("PATH").unwrap_or_default()
+            ),
+        )
         .args([
             "--config",
             config_path.to_str().unwrap(),

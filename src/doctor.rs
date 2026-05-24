@@ -766,28 +766,32 @@ mod tests {
         let root = test_root("doctor-upgrade-reads-forge-env");
         fs::create_dir_all(root.join("queue")).unwrap();
         fs::create_dir_all(root.join("projects")).unwrap();
+        let config = test_config(&root);
         let config_path = root.join("forge.conf");
-        fs::write(
-            &config_path,
-            format!(
-                "storage_root={}\napi_bind=127.0.0.1:8080\nbearer_token=test-token\n",
-                root.display()
-            ),
-        )
-        .unwrap();
+        fs::write(&config_path, format!("storage_root={}\n", root.display())).unwrap();
         fs::write(
             root.join("forge.env"),
             "FORGE_MASTER_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n",
         )
         .unwrap();
 
-        let report = run(&DoctorOptions {
-            config_path: config_path.clone(),
-            caddy_admin_url: "http://127.0.0.1:9".into(),
-            metrics_url: Some("http://127.0.0.1:9/metrics".into()),
-            upgrade: true,
-        })
-        .unwrap();
+        let mut docker = StubDocker { result: Ok(()) };
+        let http = StubHttp {
+            results: BTreeMap::from([
+                ("http://127.0.0.1:9/config/".into(), Ok(())),
+                ("http://127.0.0.1:9/metrics".into(), Ok(())),
+            ]),
+        };
+
+        let report = run_with_dependencies(
+            &config,
+            "http://127.0.0.1:9",
+            Some("http://127.0.0.1:9/metrics"),
+            true,
+            Some(&config_path),
+            &mut docker,
+            &http,
+        );
 
         assert!(
             messages_with_status(&report, DoctorStatus::Ok).contains(&format!(

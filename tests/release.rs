@@ -19,6 +19,7 @@ use serde_json::json;
 const ARTIFACT_GIT_COMMIT: &str = "artifact-commit";
 const ARTIFACT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 const ARTIFACT_BUILD_TIMESTAMP: &str = "1712345678";
+const TEST_HTTP_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn test_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -370,7 +371,7 @@ fn spawn_ok_server() -> (String, thread::JoinHandle<()>) {
                     let _ = stream.write_all(response);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if last_activity.elapsed() > Duration::from_secs(5) {
+                    if last_activity.elapsed() > TEST_HTTP_SERVER_IDLE_TIMEOUT {
                         break;
                     }
                     thread::sleep(Duration::from_millis(10));
@@ -415,7 +416,7 @@ fn spawn_readyz_sequence_server(statuses: Vec<u16>) -> (String, thread::JoinHand
                     let _ = stream.write_all(response);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if last_activity.elapsed() > Duration::from_secs(5) {
+                    if last_activity.elapsed() > TEST_HTTP_SERVER_IDLE_TIMEOUT {
                         break;
                     }
                     thread::sleep(Duration::from_millis(10));
