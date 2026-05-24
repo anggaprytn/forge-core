@@ -1343,7 +1343,10 @@ fn run_cli_in_dir(workdir: &Path, args: &[&str]) -> std::process::Output {
         .current_dir(workdir)
         .env("HOME", workdir)
         .env("XDG_CONFIG_HOME", workdir.join(".config"))
-        .env("FORGE_TEST_ETC_FORGE_CONF", workdir.join("missing-etc-forge.conf"))
+        .env(
+            "FORGE_TEST_ETC_FORGE_CONF",
+            workdir.join("missing-etc-forge.conf"),
+        )
         .env_remove("FORGE_URL")
         .env_remove("FORGE_TOKEN")
         .env_remove("FORGE_CONFIG")
