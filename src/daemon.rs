@@ -629,12 +629,7 @@ where
                 self.queue = Some(queue);
                 self.health_loops_started = true;
                 self.record_startup_step(StartupStep::HeartbeatStart);
-                self.convergence_start_blocked = !self
-                    .reconciliation_enabled(current_unix_timestamp())
-                    || self.reconciliation.replay_in_progress
-                    || self.reconciliation.replay_paused
-                    || self.reconciliation.replay_incomplete
-                    || self.reconciliation.lease_fencing_failures > 0;
+                self.convergence_start_blocked = self.startup_convergence_blocked();
                 if !self.convergence_start_blocked {
                     let convergence = StartupConvergence::new(
                         self.config.storage_root.clone(),
@@ -1350,12 +1345,20 @@ where
         }
         let now_unix = current_unix_timestamp();
         self.refresh_leadership(now_unix);
+        self.convergence_start_blocked = self.startup_convergence_blocked();
         self.refresh_runtime_startup_phase(now_unix);
         self.persist_local_cluster_node(now_unix);
     }
 
     fn reconciliation_enabled(&self, now_unix: u64) -> bool {
         !self.leadership.uncertain && self.leadership.is_leader(self.node_id(), now_unix)
+    }
+
+    fn startup_convergence_blocked(&self) -> bool {
+        self.reconciliation.replay_in_progress
+            || self.reconciliation.replay_paused
+            || self.reconciliation.replay_incomplete
+            || self.reconciliation.lease_fencing_failures > 0
     }
 
     fn local_role(&self, now_unix: u64) -> String {
@@ -6903,10 +6906,12 @@ mod daemon_control_plane_durability {
         );
         daemon.start().unwrap();
         daemon.startup_phase = StartupPhase::LeaderAcquiring;
+        daemon.convergence_start_blocked = true;
 
         daemon.heartbeat_tick();
 
         assert_eq!(daemon.startup_phase(), StartupPhase::LeaderActive);
+        assert!(!daemon.convergence_start_blocked);
     }
 
     #[test]
