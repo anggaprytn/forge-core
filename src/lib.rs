@@ -20,6 +20,7 @@ pub mod probes;
 pub mod process;
 pub mod projects;
 pub mod queue;
+pub mod readiness;
 pub mod reconciliation;
 pub mod route_truth;
 pub mod runtime;

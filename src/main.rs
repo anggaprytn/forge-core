@@ -14,9 +14,9 @@ use forge_core::api::{
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
     EventList, ForgeSchemaVersions, ForgeVersionOutput, MetricsResponse, ProjectList,
-    ProjectRecord, ProjectUpsertRequest, ReadyzResponse, RestoreLineage, RetentionRole,
-    SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus, TokenCreateRequest,
-    TokenCreateResponse, TokenListResponse, TokenRevokeResponse,
+    ProjectRecord, ProjectUpsertRequest, ReadinessExplainResponse, ReadyzResponse, RestoreLineage,
+    RetentionRole, SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus,
+    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenRevokeResponse,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -40,14 +40,15 @@ use forge_core::http::{
 use forge_core::probes::DockerNetworkProbeRuntime;
 use forge_core::projects::ProjectRegistryStore;
 use forge_core::queue::PersistentQueue;
+use forge_core::readiness::explain;
 use forge_core::reconciliation::{
     ReconciliationIntentStatus, ReconciliationStore, ReplayOptions, intent_request_for_storage_root,
 };
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
 use forge_core::storage::{
-    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, LeaderLeaseStore, NodeMetadataStore,
-    PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
+    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, ConvergenceCheckpointStore, LeaderLeaseStore,
+    NodeMetadataStore, PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
 };
 use forge_core::upgrade::{
     MANIFEST_SCHEMA_VERSION, STORAGE_COMPATIBILITY_VERSION, UpgradeOptions, apply as apply_upgrade,
@@ -96,6 +97,7 @@ where
             | Command::UpgradeRollback { .. }
             | Command::ControlPlaneLeader { .. }
             | Command::ControlPlaneLease { .. }
+            | Command::ReadinessExplain { .. }
             | Command::ControlPlaneReplayStatus { .. }
             | Command::ControlPlaneIntents { .. }
             | Command::ControlPlaneReplay { .. }
@@ -204,6 +206,12 @@ where
             control_plane_remote_client,
             config_path,
             config_path_explicit,
+        )?,
+        Command::ReadinessExplain { config_path, json } => run_readiness_explain(
+            control_plane_remote_client,
+            config_path,
+            config_path_explicit,
+            json,
         )?,
         Command::ControlPlaneReplayStatus { config_path } => {
             run_control_plane_replay_status(config_path)?
@@ -750,6 +758,22 @@ impl ForgeClient {
         )
     }
 
+    fn get_readiness_explain(&self) -> Result<ReadinessExplainResponse, CliError> {
+        let request = self
+            .http
+            .get(format!("{}/readiness/explain", self.base_url));
+        let request = if self.token.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.token)
+        };
+        decode_raw_json(
+            request
+                .send()
+                .map_err(|err| CliError::Http(err.to_string()))?,
+        )
+    }
+
     fn send_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, CliError> {
         self.decode_response(
             request
@@ -1041,6 +1065,10 @@ enum Command {
     },
     ControlPlaneLease {
         config_path: PathBuf,
+    },
+    ReadinessExplain {
+        config_path: PathBuf,
+        json: bool,
     },
     ControlPlaneReplayStatus {
         config_path: PathBuf,
@@ -1441,6 +1469,20 @@ fn parse_command(
         [group, action] if group == "control-plane" && action == "lease" => {
             Ok(Command::ControlPlaneLease { config_path })
         }
+        [group, action] if group == "readiness" && action == "explain" => {
+            Ok(Command::ReadinessExplain {
+                config_path,
+                json: false,
+            })
+        }
+        [group, action, flag]
+            if group == "readiness" && action == "explain" && flag == "--json" =>
+        {
+            Ok(Command::ReadinessExplain {
+                config_path,
+                json: true,
+            })
+        }
         [group, action] if group == "control-plane" && action == "replay-status" => {
             Ok(Command::ControlPlaneReplayStatus { config_path })
         }
@@ -1549,6 +1591,7 @@ fn usage() -> String {
         "  forge [--url URL] [--token TOKEN] token revoke <token_id>",
         "  forge [--config PATH] control-plane leader",
         "  forge [--config PATH] control-plane lease",
+        "  forge [--config PATH] [--url URL] [--token TOKEN] readiness explain [--json]",
         "  forge [--config PATH] control-plane replay-status",
         "  forge [--config PATH] control-plane intents",
         "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] control-plane replay --dry-run",
@@ -3517,6 +3560,25 @@ fn run_control_plane_lease(
     Ok(())
 }
 
+fn run_readiness_explain(
+    remote_client: Option<ForgeClient>,
+    config_path: PathBuf,
+    config_path_explicit: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let explanation = if let Some(client) = remote_client {
+        client.get_readiness_explain()?
+    } else {
+        load_local_readiness_explain(&config_path, config_path_explicit)?
+    };
+    if json {
+        print_json(&explanation)?;
+    } else {
+        print!("{}", render_readiness_explain(&explanation));
+    }
+    Ok(())
+}
+
 fn run_control_plane_replay_status(config_path: PathBuf) -> Result<(), CliError> {
     let config = DaemonConfig::load_from_file(config_path)
         .map_err(|err| CliError::Usage(err.to_string()))?;
@@ -3592,6 +3654,160 @@ fn control_plane_leader_view_from_metrics(metrics: &MetricsResponse) -> ControlP
         last_heartbeat_unix: None,
         cluster: metrics.cluster.clone(),
     }
+}
+
+fn load_local_readiness_explain(
+    config_path: &Path,
+    config_path_explicit: bool,
+) -> Result<ReadinessExplainResponse, CliError> {
+    if !config_path_explicit && !config_path.exists() {
+        return Err(CliError::Usage(
+            "missing config path; use --config /etc/forge/forge.conf".into(),
+        ));
+    }
+    let config = DaemonConfig::load_from_file(config_path)
+        .map_err(|err| CliError::Usage(err.to_string()))?;
+    let (local_node_id, lease, cluster) =
+        load_local_control_plane_state(config_path, config_path_explicit)?;
+    let reconciliation = ReconciliationStore::new(&config.storage_root).diagnostics();
+    let now_unix = now_unix();
+    let mut latest_checkpoint_unix = None;
+    let mut startup_phase = if lease.as_ref().is_some_and(|value| {
+        value.leader_node_id == local_node_id && value.expires_at_unix > now_unix
+    }) {
+        "leader_active".to_string()
+    } else if lease
+        .as_ref()
+        .is_some_and(|value| value.expires_at_unix > now_unix)
+    {
+        "follower".to_string()
+    } else {
+        "leader_acquiring".to_string()
+    };
+    let mut last_successful_convergence_unix = None;
+    let mut last_failure_historical_unix = None;
+    let mut active_failure_reason = None;
+    for (project_id, environment) in local_environment_pairs(&config.storage_root)? {
+        let env = forge_core::storage::EnvironmentPaths::new(
+            &config.storage_root,
+            &project_id,
+            &environment,
+        );
+        let Some(checkpoint) = ConvergenceCheckpointStore::new(env)
+            .load()
+            .map_err(|err| CliError::Usage(err.to_string()))?
+        else {
+            continue;
+        };
+        latest_checkpoint_unix = Some(
+            latest_checkpoint_unix
+                .unwrap_or(0)
+                .max(checkpoint.checkpointed_at_unix),
+        );
+        last_successful_convergence_unix =
+            last_successful_convergence_unix.max(checkpoint.last_successful_convergence_unix);
+        if let Some(value) = checkpoint
+            .extra
+            .get("startup_phase")
+            .and_then(|value| value.as_str())
+        {
+            startup_phase = value.to_string();
+        }
+        if checkpoint
+            .extra
+            .get("readyz_status")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "degraded")
+            || !checkpoint.readyz_reasons.is_empty()
+        {
+            last_failure_historical_unix = Some(
+                last_failure_historical_unix
+                    .unwrap_or(0)
+                    .max(checkpoint.checkpointed_at_unix),
+            );
+        }
+        let checkpoint_age_ms = now_unix
+            .saturating_sub(checkpoint.checkpointed_at_unix)
+            .saturating_mul(1_000);
+        if checkpoint_age_ms > forge_core::daemon::READYZ_CACHE_STALE_AFTER_MS {
+            active_failure_reason.get_or_insert("readiness cache stale".into());
+        } else if active_failure_reason.is_none() {
+            active_failure_reason = checkpoint.readyz_reasons.first().cloned().or_else(|| {
+                checkpoint
+                    .extra
+                    .get("readyz_status")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| *value == "degraded")
+                    .map(|_| "cached readiness degraded".to_string())
+            });
+        }
+    }
+    let readiness_cache_age_ms = latest_checkpoint_unix
+        .map(|value| now_unix.saturating_sub(value).saturating_mul(1_000))
+        .unwrap_or(0);
+    let leader = lease.as_ref().is_some_and(|value| {
+        value.leader_node_id == local_node_id && value.expires_at_unix > now_unix
+    });
+    let follower_mode = lease.as_ref().is_some_and(|value| {
+        value.leader_node_id != local_node_id && value.expires_at_unix > now_unix
+    });
+    let convergence_start_blocked = reconciliation.replay_in_progress
+        || reconciliation.replay_paused
+        || reconciliation.replay_incomplete
+        || reconciliation.lease_fencing_failures > 0;
+    let readyz = ReadyzResponse {
+        status: if active_failure_reason.is_some() {
+            "degraded".into()
+        } else {
+            "ready".into()
+        },
+        startup_phase: startup_phase.clone(),
+        active_failure: active_failure_reason.is_some(),
+        reason: active_failure_reason.clone(),
+        reasons: Vec::new(),
+    };
+    let metrics = MetricsResponse {
+        readiness_status: if active_failure_reason.is_some() {
+            "degraded".into()
+        } else {
+            "ready".into()
+        },
+        readiness_reason: active_failure_reason.clone(),
+        startup_phase,
+        convergence_last_success_unix: last_successful_convergence_unix,
+        convergence_active_failure: active_failure_reason.is_some(),
+        convergence_active_failure_reason: active_failure_reason.clone(),
+        convergence_last_failure_historical_unix: last_failure_historical_unix,
+        readiness_cache_age_ms,
+        leader,
+        lease_epoch: lease.as_ref().map(|value| value.lease_epoch).unwrap_or(0),
+        lease_age_ms: lease_age_ms(lease.as_ref(), now_unix),
+        lease_expiry_ms: lease_expiry_ms(lease.as_ref(), now_unix),
+        convergence_owner: lease
+            .as_ref()
+            .map(|value| value.leader_node_id.clone())
+            .unwrap_or_default(),
+        reconciliation_enabled: leader,
+        follower_mode,
+        pending_intents: reconciliation.pending_intents,
+        replay_queue_depth: reconciliation.replay_queue_depth,
+        replay_in_progress: reconciliation.replay_in_progress,
+        replay_paused: reconciliation.replay_paused,
+        replay_duration_ms: reconciliation.replay_duration_ms,
+        replay_failures_total: reconciliation.replay_failures_total,
+        replay_quarantined_total: reconciliation.replay_quarantined_total,
+        replay_aborted_total: reconciliation.replay_aborted_total,
+        lease_fencing_failures: reconciliation.lease_fencing_failures,
+        unrecoverable_operations: reconciliation.unrecoverable_operations,
+        last_replayed_intent: reconciliation.last_replayed_intent,
+        reconciliation_log_size_bytes: reconciliation.reconciliation_log_size_bytes,
+        convergence_start_blocked,
+        cluster,
+        docker: Default::default(),
+        caddy: Default::default(),
+        ..MetricsResponse::default()
+    };
+    Ok(explain(&readyz, &metrics))
 }
 
 fn control_plane_leader_view_from_storage(
@@ -3771,6 +3987,69 @@ fn render_control_plane_lease(view: &ControlPlaneLeaseView) -> String {
     output
 }
 
+fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Readiness: {}\n", view.readiness_status));
+    output.push_str(&format!("Startup phase: {}\n", view.startup_phase));
+    output.push_str(&format!(
+        "Active failure: {}\n",
+        if view.active_failure { "yes" } else { "no" }
+    ));
+    if let Some(reason) = view.active_failure_reason.as_deref() {
+        output.push_str(&format!("Reason: {reason}\n"));
+    }
+    output.push_str(&format!(
+        "Historical failures: {}",
+        if view.historical_failures {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    if let Some(timestamp) = view.last_historical_failure_unix {
+        output.push_str(&format!(", last at {timestamp}"));
+    }
+    output.push('\n');
+    output.push_str(&format!(
+        "Convergence: {}\n",
+        if view.convergence_blocked {
+            if view.active_failure {
+                "blocked by active control-plane condition"
+            } else {
+                "blocked"
+            }
+        } else {
+            "running normally"
+        }
+    ));
+    output.push_str(&format!(
+        "Leadership: {}\n",
+        match view.leadership_status.as_str() {
+            "active_leader" => "active leader",
+            "follower" => "read-only follower",
+            "uncertain" => "uncertain",
+            _ => "candidate",
+        }
+    ));
+    output.push_str(&format!(
+        "Replay: {}\n",
+        if view.replay_running {
+            "running"
+        } else {
+            "complete"
+        }
+    ));
+    if let Some(timestamp) = view.last_successful_convergence_unix {
+        output.push_str(&format!("Last successful convergence: {timestamp}\n"));
+    }
+    output.push_str(&format!(
+        "Interpretation: {}\n",
+        view.operator_interpretation
+    ));
+    output.push_str(&format!("Operator action: {}\n", view.safe_next_action));
+    output
+}
+
 fn load_local_control_plane_state(
     config_path: &Path,
     config_path_explicit: bool,
@@ -3837,6 +4116,30 @@ fn load_local_control_plane_state(
             ..ClusterDiagnostics::default()
         },
     ))
+}
+
+fn local_environment_pairs(storage_root: &Path) -> Result<Vec<(String, String)>, CliError> {
+    let projects_root = storage_root.join("projects");
+    let Ok(projects) = fs::read_dir(projects_root) else {
+        return Ok(Vec::new());
+    };
+    let mut environments = Vec::new();
+    for project in projects {
+        let project = project.map_err(|err| CliError::Usage(err.to_string()))?;
+        let project_id = project.file_name().to_string_lossy().into_owned();
+        let envs_dir = project.path().join("environments");
+        let Ok(envs) = fs::read_dir(envs_dir) else {
+            continue;
+        };
+        for env in envs {
+            let env = env.map_err(|err| CliError::Usage(err.to_string()))?;
+            environments.push((
+                project_id.clone(),
+                env.file_name().to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    Ok(environments)
 }
 
 fn now_unix() -> u64 {
@@ -4315,6 +4618,39 @@ mod tests {
             parsed.command,
             Command::ControlPlaneLease {
                 config_path: PathBuf::from("/tmp/forge.conf"),
+            }
+        );
+    }
+
+    #[test]
+    fn readiness_explain_command_parses() {
+        let parsed = ParsedArgs::parse(vec![
+            "--config".into(),
+            "/tmp/forge.conf".into(),
+            "readiness".into(),
+            "explain".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::ReadinessExplain {
+                config_path: PathBuf::from("/tmp/forge.conf"),
+                json: false,
+            }
+        );
+    }
+
+    #[test]
+    fn readiness_explain_json_command_parses() {
+        let parsed =
+            ParsedArgs::parse(vec!["readiness".into(), "explain".into(), "--json".into()]).unwrap();
+
+        assert_eq!(
+            parsed.command,
+            Command::ReadinessExplain {
+                config_path: PathBuf::from("forge.conf"),
+                json: true,
             }
         );
     }

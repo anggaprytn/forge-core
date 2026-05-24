@@ -870,6 +870,37 @@ pub struct MetricsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessExplainResponse {
+    pub taxonomy: String,
+    pub readiness_status: String,
+    pub startup_phase: String,
+    pub active_failure: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_failure_reason: Option<String>,
+    pub failure_scope: String,
+    #[serde(default)]
+    pub historical_failures: bool,
+    #[serde(default)]
+    pub convergence_blocked: bool,
+    #[serde(default)]
+    pub replay_running: bool,
+    #[serde(default)]
+    pub leader: bool,
+    #[serde(default)]
+    pub follower_mode: bool,
+    pub node_role: String,
+    #[serde(default)]
+    pub leadership_healthy: bool,
+    pub leadership_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_convergence_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_historical_failure_unix: Option<u64>,
+    pub operator_interpretation: String,
+    pub safe_next_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreLineage {
     pub backup_id: String,
     pub restored_generation: u64,

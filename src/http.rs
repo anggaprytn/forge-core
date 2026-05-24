@@ -24,8 +24,9 @@ use crate::api::{
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
     EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectUpsertRequest, ReadyzResponse, SecretListResponse, SecretUnsetResponse,
-    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata, TokenRevokeResponse,
+    ProjectUpsertRequest, ReadinessExplainResponse, ReadyzResponse, SecretListResponse,
+    SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata,
+    TokenRevokeResponse,
 };
 use crate::auth::{
     AuthSource, AuthenticatedPrincipal, CliTokenVerifier, TokenIssueRequest, TokenStoreError,
@@ -37,6 +38,7 @@ use crate::github::{
     GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
 };
 use crate::projects::{ProjectRegistryStore, project_registry_error_response};
+use crate::readiness::explain_snapshot;
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::status::ProjectEnvironmentStatus;
@@ -975,6 +977,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/tokens/{token_id}", delete(delete_token))
         .route("/healthz", get(get_healthz))
         .route("/readyz", get(get_readyz))
+        .route("/readiness/explain", get(get_readiness_explain))
         .route("/metrics", get(get_metrics))
         .route("/deployments", post(post_deployments))
         .route("/api/projects", post(post_projects).get(get_projects))
@@ -1744,6 +1747,24 @@ async fn get_metrics(State(state): State<HttpState>) -> Response {
             ErrorResponse {
                 code: "metrics_cache_unavailable".into(),
                 message: "metrics cache unavailable".into(),
+            },
+        ),
+    }
+}
+
+async fn get_readiness_explain(State(state): State<HttpState>) -> Response {
+    let request_id = next_request_id();
+    match state.control_plane_cache.read() {
+        Ok(cache) => {
+            let explanation: ReadinessExplainResponse = explain_snapshot(&cache);
+            json_response(StatusCode::OK, &request_id, Json(explanation))
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &request_id,
+            ErrorResponse {
+                code: "readiness_explain_unavailable".into(),
+                message: "readiness explain cache unavailable".into(),
             },
         ),
     }
@@ -5654,7 +5675,7 @@ pub mod http_error_response_is_machine_readable {
 #[cfg(test)]
 pub mod metrics_endpoint_exposes_cached_json {
     use super::*;
-    use crate::api::MetricsResponse;
+    use crate::api::{MetricsResponse, ReadinessExplainResponse};
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
@@ -5683,6 +5704,25 @@ pub mod metrics_endpoint_exposes_cached_json {
         assert_eq!(metrics.queue_depth, 0);
         assert_eq!(metrics.readyz_requests_total, 0);
         assert!(metrics.readiness_cache_age_ms <= READYZ_CACHE_STALE_AFTER_MS);
+    }
+
+    #[tokio::test]
+    async fn readiness_explain_endpoint_exposes_cached_json() {
+        let app = router(build_state(true));
+        let request = Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/readiness/explain")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let explanation: ReadinessExplainResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(explanation.taxonomy, "ready_no_active_failure");
+        assert_eq!(explanation.readiness_status, "ready");
+        assert_eq!(explanation.safe_next_action, "no action required");
     }
 
     #[tokio::test]

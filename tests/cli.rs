@@ -1039,6 +1039,68 @@ fn control_plane_lease_uses_remote_api_when_logged_in() {
 }
 
 #[test]
+fn readiness_explain_uses_remote_api_when_logged_in() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"taxonomy":"ready_no_active_failure","readiness_status":"ready","startup_phase":"leader_active","active_failure":false,"failure_scope":"historical","historical_failures":true,"convergence_blocked":false,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","last_successful_convergence_unix":1779320528,"last_historical_failure_unix":1779320400,"operator_interpretation":"Control-plane readiness is healthy. Historical failures exist, but there is no active blocker.","safe_next_action":"no action required"}"#,
+    );
+
+    let output = run_cli(&url, &["readiness", "explain"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Readiness: ready"));
+    assert!(body.contains("Historical failures: yes"));
+    assert!(body.contains("Operator action: no action required"));
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/readiness/explain");
+}
+
+#[test]
+fn readiness_explain_json_is_machine_readable() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests.clone(),
+        r#"{"taxonomy":"degraded_active_convergence_failure","readiness_status":"degraded","startup_phase":"leader_active","active_failure":true,"active_failure_reason":"route_activation_verification_failed","failure_scope":"active","historical_failures":false,"convergence_blocked":true,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","last_successful_convergence_unix":1779320528,"operator_interpretation":"Control-plane readiness is degraded by an active convergence blocker: route_activation_verification_failed.","safe_next_action":"inspect route diagnostics and Caddy admin health"}"#,
+    );
+
+    let output = run_cli(&url, &["readiness", "explain", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["taxonomy"], "degraded_active_convergence_failure");
+    assert_eq!(json["active_failure"], true);
+    assert_eq!(
+        json["active_failure_reason"],
+        "route_activation_verification_failed"
+    );
+    assert_eq!(
+        json["safe_next_action"],
+        "inspect route diagnostics and Caddy admin health"
+    );
+
+    let request = requests.lock().unwrap().remove(0);
+    assert_eq!(request.path, "/readiness/explain");
+}
+
+#[test]
+fn readiness_explain_output_does_not_expose_cli_token() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server(
+        requests,
+        r#"{"taxonomy":"ready_no_active_failure","readiness_status":"ready","startup_phase":"leader_active","active_failure":false,"failure_scope":"none","historical_failures":false,"convergence_blocked":false,"replay_running":false,"leader":true,"follower_mode":false,"node_role":"leader","leadership_healthy":true,"leadership_status":"active_leader","operator_interpretation":"Control-plane readiness is healthy and convergence is operating normally.","safe_next_action":"no action required"}"#,
+    );
+
+    let output = run_cli(&url, &["readiness", "explain"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(!body.contains("test-token"));
+    assert!(!body.contains("Bearer"));
+}
+
+#[test]
 fn control_plane_local_missing_config_returns_helpful_error() {
     let root = test_root("control-plane-local-missing-config-returns-helpful-error");
     let output = run_cli_in_dir(&root, &["control-plane", "leader"]);

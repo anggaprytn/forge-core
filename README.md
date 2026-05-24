@@ -96,6 +96,7 @@ Forge exposes four distinct operator surfaces:
 
 - **`/healthz`**: process liveness only. Verifies the daemon is running and responding. Keep it lightweight.
 - **`/readyz`**: control-plane readiness only. Serves cached readiness state derived from asynchronous convergence, including explicit `active_failure` when an unresolved current blocker exists. It is not fleet health inspection.
+- **`/readiness/explain`** and **`forge readiness explain`**: read-only operator interpretation of cached readiness, replay, leadership, and historical convergence state. This is an explanation layer, not a repair surface.
 - **`/metrics`**: cache-backed control-plane metrics and dependency breaker diagnostics in lightweight JSON. Historical convergence counters remain monotonic observability fields; active readiness blockers are exposed separately through `readiness_status`, `readiness_reason`, and `convergence_active_failure`.
 - **`forge status`**: lightweight runtime and environment summary for operators.
 - **`forge diagnose`**: deep runtime truth inspection for debugging and incident response.
