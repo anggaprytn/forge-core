@@ -5323,6 +5323,7 @@ pub mod http_readyz_cache_latency {
                         message: "reconciliation replay incomplete".into(),
                         last_checked_unix: None,
                         cache_age_ms: 0,
+                        diagnostics: None,
                     }],
                 },
                 updated_at_unix_ms: unix_now_ms(),

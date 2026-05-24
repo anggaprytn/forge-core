@@ -258,6 +258,73 @@ fn dogfood_daemon_restart_preserves_cache_initialization_behavior() {
 }
 
 #[test]
+fn upgrade_apply_readyz_ready_after_restart_handoff() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("upgrade-apply-readyz-restart-handoff") else {
+        return;
+    };
+
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+    harness.wait_for_readyz_status("ready", Duration::from_secs(5));
+
+    harness.restart_api_server(AllowAllDecider(true));
+
+    let readyz = harness.wait_for_readyz_status("ready", Duration::from_secs(5));
+    let (metrics, _) = harness.get_metrics();
+    assert_eq!(readyz.status, "ready");
+    assert!(metrics.leader);
+    assert!(!metrics.follower_mode);
+    assert_eq!(metrics.startup_phase, "leader_active");
+    assert!(metrics.convergence_last_success_unix.is_some());
+}
+
+#[test]
+fn upgrade_rollback_readyz_ready_after_restart_handoff() {
+    let _guard = integration_lock();
+    let Some(mut harness) = E2eHarness::start("upgrade-rollback-readyz-restart-handoff") else {
+        return;
+    };
+
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    harness.execute_next_deployment().unwrap();
+    harness.enqueue_deploy_for_fixture(&common::sample_http_app_fixture());
+    let second = harness.execute_next_deployment().unwrap();
+    assert_eq!(second.generation, 2);
+
+    docker(&[
+        "exec",
+        second.container_name.as_str(),
+        "sh",
+        "-lc",
+        "rm -f /www/health",
+    ])
+    .expect("active generation health endpoint should be removable");
+    harness
+        .run_convergence_ticks(&[100, 101, 102, 133])
+        .unwrap();
+    harness.wait_for_readyz_status("ready", Duration::from_secs(5));
+
+    harness.restart_api_server(AllowAllDecider(true));
+
+    let readyz = harness.wait_for_readyz_status("ready", Duration::from_secs(5));
+    let (metrics, _) = harness.get_metrics();
+    assert_eq!(readyz.status, "ready");
+    assert!(metrics.leader);
+    assert_eq!(metrics.startup_phase, "leader_active");
+    assert_eq!(
+        PointerStore::new(EnvironmentPaths::new(
+            &harness.runtime_root,
+            "api",
+            "production"
+        ))
+        .read_pointer("current")
+        .unwrap(),
+        Some(1)
+    );
+}
+
+#[test]
 fn dogfood_reboot_recovery_restores_container_and_route() {
     let _guard = integration_lock();
     let Some(mut harness) = E2eHarness::start("reboot-recovery") else {

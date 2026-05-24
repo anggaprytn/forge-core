@@ -13,8 +13,8 @@ use crate::api::{
     ConvergenceDomainSummary, DependencyBreakerDiagnostics, DeploymentAccepted,
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, MetricsDependencySnapshot, MetricsResponse, NodeInfo, ReadyzReason, ReadyzResponse,
-    ServiceLogGroup, validate_deployment_request,
+    EventList, MetricsDependencySnapshot, MetricsResponse, NodeInfo, ReadyzReason,
+    ReadyzReasonDiagnostics, ReadyzResponse, ServiceLogGroup, validate_deployment_request,
 };
 use crate::backups::{create_backup, inspect_backup, list_backups, restore_backup};
 use crate::bootstrap::{BootstrapContext, BootstrapState};
@@ -486,6 +486,7 @@ pub struct Daemon<D, R, A> {
     control_plane_snapshot: ControlPlaneSnapshot,
     convergence_loop_duration_ms: u64,
     convergence_last_success_unix: Option<u64>,
+    convergence_last_success_restored: bool,
     convergence_last_failure_unix: Option<u64>,
     convergence_failures_total: u64,
     docker_breaker: DependencyCircuitBreaker,
@@ -542,6 +543,7 @@ where
             control_plane_snapshot: ControlPlaneSnapshot::default(),
             convergence_loop_duration_ms: 0,
             convergence_last_success_unix: None,
+            convergence_last_success_restored: false,
             convergence_last_failure_unix: None,
             convergence_failures_total: 0,
             docker_breaker: DependencyCircuitBreaker::default(),
@@ -1214,6 +1216,7 @@ where
                     message: "checkpoint stale until next refresh".into(),
                     last_checked_unix: Some(checkpoint.checkpointed_at_unix),
                     cache_age_ms: age_ms,
+                    diagnostics: None,
                 });
                 continue;
             }
@@ -1229,10 +1232,12 @@ where
                     message,
                     last_checked_unix: Some(checkpoint.checkpointed_at_unix),
                     cache_age_ms: age_ms,
+                    diagnostics: None,
                 });
             }
         }
         self.convergence_last_success_unix = last_success;
+        self.convergence_last_success_restored = last_success.is_some();
         self.control_plane_snapshot.readyz = DaemonReadyzCache {
             response: ReadyzResponse {
                 status: if reasons.is_empty() {
@@ -1246,6 +1251,56 @@ where
             },
             updated_at_unix_ms: now_unix_ms(),
         };
+    }
+
+    fn convergence_enabled_for_readyz(&self, now_unix: u64) -> bool {
+        self.reconciliation_enabled(now_unix)
+            && !self.convergence_start_blocked
+            && !self.reconciliation.replay_in_progress
+            && !self.reconciliation.replay_paused
+            && !self.reconciliation.replay_incomplete
+            && self.reconciliation.lease_fencing_failures == 0
+    }
+
+    fn latest_convergence_error_from_checkpoints(&self) -> Option<String> {
+        self.environment_paths()
+            .into_iter()
+            .filter_map(|(_, _, env)| {
+                ConvergenceCheckpointStore::new(env)
+                    .load()
+                    .ok()
+                    .flatten()
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .last_convergence_error
+                            .map(|error| (checkpoint.checkpointed_at_unix, error))
+                    })
+            })
+            .max_by_key(|(timestamp, _)| *timestamp)
+            .map(|(_, error)| error)
+    }
+
+    fn convergence_stalled_reason(&self, now_unix: u64) -> ReadyzReason {
+        let cache_age_ms = self
+            .control_plane_snapshot
+            .readyz
+            .updated_at_unix_ms
+            .checked_div(1)
+            .map(|updated| now_unix_ms().saturating_sub(updated))
+            .unwrap_or(0);
+        ReadyzReason {
+            diagnostics: Some(ReadyzReasonDiagnostics {
+                last_success_unix: self.convergence_last_success_unix,
+                stall_threshold_ms: Some(CONVERGENCE_STALLED_AFTER_MS),
+                startup_phase: Some(self.startup_phase.as_str().into()),
+                replay_in_progress: Some(self.reconciliation.replay_in_progress),
+                leader: Some(self.reconciliation_enabled(now_unix)),
+                convergence_enabled: Some(self.convergence_enabled_for_readyz(now_unix)),
+                last_convergence_error: self.latest_convergence_error_from_checkpoints(),
+            }),
+            cache_age_ms,
+            ..control_plane_reason("convergence_stalled", "convergence stalled".into())
+        }
     }
 
     fn environment_paths(&self) -> Vec<(String, String, EnvironmentPaths)> {
@@ -1590,6 +1645,14 @@ where
                     "startup_phase".into(),
                     Value::String(self.startup_phase.as_str().into()),
                 ),
+                (
+                    "readyz_status".into(),
+                    Value::String(if reasons.is_empty() {
+                        "ready".into()
+                    } else {
+                        "degraded".into()
+                    }),
+                ),
             ]),
         };
         let _ = ConvergenceCheckpointStore::new(env.clone()).save(&checkpoint);
@@ -1767,15 +1830,18 @@ where
                 ))
         });
         reasons.dedup();
-        let stalled = self.reconciliation_enabled(now_unix)
+        let healthy_convergence_tick =
+            self.convergence_enabled_for_readyz(now_unix) && reasons.is_empty();
+        if healthy_convergence_tick {
+            self.convergence_last_success_unix = Some(now_unix);
+            self.convergence_last_success_restored = false;
+        }
+        let stalled = self.convergence_enabled_for_readyz(now_unix)
             && self.convergence_last_success_unix.is_some_and(|value| {
                 now_unix.saturating_sub(value) * 1_000 > CONVERGENCE_STALLED_AFTER_MS
             });
         if stalled {
-            reasons.push(control_plane_reason(
-                "convergence_stalled",
-                "convergence stalled".into(),
-            ));
+            reasons.push(self.convergence_stalled_reason(now_unix));
         }
         self.record_cluster_events(now_unix, &previous_cluster_signals, &cluster_signals);
         self.cluster_signals = cluster_signals;
@@ -1789,8 +1855,9 @@ where
         if degraded {
             self.convergence_last_failure_unix = Some(now_unix);
             self.convergence_failures_total = self.convergence_failures_total.saturating_add(1);
-        } else if self.reconciliation_enabled(now_unix) {
+        } else if self.convergence_enabled_for_readyz(now_unix) {
             self.convergence_last_success_unix = Some(now_unix);
+            self.convergence_last_success_restored = false;
         }
         let reason = reasons
             .iter()
@@ -1860,13 +1927,13 @@ where
         }
         if self.convergence_start_blocked {
             reasons.push(control_plane_reason(
-                "convergence_start_blocked",
-                "convergence start blocked pending stable startup".into(),
+                "convergence_disabled",
+                "convergence disabled pending stable startup".into(),
             ));
         }
         if self.reconciliation.replay_incomplete {
             reasons.push(control_plane_reason(
-                "reconciliation_replay_incomplete",
+                "replay_incomplete",
                 "reconciliation replay incomplete".into(),
             ));
         }
@@ -1939,6 +2006,15 @@ where
             ));
         }
         if !self.reconciliation_enabled(now_unix) {
+            let marker = match self.local_role(now_unix).as_str() {
+                "follower" => "follower_mode",
+                _ => "convergence_disabled",
+            };
+            let message = match marker {
+                "follower_mode" => "convergence disabled while following active leader".into(),
+                _ => "convergence disabled until leadership is established".into(),
+            };
+            reasons.push(control_plane_reason(marker, message));
             return reasons;
         }
         if fs::metadata(&self.config.storage_root).is_err() {
@@ -2030,6 +2106,7 @@ where
                             message: "checkpoint epoch mismatch".into(),
                             last_checked_unix: Some(checkpoint.checkpointed_at_unix),
                             cache_age_ms,
+                            diagnostics: None,
                         });
                     }
                     if !checkpoint.convergence_owner.is_empty()
@@ -2057,6 +2134,7 @@ where
                             message: "checkpoint owner mismatch".into(),
                             last_checked_unix: Some(checkpoint.checkpointed_at_unix),
                             cache_age_ms,
+                            diagnostics: None,
                         });
                     }
                 }
@@ -2089,6 +2167,7 @@ where
                             cache_age_ms: now_unix
                                 .saturating_sub(snapshot.created_at_unix)
                                 .saturating_mul(1_000),
+                            diagnostics: None,
                         });
                     }
                 }
@@ -2161,6 +2240,7 @@ where
                 message,
                 last_checked_unix: Some(now_unix),
                 cache_age_ms: 0,
+                diagnostics: None,
             }),
             RouteFailureState::Unknown => {
                 let historical_startup_failure = summary
@@ -2186,6 +2266,7 @@ where
                         message,
                         last_checked_unix: Some(now_unix),
                         cache_age_ms: 0,
+                        diagnostics: None,
                     });
                 }
                 let message = summary
@@ -2203,6 +2284,7 @@ where
                     message,
                     last_checked_unix: Some(now_unix),
                     cache_age_ms: 0,
+                    diagnostics: None,
                 })
             }
         }
@@ -2569,6 +2651,7 @@ fn readyz_reasons_for_runtime_state(
         message,
         last_checked_unix: Some(now_unix),
         cache_age_ms: 0,
+        diagnostics: None,
     }]
 }
 
@@ -2584,6 +2667,7 @@ fn control_plane_reason(marker: &str, message: String) -> ReadyzReason {
         message,
         last_checked_unix: Some(current_unix_timestamp()),
         cache_age_ms: 0,
+        diagnostics: None,
     }
 }
 
@@ -4176,10 +4260,87 @@ pub mod daemon_readyz_cache_behavior {
 #[cfg(test)]
 pub mod daemon_operational_hardening {
     use super::*;
+    use crate::api::ProjectUpsertRequest;
+    use crate::storage::RuntimeState;
+
+    fn seed_project(root: &std::path::Path) {
+        ProjectRegistryStore::new(root)
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("api".into()),
+                    repo_url: "https://example.com/api.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    fn seed_cached_runtime(
+        root: &std::path::Path,
+        project_id: &str,
+        environment: &str,
+        generation: u64,
+        health_state: RuntimeHealthState,
+        error_code: Option<&str>,
+    ) {
+        use crate::storage::{SnapshotState, SnapshotWriter};
+
+        let env = EnvironmentPaths::new(root, project_id, environment);
+        SnapshotWriter::new(env.clone(), generation)
+            .unwrap()
+            .finalize(project_id, environment, SnapshotState::Healthy)
+            .unwrap();
+        RuntimeStateStore::new(env.clone())
+            .save(&RuntimeState {
+                active_generation: Some(generation),
+                health_state,
+                failed_probe_count: 0,
+                successful_probe_count: 0,
+                restart_attempted: false,
+                degraded_since_unix: Some(1),
+                last_transition: "degraded".into(),
+                last_error_code: error_code.map(str::to_string),
+            })
+            .unwrap();
+        DiagnosticsStore::new(env, generation)
+            .write_summary(&crate::storage::DiagnosticSummary {
+                deployment_id: Some(format!("dep-{generation}")),
+                failure_stage: "warming".into(),
+                failure_reason: format!("{project_id}/{environment} degraded"),
+                blocking_reason: None,
+                container_name: format!("{environment}-{project_id}-gen-{generation}"),
+                failed_service_name: None,
+                blocking_service_name: None,
+                probe_target_host: None,
+                probe_target_port: None,
+                probe_target_path: None,
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: false,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+    }
 
     #[test]
     fn stale_convergence_marks_readyz_degraded() {
         let root = test_root("stale-convergence-marks-readyz-degraded");
+        seed_cached_runtime(
+            &root,
+            "api",
+            "production",
+            1,
+            RuntimeHealthState::Degraded,
+            Some("tcp_unreachable"),
+        );
         let mut daemon = Daemon::new(
             config_with_root(root),
             NoopDockerRuntime,
@@ -4193,6 +4354,129 @@ pub mod daemon_operational_hardening {
         let readiness = daemon.readyz_response();
         assert_eq!(readiness.status, "degraded");
         assert_eq!(readiness.reason.as_deref(), Some("convergence stalled"));
+    }
+
+    #[test]
+    fn convergence_stalled_clears_after_successful_tick() {
+        let root = test_root("convergence-stalled-clears-after-successful-tick");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.convergence_last_success_unix = Some(current_unix_timestamp().saturating_sub(60));
+
+        daemon.refresh_readyz_cache();
+
+        let readiness = daemon.readyz_response();
+        assert_eq!(readiness.status, "ready");
+        assert!(readiness.reasons.is_empty());
+        assert!(daemon.convergence_last_success_unix.unwrap() >= current_unix_timestamp());
+    }
+
+    #[test]
+    fn readyz_convergence_stalled_reports_cached_diagnostics() {
+        let root = test_root("readyz-convergence-stalled-reports-cached-diagnostics");
+        seed_cached_runtime(
+            &root,
+            "api",
+            "production",
+            1,
+            RuntimeHealthState::Degraded,
+            Some("tcp_unreachable"),
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let node_id = local_node_id(&root);
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: current_unix_timestamp(),
+                last_successful_convergence_unix: Some(current_unix_timestamp().saturating_sub(60)),
+                last_convergence_duration_ms: 10,
+                last_convergence_generation: Some(1),
+                last_convergence_error: Some("tcp_unreachable".into()),
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Degraded,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                node_id: node_id.clone(),
+                lease_epoch: 1,
+                convergence_owner: node_id,
+                readyz_reasons: Vec::new(),
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.convergence_last_success_unix = Some(current_unix_timestamp().saturating_sub(60));
+
+        daemon.refresh_readyz_cache();
+
+        let readiness = daemon.readyz_response();
+        let stalled = readiness
+            .reasons
+            .iter()
+            .find(|reason| reason.marker == "convergence_stalled")
+            .expect("stalled reason should be present");
+        let diagnostics = stalled
+            .diagnostics
+            .as_ref()
+            .expect("stalled reason should include diagnostics");
+        assert_eq!(diagnostics.startup_phase.as_deref(), Some("leader_active"));
+        assert_eq!(diagnostics.leader, Some(true));
+        assert_eq!(diagnostics.convergence_enabled, Some(true));
+        assert_eq!(diagnostics.replay_in_progress, Some(false));
+        assert_eq!(
+            diagnostics.last_convergence_error.as_deref(),
+            Some("tcp_unreachable")
+        );
+        assert_eq!(
+            diagnostics.stall_threshold_ms,
+            Some(CONVERGENCE_STALLED_AFTER_MS)
+        );
+        assert!(stalled.cache_age_ms <= READYZ_CACHE_STALE_AFTER_MS);
+    }
+
+    #[test]
+    fn convergence_success_updates_checkpoint_and_readiness_cache() {
+        let root = test_root("convergence-success-updates-checkpoint-and-readiness-cache");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.refresh_readyz_cache();
+
+        let checkpoint = ConvergenceCheckpointStore::new(env)
+            .load()
+            .unwrap()
+            .expect("checkpoint should exist");
+        assert_eq!(
+            checkpoint.last_successful_convergence_unix,
+            daemon.convergence_last_success_unix
+        );
+        assert_eq!(
+            checkpoint.extra.get("readyz_status"),
+            Some(&Value::String("ready".into()))
+        );
+        assert!(checkpoint.extra.contains_key("convergence_domains"));
     }
 
     #[test]
@@ -4407,7 +4691,7 @@ pub mod daemon_refresh_loop_hardening {
         wait_until(|| {
             control_plane_cache
                 .read()
-                .map(|cache| cache.readyz.response.status == "degraded")
+                .map(|cache| cache.readyz.response.status == "ready")
                 .unwrap_or(false)
         });
 
@@ -5441,6 +5725,149 @@ mod daemon_control_plane_durability {
     }
 
     #[test]
+    fn stale_checkpoint_convergence_stalled_does_not_survive_fresh_success() {
+        let root = test_root("stale-checkpoint-convergence-stalled-does-not-survive-fresh-success");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        let stale_success = current_unix_timestamp().saturating_sub(60);
+        let node_id = local_node_id(&root);
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: stale_success,
+                last_successful_convergence_unix: Some(stale_success),
+                last_convergence_duration_ms: 10,
+                last_convergence_generation: None,
+                last_convergence_error: None,
+                active_generation: None,
+                health_state: RuntimeHealthState::Healthy,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                node_id: node_id.clone(),
+                lease_epoch: 1,
+                convergence_owner: node_id,
+                readyz_reasons: vec!["convergence stalled".into()],
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let readyz = daemon.readyz_response();
+        assert_eq!(readyz.status, "ready");
+        assert!(readyz.reasons.is_empty());
+        assert!(daemon.convergence_last_success_unix.unwrap() >= stale_success + 1);
+    }
+
+    #[test]
+    fn leader_active_triggers_immediate_convergence_after_restart() {
+        let root = test_root("leader-active-triggers-immediate-convergence-after-restart");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        let stale_success = current_unix_timestamp().saturating_sub(60);
+        let node_id = local_node_id(&root);
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: stale_success,
+                last_successful_convergence_unix: Some(stale_success),
+                last_convergence_duration_ms: 10,
+                last_convergence_generation: None,
+                last_convergence_error: None,
+                active_generation: None,
+                health_state: RuntimeHealthState::Healthy,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                node_id: node_id.clone(),
+                lease_epoch: 1,
+                convergence_owner: node_id,
+                readyz_reasons: Vec::new(),
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert_eq!(metrics.startup_phase, "leader_active");
+        assert!(metrics.leader);
+        assert_eq!(daemon.readyz_response().status, "ready");
+        assert!(metrics.convergence_last_success_unix.is_some());
+    }
+
+    #[test]
+    fn upgrade_restart_clears_stale_convergence_stalled() {
+        let root = test_root("upgrade-restart-clears-stale-convergence-stalled");
+        seed_project(&root);
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        let stale_success = current_unix_timestamp().saturating_sub(60);
+        let node_id = local_node_id(&root);
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                checkpointed_at_unix: stale_success,
+                last_successful_convergence_unix: Some(stale_success),
+                last_convergence_duration_ms: 10,
+                last_convergence_generation: Some(1),
+                last_convergence_error: Some("tcp_unreachable".into()),
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Healthy,
+                dependency_states: BTreeMap::new(),
+                breaker_states: BTreeMap::new(),
+                queue_depth_snapshot: 0,
+                node_id: node_id.clone(),
+                lease_epoch: 1,
+                convergence_owner: node_id,
+                readyz_reasons: vec!["convergence stalled".into()],
+                extra: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+
+        assert_eq!(daemon.readyz_response().status, "ready");
+        assert!(
+            !daemon
+                .readyz_response()
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "convergence_stalled")
+        );
+    }
+
+    #[test]
     fn stale_checkpoint_degrades_until_refresh() {
         let root = test_root("stale-checkpoint-degrades-until-refresh");
         seed_project(&root);
@@ -6049,6 +6476,38 @@ mod daemon_control_plane_durability {
     }
 
     #[test]
+    fn leader_true_but_convergence_disabled_reports_specific_reason() {
+        let root = test_root("leader-true-but-convergence-disabled-reports-specific-reason");
+        let mut daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        daemon.start().unwrap();
+        daemon.convergence_start_blocked = true;
+
+        daemon.refresh_readyz_cache();
+
+        let readiness = daemon.readyz_response();
+        let metrics = daemon.control_plane_snapshot().metrics;
+        assert!(metrics.leader);
+        assert_eq!(readiness.status, "degraded");
+        assert!(
+            readiness
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "convergence_disabled")
+        );
+        assert!(
+            !readiness
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "convergence_stalled")
+        );
+    }
+
+    #[test]
     fn follower_node_does_not_reconcile() {
         let root = test_root("follower-node-does-not-reconcile");
         let local_node = local_node_id(&root);
@@ -6634,6 +7093,67 @@ mod daemon_control_plane_durability {
         let metrics = daemon.control_plane_snapshot().metrics;
         assert!(metrics.replay_paused);
         assert!(metrics.convergence_start_blocked);
+        let readyz = daemon.readyz_response();
+        assert!(
+            readyz
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "replay_incomplete")
+        );
+        assert!(
+            !readyz
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "convergence_stalled")
+        );
+    }
+
+    #[test]
+    fn replay_complete_unblocks_convergence_tick() {
+        let root = test_root("replay-complete-unblocks-convergence-tick");
+        let mut config = config_with_root(root.clone());
+        config.startup_replay_max_duration_ms = 0;
+        let node_id = local_node_id(&root);
+        force_leader_lease(
+            &root,
+            &node_id,
+            current_unix_timestamp(),
+            LEADER_LEASE_TTL_SECONDS,
+            5,
+        );
+        seed_pending_promotion_intent(&root, &node_id, 5, 2);
+
+        let mut blocked = Daemon::new(
+            config,
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        blocked.start().unwrap();
+        assert!(
+            blocked
+                .readyz_response()
+                .reasons
+                .iter()
+                .any(|reason| reason.marker == "replay_incomplete")
+        );
+
+        std::fs::write(EnvironmentPaths::reconciliation_log_file(&root), "").unwrap();
+        let cursor = EnvironmentPaths::reconciliation_cursor_file(&root);
+        if cursor.exists() {
+            std::fs::remove_file(cursor).unwrap();
+        }
+
+        let mut restarted = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+        restarted.start().unwrap();
+        let readyz = restarted.readyz_response();
+        assert_eq!(readyz.status, "ready");
+        assert!(restarted.convergence_last_success_unix.is_some());
     }
 
     #[test]

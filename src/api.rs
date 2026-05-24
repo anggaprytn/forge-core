@@ -682,6 +682,26 @@ pub struct ReadyzReason {
     pub last_checked_unix: Option<u64>,
     #[serde(default)]
     pub cache_age_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<ReadyzReasonDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReadyzReasonDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_threshold_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_in_progress: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_convergence_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
