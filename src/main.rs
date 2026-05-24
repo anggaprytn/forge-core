@@ -1399,7 +1399,6 @@ fn resolve_local_config_path(
 }
 
 fn installed_server_config_path() -> PathBuf {
-    #[cfg(test)]
     if let Some(path) = env::var_os("FORGE_TEST_ETC_FORGE_CONF") {
         return PathBuf::from(path);
     }
