@@ -765,6 +765,7 @@ fn version_outputs_build_metadata() {
     assert!(body.contains("\"version\":"));
     assert!(body.contains(env!("CARGO_PKG_VERSION")));
     assert!(body.contains("\"git_commit\":"));
+    assert!(body.contains("\"git_dirty\":"));
     assert!(body.contains("\"build_timestamp\":"));
     assert!(body.contains("\"target_triple\":"));
 }

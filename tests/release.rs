@@ -29,6 +29,84 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+fn run_git(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn git_ok(root: &Path, args: &[&str]) {
+    let output = run_git(root, args);
+    assert!(
+        output.status.success(),
+        "git {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let output = run_git(root, args);
+    assert!(
+        output.status.success(),
+        "git {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn init_package_repo(name: &str) -> PathBuf {
+    let root = test_root(name);
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("deploy")).unwrap();
+    fs::create_dir_all(root.join("examples")).unwrap();
+    fs::create_dir_all(root.join("fake-bin")).unwrap();
+
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/package-release.sh"),
+        root.join("scripts/package-release.sh"),
+    )
+    .unwrap();
+    write_executable(
+        &root.join("install.sh"),
+        "#!/usr/bin/env bash\nset -euo pipefail\n",
+    );
+    fs::write(root.join("README.md"), "release notes\n").unwrap();
+    fs::write(
+        root.join("deploy/forge.conf.example"),
+        "storage_root=/tmp/forge\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("examples/forge.env.example"),
+        "FORGE_MASTER_KEY=replace-with-64-hex-characters\n",
+    )
+    .unwrap();
+    fs::write(root.join("LICENSE"), "license\n").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"forge_core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(root.join(".gitignore"), "dist/\ntarget/\ncargo-env.log\n").unwrap();
+    write_executable(
+        &root.join("fake-bin/cargo"),
+        "#!/usr/bin/env bash\nset -euo pipefail\ntriple=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--target\" ]; then\n    triple=\"$2\"\n    shift 2\n    continue\n  fi\n  shift\ndone\n[ -n \"$triple\" ] || { echo \"missing --target\" >&2; exit 1; }\nprintf '%s|%s|%s|%s\\n' \"${FORGE_GIT_COMMIT:-}\" \"${FORGE_GIT_DIRTY:-}\" \"${FORGE_BUILD_TIMESTAMP:-}\" \"${FORGE_TARGET_TRIPLE:-}\" >> cargo-env.log\nmkdir -p \"target/$triple/release\"\ncat > \"target/$triple/release/forge\" <<EOF\n#!/usr/bin/env bash\nif [ \"${1:-}\" = \"version\" ]; then\n  printf '%s\\n' '{\"version\":\"0.1.0\",\"git_commit\":\"${FORGE_GIT_COMMIT:-unknown}\",\"git_dirty\":\"${FORGE_GIT_DIRTY:-unknown}\",\"build_timestamp\":\"${FORGE_BUILD_TIMESTAMP:-unknown}\",\"target_triple\":\"${FORGE_TARGET_TRIPLE:-unknown}\",\"schema_versions\":{\"manifest_schema\":1,\"snapshot_schema\":1,\"checkpoint_schema\":1,\"reconciliation_log_schema\":1,\"storage_compatibility\":1}}'\nfi\nEOF\nchmod +x \"target/$triple/release/forge\"\n",
+    );
+
+    git_ok(&root, &["init"]);
+    git_ok(&root, &["config", "user.name", "Forge Tests"]);
+    git_ok(&root, &["config", "user.email", "forge-tests@example.com"]);
+    git_ok(&root, &["add", "."]);
+    git_ok(&root, &["commit", "-m", "initial"]);
+    root
+}
+
 fn make_fake_binary(path: &Path, version: &str) {
     make_fake_binary_with_schema(path, version, 1, 1, 1, 1, 1);
 }
@@ -214,6 +292,7 @@ fn package_release_creates_tarball() {
 
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
+        .arg("--allow-dirty")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("FORGE_PACKAGE_OUTPUT_DIR", root.join("dist"))
         .env("FORGE_PACKAGE_VERSION", "9.9.9")
@@ -234,6 +313,7 @@ fn package_release_creates_checksums() {
 
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
+        .arg("--allow-dirty")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("FORGE_PACKAGE_OUTPUT_DIR", root.join("dist"))
         .env("FORGE_PACKAGE_VERSION", "9.9.9")
@@ -255,6 +335,7 @@ fn package_release_includes_required_files() {
 
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
+        .arg("--allow-dirty")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("FORGE_PACKAGE_OUTPUT_DIR", root.join("dist"))
         .env("FORGE_PACKAGE_VERSION", "9.9.9")
@@ -279,6 +360,132 @@ fn package_release_includes_required_files() {
     assert!(extract.join("README.md").exists());
     assert!(extract.join("forge.conf.example").exists());
     assert!(extract.join("forge.env.example").exists());
+}
+
+#[test]
+fn package_release_injects_current_git_commit() {
+    let root = init_package_repo("package-injects-git-commit");
+    let expected_commit = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let output = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let env_log = fs::read_to_string(root.join("cargo-env.log")).unwrap();
+    let line = env_log.lines().last().unwrap();
+    let parts = line.split('|').collect::<Vec<_>>();
+    assert_eq!(parts[0], expected_commit);
+    assert_eq!(parts[1], "false");
+    assert_eq!(parts[3], "x86_64-unknown-linux-gnu");
+}
+
+#[test]
+fn package_release_refuses_dirty_tree_by_default() {
+    let root = init_package_repo("package-refuses-dirty");
+    fs::write(root.join("README.md"), "dirty release notes\n").unwrap();
+
+    let output = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("workspace is dirty"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn package_release_allows_dirty_tree_with_flag() {
+    let root = init_package_repo("package-allows-dirty");
+    fs::write(root.join("README.md"), "dirty release notes\n").unwrap();
+
+    let output = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .arg("--allow-dirty")
+        .current_dir(&root)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let env_log = fs::read_to_string(root.join("cargo-env.log")).unwrap();
+    let line = env_log.lines().last().unwrap();
+    let parts = line.split('|').collect::<Vec<_>>();
+    assert_eq!(parts[1], "true");
+}
+
+#[test]
+fn package_release_does_not_reuse_stale_git_commit() {
+    let root = init_package_repo("package-stale-git-commit");
+    let path_env = format!(
+        "{}:{}",
+        root.join("fake-bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let first_commit = git_stdout(&root, &["rev-parse", "HEAD"]);
+    let first = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .current_dir(&root)
+        .env("PATH", &path_env)
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+
+    fs::write(root.join("README.md"), "release notes v2\n").unwrap();
+    git_ok(&root, &["add", "README.md"]);
+    git_ok(&root, &["commit", "-m", "second"]);
+    let second_commit = git_stdout(&root, &["rev-parse", "HEAD"]);
+
+    let second = Command::new("bash")
+        .arg("scripts/package-release.sh")
+        .current_dir(&root)
+        .env("PATH", &path_env)
+        .env("FORGE_PACKAGE_TARGETS", "linux-amd64")
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+
+    let env_log = fs::read_to_string(root.join("cargo-env.log")).unwrap();
+    let commits = env_log
+        .lines()
+        .map(|line| line.split('|').next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(commits, vec![first_commit, second_commit.clone()]);
+    assert_ne!(commits[0], second_commit);
 }
 
 #[test]
@@ -1408,6 +1615,7 @@ fn package_release_child_process_timeout() {
 
     let output = Command::new("bash")
         .arg("scripts/package-release.sh")
+        .arg("--allow-dirty")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env(
             "PATH",

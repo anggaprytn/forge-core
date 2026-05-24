@@ -284,6 +284,7 @@ pub struct TokenRevokeResponse {
 pub struct ForgeVersionOutput {
     pub version: String,
     pub git_commit: String,
+    pub git_dirty: String,
     pub build_timestamp: String,
     pub target_triple: String,
     pub schema_versions: ForgeSchemaVersions,

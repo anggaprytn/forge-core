@@ -12,6 +12,8 @@ ENV_SRC="${FORGE_PACKAGE_ENV:-$REPO_ROOT/examples/forge.env.example}"
 LICENSE_SRC="${FORGE_PACKAGE_LICENSE:-$REPO_ROOT/LICENSE}"
 INSTALLER_SRC="$REPO_ROOT/install.sh"
 PACKAGE_TIMEOUT_SECS="${FORGE_PACKAGE_TIMEOUT_SECS:-1800}"
+ALLOW_DIRTY=0
+BUILD_TIMESTAMP="${FORGE_BUILD_TIMESTAMP:-}"
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -20,6 +22,12 @@ log() {
 die() {
   printf '[ERROR] %s\n' "$*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/package-release.sh [--allow-dirty]
+EOF
 }
 
 run_with_timeout() {
@@ -33,6 +41,24 @@ run_with_timeout() {
     die "$1 timed out after ${timeout_secs}s"
   fi
   return "$status"
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --allow-dirty)
+        ALLOW_DIRTY=1
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
 }
 
 sha256_file() {
@@ -68,15 +94,46 @@ target_triple() {
   esac
 }
 
+git_commit() {
+  git rev-parse HEAD 2>/dev/null | tr -d '\n'
+}
+
+git_dirty() {
+  local status
+  status="$(git status --porcelain --untracked-files=normal 2>/dev/null)" || return 1
+  if [ -n "$status" ]; then
+    printf '%s\n' "true"
+  else
+    printf '%s\n' "false"
+  fi
+}
+
+build_timestamp() {
+  if [ -n "$BUILD_TIMESTAMP" ]; then
+    printf '%s\n' "$BUILD_TIMESTAMP"
+    return 0
+  fi
+  date -u '+%s'
+}
+
 binary_path_for_target() {
   local target="$1"
   if [ -n "$BIN_DIR" ]; then
     printf '%s\n' "$BIN_DIR/$target/forge"
     return 0
   fi
-  local triple
+  local triple git_commit_value git_dirty_value build_timestamp_value
   triple="$(target_triple "$target")" || die "unsupported target label: $target"
-  run_with_timeout "$PACKAGE_TIMEOUT_SECS" cargo build --release --bin forge --target "$triple" >/dev/null
+  git_commit_value="${FORGE_GIT_COMMIT:-$(git_commit)}"
+  [ -n "$git_commit_value" ] || die "could not determine git commit"
+  git_dirty_value="${FORGE_GIT_DIRTY:-$(git_dirty || printf '%s' "unknown")}"
+  build_timestamp_value="$(build_timestamp)"
+  run_with_timeout "$PACKAGE_TIMEOUT_SECS" env \
+    FORGE_GIT_COMMIT="$git_commit_value" \
+    FORGE_GIT_DIRTY="$git_dirty_value" \
+    FORGE_BUILD_TIMESTAMP="$build_timestamp_value" \
+    FORGE_TARGET_TRIPLE="$triple" \
+    cargo build --release --bin forge --target "$triple" >/dev/null
   printf '%s\n' "$REPO_ROOT/target/$triple/release/forge"
 }
 
@@ -113,11 +170,25 @@ stage_target() {
 }
 
 main() {
+  local local_dirty
+  parse_args "$@"
   [ -n "$VERSION" ] || die "could not determine package version"
   [ -f "$INSTALLER_SRC" ] || die "missing installer: $INSTALLER_SRC"
   [ -f "$README_SRC" ] || die "missing README/RELEASE_NOTES: $README_SRC"
   [ -f "$CONFIG_SRC" ] || die "missing config example: $CONFIG_SRC"
   [ -f "$ENV_SRC" ] || die "missing env example: $ENV_SRC"
+
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    local_dirty="$(git_dirty || printf '%s' "unknown")"
+    if [ "$local_dirty" = "true" ] && [ "$ALLOW_DIRTY" -ne 1 ]; then
+      die "workspace is dirty; commit or stash changes, or rerun with --allow-dirty"
+    fi
+    FORGE_GIT_COMMIT="$(git_commit)"
+    export FORGE_GIT_COMMIT
+    FORGE_GIT_DIRTY="$local_dirty"
+    export FORGE_GIT_DIRTY
+  fi
+  [ -n "${FORGE_GIT_COMMIT:-}" ] || die "could not determine git commit"
 
   if [ -z "$TARGETS" ]; then
     TARGETS="$(host_targets | paste -sd, -)"

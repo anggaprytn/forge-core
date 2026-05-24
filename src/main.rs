@@ -3197,11 +3197,26 @@ fn run_whoami(parsed: &ParsedArgs) -> Result<(), CliError> {
 }
 
 fn forge_version_output() -> ForgeVersionOutput {
+    forge_version_output_with_metadata(
+        option_env!("FORGE_GIT_COMMIT"),
+        option_env!("FORGE_GIT_DIRTY"),
+        option_env!("FORGE_BUILD_TIMESTAMP"),
+        option_env!("FORGE_TARGET_TRIPLE"),
+    )
+}
+
+fn forge_version_output_with_metadata(
+    git_commit: Option<&str>,
+    git_dirty: Option<&str>,
+    build_timestamp: Option<&str>,
+    target_triple: Option<&str>,
+) -> ForgeVersionOutput {
     ForgeVersionOutput {
         version: env!("CARGO_PKG_VERSION").into(),
-        git_commit: build_metadata_value(option_env!("FORGE_GIT_COMMIT")),
-        build_timestamp: build_metadata_value(option_env!("FORGE_BUILD_TIMESTAMP")),
-        target_triple: build_metadata_value(option_env!("FORGE_TARGET_TRIPLE")),
+        git_commit: build_metadata_value(git_commit),
+        git_dirty: build_metadata_bool(git_dirty),
+        build_timestamp: build_metadata_value(build_timestamp),
+        target_triple: build_metadata_value(target_triple),
         schema_versions: ForgeSchemaVersions {
             manifest_schema: MANIFEST_SCHEMA_VERSION,
             snapshot_schema: SNAPSHOT_SCHEMA_VERSION,
@@ -3218,6 +3233,14 @@ fn build_metadata_value(value: Option<&str>) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn build_metadata_bool(value: Option<&str>) -> String {
+    match value.map(str::trim) {
+        Some("true") => "true".into(),
+        Some("false") => "false".into(),
+        _ => "unknown".into(),
+    }
 }
 
 fn run_gc_command(
@@ -4007,10 +4030,37 @@ mod tests {
     }
 
     #[test]
+    fn version_reports_injected_git_commit() {
+        let output = forge_version_output_with_metadata(
+            Some("abc123"),
+            Some("false"),
+            Some("1712345678"),
+            Some("x86_64-unknown-linux-gnu"),
+        );
+        assert_eq!(output.git_commit, "abc123");
+        assert_eq!(output.git_dirty, "false");
+        assert_eq!(output.build_timestamp, "1712345678");
+        assert_eq!(output.target_triple, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn version_reports_unknown_when_git_commit_missing() {
+        let output = forge_version_output_with_metadata(None, Some("maybe"), Some(""), Some(""));
+        assert_eq!(output.git_commit, "unknown");
+        assert_eq!(output.git_dirty, "unknown");
+        assert_eq!(output.build_timestamp, "unknown");
+        assert_eq!(output.target_triple, "unknown");
+    }
+
+    #[test]
     fn version_handles_missing_git_metadata() {
         assert_eq!(build_metadata_value(None), "unknown");
         assert_eq!(build_metadata_value(Some("")), "unknown");
         assert_eq!(build_metadata_value(Some("abc123")), "abc123");
+        assert_eq!(build_metadata_bool(None), "unknown");
+        assert_eq!(build_metadata_bool(Some("true")), "true");
+        assert_eq!(build_metadata_bool(Some("false")), "false");
+        assert_eq!(build_metadata_bool(Some("yes")), "unknown");
     }
 
     #[test]
