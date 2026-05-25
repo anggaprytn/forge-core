@@ -95,8 +95,8 @@ h3 {
 .gateway-body,
 .login-page {
   background:
-    radial-gradient(circle at top center, rgba(255, 255, 255, 0.07), transparent 34%),
-    linear-gradient(180deg, #060b11 0%, #09111a 55%, #0b1320 100%);
+    radial-gradient(circle at top center, rgba(255, 255, 255, 0.03), transparent 30%),
+    linear-gradient(180deg, #080c12 0%, #0b1017 52%, #0c121a 100%);
 }
 
 .console-shell,
@@ -675,44 +675,26 @@ h3 {
   color: var(--text-secondary);
 }
 
-.landing-shell,
-.login-shell {
+.entry-shell {
   width: min(100% - 32px, 1200px);
   min-height: 100vh;
   margin: 0 auto;
-  padding: 32px 0;
+  padding: 40px 0;
   display: grid;
   place-items: center;
 }
 
 .landing-frame,
 .login-card {
-  position: relative;
   width: 100%;
-  max-width: 760px;
+  max-width: 980px;
   display: grid;
-  gap: 24px;
-  padding: clamp(28px, 5vw, 56px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 28px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.025) 100%),
-    rgba(8, 17, 27, 0.72);
-  box-shadow:
-    0 20px 60px rgba(0, 0, 0, 0.28),
-    inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(18px);
-}
-
-.landing-frame::before,
-.login-card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.08), transparent 40%);
-  opacity: 0.8;
+  gap: 28px;
+  padding: clamp(28px, 4vw, 48px);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 24px;
+  background: rgba(12, 18, 26, 0.88);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
 }
 
 .landing-mark,
@@ -721,12 +703,12 @@ h3 {
   align-items: center;
   gap: 10px;
   width: fit-content;
-  padding: 10px 14px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.03);
-  color: rgba(227, 237, 248, 0.92);
-  font-size: 0.92rem;
+  background: rgba(255, 255, 255, 0.02);
+  color: rgba(227, 237, 248, 0.9);
+  font-size: 0.88rem;
   font-weight: 600;
   letter-spacing: 0.01em;
 }
@@ -743,13 +725,13 @@ h3 {
 .landing-copy,
 .login-copy {
   display: grid;
-  gap: 14px;
+  gap: 12px;
 }
 
 .landing-eyebrow,
 .login-eyebrow {
-  color: rgba(159, 177, 199, 0.9);
-  font-size: 0.82rem;
+  color: rgba(159, 177, 199, 0.84);
+  font-size: 0.78rem;
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -757,10 +739,10 @@ h3 {
 
 .landing-title,
 .login-title {
-  max-width: 12ch;
-  font-size: clamp(2.5rem, 6vw, 4.8rem);
-  line-height: 0.98;
-  letter-spacing: -0.055em;
+  max-width: 16ch;
+  font-size: clamp(2rem, 4vw, 3.4rem);
+  line-height: 1.02;
+  letter-spacing: -0.045em;
 }
 
 .landing-description,
@@ -769,10 +751,10 @@ h3 {
 .login-secondary .page-note,
 .login-secondary .env-list,
 .login-secondary .status-block {
-  max-width: 36rem;
-  color: rgba(227, 237, 248, 0.72);
-  font-size: 1rem;
-  line-height: 1.6;
+  max-width: 34rem;
+  color: rgba(227, 237, 248, 0.68);
+  font-size: 0.98rem;
+  line-height: 1.55;
 }
 
 .landing-actions,
@@ -787,19 +769,16 @@ h3 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 48px;
-  padding: 0 18px;
+  min-height: 44px;
+  padding: 0 16px;
   border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 999px;
-  background: #f5f7fb;
-  color: #08111b;
+  border-radius: 12px;
+  background: #eef2f7;
+  color: #0a1118;
   font: inherit;
   font-weight: 600;
   text-decoration: none;
-  transition:
-    transform 140ms ease,
-    box-shadow 140ms ease,
-    background-color 140ms ease;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .landing-button:hover,
@@ -807,47 +786,27 @@ h3 {
 .auth-primary-button:hover,
 .auth-primary-button:focus-visible {
   outline: none;
-  transform: translateY(-1px);
   background: #ffffff;
-  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.22);
-}
-
-.landing-trust {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.landing-trust li {
-  min-height: 100%;
-  padding: 16px 18px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.03);
-  color: rgba(227, 237, 248, 0.78);
-  line-height: 1.5;
+  border-color: rgba(255, 255, 255, 0.22);
 }
 
 .login-card {
-  max-width: 520px;
-  gap: 20px;
+  max-width: 460px;
+  gap: 22px;
 }
 
 .login-title {
-  max-width: 10ch;
-  font-size: clamp(2.2rem, 5vw, 3.6rem);
+  max-width: none;
+  font-size: clamp(1.8rem, 4vw, 2.6rem);
 }
 
 .login-description {
-  max-width: 26rem;
+  max-width: 20rem;
 }
 
 .login-secondary {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .login-secondary:empty {
@@ -855,34 +814,108 @@ h3 {
 }
 
 .login-secondary .status-block {
-  padding: 14px 16px;
-  border: 1px solid rgba(243, 196, 106, 0.18);
-  border-radius: 16px;
-  background: rgba(243, 196, 106, 0.08);
+  padding: 12px 14px;
+  border: 1px solid rgba(243, 196, 106, 0.16);
+  border-radius: 12px;
+  background: rgba(243, 196, 106, 0.07);
   color: #f3c46a;
 }
 
 .login-secondary .page-note {
-  color: rgba(227, 237, 248, 0.6);
+  color: rgba(227, 237, 248, 0.56);
 }
 
 .login-secondary .env-list {
   display: grid;
-  gap: 8px;
+  gap: 6px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
 .login-secondary .env-list li {
-  padding: 10px 12px;
+  padding: 9px 11px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
-  color: rgba(227, 237, 248, 0.72);
+  background: rgba(255, 255, 255, 0.02);
+  color: rgba(227, 237, 248, 0.66);
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
   font-size: 0.82rem;
   line-height: 1.5;
+}
+
+.entry-mark-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.entry-meta,
+.landing-footnote {
+  color: rgba(159, 177, 199, 0.62);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.landing-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(240px, 0.85fr);
+  gap: 28px;
+  align-items: end;
+}
+
+.landing-preview {
+  display: grid;
+}
+
+.preview-panel {
+  display: grid;
+  gap: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.preview-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.preview-row:first-child {
+  border-top: 0;
+}
+
+.preview-label {
+  color: rgba(159, 177, 199, 0.76);
+  font-size: 0.88rem;
+}
+
+.preview-value {
+  color: var(--text);
+  font-size: 0.92rem;
+  font-weight: 500;
+  text-align: right;
+}
+
+.preview-value.is-ok {
+  color: var(--success);
+}
+
+.landing-trust {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: rgba(159, 177, 199, 0.72);
+  font-size: 0.88rem;
 }
 
 @media (max-width: 1080px) {
@@ -890,7 +923,8 @@ h3 {
   .gateway-grid,
   .access-grid,
   .command-strip,
-  .inventory-toolbar {
+  .inventory-toolbar,
+  .landing-layout {
     grid-template-columns: 1fr;
   }
 
@@ -941,8 +975,7 @@ h3 {
     grid-template-columns: 1fr;
   }
 
-  .landing-shell,
-  .login-shell {
+  .entry-shell {
     width: min(100% - 20px, 1200px);
     padding: 20px 0;
   }
@@ -951,10 +984,11 @@ h3 {
   .login-card {
     gap: 18px;
     padding: 22px;
-    border-radius: 22px;
+    border-radius: 20px;
   }
 
-  .landing-trust {
-    grid-template-columns: 1fr;
+  .entry-mark-row {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

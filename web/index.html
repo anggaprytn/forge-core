@@ -8,26 +8,53 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body class="gateway-body">
-    <main class="landing-shell">
+    <main class="entry-shell">
       <section class="landing-frame" aria-labelledby="landing-title">
-        <div class="landing-mark">
-          <span class="landing-mark-dot" aria-hidden="true"></span>
-          <span>Forge</span>
+        <div class="entry-mark-row">
+          <div class="landing-mark">
+            <span class="landing-mark-dot" aria-hidden="true"></span>
+            <span>Forge</span>
+          </div>
+          <p class="entry-meta">Control plane</p>
         </div>
-        <div class="landing-copy">
-          <p class="landing-eyebrow">Runtime control plane</p>
-          <h1 id="landing-title" class="landing-title">Operate every environment with clarity.</h1>
-          <p class="landing-description">
-            Forge gives operators one calm surface for readiness, inventory, and deployment context.
-          </p>
+
+        <div class="landing-layout">
+          <div class="landing-copy">
+            <p class="landing-eyebrow">Operator workspace</p>
+            <h1 id="landing-title" class="landing-title">See the state. Act with context.</h1>
+            <p class="landing-description">Readiness, inventory, and deployment lanes in one quiet surface.</p>
+            <div class="landing-actions">
+              <a class="landing-button" href="/login">Open Forge</a>
+            </div>
+            <p class="landing-footnote">GitHub sign-in. CLI and API stay primary for execution.</p>
+          </div>
+
+          <aside class="landing-preview" aria-label="Product preview">
+            <div class="preview-panel">
+              <div class="preview-row">
+                <span class="preview-label">Control plane</span>
+                <span class="preview-value is-ok">Live</span>
+              </div>
+              <div class="preview-row">
+                <span class="preview-label">Blockers</span>
+                <span class="preview-value">2 active</span>
+              </div>
+              <div class="preview-row">
+                <span class="preview-label">Projects</span>
+                <span class="preview-value">24 tracked</span>
+              </div>
+              <div class="preview-row">
+                <span class="preview-label">Focus</span>
+                <span class="preview-value">Environment lanes</span>
+              </div>
+            </div>
+          </aside>
         </div>
-        <div class="landing-actions">
-          <a class="landing-button" href="/login">Open operator access</a>
-        </div>
-        <ul class="landing-trust" aria-label="Core product value">
-          <li>Readiness without noise</li>
-          <li>Project and environment context in one place</li>
-          <li>CLI and API remain the execution path</li>
+
+        <ul class="landing-trust" aria-label="Product attributes">
+          <li>Fast to scan</li>
+          <li>Built for repeat use</li>
+          <li>Operational by default</li>
         </ul>
       </section>
     </main>
