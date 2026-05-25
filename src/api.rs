@@ -517,6 +517,48 @@ pub struct EnvironmentVariableReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvInventoryCell {
+    pub exists: bool,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvInventoryVariable {
+    pub key: String,
+    pub environments: BTreeMap<String, EnvInventoryCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvInventoryEnvironmentSource {
+    pub environment: String,
+    pub source_kind: String,
+    pub source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvInventoryResponse {
+    pub project_id: String,
+    pub source_kind: String,
+    pub source_label: String,
+    pub partial_metadata: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_metadata_notice: Option<String>,
+    #[serde(default)]
+    pub environments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+    pub total_variables: usize,
+    #[serde(default)]
+    pub variables: Vec<EnvInventoryVariable>,
+    #[serde(default)]
+    pub environment_sources: Vec<EnvInventoryEnvironmentSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventList {
     pub events: Vec<EventRecord>,
 }

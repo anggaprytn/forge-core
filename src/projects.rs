@@ -93,6 +93,10 @@ impl ProjectRegistryStore {
         }
     }
 
+    pub fn storage_root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn upsert(
         &self,
         request: ProjectUpsertRequest,

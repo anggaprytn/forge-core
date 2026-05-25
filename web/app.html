@@ -142,6 +142,52 @@
           <article class="detail-panel panel-surface" aria-labelledby="signals-title">
             <div class="section-head">
               <div>
+                <p class="eyebrow">Env inventory</p>
+                <h2 id="env-inventory-title">Masked keys across lanes</h2>
+              </div>
+              <span id="env-total-chip" class="status-chip">0 vars</span>
+            </div>
+
+            <div class="env-toolbar">
+              <label class="search-field env-search" for="env-key-search">
+                <span>Search key</span>
+                <input id="env-key-search" type="search" placeholder="APP_NAME, DATABASE_URL">
+              </label>
+              <label id="env-service-filter" class="search-field env-service-filter" for="env-service-select" hidden>
+                <span>Service</span>
+                <select id="env-service-select">
+                  <option value="">All services</option>
+                </select>
+              </label>
+            </div>
+
+            <div id="env-inventory-meta" class="env-meta" hidden>
+              <p id="env-source-label" class="env-source-label">Unknown source</p>
+              <p id="env-source-note" class="env-source-note">Masked values only.</p>
+            </div>
+
+            <div id="env-inventory-state" class="inline-state">Select a project to inspect masked environment keys.</div>
+
+            <div id="env-inventory" class="env-inventory" hidden>
+              <div class="env-table-scroll">
+                <table class="env-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Variable key</th>
+                      <th scope="col">Development</th>
+                      <th scope="col">Staging</th>
+                      <th scope="col">Production</th>
+                    </tr>
+                  </thead>
+                  <tbody id="env-table-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </article>
+
+          <article class="detail-panel panel-surface" aria-labelledby="signals-title">
+            <div class="section-head">
+              <div>
                 <p class="eyebrow">Signals</p>
                 <h2 id="signals-title">Latest blockers</h2>
               </div>

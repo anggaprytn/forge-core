@@ -197,6 +197,69 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/env:
+    get:
+      summary: Get masked environment inventory across development, staging, and production
+      operationId: getProjectEnvInventory
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Masked environment inventory
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeEnvInventory'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/env/{environment}:
+    get:
+      summary: Get masked environment inventory for one environment
+      operationId: getProjectEnvInventoryEnvironment
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: environment
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Masked environment inventory
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeEnvInventory'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project or environment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/projects/{project_id}/environments/{environment}/status:
     get:
       summary: Get runtime status for one project environment
@@ -1122,6 +1185,83 @@ components:
           type: boolean
         probe_flapping:
           type: boolean
+    EnvInventoryCell:
+      type: object
+      required: [exists, value]
+      properties:
+        exists:
+          type: boolean
+        value:
+          type: string
+    EnvInventoryVariable:
+      type: object
+      required: [key, environments]
+      properties:
+        key:
+          type: string
+        environments:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/EnvInventoryCell'
+    EnvInventoryEnvironmentSource:
+      type: object
+      required: [environment, source_kind, source_label]
+      properties:
+        environment:
+          type: string
+        source_kind:
+          type: string
+        source_label:
+          type: string
+        generation:
+          type: integer
+          format: int64
+          nullable: true
+        deployment_id:
+          type: string
+          nullable: true
+    EnvInventoryResponse:
+      type: object
+      required:
+        - project_id
+        - source_kind
+        - source_label
+        - partial_metadata
+        - environments
+        - services
+        - total_variables
+        - variables
+        - environment_sources
+      properties:
+        project_id:
+          type: string
+        source_kind:
+          type: string
+        source_label:
+          type: string
+        partial_metadata:
+          type: boolean
+        partial_metadata_notice:
+          type: string
+          nullable: true
+        environments:
+          type: array
+          items:
+            type: string
+        services:
+          type: array
+          items:
+            type: string
+        total_variables:
+          type: integer
+        variables:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvInventoryVariable'
+        environment_sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvInventoryEnvironmentSource'
     BackupVolumeRecord:
       type: object
       required:
@@ -1383,6 +1523,13 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/ProjectList'}
+    SuccessEnvelopeEnvInventory:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/EnvInventoryResponse'}
     SuccessEnvelopeDeploymentStatus:
       type: object
       required: [request_id, correlation_id, data]

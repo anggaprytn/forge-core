@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::api::{
     ContainerRuntimeDiagnostics, ConvergenceDomainSummary, DeploymentHistoryEntry,
-    DeploymentHistoryResponse, EnvironmentDiagnostics, EnvironmentDiffEntry,
+    DeploymentHistoryResponse, EnvInventoryCell, EnvInventoryEnvironmentSource,
+    EnvInventoryResponse, EnvInventoryVariable, EnvironmentDiagnostics, EnvironmentDiffEntry,
     EnvironmentDiffResponse, EnvironmentDiffSummary, EnvironmentValueChange,
     EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse, NodeInfo,
     ProbeStabilityDiagnostics, ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction,
@@ -28,7 +29,7 @@ use crate::runtime::{
 };
 use crate::runtime_env::restore_runtime_env;
 use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
-use crate::secrets::SecretStore;
+use crate::secrets::{SecretStore, unseal_value};
 use crate::storage::{
     ControlPlaneSnapshotStore, ConvergenceCheckpointStore, DeploymentLifecycleState,
     DiagnosticsStore, EnvironmentPaths, GcStore, GenerationHistoryRecord, NodeMetadataStore,
@@ -53,6 +54,11 @@ const PROBE_MIN_SAMPLES_FOR_RATE: usize = 4;
 const PROBE_MIN_FAILURES_FOR_FLAPPING: usize = 2;
 const PROBE_MIN_ALTERNATIONS_FOR_FLAPPING: usize = 3;
 const PROBE_SUCCESS_RATE_THRESHOLD: f64 = 0.75;
+const INVENTORY_ENVIRONMENTS: [&str; 3] = ["development", "staging", "production"];
+const SEALED_GENERATION_SNAPSHOT_SOURCE: &str = "sealed_generation_snapshot";
+const LATEST_CONFIGURED_ENV_STORE_SOURCE: &str = "latest_configured_env_store";
+const UNKNOWN_ENV_SOURCE: &str = "unknown";
+const PARTIAL_METADATA_NOTICE: &str = "Only sealed generation snapshots are available. Values shown may reflect the latest deployed generation, not unapplied future configuration.";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RepairEventBuckets {
@@ -1384,6 +1390,302 @@ pub fn load_project_environment_env_report(
         domain: snapshot.domain,
         values,
     })
+}
+
+#[derive(Debug, Clone)]
+struct EnvironmentInventorySnapshot {
+    source_kind: String,
+    source_label: String,
+    generation: Option<u64>,
+    deployment_id: Option<String>,
+    values: BTreeMap<String, String>,
+}
+
+pub fn mask_env_inventory_value(value: Option<&str>) -> String {
+    match value {
+        None => "missing".into(),
+        Some("") => "<empty>".into(),
+        Some(raw) => {
+            let chars = raw.chars().collect::<Vec<_>>();
+            let len = chars.len();
+            if len <= 4 {
+                "****".into()
+            } else if len <= 8 {
+                format!("{}*****{}", chars[0], chars[len - 1])
+            } else {
+                format!(
+                    "{}{}{}*****{}{}",
+                    chars[0],
+                    chars[1],
+                    chars[2],
+                    chars[len - 2],
+                    chars[len - 1]
+                )
+            }
+        }
+    }
+}
+
+pub fn load_project_env_inventory_report(
+    storage_root: &Path,
+    secret_store: &SecretStore,
+    project_id: &str,
+    environment: Option<&str>,
+) -> Result<EnvInventoryResponse, ProjectStatusError> {
+    let environments = match environment {
+        Some(value) => {
+            if !matches!(value, "development" | "staging" | "production") {
+                return Err(ProjectStatusError::InvalidEnvironment);
+            }
+            vec![value.to_string()]
+        }
+        None => INVENTORY_ENVIRONMENTS
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+    };
+
+    ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ProjectStatusError::ProjectLookup(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?
+        .ok_or(ProjectStatusError::ProjectNotFound)?;
+
+    let mut keys = BTreeSet::new();
+    let mut snapshots = Vec::new();
+
+    for env_name in &environments {
+        let snapshot =
+            load_environment_inventory_snapshot(storage_root, secret_store, project_id, env_name)?;
+        keys.extend(snapshot.values.keys().cloned());
+        snapshots.push((env_name.clone(), snapshot));
+    }
+
+    let variables = keys
+        .into_iter()
+        .map(|key| {
+            let mut cells = BTreeMap::new();
+            for (env_name, snapshot) in &snapshots {
+                let exists = snapshot.values.contains_key(&key);
+                let value = snapshot
+                    .values
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| "missing".into());
+                cells.insert(env_name.clone(), EnvInventoryCell { exists, value });
+            }
+            EnvInventoryVariable {
+                key,
+                environments: cells,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let environment_sources = snapshots
+        .iter()
+        .map(|(env_name, snapshot)| EnvInventoryEnvironmentSource {
+            environment: env_name.clone(),
+            source_kind: snapshot.source_kind.clone(),
+            source_label: snapshot.source_label.clone(),
+            generation: snapshot.generation,
+            deployment_id: snapshot.deployment_id.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let source_kind = if snapshots
+        .iter()
+        .all(|(_, snapshot)| snapshot.source_kind == SEALED_GENERATION_SNAPSHOT_SOURCE)
+    {
+        SEALED_GENERATION_SNAPSHOT_SOURCE.to_string()
+    } else if snapshots
+        .iter()
+        .all(|(_, snapshot)| snapshot.source_kind == LATEST_CONFIGURED_ENV_STORE_SOURCE)
+    {
+        LATEST_CONFIGURED_ENV_STORE_SOURCE.to_string()
+    } else if snapshots
+        .iter()
+        .all(|(_, snapshot)| snapshot.source_kind == UNKNOWN_ENV_SOURCE)
+    {
+        UNKNOWN_ENV_SOURCE.to_string()
+    } else {
+        "mixed".into()
+    };
+    let source_label = match source_kind.as_str() {
+        SEALED_GENERATION_SNAPSHOT_SOURCE => "Current sealed generation snapshot".into(),
+        LATEST_CONFIGURED_ENV_STORE_SOURCE => "Latest configured env store".into(),
+        UNKNOWN_ENV_SOURCE => "Unknown source".into(),
+        _ => "Mixed sources".into(),
+    };
+    let partial_metadata = snapshots
+        .iter()
+        .any(|(_, snapshot)| snapshot.source_kind == SEALED_GENERATION_SNAPSHOT_SOURCE);
+
+    Ok(EnvInventoryResponse {
+        project_id: project_id.to_string(),
+        source_kind,
+        source_label,
+        partial_metadata,
+        partial_metadata_notice: partial_metadata.then(|| PARTIAL_METADATA_NOTICE.to_string()),
+        environments,
+        services: Vec::new(),
+        total_variables: variables.len(),
+        variables,
+        environment_sources,
+    })
+}
+
+fn load_environment_inventory_snapshot(
+    storage_root: &Path,
+    secret_store: &SecretStore,
+    project_id: &str,
+    environment: &str,
+) -> Result<EnvironmentInventorySnapshot, ProjectStatusError> {
+    let env = EnvironmentPaths::new(storage_root, project_id, environment);
+    env.ensure_exists()?;
+
+    let secret_listing = secret_store
+        .list_environment_secrets(project_id, environment)
+        .map_err(secret_store_error)?;
+    let secret_keys = secret_listing
+        .secrets
+        .into_iter()
+        .map(|entry| entry.key)
+        .collect::<BTreeSet<_>>();
+
+    let generation = load_environment_active_generation(&env)?;
+    let snapshot = generation
+        .map(|value| load_generation_runtime_env_snapshot(&env, value))
+        .transpose()?
+        .flatten();
+    let resolved = generation
+        .map(|value| load_generation_resolved_runtime(&env, value))
+        .transpose()?
+        .flatten();
+
+    if let Some(snapshot) = snapshot {
+        let mut values = BTreeMap::new();
+        let mut keys = snapshot.entries.keys().cloned().collect::<BTreeSet<_>>();
+        keys.extend(secret_keys);
+        if let Some(resolved) = resolved.as_ref() {
+            keys.extend(resolved.entries.keys().cloned());
+        }
+
+        for key in keys {
+            if let Some(masked) = resolve_inventory_masked_value(
+                secret_store,
+                project_id,
+                environment,
+                &key,
+                snapshot.entries.get(&key),
+                resolved.as_ref().and_then(|value| value.entries.get(&key)),
+            )? {
+                values.insert(key, masked);
+            }
+        }
+
+        return Ok(EnvironmentInventorySnapshot {
+            source_kind: SEALED_GENERATION_SNAPSHOT_SOURCE.into(),
+            source_label: "Current sealed generation snapshot".into(),
+            generation: Some(snapshot.generation),
+            deployment_id: Some(snapshot.deployment_id),
+            values,
+        });
+    }
+
+    if !secret_keys.is_empty() {
+        let mut values = BTreeMap::new();
+        for key in secret_keys {
+            let current = secret_store
+                .current_secret_value(project_id, environment, &key)
+                .map_err(secret_store_error)?;
+            values.insert(
+                key,
+                current
+                    .as_deref()
+                    .map(|value| mask_env_inventory_value(Some(value)))
+                    .unwrap_or_else(|| "****".into()),
+            );
+        }
+        return Ok(EnvironmentInventorySnapshot {
+            source_kind: LATEST_CONFIGURED_ENV_STORE_SOURCE.into(),
+            source_label: "Latest configured env store".into(),
+            generation: None,
+            deployment_id: None,
+            values,
+        });
+    }
+
+    Ok(EnvironmentInventorySnapshot {
+        source_kind: UNKNOWN_ENV_SOURCE.into(),
+        source_label: "Unknown source".into(),
+        generation: generation,
+        deployment_id: None,
+        values: BTreeMap::new(),
+    })
+}
+
+fn resolve_inventory_masked_value(
+    secret_store: &SecretStore,
+    project_id: &str,
+    environment: &str,
+    key: &str,
+    snapshot_entry: Option<&crate::storage::PersistedRuntimeEnvEntry>,
+    resolved_entry: Option<&crate::storage::PersistedResolvedRuntimeEntry>,
+) -> Result<Option<String>, ProjectStatusError> {
+    if let Some(entry) = snapshot_entry {
+        if let Some(value) = entry.value.as_deref() {
+            return Ok(Some(mask_env_inventory_value(Some(value))));
+        }
+    }
+
+    if let Some(entry) = resolved_entry {
+        if let Some(value) = entry.value.as_deref() {
+            if value != "<secret>" {
+                return Ok(Some(mask_env_inventory_value(Some(value))));
+            }
+        }
+        if let Some(sealed) = entry.sealed_value.as_ref() {
+            if let Ok(value) = unseal_value(sealed) {
+                return Ok(Some(mask_env_inventory_value(Some(&value))));
+            }
+        }
+    }
+
+    let secret_key = snapshot_entry
+        .and_then(|entry| {
+            entry
+                .secret_reference
+                .as_ref()
+                .map(|reference| reference.key.clone())
+        })
+        .or_else(|| {
+            resolved_entry.and_then(|entry| {
+                entry
+                    .secret_reference
+                    .as_ref()
+                    .map(|reference| reference.key.clone())
+            })
+        })
+        .unwrap_or_else(|| key.to_string());
+    let current = secret_store
+        .current_secret_value(project_id, environment, &secret_key)
+        .map_err(secret_store_error)?;
+    if let Some(value) = current.as_deref() {
+        return Ok(Some(mask_env_inventory_value(Some(value))));
+    }
+
+    if snapshot_entry.is_some() || resolved_entry.is_some() {
+        return Ok(Some("****".into()));
+    }
+
+    Ok(None)
+}
+
+fn secret_store_error(err: crate::secrets::SecretError) -> ProjectStatusError {
+    ProjectStatusError::ProjectLookup(format!("env inventory unavailable: {err}"))
 }
 
 pub fn load_environment_diff(
@@ -4957,6 +5259,146 @@ mod tests {
                 .generated_forge_vars["FORGE_PROJECT_ID"],
             "api"
         );
+    }
+
+    #[test]
+    fn env_inventory_masking_rules_are_deterministic() {
+        assert_eq!(mask_env_inventory_value(None), "missing");
+        assert_eq!(mask_env_inventory_value(Some("")), "<empty>");
+        assert_eq!(mask_env_inventory_value(Some("abc")), "****");
+        assert_eq!(mask_env_inventory_value(Some("abcdef")), "a*****f");
+        assert_eq!(mask_env_inventory_value(Some("abcdefghijk")), "abc*****jk");
+    }
+
+    #[test]
+    fn env_inventory_masks_values_and_exposes_only_masked_output() {
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        let root = test_root("env-inventory-masks-values-and-exposes-only-masked-output");
+        register_project(&root, "api", "api.example.com");
+        write_generation_with_runtime(
+            &root,
+            7,
+            "https://api.example.com",
+            "DATABASE_URL",
+            "postgres://super-secret",
+        );
+
+        let env = EnvironmentPaths::new(&root, "api", "staging");
+        atomic_write(env.current_pointer(), b"7\n").unwrap();
+        atomic_write(env.promoted_pointer(), b"7\n").unwrap();
+        let snapshot_path = env.generation_dir(7).join("runtime_env_snapshot.json");
+        let resolved_path = env.generation_dir(7).join("resolved_runtime.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&snapshot_path).unwrap()).unwrap();
+        let snapshot_entries = snapshot["entries"].as_object_mut().unwrap();
+        snapshot_entries.insert(
+            "APP_NAME".into(),
+            serde_json::json!({
+                "source": "forge_yaml",
+                "value": "FLEETSTAG",
+                "sensitive": false,
+                "redacted": false
+            }),
+        );
+        snapshot_entries.insert(
+            "EMPTY_VALUE".into(),
+            serde_json::json!({
+                "source": "forge_yaml",
+                "value": "",
+                "sensitive": false,
+                "redacted": false
+            }),
+        );
+        snapshot_entries.insert(
+            "SHORTY".into(),
+            serde_json::json!({
+                "source": "forge_yaml",
+                "value": "abc",
+                "sensitive": false,
+                "redacted": false
+            }),
+        );
+        atomic_write(
+            &snapshot_path,
+            format!("{}\n", serde_json::to_string_pretty(&snapshot).unwrap()).as_bytes(),
+        )
+        .unwrap();
+
+        let mut resolved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&resolved_path).unwrap()).unwrap();
+        let resolved_entries = resolved["entries"].as_object_mut().unwrap();
+        resolved_entries.insert(
+            "APP_NAME".into(),
+            serde_json::json!({
+                "source": "forge_yaml",
+                "value": "FLEETSTAG",
+                "sensitive": false
+            }),
+        );
+        resolved_entries.insert(
+            "EMPTY_VALUE".into(),
+            serde_json::json!({
+                "source": "forge_yaml",
+                "value": "",
+                "sensitive": false
+            }),
+        );
+        resolved_entries.insert(
+            "SHORTY".into(),
+            serde_json::json!({
+                "source": "forge_yaml",
+                "value": "abc",
+                "sensitive": false
+            }),
+        );
+        atomic_write(
+            &resolved_path,
+            format!("{}\n", serde_json::to_string_pretty(&resolved).unwrap()).as_bytes(),
+        )
+        .unwrap();
+
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        let inventory =
+            load_project_env_inventory_report(&root, &store, "api", Some("staging")).unwrap();
+        let rendered = serde_json::to_string(&inventory).unwrap();
+
+        assert_eq!(inventory.total_variables, 5);
+        assert!(
+            inventory
+                .variables
+                .iter()
+                .any(|entry| entry.key == "EMPTY_VALUE"
+                    && entry.environments["staging"].value == "<empty>")
+        );
+        assert!(
+            inventory
+                .variables
+                .iter()
+                .any(|entry| entry.key == "SHORTY"
+                    && entry.environments["staging"].value == "****")
+        );
+        assert!(
+            inventory
+                .variables
+                .iter()
+                .any(|entry| entry.key == "APP_NAME"
+                    && entry.environments["staging"].value == "FLE*****AG")
+        );
+        assert!(
+            inventory
+                .variables
+                .iter()
+                .any(|entry| entry.key == "DATABASE_URL"
+                    && entry.environments["staging"].value == "pos*****et")
+        );
+        assert!(!rendered.contains("FLEETSTAG"));
+        assert!(!rendered.contains("postgres://super-secret"));
+        assert!(!rendered.contains("https://api.example.com"));
     }
 
     #[test]

@@ -7,11 +7,15 @@ const API_PATHS = {
   projectEnvironments(projectId) {
     return `/api/projects/${encodeURIComponent(projectId)}/environments`;
   },
+  projectEnvInventory(projectId) {
+    return `/api/projects/${encodeURIComponent(projectId)}/env`;
+  },
 };
 
 const uiState = {
   query: "",
   selectedProjectId: "",
+  envQuery: "",
 };
 
 const dataState = {
@@ -21,6 +25,7 @@ const dataState = {
   timeline: null,
   projects: [],
   environmentsByProject: new Map(),
+  envInventoryByProject: new Map(),
 };
 
 function element(id) {
@@ -192,6 +197,15 @@ function selectedProject() {
   return projectList().find((project) => project.project_id === uiState.selectedProjectId) || null;
 }
 
+function filteredEnvVariables(inventory) {
+  const variables = inventory && Array.isArray(inventory.variables) ? inventory.variables : [];
+  const query = lower(uiState.envQuery);
+  if (!query) {
+    return variables;
+  }
+  return variables.filter((entry) => lower(entry.key).includes(query));
+}
+
 function activeTimelineEntries() {
   const entries = dataState.timeline && Array.isArray(dataState.timeline.entries)
     ? dataState.timeline.entries
@@ -338,6 +352,23 @@ async function ensureProjectEnvironments(projectId) {
   }
 }
 
+async function ensureProjectEnvInventory(projectId) {
+  if (!projectId) {
+    return null;
+  }
+  if (dataState.envInventoryByProject.has(projectId)) {
+    return dataState.envInventoryByProject.get(projectId) || null;
+  }
+
+  try {
+    const payload = await fetchApiData(API_PATHS.projectEnvInventory(projectId));
+    dataState.envInventoryByProject.set(projectId, payload);
+    return payload;
+  } catch (_error) {
+    throw new Error("Env inventory unavailable.");
+  }
+}
+
 function appendMeta(container, label, value) {
   const wrapper = document.createElement("div");
   const term = document.createElement("dt");
@@ -400,6 +431,107 @@ function environmentCard(environment) {
   return card;
 }
 
+function envColumnNames(inventory) {
+  const environments = inventory && Array.isArray(inventory.environments) ? inventory.environments : [];
+  return environments.length ? environments : ["development", "staging", "production"];
+}
+
+function setEnvSourceMeta(inventory) {
+  const note = inventory && inventory.partial_metadata_note
+    ? inventory.partial_metadata_note
+    : inventory && inventory.partial_metadata_notice
+      ? inventory.partial_metadata_notice
+      : "Masked values only.";
+  element("env-source-label").textContent = inventory ? text(inventory.source_label) : "Unknown source";
+  element("env-source-note").textContent = note;
+  show("env-inventory-meta");
+}
+
+function renderEnvInventory(inventory) {
+  const table = element("env-inventory");
+  const body = element("env-table-body");
+  const chip = element("env-total-chip");
+  const filter = filteredEnvVariables(inventory);
+  const total = inventory && typeof inventory.total_variables === "number"
+    ? inventory.total_variables
+    : 0;
+  const environments = envColumnNames(inventory);
+
+  clearChildren(body);
+  hide("env-inventory");
+  hide("env-inventory-meta");
+
+  if (!inventory || !total) {
+    chip.textContent = "0 vars";
+    showState("env-inventory-state", "No environment variables recorded for this project yet.");
+    return;
+  }
+
+  setEnvSourceMeta(inventory);
+  chip.textContent = uiState.envQuery && filter.length !== total
+    ? `${filter.length}/${total} vars`
+    : `${total} vars`;
+
+  if (!filter.length) {
+    showState("env-inventory-state", "No environment variable matches that search.");
+    return;
+  }
+
+  hideState("env-inventory-state");
+  show("env-inventory");
+
+  for (const row of filter) {
+    const tr = document.createElement("tr");
+    const keyCell = document.createElement("th");
+    keyCell.scope = "row";
+    keyCell.className = "env-key";
+    keyCell.textContent = row.key;
+    tr.appendChild(keyCell);
+
+    for (const environment of environments) {
+      const td = document.createElement("td");
+      const wrapper = document.createElement("div");
+      wrapper.className = "env-cell";
+
+      const cell = row.environments && row.environments[environment]
+        ? row.environments[environment]
+        : { exists: false, value: "missing" };
+
+      const presence = document.createElement("div");
+      presence.className = `env-presence ${cell.exists ? "exists" : "missing"}`;
+      const dot = document.createElement("span");
+      dot.className = "env-presence-dot";
+      const label = document.createElement("span");
+      label.textContent = cell.exists ? "present" : "missing";
+      presence.append(dot, label);
+
+      const value = document.createElement("p");
+      value.className = `env-value${cell.exists ? "" : " missing"}`;
+      value.textContent = text(cell.value, "missing");
+
+      wrapper.append(presence, value);
+      td.appendChild(wrapper);
+      tr.appendChild(td);
+    }
+
+    body.appendChild(tr);
+  }
+
+  if (table) {
+    const headCells = table.querySelectorAll("thead th");
+    if (headCells.length >= 4) {
+      headCells[1].textContent = "Development";
+      headCells[2].textContent = "Staging";
+      headCells[3].textContent = "Production";
+      environments.forEach((environment, index) => {
+        if (headCells[index + 1]) {
+          headCells[index + 1].textContent = text(environment);
+        }
+      });
+    }
+  }
+}
+
 async function renderSelectedProject() {
   const project = selectedProject();
   if (!project) {
@@ -407,6 +539,10 @@ async function renderSelectedProject() {
     showState("project-detail-state", "Project no longer exists or has no registered environments.");
     setChip("project-health-chip", "No project", "stale");
     setChip("environment-count-chip", "0 env", "stale");
+    showState("env-inventory-state", "Select a project to inspect masked environment keys.");
+    hide("env-inventory");
+    hide("env-inventory-meta");
+    setChip("env-total-chip", "0 vars", "stale");
     return;
   }
 
@@ -419,13 +555,20 @@ async function renderSelectedProject() {
 
   hide("project-detail");
   showState("project-detail-state", "Loading environment inventory...");
+  hide("env-inventory");
+  hide("env-inventory-meta");
+  showState("env-inventory-state", "Loading masked environment inventory...");
 
   try {
-    const environments = await ensureProjectEnvironments(project.project_id);
+    const [environments, inventory] = await Promise.all([
+      ensureProjectEnvironments(project.project_id),
+      ensureProjectEnvInventory(project.project_id),
+    ]);
     if (!environments.length) {
       showState("project-detail-state", "Project no longer exists or has no registered environments.");
       setChip("project-health-chip", "No environments", "stale");
       setChip("environment-count-chip", "0 env", "stale");
+      renderEnvInventory(inventory);
       return;
     }
 
@@ -453,10 +596,13 @@ async function renderSelectedProject() {
     );
     hideState("project-detail-state");
     show("project-detail");
+    renderEnvInventory(inventory);
   } catch (error) {
     showState("project-detail-state", error.message || "Environment inventory unavailable.", "warn");
+    showState("env-inventory-state", error.message || "Env inventory unavailable.", "warn");
     setChip("project-health-chip", "Unavailable", "stale");
     setChip("environment-count-chip", "0 env", "stale");
+    setChip("env-total-chip", "0 vars", "stale");
   }
 }
 
@@ -623,7 +769,17 @@ function bindControls() {
   const refreshButton = element("refresh-button");
   if (refreshButton) {
     refreshButton.addEventListener("click", () => {
+      dataState.envInventoryByProject.clear();
+      dataState.environmentsByProject.clear();
       void loadConsole();
+    });
+  }
+
+  const envSearch = element("env-key-search");
+  if (envSearch) {
+    envSearch.addEventListener("input", (event) => {
+      uiState.envQuery = event.target.value || "";
+      renderEnvInventory(dataState.envInventoryByProject.get(uiState.selectedProjectId) || null);
     });
   }
 }
