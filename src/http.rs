@@ -5161,6 +5161,7 @@ pub mod app_page_preserves_auth_gate {
         assert!(body.contains("octocat"));
         assert!(body.contains("/app.js"));
         assert!(body.contains("Status overview"));
+        assert!(body.contains("What matters now."));
         assert!(!body.contains("test-session-secret"));
         assert!(!body.contains("FORGE_SESSION_SECRET"));
         assert!(!body.contains("FORGE_GITHUB_OAUTH_CLIENT_SECRET"));
@@ -5199,6 +5200,7 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("\"/readiness/timeline\""));
         assert!(body.contains("\"/api/projects\""));
         assert!(body.contains("/environments"));
+        assert!(body.contains("projectEnvironments(projectId)"));
         assert!(body.contains("credentials: \"same-origin\""));
         assert!(!body.contains("/secrets"));
         assert!(!body.contains("/tokens"));
@@ -5233,7 +5235,6 @@ pub mod app_js_ships_safe_error_states {
         assert!(body.contains("Readiness degraded details unavailable."));
         assert!(body.contains("Timeline unavailable."));
         assert!(body.contains("Metrics unavailable."));
-        assert!(body.contains("API unreachable for operator recommendations."));
         assert!(body.contains("Project inventory unavailable."));
         assert!(body.contains("Environment inventory unavailable."));
         assert!(body.contains("No projects registered yet."));
@@ -5277,11 +5278,10 @@ pub mod app_assets_ship_calm_readiness_copy {
         let app_js = to_bytes(app_js.into_body(), usize::MAX).await.unwrap();
         let app_js = String::from_utf8(app_js.to_vec()).unwrap();
         assert!(app_js.contains("No active readiness blockers."));
-        assert!(app_js.contains("Previously observed, now cleared."));
-        assert!(app_js.contains("Past suggested check:"));
-        assert!(app_js.contains("Historical convergence failure recorded."));
-        assert!(app_js.contains("Not an active readiness blocker."));
-        assert!(app_js.contains("Review timeline only if investigating a past incident."));
+        assert!(app_js.contains("Suggested check:"));
+        assert!(app_js.contains("Current issues need review."));
+        assert!(app_js.contains("No additional readiness notes."));
+        assert!(app_js.contains("Quiet"));
 
         let app_html = app
             .oneshot(
@@ -5301,7 +5301,7 @@ pub mod app_assets_ship_calm_readiness_copy {
         let app_html = to_bytes(app_html.into_body(), usize::MAX).await.unwrap();
         let app_html = String::from_utf8(app_html.to_vec()).unwrap();
         assert!(app_html.contains(
-            "Project and environment inventory is read-only here. Deploy, rollback, environment, secret, and project mutation remain outside this console."
+            "Read-only surface. Deploy, rollback, secrets, and project changes stay in CLI or API."
         ));
     }
 }
@@ -5330,12 +5330,12 @@ pub mod app_js_dedupes_recommendations_and_mutes_history {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("function dedupeRecommendations("));
-        assert!(body.contains("action_id"));
-        assert!(body.contains("Also seen in cleared history."));
-        assert!(body.contains("Historical recommendation only. Not an active readiness blocker."));
-        assert!(body.contains("Show all"));
-        assert!(body.contains("Show history"));
+        assert!(body.contains("function activeTimelineEntries("));
+        assert!(body.contains("Suggested check:"));
+        assert!(body.contains("No project matches that search."));
+        assert!(body.contains("No additional readiness notes."));
+        assert!(body.contains("Quiet"));
+        assert!(body.contains("projectEnvironments(projectId)"));
     }
 }
 
