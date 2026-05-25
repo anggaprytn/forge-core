@@ -4927,6 +4927,7 @@ pub mod static_assets_do_not_expose_secrets {
             assert!(!body.contains("test-session-secret"));
             assert!(!body.contains("forge_session"));
             assert!(!body.contains("FORGE_SESSION_SECRET"));
+            assert!(!body.contains("FORGE_GITHUB_OAUTH_CLIENT_SECRET"));
         }
     }
 }
@@ -4969,9 +4970,78 @@ pub mod app_page_preserves_auth_gate {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Forge Control"));
+        assert!(body.contains("Forge Operator Console"));
         assert!(body.contains("octocat"));
         assert!(body.contains("/app.js"));
+        assert!(body.contains("Status overview"));
+        assert!(!body.contains("test-session-secret"));
+        assert!(!body.contains("FORGE_SESSION_SECRET"));
+        assert!(!body.contains("FORGE_GITHUB_OAUTH_CLIENT_SECRET"));
+        assert!(!body.contains("Bearer "));
+        assert!(!body.contains(&session_cookie));
+    }
+}
+
+#[cfg(test)]
+pub mod app_js_references_existing_readiness_apis {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn app_js_references_existing_readiness_apis() {
+        let app = router(build_cli_login_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"/readyz\""));
+        assert!(body.contains("\"/metrics\""));
+        assert!(body.contains("\"/readiness/explain\""));
+        assert!(body.contains("\"/readiness/timeline\""));
+    }
+}
+
+#[cfg(test)]
+pub mod app_js_ships_safe_error_states {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn app_js_ships_safe_error_states() {
+        let app = router(build_cli_login_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("API unreachable for readiness overview."));
+        assert!(body.contains("Readiness degraded details unavailable."));
+        assert!(body.contains("Timeline unavailable."));
+        assert!(body.contains("Metrics unavailable."));
+        assert!(body.contains("API unreachable for operator recommendations."));
     }
 }
 

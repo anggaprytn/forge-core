@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Forge Control</title>
+    <title>Forge Operator Console</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
@@ -12,7 +12,7 @@
         <div class="app-header">
           <div>
             <p class="eyebrow">Authenticated</p>
-            <h1>Forge Control</h1>
+            <h1>Forge Operator Console</h1>
           </div>
           <form action="/logout" method="post">
             <button class="button button-secondary" type="submit">Log out</button>
@@ -21,17 +21,93 @@
 
         <p class="lede">Signed in as <strong>__GITHUB_LOGIN__</strong>.</p>
         <p class="page-note">
-          Forge web login is for human operators. CLI and bearer-token API access remain available for automation.
+          Read-only visibility for readiness and control-plane state. Deploy, rollback, mutation, and offline workflows remain CLI or API responsibilities.
+        </p>
+        <p class="page-note">
+          Browser console data comes from the existing control-plane APIs only. Offline or postmortem mode is not available here unless the server explicitly exposes it.
         </p>
 
-        <section class="status-grid" aria-label="Runtime visibility">
-          <article class="status-card">
-            <h2>Health</h2>
-            <p id="healthz-status">Checking...</p>
+        <section class="app-grid" aria-label="Operator console panels">
+          <article class="status-card section-card" aria-labelledby="overview-title">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">Overview</p>
+                <h2 id="overview-title">Status overview</h2>
+              </div>
+              <span id="overview-badge" class="status-pill">Loading</span>
+            </div>
+            <div id="overview-state" class="inline-state">Loading current control-plane status...</div>
+            <dl id="overview-grid" class="key-value-grid" hidden></dl>
           </article>
-          <article class="status-card">
-            <h2>Readiness</h2>
-            <p id="readyz-status">Checking...</p>
+
+          <article class="status-card section-card" aria-labelledby="readiness-title">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">Explain</p>
+                <h2 id="readiness-title">Readiness panel</h2>
+              </div>
+              <span id="readiness-badge" class="status-pill">Loading</span>
+            </div>
+            <div id="readiness-state" class="inline-state">Loading readiness explanation...</div>
+            <dl id="readiness-grid" class="key-value-stack" hidden></dl>
+          </article>
+
+          <article class="status-card section-card" aria-labelledby="timeline-title">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">Timeline</p>
+                <h2 id="timeline-title">Blocker timeline</h2>
+              </div>
+              <span id="timeline-badge" class="status-pill">Loading</span>
+            </div>
+            <div id="timeline-state" class="inline-state">Loading readiness timeline...</div>
+            <div id="timeline-groups" class="timeline-groups" hidden>
+              <section class="timeline-group">
+                <h3>Active blockers</h3>
+                <ul id="timeline-active" class="timeline-list"></ul>
+              </section>
+              <section class="timeline-group">
+                <h3>Recently cleared</h3>
+                <ul id="timeline-cleared" class="timeline-list"></ul>
+              </section>
+              <section class="timeline-group">
+                <h3>Historical</h3>
+                <ul id="timeline-historical" class="timeline-list"></ul>
+              </section>
+            </div>
+          </article>
+
+          <article class="status-card section-card" aria-labelledby="recommendations-title">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">Recommendations</p>
+                <h2 id="recommendations-title">Operator guidance</h2>
+              </div>
+              <span id="recommendations-badge" class="status-pill">Loading</span>
+            </div>
+            <div id="recommendations-state" class="inline-state">Loading recommendations...</div>
+            <div id="recommendations-content" class="recommendations-content" hidden>
+              <section class="recommendation-primary">
+                <h3>Primary recommendation</h3>
+                <div id="recommendation-primary"></div>
+              </section>
+              <section class="recommendation-secondary">
+                <h3>Additional recommendations</h3>
+                <ul id="recommendation-list" class="recommendation-list"></ul>
+              </section>
+            </div>
+          </article>
+
+          <article class="status-card section-card metrics-card" aria-labelledby="metrics-title">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">Metrics</p>
+                <h2 id="metrics-title">Metrics summary</h2>
+              </div>
+              <span id="metrics-badge" class="status-pill">Loading</span>
+            </div>
+            <div id="metrics-state" class="inline-state">Loading metrics summary...</div>
+            <dl id="metrics-grid" class="key-value-grid" hidden></dl>
           </article>
         </section>
       </section>
