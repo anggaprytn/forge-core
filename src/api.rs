@@ -1073,11 +1073,124 @@ pub struct ProjectRecord {
     pub domain_mode: String,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<ProjectEnvironmentSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectList {
     pub projects: Vec<ProjectRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentSummary {
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_deployment_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_summary: Option<ProjectEnvironmentReadinessSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentReadinessSummary {
+    pub health_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_convergence_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentInventoryList {
+    pub project_id: String,
+    #[serde(default)]
+    pub environments: Vec<ProjectEnvironmentDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentDetail {
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_services: Vec<ProjectEnvironmentServiceSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_deployment_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_deployment_timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_eligibility: Option<ProjectEnvironmentRollbackSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_lineage: Option<ProjectEnvironmentRestoreSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy: Option<ProjectEnvironmentRuntimePolicySummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_summary: Option<ProjectEnvironmentReadinessSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentServiceSummary {
+    pub service_id: String,
+    pub role: String,
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentRollbackSummary {
+    pub eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_generation: Option<u64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentRestoreSummary {
+    pub backup_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_deployment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentRuntimePolicySummary {
+    pub restart_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ProjectEnvironmentServiceRuntimePolicySummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnvironmentServiceRuntimePolicySummary {
+    pub service_id: String,
+    pub restart_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -23,10 +23,10 @@ use crate::api::{
     BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvironmentDiagnostics,
-    EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList, ProjectList,
-    ProjectUpsertRequest, ReadinessExplainResponse, ReadinessTimelineResponse, ReadyzResponse,
-    SecretListResponse, SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse,
-    TokenListResponse, TokenMetadata, TokenRevokeResponse,
+    EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse, EventList,
+    ProjectEnvironmentInventoryList, ProjectList, ProjectUpsertRequest, ReadinessExplainResponse,
+    ReadinessTimelineResponse, ReadyzResponse, SecretListResponse, SecretUnsetResponse,
+    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata, TokenRevokeResponse,
 };
 use crate::auth::{
     AuthSource, AuthenticatedPrincipal, CliTokenVerifier, TokenIssueRequest, TokenStoreError,
@@ -981,6 +981,10 @@ pub fn router(state: HttpState) -> Router {
         .route("/deployments", post(post_deployments))
         .route("/api/projects", post(post_projects).get(get_projects))
         .route("/api/projects/{project_id}", get(get_project))
+        .route(
+            "/api/projects/{project_id}/environments",
+            get(get_project_environments),
+        )
         .route(
             "/api/projects/{project_id}/environments/{environment}/status",
             get(get_project_environment_status),
@@ -2075,15 +2079,29 @@ async fn post_projects(
         .project_registry
         .upsert(request, apps_domain.as_deref())
     {
-        Ok(project) => json_response(
-            StatusCode::OK,
-            &request_id,
-            Json(SuccessEnvelope {
-                request_id: request_id.clone(),
-                correlation_id: request_id.clone(),
-                data: project,
-            }),
-        ),
+        Ok(project) => match state.project_registry.get_inventory(&project.project_id) {
+            Ok(Some(project)) => json_response(
+                StatusCode::OK,
+                &request_id,
+                Json(SuccessEnvelope {
+                    request_id: request_id.clone(),
+                    correlation_id: request_id.clone(),
+                    data: project,
+                }),
+            ),
+            Ok(None) => error_response(
+                StatusCode::NOT_FOUND,
+                &request_id,
+                ErrorResponse {
+                    code: "project_not_found".into(),
+                    message: "project not found".into(),
+                },
+            ),
+            Err(err) => {
+                let (status, response) = project_registry_error_response(err);
+                error_response(status, &request_id, response)
+            }
+        },
         Err(err) => {
             let (status, response) = project_registry_error_response(err);
             error_response(status, &request_id, response)
@@ -2097,7 +2115,7 @@ async fn get_projects(State(state): State<HttpState>, headers: HeaderMap) -> Res
         return response;
     }
 
-    match state.project_registry.list() {
+    match state.project_registry.list_inventory() {
         Ok(projects) => json_response(
             StatusCode::OK,
             &request_id,
@@ -2124,7 +2142,7 @@ async fn get_project(
         return response;
     }
 
-    match state.project_registry.get(&project_id) {
+    match state.project_registry.get_inventory(&project_id) {
         Ok(Some(project)) => json_response(
             StatusCode::OK,
             &request_id,
@@ -2132,6 +2150,44 @@ async fn get_project(
                 request_id: request_id.clone(),
                 correlation_id: request_id.clone(),
                 data: project,
+            }),
+        ),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            &request_id,
+            ErrorResponse {
+                code: "project_not_found".into(),
+                message: "project not found".into(),
+            },
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
+async fn get_project_environments(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(project_id): AxumPath<String>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state
+        .project_registry
+        .get_environment_inventory(&project_id)
+    {
+        Ok(Some(environments)) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope::<ProjectEnvironmentInventoryList> {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: environments,
             }),
         ),
         Ok(None) => error_response(
@@ -3775,6 +3831,48 @@ fn seed_project_status_runtime(root: &Path, generation: u64) {
 }
 
 #[cfg(test)]
+fn seed_previous_project_generation(root: &Path, generation: u64) {
+    use crate::storage::{EnvironmentPaths, PointerStore, SnapshotState, SnapshotWriter};
+
+    let env = EnvironmentPaths::new(root, "api", "staging");
+    let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+    writer
+        .write_artifact(
+            "build.json",
+            &format!(
+                "{{\n  \"deployment_id\": \"dep-{generation}\",\n  \"image_ref\": \"forge/api:staging-gen-{generation}\"\n}}\n"
+            ),
+        )
+        .unwrap();
+    writer
+        .write_artifact(
+            "runtime.json",
+            &format!(
+                concat!(
+                    "{{\n",
+                    "  \"container_name\": \"staging-api-gen-{generation}\",\n",
+                    "  \"running\": false,\n",
+                    "  \"runtime_policy\": {{\"restart_policy\": \"no\"}},\n",
+                    "  \"environment_variables\": {{}},\n",
+                    "  \"volume_mounts\": [],\n",
+                    "  \"services\": {{}},\n",
+                    "  \"startup_order\": []\n",
+                    "}}\n"
+                ),
+                generation = generation,
+            ),
+        )
+        .unwrap();
+    writer
+        .finalize("api", "staging", SnapshotState::Healthy)
+        .unwrap();
+    std::fs::write(env.previous_pointer(), format!("{generation}\n")).unwrap();
+    PointerStore::new(env.clone())
+        .read_pointer("previous")
+        .unwrap();
+}
+
+#[cfg(test)]
 fn git_test(root: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .current_dir(root)
@@ -5016,8 +5114,8 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("\"/metrics\""));
         assert!(body.contains("\"/readiness/explain\""));
         assert!(body.contains("\"/readiness/timeline\""));
-        assert!(!body.contains("/projects"));
-        assert!(!body.contains("/environments"));
+        assert!(body.contains("\"/api/projects\""));
+        assert!(body.contains("/environments"));
         assert!(!body.contains("/secrets"));
         assert!(!body.contains("/tokens"));
     }
@@ -5052,6 +5150,9 @@ pub mod app_js_ships_safe_error_states {
         assert!(body.contains("Timeline unavailable."));
         assert!(body.contains("Metrics unavailable."));
         assert!(body.contains("API unreachable for operator recommendations."));
+        assert!(body.contains("Project inventory unavailable."));
+        assert!(body.contains("Environment inventory unavailable."));
+        assert!(body.contains("No projects registered yet."));
     }
 }
 
@@ -5115,7 +5216,7 @@ pub mod app_assets_ship_calm_readiness_copy {
         let app_html = to_bytes(app_html.into_body(), usize::MAX).await.unwrap();
         let app_html = String::from_utf8(app_html.to_vec()).unwrap();
         assert!(app_html.contains(
-            "This console shows control-plane readiness only. Project and environment views are not enabled in this build."
+            "Project and environment inventory is read-only here. Deploy, rollback, environment, secret, and project mutation remain outside this console."
         ));
     }
 }
@@ -6721,6 +6822,7 @@ pub mod project_registry_endpoints_round_trip {
             .unwrap();
         let list_json: Value = serde_json::from_slice(&list_body).unwrap();
         assert_eq!(list_json["data"]["projects"][0]["project_id"], "api");
+        assert!(list_json["data"]["projects"][0]["environments"].is_null());
 
         let show = Request::builder()
             .method(axum::http::Method::GET)
@@ -6736,6 +6838,199 @@ pub mod project_registry_endpoints_round_trip {
         let show_json: Value = serde_json::from_slice(&show_body).unwrap();
         assert_eq!(show_json["data"]["base_domain"], "api.example.com");
         assert_eq!(show_json["data"]["domain_mode"], "explicit");
+        assert!(show_json["data"]["environments"].is_null());
+    }
+}
+
+#[cfg(test)]
+pub mod project_inventory_api_requires_authentication {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn unauthenticated_project_inventory_is_rejected() {
+        let app = router(build_state(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(test)]
+pub mod project_inventory_api_returns_safe_metadata {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn authenticated_project_list_returns_safe_metadata() {
+        let (state, root) = build_state_with_root(true);
+        seed_project_status_runtime(&root, 7);
+        seed_previous_project_generation(&root, 6);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let project = &json["data"]["projects"][0];
+        assert_eq!(project["project_id"], "api");
+        assert!(project["repo_url"].as_str().is_some());
+        assert_eq!(project["base_domain"], "api.example.com");
+        assert_eq!(project["default_branch"], "main");
+        assert_eq!(project["environments"][0]["environment"], "staging");
+        assert_eq!(project["environments"][0]["current_generation"], 7);
+        assert_eq!(project["environments"][0]["previous_generation"], 6);
+        assert_eq!(
+            project["environments"][0]["last_deployment_status"],
+            "healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn credentialed_repo_urls_are_masked_in_output() {
+        let (state, root) = build_state_with_root(true);
+        std::fs::create_dir_all(root.join("projects/api")).unwrap();
+        std::fs::write(
+            root.join("projects/api/project.json"),
+            concat!(
+                "{\n",
+                "  \"project_id\": \"api\",\n",
+                "  \"repo_url\": \"https://token:secret@github.com/example/api.git\",\n",
+                "  \"default_branch\": \"main\",\n",
+                "  \"base_domain\": \"api.example.com\",\n",
+                "  \"domain_mode\": \"explicit\",\n",
+                "  \"created_at_unix\": 1,\n",
+                "  \"updated_at_unix\": 1\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["repo_url"],
+            "https://***@github.com/example/api.git"
+        );
+        assert!(!String::from_utf8(body.to_vec()).unwrap().contains("secret"));
+    }
+}
+
+#[cfg(test)]
+pub mod project_environment_inventory_api_uses_persisted_state {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn environment_detail_contains_current_previous_generation_when_available() {
+        let (state, root) = build_state_with_root(true);
+        seed_project_status_runtime(&root, 7);
+        seed_previous_project_generation(&root, 6);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
+        assert_eq!(json["data"]["environments"][0]["environment"], "staging");
+        assert_eq!(json["data"]["environments"][0]["current_generation"], 7);
+        assert_eq!(json["data"]["environments"][0]["previous_generation"], 6);
+    }
+
+    #[tokio::test]
+    async fn project_environment_inventory_does_not_expose_secrets_or_env_values() {
+        let (state, root) = build_state_with_root(true);
+        seed_project_status_runtime(&root, 7);
+        std::fs::write(
+            root.join("projects/api/environments/staging/generations/7/runtime_env_snapshot.json"),
+            concat!(
+                "{\n",
+                "  \"snapshot_version\": 1,\n",
+                "  \"project_id\": \"api\",\n",
+                "  \"environment\": \"staging\",\n",
+                "  \"generation\": 7,\n",
+                "  \"deployment_id\": \"dep-7\",\n",
+                "  \"source_environment\": \"staging\",\n",
+                "  \"entries\": {\n",
+                "    \"DATABASE_URL\": {\"source\": \"project_environment_secret\", \"value\": \"postgres://super-secret\", \"sensitive\": true, \"redacted\": false}\n",
+                "  }\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("DATABASE_URL"));
+        assert!(!body_text.contains("postgres://super-secret"));
     }
 }
 

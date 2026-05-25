@@ -169,6 +169,10 @@ h2 {
   grid-column: 1 / -1;
 }
 
+.inventory-card {
+  grid-column: 1 / -1;
+}
+
 .section-header {
   display: flex;
   justify-content: space-between;
@@ -248,16 +252,119 @@ h2 {
 }
 
 .timeline-groups,
-.recommendations-content {
+.recommendations-content,
+.inventory-list,
+.project-detail {
   display: grid;
   gap: 16px;
 }
 
+.search-field {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.search-field input {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.84);
+  color: var(--text);
+  font: inherit;
+}
+
+.search-field input:focus {
+  outline: 2px solid rgba(31, 95, 74, 0.2);
+  outline-offset: 2px;
+}
+
 .timeline-group,
 .recommendation-primary,
-.recommendation-secondary {
+.recommendation-secondary,
+.project-detail-section {
   display: grid;
   gap: 12px;
+}
+
+.inventory-list {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.inventory-project,
+.environment-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.82);
+  text-align: left;
+}
+
+.inventory-project {
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.inventory-project.is-selected {
+  border-color: rgba(31, 95, 74, 0.3);
+  box-shadow: inset 0 0 0 1px rgba(31, 95, 74, 0.12);
+}
+
+.inventory-project-header,
+.environment-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+
+.inventory-project-title,
+.environment-card-title {
+  font-size: 1.05rem;
+  color: var(--text);
+}
+
+.inventory-project-meta,
+.inventory-project-note,
+.environment-card-note {
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.inventory-project-badges,
+.environment-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.project-detail-header {
+  display: grid;
+  gap: 6px;
+}
+
+.environment-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px 16px;
+}
+
+.environment-detail-grid dt {
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.environment-detail-grid dd {
+  margin: 4px 0 0;
 }
 
 .group-header {

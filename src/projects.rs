@@ -1,5 +1,18 @@
-use crate::api::{ErrorResponse, ProjectRecord, ProjectUpsertRequest};
-use crate::storage::{StorageError, atomic_write};
+use crate::api::{
+    ErrorResponse, ProjectEnvironmentDetail, ProjectEnvironmentInventoryList,
+    ProjectEnvironmentReadinessSummary, ProjectEnvironmentRestoreSummary,
+    ProjectEnvironmentRollbackSummary, ProjectEnvironmentRuntimePolicySummary,
+    ProjectEnvironmentServiceRuntimePolicySummary, ProjectEnvironmentServiceSummary,
+    ProjectEnvironmentSummary, ProjectRecord, ProjectUpsertRequest,
+};
+use crate::backups::load_backup_restore_lineage;
+use crate::status::derive_environment_domain;
+use crate::storage::{
+    ConvergenceCheckpointStore, EnvironmentPaths, GenerationHistoryRecord, PersistedActivationMode,
+    PersistedRuntimeInfo, RetentionStore, StorageError, atomic_write, load_generation_build_info,
+    load_generation_lifecycle, load_generation_runtime_info, load_generation_snapshot_metadata,
+};
+use crate::topology::runtime_with_primary_service;
 use serde_json::Error as JsonError;
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
@@ -118,6 +131,7 @@ impl ProjectRegistryStore {
                 domain_mode,
                 created_at_unix,
                 updated_at_unix: unix_now(),
+                environments: Vec::new(),
             };
             self.write(&updated)?;
             return Ok(updated);
@@ -131,6 +145,7 @@ impl ProjectRegistryStore {
             domain_mode,
             created_at_unix,
             updated_at_unix: created_at_unix,
+            environments: Vec::new(),
         };
         self.write(&created)?;
         Ok(created)
@@ -169,6 +184,40 @@ impl ProjectRegistryStore {
         Ok(Some(serde_json::from_str(&raw)?))
     }
 
+    pub fn list_inventory(&self) -> Result<Vec<ProjectRecord>, ProjectRegistryError> {
+        self.list()?
+            .into_iter()
+            .map(|project| self.decorate_project_inventory(project))
+            .collect()
+    }
+
+    pub fn get_inventory(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectRecord>, ProjectRegistryError> {
+        self.get(project_id)?
+            .map(|project| self.decorate_project_inventory(project))
+            .transpose()
+    }
+
+    pub fn get_environment_inventory(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectEnvironmentInventoryList>, ProjectRegistryError> {
+        let Some(project) = self.get(project_id)? else {
+            return Ok(None);
+        };
+        let environments = self
+            .environment_names(&project.project_id)?
+            .into_iter()
+            .map(|environment| self.build_environment_detail(&project, &environment))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ProjectEnvironmentInventoryList {
+            project_id: project.project_id,
+            environments,
+        }))
+    }
+
     fn write(&self, project: &ProjectRecord) -> Result<(), ProjectRegistryError> {
         let payload = serde_json::to_vec_pretty(project)?;
         let mut payload = payload;
@@ -192,6 +241,327 @@ impl ProjectRegistryStore {
             .find(|project| project.base_domain == base_domain)
             .map(|project| project.project_id))
     }
+
+    fn decorate_project_inventory(
+        &self,
+        mut project: ProjectRecord,
+    ) -> Result<ProjectRecord, ProjectRegistryError> {
+        project.repo_url = sanitize_repo_url(&project.repo_url);
+        project.environments = self
+            .environment_names(&project.project_id)?
+            .into_iter()
+            .map(|environment| self.build_environment_summary(&project, &environment))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(project)
+    }
+
+    fn environment_names(&self, project_id: &str) -> Result<Vec<String>, ProjectRegistryError> {
+        let root = self.projects_root().join(project_id).join("environments");
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut names = Vec::new();
+        for environment in ["development", "staging", "production"] {
+            if root.join(environment).is_dir() {
+                names.push(environment.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    fn build_environment_summary(
+        &self,
+        project: &ProjectRecord,
+        environment: &str,
+    ) -> Result<ProjectEnvironmentSummary, ProjectRegistryError> {
+        let detail = self.build_environment_detail(project, environment)?;
+        Ok(ProjectEnvironmentSummary {
+            environment: detail.environment,
+            current_generation: detail.current_generation,
+            previous_generation: detail.previous_generation,
+            route: detail.route,
+            last_deployment_status: detail.last_deployment_status,
+            readiness_summary: detail.readiness_summary,
+        })
+    }
+
+    fn build_environment_detail(
+        &self,
+        project: &ProjectRecord,
+        environment: &str,
+    ) -> Result<ProjectEnvironmentDetail, ProjectRegistryError> {
+        let env = EnvironmentPaths::new(&self.root, &project.project_id, environment);
+        let current_generation = read_authoritative_generation(&env)?;
+        let previous_generation = read_optional_pointer(env.previous_pointer())?;
+        let latest_generation = latest_generation(&env)?;
+        let selected_generation = current_generation
+            .or(latest_generation)
+            .or(previous_generation);
+        let selected_snapshot = selected_generation
+            .map(|generation| load_generation_snapshot_metadata(&env, generation))
+            .transpose()?
+            .flatten();
+        let selected_build = selected_generation
+            .map(|generation| load_generation_build_info(&env, generation))
+            .transpose()?
+            .flatten();
+        let selected_lifecycle = selected_generation
+            .map(|generation| load_generation_lifecycle(&env, generation))
+            .transpose()?
+            .flatten();
+        let selected_runtime = selected_generation
+            .map(|generation| load_generation_runtime_info(&env, generation))
+            .transpose()?
+            .flatten()
+            .map(|runtime| runtime_with_primary_service(&runtime));
+        let retention = RetentionStore::new(env.clone()).read()?;
+        let history_record = selected_generation.and_then(|generation| {
+            retention
+                .generations
+                .iter()
+                .find(|record| record.generation == generation)
+                .cloned()
+        });
+        let domain = derive_environment_domain(&project.base_domain, environment);
+        let route = route_for_runtime(selected_runtime.as_ref(), &domain);
+        let last_deployment_status = selected_lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.state.as_str().to_string())
+            .or_else(|| {
+                selected_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.state.clone())
+            });
+        let last_deployment_timestamp = selected_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.finalized_at_unix)
+            .or_else(|| {
+                selected_lifecycle
+                    .as_ref()
+                    .map(|lifecycle| lifecycle.entered_at_unix)
+            })
+            .or_else(|| {
+                history_record
+                    .as_ref()
+                    .and_then(|record| record.finalized_at_unix)
+            })
+            .or_else(|| {
+                history_record
+                    .as_ref()
+                    .and_then(|record| record.created_at_unix)
+            });
+        let restore_lineage = selected_generation.and_then(|generation| {
+            let record = history_record
+                .clone()
+                .unwrap_or_else(|| GenerationHistoryRecord {
+                    generation,
+                    deployment_id: selected_build
+                        .as_ref()
+                        .map(|build| build.deployment_id.clone()),
+                    finalized_at_unix: selected_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.finalized_at_unix),
+                    finalized_state: selected_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.state.clone()),
+                    ..GenerationHistoryRecord::default()
+                });
+            load_backup_restore_lineage(&self.root, &project.project_id, environment, &record).map(
+                |restore| ProjectEnvironmentRestoreSummary {
+                    backup_id: restore.backup_id,
+                    source_generation: restore.source_generation,
+                    source_deployment_id: restore.source_deployment_id,
+                    restored_at_unix: restore.restored_at_unix,
+                },
+            )
+        });
+        let rollback_eligibility = Some(build_rollback_summary(
+            previous_generation,
+            selected_generation,
+        ));
+        let runtime_policy = selected_runtime.as_ref().map(build_runtime_policy_summary);
+        let readiness_summary =
+            ConvergenceCheckpointStore::new(env.clone())
+                .load()?
+                .map(|checkpoint| ProjectEnvironmentReadinessSummary {
+                    health_state: runtime_health_state(&checkpoint.health_state),
+                    active_generation: checkpoint.active_generation,
+                    last_successful_convergence_unix: checkpoint.last_successful_convergence_unix,
+                    reasons: checkpoint.readyz_reasons,
+                });
+
+        Ok(ProjectEnvironmentDetail {
+            environment: environment.to_string(),
+            current_generation,
+            previous_generation,
+            active_services: selected_runtime
+                .as_ref()
+                .map(|runtime| build_service_summaries(runtime, &domain))
+                .unwrap_or_default(),
+            route,
+            last_deployment_status,
+            last_deployment_timestamp,
+            rollback_eligibility,
+            restore_lineage,
+            runtime_policy,
+            readiness_summary,
+        })
+    }
+}
+
+fn build_service_summaries(
+    runtime: &PersistedRuntimeInfo,
+    domain: &str,
+) -> Vec<ProjectEnvironmentServiceSummary> {
+    runtime
+        .services
+        .iter()
+        .map(|(service_id, service)| ProjectEnvironmentServiceSummary {
+            service_id: service_id.clone(),
+            role: if service.externally_exposed {
+                "exposed".into()
+            } else {
+                "internal".into()
+            },
+            running: service.running,
+            route: if service.externally_exposed {
+                service_route(service.activation.as_ref(), domain)
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
+fn build_runtime_policy_summary(
+    runtime: &PersistedRuntimeInfo,
+) -> ProjectEnvironmentRuntimePolicySummary {
+    ProjectEnvironmentRuntimePolicySummary {
+        restart_policy: runtime.runtime_policy.restart_policy.clone(),
+        max_retries: runtime.runtime_policy.max_retries,
+        cpu_limit: runtime.runtime_policy.cpu_limit.clone(),
+        memory_limit_mb: runtime.runtime_policy.memory_limit_mb,
+        services: runtime
+            .services
+            .iter()
+            .map(
+                |(service_id, service)| ProjectEnvironmentServiceRuntimePolicySummary {
+                    service_id: service_id.clone(),
+                    restart_policy: service.runtime_policy.restart_policy.clone(),
+                    max_retries: service.runtime_policy.max_retries,
+                    cpu_limit: service.runtime_policy.cpu_limit.clone(),
+                    memory_limit_mb: service.runtime_policy.memory_limit_mb,
+                },
+            )
+            .collect(),
+    }
+}
+
+fn build_rollback_summary(
+    previous_generation: Option<u64>,
+    current_generation: Option<u64>,
+) -> ProjectEnvironmentRollbackSummary {
+    match previous_generation {
+        Some(target_generation) => ProjectEnvironmentRollbackSummary {
+            eligible: true,
+            target_generation: Some(target_generation),
+            reason: format!(
+                "previous generation {target_generation} is available as a rollback target"
+            ),
+        },
+        None if current_generation.is_some() => ProjectEnvironmentRollbackSummary {
+            eligible: false,
+            target_generation: None,
+            reason: "no previous generation is retained for rollback".into(),
+        },
+        None => ProjectEnvironmentRollbackSummary {
+            eligible: false,
+            target_generation: None,
+            reason: "no active generation is available yet".into(),
+        },
+    }
+}
+
+fn route_for_runtime(runtime: Option<&PersistedRuntimeInfo>, domain: &str) -> Option<String> {
+    runtime.and_then(|runtime| service_route(runtime.activation.as_ref(), domain))
+}
+
+fn service_route(activation: Option<&PersistedActivationMode>, domain: &str) -> Option<String> {
+    match activation {
+        Some(PersistedActivationMode::Http { .. }) => Some(domain.to_string()),
+        Some(PersistedActivationMode::Direct) | None => None,
+    }
+}
+
+fn read_authoritative_generation(
+    env: &EnvironmentPaths,
+) -> Result<Option<u64>, ProjectRegistryError> {
+    let promoted = read_optional_pointer(env.promoted_pointer())?;
+    match promoted {
+        Some(generation) => Ok(Some(generation)),
+        None => read_optional_pointer(env.current_pointer()),
+    }
+}
+
+fn read_optional_pointer(path: PathBuf) -> Result<Option<u64>, ProjectRegistryError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| ProjectRegistryError::Storage(StorageError::InvalidPointer(path.clone())))
+}
+
+fn latest_generation(env: &EnvironmentPaths) -> Result<Option<u64>, ProjectRegistryError> {
+    let generations_dir = env.generations_dir();
+    if !generations_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut latest = None;
+    for entry in fs::read_dir(generations_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(generation) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if latest.is_none_or(|current| generation > current) {
+            latest = Some(generation);
+        }
+    }
+    Ok(latest)
+}
+
+fn runtime_health_state(state: &crate::storage::RuntimeHealthState) -> String {
+    match state {
+        crate::storage::RuntimeHealthState::Healthy => "healthy".into(),
+        crate::storage::RuntimeHealthState::Degraded => "degraded".into(),
+        crate::storage::RuntimeHealthState::Unavailable => "unavailable".into(),
+    }
+}
+
+fn sanitize_repo_url(input: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(input) {
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            let _ = parsed.set_username("***");
+            let _ = parsed.set_password(None);
+            return parsed.to_string();
+        }
+    }
+    input.to_string()
 }
 
 pub fn project_registry_error_response(

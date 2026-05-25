@@ -3,6 +3,7 @@ const API_PATHS = {
   metrics: "/metrics",
   explain: "/readiness/explain",
   timeline: "/readiness/timeline",
+  projects: "/api/projects",
 };
 
 const PANEL_STATE = {
@@ -31,6 +32,13 @@ const uiState = {
   showAllCleared: false,
   showHistorical: false,
   showPastRecommendations: false,
+  projectQuery: "",
+  selectedProjectId: "",
+};
+
+const inventoryState = {
+  projects: [],
+  environmentsByProject: new Map(),
 };
 
 function element(id) {
@@ -48,6 +56,11 @@ async function fetchJson(path) {
   }
 
   return response.json();
+}
+
+async function fetchApiData(path) {
+  const payload = await fetchJson(path);
+  return payload && Object.prototype.hasOwnProperty.call(payload, "data") ? payload.data : payload;
 }
 
 function setBadge(id, label, tone) {
@@ -920,17 +933,282 @@ function renderMetrics(metrics) {
   setBadge("metrics-badge", label, tone);
 }
 
+function statusTone(status) {
+  const normalized = lower(status);
+  if (normalized === "healthy" || normalized === "promoted") {
+    return "ok";
+  }
+  if (normalized === "missing" || normalized === "unavailable") {
+    return "stale";
+  }
+  return "warn";
+}
+
+function generationLabel(value) {
+  return value === null || value === undefined ? "None" : `Gen ${value}`;
+}
+
+function projectInventoryFilter(project) {
+  if (!uiState.projectQuery) {
+    return true;
+  }
+  return lower(project.project_id).includes(lower(uiState.projectQuery));
+}
+
+function bindInventoryControls() {
+  const search = element("inventory-search");
+  if (!search || search.dataset.bound === "true") {
+    return;
+  }
+  search.dataset.bound = "true";
+  search.addEventListener("input", () => {
+    uiState.projectQuery = search.value.trim();
+    renderProjectInventory();
+  });
+}
+
+function renderProjectInventory() {
+  const list = element("inventory-list");
+  if (!list) {
+    return;
+  }
+
+  bindInventoryControls();
+  clearChildren(list);
+
+  const filtered = inventoryState.projects.filter(projectInventoryFilter);
+  if (!filtered.length) {
+    showState("inventory-state", "No projects registered yet.", "ok");
+    list.hidden = true;
+    showState("project-detail-state", "Select a project to inspect its environments.", "ok");
+    element("project-detail").hidden = true;
+    setBadge("inventory-badge", inventoryState.projects.length ? PANEL_STATE.ok : PANEL_STATE.stale, inventoryState.projects.length ? "ok" : "stale");
+    setBadge("project-detail-badge", PANEL_STATE.stale, "stale");
+    return;
+  }
+
+  hideState("inventory-state");
+  showContainer("inventory-list");
+
+  if (!uiState.selectedProjectId || !filtered.some((project) => project.project_id === uiState.selectedProjectId)) {
+    uiState.selectedProjectId = filtered[0].project_id;
+  }
+
+  for (const project of filtered) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `inventory-project${project.project_id === uiState.selectedProjectId ? " is-selected" : ""}`;
+    button.addEventListener("click", () => {
+      uiState.selectedProjectId = project.project_id;
+      renderProjectInventory();
+      void loadProjectEnvironments(project.project_id);
+    });
+
+    const header = document.createElement("div");
+    header.className = "inventory-project-header";
+
+    const titleWrap = document.createElement("div");
+    const title = document.createElement("p");
+    title.className = "inventory-project-title";
+    title.textContent = project.project_id;
+    titleWrap.appendChild(title);
+
+    const meta = document.createElement("p");
+    meta.className = "inventory-project-meta";
+    meta.textContent = project.base_domain || text(project.repo_url, "No domain recorded");
+    titleWrap.appendChild(meta);
+    header.appendChild(titleWrap);
+
+    const status = document.createElement("span");
+    const firstStatus = (project.environments || []).find((environment) => environment.last_deployment_status);
+    status.className = `status-pill ${statusTone(firstStatus && firstStatus.last_deployment_status)}`;
+    status.textContent = firstStatus ? text(firstStatus.last_deployment_status) : "Inventory";
+    header.appendChild(status);
+    button.appendChild(header);
+
+    const badges = document.createElement("div");
+    badges.className = "inventory-project-badges";
+    for (const environment of project.environments || []) {
+      badges.appendChild(createBadge(environment.environment, environment.readiness_summary ? "info" : "historical"));
+      if (environment.current_generation !== null && environment.current_generation !== undefined) {
+        badges.appendChild(createBadge(generationLabel(environment.current_generation), "info"));
+      }
+    }
+    button.appendChild(badges);
+
+    const note = document.createElement("p");
+    note.className = "inventory-project-note";
+    note.textContent = `Branch ${text(project.default_branch)}. ${project.environments.length ? `${project.environments.length} environment views available.` : "No environments discovered yet."}`;
+    button.appendChild(note);
+
+    list.appendChild(button);
+  }
+
+  setBadge("inventory-badge", PANEL_STATE.ok, "ok");
+}
+
+function renderProjectEnvironmentDetails(projectId, environments) {
+  const container = element("project-detail");
+  if (!container) {
+    return;
+  }
+
+  clearChildren(container);
+  const project = inventoryState.projects.find((entry) => entry.project_id === projectId);
+  if (project) {
+    const header = document.createElement("div");
+    header.className = "project-detail-header";
+    const title = document.createElement("p");
+    title.className = "inventory-project-title";
+    title.textContent = project.project_id;
+    header.appendChild(title);
+    const note = document.createElement("p");
+    note.className = "inventory-project-note";
+    note.textContent = `Read-only environment inventory for ${text(project.base_domain, "this project")}.`;
+    header.appendChild(note);
+    container.appendChild(header);
+  }
+
+  if (!environments.length) {
+    showState("project-detail-state", "No environments registered for this project.", "ok");
+    container.hidden = true;
+    setBadge("project-detail-badge", PANEL_STATE.stale, "stale");
+    return;
+  }
+
+  hideState("project-detail-state");
+  showContainer("project-detail");
+
+  for (const environment of environments) {
+    const card = document.createElement("section");
+    card.className = "environment-card";
+
+    const header = document.createElement("div");
+    header.className = "environment-card-header";
+    const title = document.createElement("p");
+    title.className = "environment-card-title";
+    title.textContent = environment.environment;
+    header.appendChild(title);
+    const badge = document.createElement("span");
+    badge.className = `status-pill ${statusTone(environment.last_deployment_status)}`;
+    badge.textContent = text(environment.last_deployment_status, "Unknown");
+    header.appendChild(badge);
+    card.appendChild(header);
+
+    const badges = document.createElement("div");
+    badges.className = "environment-card-badges";
+    badges.appendChild(createBadge(`Current ${generationLabel(environment.current_generation)}`, "info"));
+    badges.appendChild(createBadge(`Previous ${generationLabel(environment.previous_generation)}`, "historical"));
+    if (environment.route) {
+      badges.appendChild(createBadge(environment.route, "info"));
+    }
+    card.appendChild(badges);
+
+    const grid = document.createElement("dl");
+    grid.className = "environment-detail-grid";
+    appendField(grid, "Route", text(environment.route, "None"));
+    appendField(grid, "Last deploy", formatUnix(environment.last_deployment_timestamp));
+    appendField(
+      grid,
+      "Rollback",
+      environment.rollback_eligibility
+        ? `${environment.rollback_eligibility.eligible ? "Eligible" : "Not eligible"}: ${environment.rollback_eligibility.reason}`
+        : "Unknown",
+    );
+    appendField(
+      grid,
+      "Restore lineage",
+      environment.restore_lineage
+        ? `Backup ${environment.restore_lineage.backup_id} from ${generationLabel(environment.restore_lineage.source_generation)}`
+        : "None",
+    );
+    appendField(
+      grid,
+      "Runtime policy",
+      environment.runtime_policy
+        ? `${text(environment.runtime_policy.restart_policy)} restart`
+        : "Unknown",
+    );
+    appendField(
+      grid,
+      "Readiness",
+      environment.readiness_summary
+        ? text(environment.readiness_summary.health_state)
+        : "Unknown",
+    );
+    appendField(
+      grid,
+      "Active services",
+      (environment.active_services || []).length
+        ? environment.active_services.map((service) => service.service_id).join(", ")
+        : "None recorded",
+    );
+    card.appendChild(grid);
+
+    if (environment.active_services && environment.active_services.length) {
+      const note = document.createElement("p");
+      note.className = "environment-card-note";
+      note.textContent = environment.active_services
+        .map((service) => `${service.service_id} (${service.role}${service.route ? ` via ${service.route}` : ""})`)
+        .join(" • ");
+      card.appendChild(note);
+    }
+
+    container.appendChild(card);
+  }
+
+  setBadge("project-detail-badge", PANEL_STATE.ok, "ok");
+}
+
+async function loadProjectEnvironments(projectId) {
+  if (!projectId) {
+    return;
+  }
+  if (inventoryState.environmentsByProject.has(projectId)) {
+    renderProjectEnvironmentDetails(projectId, inventoryState.environmentsByProject.get(projectId) || []);
+    return;
+  }
+
+  showState("project-detail-state", "Loading environment inventory...", "ok");
+  element("project-detail").hidden = true;
+
+  try {
+    const payload = await fetchApiData(`${API_PATHS.projects}/${encodeURIComponent(projectId)}/environments`);
+    const environments = payload && payload.environments ? payload.environments : [];
+    inventoryState.environmentsByProject.set(projectId, environments);
+    renderProjectEnvironmentDetails(projectId, environments);
+  } catch (_err) {
+    renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
+  }
+}
+
+async function loadInventory() {
+  bindInventoryControls();
+  try {
+    const payload = await fetchApiData(API_PATHS.projects);
+    inventoryState.projects = payload && payload.projects ? payload.projects : [];
+    renderProjectInventory();
+    if (uiState.selectedProjectId) {
+      await loadProjectEnvironments(uiState.selectedProjectId);
+    }
+  } catch (_err) {
+    renderUnavailable("inventory-state", "inventory-badge", "Project inventory unavailable.");
+    renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
+  }
+}
+
 function renderUnavailable(panel, badge, message) {
   showState(panel, message, "warn");
   setBadge(badge, PANEL_STATE.unavailable, "warn");
 }
 
 async function loadConsole() {
-  const [readyz, metrics, explain, timeline] = await Promise.allSettled([
+  const [readyz, metrics, explain, timeline, inventory] = await Promise.allSettled([
     fetchJson(API_PATHS.readyz),
     fetchJson(API_PATHS.metrics),
     fetchJson(API_PATHS.explain),
     fetchJson(API_PATHS.timeline),
+    loadInventory(),
   ]);
 
   if (readyz.status === "fulfilled" && metrics.status === "fulfilled") {
@@ -971,6 +1249,11 @@ async function loadConsole() {
       "recommendations-badge",
       "API unreachable for operator recommendations.",
     );
+  }
+
+  if (inventory.status === "rejected") {
+    renderUnavailable("inventory-state", "inventory-badge", "Project inventory unavailable.");
+    renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
   }
 }
 

@@ -27,7 +27,7 @@
           Browser console data comes from the existing control-plane APIs only. Offline or postmortem mode is not available here unless the server explicitly exposes it.
         </p>
         <p class="page-note page-note-muted">
-          This console shows control-plane readiness only. Project and environment views are not enabled in this build.
+          Project and environment inventory is read-only here. Deploy, rollback, environment, secret, and project mutation remain outside this console.
         </p>
 
         <section class="app-grid" aria-label="Operator console panels">
@@ -120,6 +120,34 @@
             </div>
             <div id="metrics-state" class="inline-state">Loading metrics summary...</div>
             <dl id="metrics-grid" class="key-value-grid" hidden></dl>
+          </article>
+
+          <article class="status-card section-card inventory-card" aria-labelledby="inventory-title">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">Inventory</p>
+                <h2 id="inventory-title">Project inventory</h2>
+              </div>
+              <span id="inventory-badge" class="status-pill">Loading</span>
+            </div>
+            <label class="search-field" for="inventory-search">
+              <span>Search by project ID</span>
+              <input id="inventory-search" name="inventory-search" type="search" placeholder="api">
+            </label>
+            <div id="inventory-state" class="inline-state">Loading project inventory...</div>
+            <div id="inventory-list" class="inventory-list" hidden></div>
+          </article>
+
+          <article class="status-card section-card inventory-card" aria-labelledby="project-detail-title">
+            <div class="section-header">
+              <div>
+                <p class="eyebrow">Details</p>
+                <h2 id="project-detail-title">Environment details</h2>
+              </div>
+              <span id="project-detail-badge" class="status-pill">Loading</span>
+            </div>
+            <div id="project-detail-state" class="inline-state">Select a project to inspect its environments.</div>
+            <div id="project-detail" class="project-detail" hidden></div>
           </article>
         </section>
       </section>
