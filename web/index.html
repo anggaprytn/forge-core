@@ -3,60 +3,37 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Forge control-plane access gateway">
-    <title>Forge Runtime Gateway</title>
+    <title>Forge</title>
     <link rel="stylesheet" href="/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   </head>
-  <body class="gateway-body">
-    <main class="entry-shell">
-      <section class="landing-frame" aria-labelledby="landing-title">
-        <div class="entry-mark-row">
-          <div class="landing-mark">
-            <span class="landing-mark-dot" aria-hidden="true"></span>
-            <span>Forge</span>
-          </div>
-          <p class="entry-meta">Control plane</p>
+  <body class="landing-page">
+    <nav class="nav">
+      <div class="logo">
+        <div class="logo-dot"></div>
+        <span>Forge</span>
+      </div>
+      <div class="nav-links">
+        <a href="/login" class="btn btn-secondary">Sign in</a>
+      </div>
+    </nav>
+
+    <main class="hero">
+      <div class="container">
+        <h1 class="hero-title">Forge your infrastructure.</h1>
+        <p class="hero-subtitle">A minimal control plane for modern deployment lanes. Quiet, fast, and operational by default.</p>
+        <div class="hero-actions">
+          <a href="/login" class="btn btn-primary">Open Forge</a>
         </div>
-
-        <div class="landing-layout">
-          <div class="landing-copy">
-            <p class="landing-eyebrow">Operator workspace</p>
-            <h1 id="landing-title" class="landing-title">See the state. Act with context.</h1>
-            <p class="landing-description">Readiness, inventory, and deployment lanes in one quiet surface.</p>
-            <div class="landing-actions">
-              <a class="landing-button" href="/login">Open Forge</a>
-            </div>
-            <p class="landing-footnote">GitHub sign-in. CLI and API stay primary for execution.</p>
-          </div>
-
-          <aside class="landing-preview" aria-label="Product preview">
-            <div class="preview-panel">
-              <div class="preview-row">
-                <span class="preview-label">Control plane</span>
-                <span class="preview-value is-ok">Live</span>
-              </div>
-              <div class="preview-row">
-                <span class="preview-label">Blockers</span>
-                <span class="preview-value">2 active</span>
-              </div>
-              <div class="preview-row">
-                <span class="preview-label">Projects</span>
-                <span class="preview-value">24 tracked</span>
-              </div>
-              <div class="preview-row">
-                <span class="preview-label">Focus</span>
-                <span class="preview-value">Environment lanes</span>
-              </div>
-            </div>
-          </aside>
-        </div>
-
-        <ul class="landing-trust" aria-label="Product attributes">
-          <li>Fast to scan</li>
-          <li>Built for repeat use</li>
-          <li>Operational by default</li>
-        </ul>
-      </section>
+      </div>
     </main>
+
+    <footer class="footer">
+      <div class="container">
+        <p>&copy; 2026 Forge. Built for operators.</p>
+      </div>
+    </footer>
   </body>
 </html>
