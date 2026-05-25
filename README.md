@@ -222,7 +222,7 @@ Previous readiness behavior was coupled to synchronous fleet-wide diagnostics, w
 
 Forge is in **Alpha**. Alpha Core Loop v5 is the current frozen milestone for the durable single-writer control plane on single-node stateful deployments.
 
-[Roadmap](./ROADMAP.md) | [Architecture](./ARCHITECTURE.md) | [Invariants](./INVARIANTS.md)
+[Roadmap](./docs/ROADMAP.md) | [Architecture](./docs/ARCHITECTURE.md) | [Invariants](./docs/INVARIANTS.md)
 
 ---
 
