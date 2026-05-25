@@ -8,28 +8,27 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body class="gateway-body">
-    <main class="gateway-shell">
-      <section class="gateway-grid">
-        <article class="panel gateway-primary">
-          <p class="eyebrow">Forge Runtime</p>
-          <h1>Control-plane gateway for runtime operations.</h1>
-          <p class="lede">
-            Deterministic convergence, readiness inspection, deployment-lane visibility, and operator authentication in one controlled surface.
+    <main class="landing-shell">
+      <section class="landing-frame" aria-labelledby="landing-title">
+        <div class="landing-mark">
+          <span class="landing-mark-dot" aria-hidden="true"></span>
+          <span>Forge</span>
+        </div>
+        <div class="landing-copy">
+          <p class="landing-eyebrow">Runtime control plane</p>
+          <h1 id="landing-title" class="landing-title">Operate every environment with clarity.</h1>
+          <p class="landing-description">
+            Forge gives operators one calm surface for readiness, inventory, and deployment context.
           </p>
-          <div class="gateway-actions">
-            <a class="button" href="/login">Authenticate operator</a>
-          </div>
-        </article>
-
-        <article class="panel gateway-secondary">
-          <p class="kpi-label">What this surface is for</p>
-          <ul class="gateway-list" aria-label="System intent">
-            <li>Inspect control-plane readiness and blocker state</li>
-            <li>Review queue depth, probe latency, and recovery signals</li>
-            <li>Traverse projects, environments, generations, and rollback posture</li>
-            <li>Hand off execution to CLI or API without losing context</li>
-          </ul>
-        </article>
+        </div>
+        <div class="landing-actions">
+          <a class="landing-button" href="/login">Open operator access</a>
+        </div>
+        <ul class="landing-trust" aria-label="Core product value">
+          <li>Readiness without noise</li>
+          <li>Project and environment context in one place</li>
+          <li>CLI and API remain the execution path</li>
+        </ul>
       </section>
     </main>
   </body>

@@ -7,38 +7,21 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body class="login-page">
-    <main class="access-shell">
-      <section class="panel access-panel">
-        <div class="access-header">
-          <p class="eyebrow">Operator Access</p>
-          <h1>Authenticate into the Forge control plane.</h1>
-          <p class="auth-subtitle">This is an access checkpoint for operators, not a public product entry.</p>
+    <main class="login-shell">
+      <section class="login-card" aria-labelledby="login-title">
+        <div class="login-mark">
+          <span class="login-mark-dot" aria-hidden="true"></span>
+          <span>Forge</span>
         </div>
-
-        <div class="access-grid">
-          <section class="access-column">
-            <p class="kpi-label">Capabilities after login</p>
-            <ul class="auth-notes" aria-label="Operator capabilities">
-              <li>Readiness interpretation and blocker history</li>
-              <li>Project inventory, environment posture, and generation lineage</li>
-              <li>Queue, probe, and convergence metrics</li>
-            </ul>
-          </section>
-
-          <section class="access-column">
-            <p class="kpi-label">Operational constraints</p>
-            <ul class="auth-notes" aria-label="Access constraints">
-              <li>Registration is controlled by server configuration</li>
-              <li>Browser access remains read-only by design</li>
-              <li>Deploy, rollback, and mutation stay in CLI or API flows</li>
-            </ul>
-          </section>
+        <div class="login-copy">
+          <p class="login-eyebrow">Operator access</p>
+          <h1 id="login-title" class="login-title">Continue to the control plane.</h1>
+          <p class="login-description">GitHub SSO is the only sign-in method.</p>
         </div>
-
-        <div class="actions auth-actions">
+        <div class="login-actions">
           __LOGIN_PRIMARY__
         </div>
-        <div class="auth-secondary">
+        <div class="login-secondary">
           __LOGIN_SECONDARY__
         </div>
       </section>

@@ -1044,8 +1044,8 @@ async fn get_login(State(state): State<HttpState>, headers: HeaderMap) -> Respon
 
     let body = if state.web_auth.config.is_some() {
         render_login_page(
-            "<a class=\"button\" href=\"/oauth/github/start\">Continue with GitHub</a>",
-            "<p class=\"page-note\">CLI and bearer-token API access remain available for automation.</p>",
+            "<a class=\"auth-primary-button\" href=\"/oauth/github/start\">Continue with GitHub</a>",
+            "<p class=\"page-note\">For operators only. CLI and API access remain available for automation.</p>",
         )
     } else {
         render_login_page(
@@ -4177,8 +4177,8 @@ pub mod login_serves_web_login {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Forge Operator Console"));
-        assert!(body.contains("Authenticated access to the Forge control plane."));
+        assert!(body.contains("Continue to the control plane."));
+        assert!(body.contains("GitHub SSO is the only sign-in method."));
         assert!(body.contains("/styles.css"));
     }
 }
@@ -4204,7 +4204,7 @@ pub mod login_endpoint_mentions_missing_oauth_config_when_unconfigured {
         let body = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(body.contains("GitHub OAuth login is not configured yet"));
-        assert!(body.contains("Registration controlled by server configuration"));
+        assert!(body.contains("Expected env vars"));
         for key in WEB_LOGIN_REQUIRED_ENV_VARS {
             assert!(body.contains(key));
         }
