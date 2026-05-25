@@ -73,6 +73,29 @@ a {
   gap: 20px;
 }
 
+.login-page {
+  background:
+    radial-gradient(circle at top, rgba(122, 162, 247, 0.08), transparent 32%),
+    linear-gradient(180deg, #1c2030 0%, #181c2b 100%);
+}
+
+.login-shell {
+  width: min(100% - 24px, 520px);
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px 0;
+}
+
+.operator-login-panel {
+  width: 100%;
+  gap: 14px;
+  padding: 24px;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(41, 46, 66, 0.98) 0%, rgba(28, 32, 48, 0.98) 100%);
+}
+
 .eyebrow {
   margin: 0;
   font-size: 0.8rem;
@@ -107,6 +130,18 @@ h3 {
   line-height: 1.6;
 }
 
+.auth-subtitle {
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.auth-supporting-copy {
+  font-size: 0.96rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
 .page-note,
 .env-list,
 .status-card p {
@@ -122,6 +157,41 @@ h3 {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
+}
+
+.auth-actions {
+  padding-top: 6px;
+}
+
+.auth-notes {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.auth-notes li,
+.auth-secondary {
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.auth-notes li {
+  padding: 9px 12px;
+  border: 1px solid rgba(59, 66, 97, 0.76);
+  border-radius: 10px;
+  background: rgba(36, 40, 59, 0.82);
+}
+
+.auth-secondary:empty {
+  display: none;
+}
+
+.login-page .button {
+  min-height: 42px;
+  transition: none;
 }
 
 .button {
@@ -588,6 +658,11 @@ h3 {
   .page-shell {
     width: min(100% - 20px, 860px);
     padding: 20px 0 40px;
+  }
+
+  .login-shell {
+    width: min(100% - 20px, 520px);
+    padding: 16px 0;
   }
 
   .panel {

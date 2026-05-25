@@ -3,19 +3,29 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Forge Login</title>
+    <title>Forge Operator Console</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
-  <body>
-    <main class="page-shell">
-      <section class="panel auth-panel">
-        <p class="eyebrow">Control Plane</p>
-        <h1>Forge Login</h1>
-        <p class="lede">Forge web login is the primary operator entrypoint.</p>
-        <div class="actions">
+  <body class="login-page">
+    <main class="page-shell login-shell">
+      <section class="panel auth-panel operator-login-panel">
+        <p class="eyebrow">Control Plane Access</p>
+        <h1>Forge Operator Console</h1>
+        <p class="auth-subtitle">Authenticated access to the Forge control plane.</p>
+        <p class="auth-supporting-copy">
+          Inspect readiness, project inventory, and operational state.
+        </p>
+        <ul class="auth-notes" aria-label="Access notes">
+          <li>Self-hosted control plane</li>
+          <li>Authenticated operator access</li>
+          <li>Registration controlled by server configuration</li>
+        </ul>
+        <div class="actions auth-actions">
           __LOGIN_PRIMARY__
         </div>
-        __LOGIN_SECONDARY__
+        <div class="auth-secondary">
+          __LOGIN_SECONDARY__
+        </div>
       </section>
     </main>
   </body>
