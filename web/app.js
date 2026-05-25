@@ -950,6 +950,64 @@ function generationLabel(value) {
   return value === null || value === undefined ? "None" : `Gen ${value}`;
 }
 
+function projectDomainSource(project) {
+  const mode = lower(project.domain_mode);
+  const baseDomain = lower(project.base_domain);
+  const prefix = `${lower(project.project_id)}.`;
+  if (mode === "explicit") {
+    return "explicit";
+  }
+  if (mode === "generated") {
+    return baseDomain.startsWith(prefix) ? "generated" : "generated fallback";
+  }
+  return "unknown";
+}
+
+function readinessTone(readiness) {
+  const state = lower(readiness && readiness.health_state);
+  if (state === "healthy") {
+    return "ok";
+  }
+  if (state === "degraded") {
+    return "warn";
+  }
+  if (state === "unavailable") {
+    return "stale";
+  }
+  return "neutral";
+}
+
+function readinessStateLabel(readiness) {
+  return readiness ? text(readiness.health_state) : "Unknown";
+}
+
+function environmentCardTone(environment) {
+  const readiness = lower(environment.readiness_summary && environment.readiness_summary.health_state);
+  if (readiness === "degraded") {
+    return "readiness-degraded";
+  }
+  if (readiness === "unavailable") {
+    return "readiness-unavailable";
+  }
+  if (readiness === "healthy") {
+    return "readiness-healthy";
+  }
+  return "readiness-unknown";
+}
+
+function appendSummaryField(container, label, value) {
+  const row = document.createElement("div");
+  row.className = "summary-field";
+  const term = document.createElement("p");
+  term.className = "summary-field-label";
+  term.textContent = label;
+  const description = document.createElement("p");
+  description.className = "summary-field-value";
+  description.textContent = value;
+  row.append(term, description);
+  container.appendChild(row);
+}
+
 function projectInventoryFilter(project) {
   if (!uiState.projectQuery) {
     return true;
@@ -1010,15 +1068,16 @@ function renderProjectInventory() {
     header.className = "inventory-project-header";
 
     const titleWrap = document.createElement("div");
+    const label = document.createElement("p");
+    label.className = "inventory-section-label";
+    label.textContent = "Project";
+    titleWrap.appendChild(label);
+
     const title = document.createElement("p");
     title.className = "inventory-project-title";
     title.textContent = project.project_id;
     titleWrap.appendChild(title);
 
-    const meta = document.createElement("p");
-    meta.className = "inventory-project-meta";
-    meta.textContent = project.base_domain || text(project.repo_url, "No domain recorded");
-    titleWrap.appendChild(meta);
     header.appendChild(titleWrap);
 
     const status = document.createElement("span");
@@ -1028,19 +1087,36 @@ function renderProjectInventory() {
     header.appendChild(status);
     button.appendChild(header);
 
+    const summary = document.createElement("div");
+    summary.className = "inventory-summary-grid";
+    appendSummaryField(summary, "Project ID", text(project.project_id));
+    appendSummaryField(summary, "Base domain", text(project.base_domain, "Unknown"));
+    appendSummaryField(summary, "Domain source", projectDomainSource(project));
+    appendSummaryField(summary, "Default branch", text(project.default_branch));
+    appendSummaryField(
+      summary,
+      "Environments",
+      project.environments.length
+        ? project.environments.map((environment) => environment.environment).join(", ")
+        : "None discovered",
+    );
+    button.appendChild(summary);
+
     const badges = document.createElement("div");
     badges.className = "inventory-project-badges";
     for (const environment of project.environments || []) {
-      badges.appendChild(createBadge(environment.environment, environment.readiness_summary ? "info" : "historical"));
+      badges.appendChild(createBadge(environment.environment, readinessTone(environment.readiness_summary)));
       if (environment.current_generation !== null && environment.current_generation !== undefined) {
-        badges.appendChild(createBadge(generationLabel(environment.current_generation), "info"));
+        badges.appendChild(createBadge(`Current ${generationLabel(environment.current_generation)}`, "info"));
       }
     }
     button.appendChild(badges);
 
     const note = document.createElement("p");
     note.className = "inventory-project-note";
-    note.textContent = `Branch ${text(project.default_branch)}. ${project.environments.length ? `${project.environments.length} environment views available.` : "No environments discovered yet."}`;
+    note.textContent = project.environments.length
+      ? `${project.environments.length} environment views available. Project ID remains the stable Forge identity; base domain is the routing identity.`
+      : "No environments discovered yet.";
     button.appendChild(note);
 
     list.appendChild(button);
@@ -1060,13 +1136,17 @@ function renderProjectEnvironmentDetails(projectId, environments) {
   if (project) {
     const header = document.createElement("div");
     header.className = "project-detail-header";
+    const label = document.createElement("p");
+    label.className = "inventory-section-label";
+    label.textContent = "Project";
+    header.appendChild(label);
     const title = document.createElement("p");
     title.className = "inventory-project-title";
     title.textContent = project.project_id;
     header.appendChild(title);
     const note = document.createElement("p");
     note.className = "inventory-project-note";
-    note.textContent = `Read-only environment inventory for ${text(project.base_domain, "this project")}.`;
+    note.textContent = `Read-only environment inventory for ${text(project.base_domain, "this project")}. Domain source: ${projectDomainSource(project)}.`;
     header.appendChild(note);
     container.appendChild(header);
   }
@@ -1083,38 +1163,55 @@ function renderProjectEnvironmentDetails(projectId, environments) {
 
   for (const environment of environments) {
     const card = document.createElement("section");
-    card.className = "environment-card";
+    card.className = `environment-card ${environmentCardTone(environment)}`;
 
     const header = document.createElement("div");
     header.className = "environment-card-header";
+    const titleWrap = document.createElement("div");
+    const label = document.createElement("p");
+    label.className = "inventory-section-label";
+    label.textContent = "Environment";
+    titleWrap.appendChild(label);
     const title = document.createElement("p");
     title.className = "environment-card-title";
     title.textContent = environment.environment;
-    header.appendChild(title);
-    const badge = document.createElement("span");
-    badge.className = `status-pill ${statusTone(environment.last_deployment_status)}`;
-    badge.textContent = text(environment.last_deployment_status, "Unknown");
-    header.appendChild(badge);
-    card.appendChild(header);
+    titleWrap.appendChild(title);
+    header.appendChild(titleWrap);
 
     const badges = document.createElement("div");
     badges.className = "environment-card-badges";
-    badges.appendChild(createBadge(`Current ${generationLabel(environment.current_generation)}`, "info"));
-    badges.appendChild(createBadge(`Previous ${generationLabel(environment.previous_generation)}`, "historical"));
-    if (environment.route) {
-      badges.appendChild(createBadge(environment.route, "info"));
-    }
-    card.appendChild(badges);
+    const statusBadge = createBadge(`Status: ${text(environment.last_deployment_status, "Unknown")}`, statusTone(environment.last_deployment_status));
+    const readinessBadge = createBadge(`Readiness: ${readinessStateLabel(environment.readiness_summary)}`, readinessTone(environment.readiness_summary));
+    badges.append(statusBadge, readinessBadge);
+    header.appendChild(badges);
+    card.appendChild(header);
+
+    const semanticNote = document.createElement("p");
+    semanticNote.className = "environment-card-note environment-card-note-strong";
+    semanticNote.textContent = "Status reflects deployment lifecycle. Readiness reflects the live environment lane and is separate from control-plane readiness.";
+    card.appendChild(semanticNote);
 
     const grid = document.createElement("dl");
     grid.className = "environment-detail-grid";
-    appendField(grid, "Route", text(environment.route, "None"));
-    appendField(grid, "Last deploy", formatUnix(environment.last_deployment_timestamp));
+    appendField(grid, "Environment", text(environment.environment));
+    appendField(grid, "Status", text(environment.last_deployment_status, "Unknown"));
+    appendField(grid, "Readiness", readinessStateLabel(environment.readiness_summary));
+    appendField(grid, "Current generation", generationLabel(environment.current_generation));
+    appendField(grid, "Previous generation", generationLabel(environment.previous_generation));
     appendField(
       grid,
-      "Rollback",
+      "Rollback eligibility",
       environment.rollback_eligibility
         ? `${environment.rollback_eligibility.eligible ? "Eligible" : "Not eligible"}: ${environment.rollback_eligibility.reason}`
+        : "Unknown",
+    );
+    appendField(grid, "Active route", text(environment.route, "None"));
+    appendField(grid, "Last deployment", formatUnix(environment.last_deployment_timestamp));
+    appendField(
+      grid,
+      "Runtime policy",
+      environment.runtime_policy
+        ? `${text(environment.runtime_policy.restart_policy)} restart`
         : "Unknown",
     );
     appendField(
@@ -1126,24 +1223,15 @@ function renderProjectEnvironmentDetails(projectId, environments) {
     );
     appendField(
       grid,
-      "Runtime policy",
-      environment.runtime_policy
-        ? `${text(environment.runtime_policy.restart_policy)} restart`
-        : "Unknown",
-    );
-    appendField(
-      grid,
-      "Readiness",
-      environment.readiness_summary
-        ? text(environment.readiness_summary.health_state)
-        : "Unknown",
-    );
-    appendField(
-      grid,
       "Active services",
       (environment.active_services || []).length
         ? environment.active_services.map((service) => service.service_id).join(", ")
-        : "None recorded",
+        : "Service metadata not recorded for this generation.",
+    );
+    appendField(
+      grid,
+      "Control-plane readiness",
+      "See the readiness panel above for operator and convergence state.",
     );
     card.appendChild(grid);
 
@@ -1153,6 +1241,13 @@ function renderProjectEnvironmentDetails(projectId, environments) {
       note.textContent = environment.active_services
         .map((service) => `${service.service_id} (${service.role}${service.route ? ` via ${service.route}` : ""})`)
         .join(" • ");
+      card.appendChild(note);
+    }
+
+    if (environment.readiness_summary && environment.readiness_summary.reasons && environment.readiness_summary.reasons.length) {
+      const note = document.createElement("p");
+      note.className = "environment-card-note";
+      note.textContent = `Readiness detail: ${environment.readiness_summary.reasons.join(" | ")}`;
       card.appendChild(note);
     }
 

@@ -130,6 +130,9 @@
               </div>
               <span id="inventory-badge" class="status-pill">Loading</span>
             </div>
+            <p class="page-note inventory-model-note">
+              Forge treats project_id as stable identity, base_domain as routing identity, current generation as active intent, and previous generation as rollback target.
+            </p>
             <label class="search-field" for="inventory-search">
               <span>Search by project ID</span>
               <input id="inventory-search" name="inventory-search" type="search" placeholder="api">
@@ -146,6 +149,9 @@
               </div>
               <span id="project-detail-badge" class="status-pill">Loading</span>
             </div>
+            <p class="page-note inventory-model-note">
+              Control-plane readiness stays in the readiness panel above. Environment readiness below describes each deployment lane separately.
+            </p>
             <div id="project-detail-state" class="inline-state">Select a project to inspect its environments.</div>
             <div id="project-detail" class="project-detail" hidden></div>
           </article>
