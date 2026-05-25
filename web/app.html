@@ -3,18 +3,24 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Forge Operator Console</title>
+    <title>Forge Control Plane</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body class="console-body">
-    <main class="console-shell">
-      <header class="topbar">
-        <div class="topbar-title">
-          <p class="eyebrow">Forge Control Plane</p>
-          <h1>Operator Console</h1>
-          <p class="topbar-subtitle">Read-only control surface for readiness, queues, inventory, and deployment lane inspection.</p>
+    <main class="app-shell">
+      <aside id="app-sidebar" class="app-sidebar" aria-label="Forge navigation">
+        <div class="sidebar-head">
+          <button id="sidebar-toggle" class="icon-button mobile-only" type="button" aria-label="Toggle navigation">
+            <span></span>
+            <span></span>
+          </button>
+          <div class="brand-lockup">
+            <p class="brand-eyebrow">Forge</p>
+            <h1 class="brand-title">Control Plane</h1>
+          </div>
         </div>
-        <div class="topbar-meta">
+
+        <div class="sidebar-meta">
           <div class="identity-chip">
             <span class="identity-label">Operator</span>
             <strong>__GITHUB_LOGIN__</strong>
@@ -23,180 +29,473 @@
             <span class="identity-label">Mode</span>
             <strong>Observe</strong>
           </div>
+        </div>
+
+        <nav class="sidebar-nav">
+          <section class="nav-group" data-group="operate">
+            <button class="nav-group-toggle" type="button" data-group-toggle="operate" aria-expanded="true">
+              <span>Operate</span>
+              <span class="nav-group-count">3</span>
+            </button>
+            <div class="nav-group-items">
+              <button class="nav-item is-active" type="button" data-route="overview">
+                <span class="nav-item-label">Overview</span>
+                <span class="nav-item-meta">System posture</span>
+              </button>
+              <button class="nav-item" type="button" data-route="monitoring">
+                <span class="nav-item-label">Monitoring</span>
+                <span class="nav-item-meta">Readiness and incidents</span>
+              </button>
+              <button class="nav-item" type="button" data-route="logs">
+                <span class="nav-item-label">Logs</span>
+                <span class="nav-item-meta">Timeline and notes</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="nav-group" data-group="delivery">
+            <button class="nav-group-toggle" type="button" data-group-toggle="delivery" aria-expanded="true">
+              <span>Build &amp; Ship</span>
+              <span class="nav-group-count">2</span>
+            </button>
+            <div class="nav-group-items">
+              <button class="nav-item" type="button" data-route="deployments">
+                <span class="nav-item-label">Deployments</span>
+                <span class="nav-item-meta">Lane state and rollback</span>
+              </button>
+              <button class="nav-item" type="button" data-route="runtime">
+                <span class="nav-item-label">Runtime</span>
+                <span class="nav-item-meta">Execution surfaces</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="nav-group" data-group="platform">
+            <button class="nav-group-toggle" type="button" data-group-toggle="platform" aria-expanded="true">
+              <span>Platform</span>
+              <span class="nav-group-count">1</span>
+            </button>
+            <div class="nav-group-items">
+              <button class="nav-item" type="button" data-route="infrastructure">
+                <span class="nav-item-label">Infrastructure</span>
+                <span class="nav-item-meta">Projects and environments</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="nav-group" data-group="intelligence">
+            <button class="nav-group-toggle" type="button" data-group-toggle="intelligence" aria-expanded="false">
+              <span>AI</span>
+              <span class="nav-group-count">1</span>
+            </button>
+            <div class="nav-group-items">
+              <button class="nav-item" type="button" data-route="ai-systems">
+                <span class="nav-item-label">AI Systems</span>
+                <span class="nav-item-meta">Retrieval and orchestration</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="nav-group" data-group="admin">
+            <button class="nav-group-toggle" type="button" data-group-toggle="admin" aria-expanded="false">
+              <span>Admin</span>
+              <span class="nav-group-count">1</span>
+            </button>
+            <div class="nav-group-items">
+              <button class="nav-item" type="button" data-route="settings">
+                <span class="nav-item-label">Settings</span>
+                <span class="nav-item-meta">Access and policy</span>
+              </button>
+            </div>
+          </section>
+        </nav>
+
+        <div class="sidebar-footer">
           <form action="/logout" method="post">
-            <button class="button button-secondary" type="submit">Log out</button>
+            <button class="button button-secondary sidebar-logout" type="submit">Log out</button>
           </form>
         </div>
-      </header>
+      </aside>
 
-      <section class="command-strip panel" aria-label="Command surface">
-        <div class="command-strip-main">
-          <p class="eyebrow">Command Surface</p>
-          <p class="command-strip-title">Orient, inspect, and hand off execution without leaving context.</p>
-          <p class="command-strip-note">Mutation stays in CLI or API. This surface prioritizes retrieval speed, blocker detection, and decision support.</p>
-        </div>
-        <div class="command-actions">
-          <button id="action-refresh" class="button" type="button">Refresh state</button>
-          <a class="button button-secondary" href="#timeline-section">Jump to blockers</a>
-          <a class="button button-secondary" href="#inventory-section">Jump to inventory</a>
-          <a class="button button-secondary" href="#project-detail-section">Environment lane</a>
-        </div>
-      </section>
+      <div id="sidebar-scrim" class="sidebar-scrim" hidden></div>
 
-      <section class="kpi-strip" aria-label="Operational summary">
-        <article class="kpi-card panel">
-          <p class="kpi-label">Control plane</p>
-          <p id="kpi-control-plane" class="kpi-value">Loading</p>
-          <p class="kpi-note">Overall service posture</p>
-        </article>
-        <article class="kpi-card panel">
-          <p class="kpi-label">Active blockers</p>
-          <p id="kpi-blockers" class="kpi-value">Loading</p>
-          <p class="kpi-note">Immediate readiness risks</p>
-        </article>
-        <article class="kpi-card panel">
-          <p class="kpi-label">Projects</p>
-          <p id="kpi-projects" class="kpi-value">Loading</p>
-          <p class="kpi-note">Registered identities</p>
-        </article>
-        <article class="kpi-card panel">
-          <p class="kpi-label">Degraded lanes</p>
-          <p id="kpi-environments" class="kpi-value">Loading</p>
-          <p class="kpi-note">Environment attention count</p>
-        </article>
-      </section>
-
-      <section class="workspace-grid" aria-label="Operator workspace">
-        <div class="workspace-main">
-          <article id="overview-section" class="status-card section-card panel" aria-labelledby="overview-title">
-            <div class="section-header">
-              <div>
-                <p class="eyebrow">System State</p>
-                <h2 id="overview-title">Control plane overview</h2>
-              </div>
-              <span id="overview-badge" class="status-pill">Loading</span>
-            </div>
-            <div id="overview-state" class="inline-state">Loading current control-plane status...</div>
-            <dl id="overview-grid" class="key-value-grid" hidden></dl>
-          </article>
-
-          <article id="timeline-section" class="status-card section-card panel" aria-labelledby="timeline-title">
-            <div class="section-header">
-              <div>
-                <p class="eyebrow">Incident Timeline</p>
-                <h2 id="timeline-title">Readiness blockers and recovery history</h2>
-              </div>
-              <span id="timeline-badge" class="status-pill">Loading</span>
-            </div>
-            <div id="timeline-state" class="inline-state">Loading readiness timeline...</div>
-            <div id="timeline-groups" class="timeline-groups" hidden>
-              <section class="timeline-group">
-                <h3>Requires action now</h3>
-                <ul id="timeline-active" class="timeline-list"></ul>
-              </section>
-              <section class="timeline-group">
-                <div class="group-header">
-                  <h3>Recovered recently</h3>
-                  <button id="timeline-cleared-toggle" class="text-button" type="button" hidden></button>
-                </div>
-                <ul id="timeline-cleared" class="timeline-list"></ul>
-              </section>
-              <section class="timeline-group">
-                <div class="group-header">
-                  <h3>Historical pattern</h3>
-                  <button id="timeline-historical-toggle" class="text-button" type="button" hidden></button>
-                </div>
-                <ul id="timeline-historical" class="timeline-list"></ul>
-              </section>
-            </div>
-          </article>
-
-          <article id="inventory-section" class="status-card section-card panel inventory-card" aria-labelledby="inventory-title">
-            <div class="section-header">
-              <div>
-                <p class="eyebrow">Inventory Workbench</p>
-                <h2 id="inventory-title">Projects, routing identity, and environment coverage</h2>
-              </div>
-              <span id="inventory-badge" class="status-pill">Loading</span>
-            </div>
-            <div class="inventory-toolbar">
-              <p class="page-note inventory-model-note">
-                Project ID is stable identity. Base domain is routing identity. Current generation is active intent. Previous generation is rollback target.
-              </p>
-              <label class="search-field" for="inventory-search">
-                <span>Filter by project ID</span>
-                <input id="inventory-search" name="inventory-search" type="search" placeholder="Press / to search">
-              </label>
-            </div>
-            <div id="inventory-state" class="inline-state">Loading project inventory...</div>
-            <div id="inventory-list" class="inventory-list" hidden></div>
-          </article>
-
-          <article id="project-detail-section" class="status-card section-card panel inventory-card" aria-labelledby="project-detail-title">
-            <div class="section-header">
-              <div>
-                <p class="eyebrow">Environment Lane</p>
-                <h2 id="project-detail-title">Selected project execution lanes</h2>
-              </div>
-              <span id="project-detail-badge" class="status-pill">Loading</span>
-            </div>
-            <p class="page-note inventory-model-note">
-              Control-plane readiness and environment readiness are separate signals. This pane isolates deployment lane state for the selected project.
+      <section class="shell-main">
+        <header class="utility-bar">
+          <div class="utility-bar-main">
+            <p id="current-view-eyebrow" class="eyebrow">Operate</p>
+            <h2 id="current-view-title" class="page-title">Overview</h2>
+            <p id="current-view-description" class="page-subtitle">
+              Current control-plane posture, blockers, and operator next actions.
             </p>
-            <div id="project-detail-state" class="inline-state">Select a project to inspect its environments.</div>
-            <div id="project-detail" class="project-detail" hidden></div>
-          </article>
-        </div>
+          </div>
 
-        <aside class="workspace-side">
-          <article id="readiness-section" class="status-card section-card panel" aria-labelledby="readiness-title">
-            <div class="section-header">
-              <div>
-                <p class="eyebrow">Interpretation</p>
-                <h2 id="readiness-title">Operator readiness brief</h2>
-              </div>
-              <span id="readiness-badge" class="status-pill">Loading</span>
-            </div>
-            <div id="readiness-state" class="inline-state">Loading readiness explanation...</div>
-            <dl id="readiness-grid" class="key-value-stack" hidden></dl>
-          </article>
+          <div class="utility-bar-actions">
+            <button id="utility-search-trigger" class="button button-secondary" type="button">Project search</button>
+            <button id="action-refresh" class="button" type="button">Refresh state</button>
+          </div>
+        </header>
 
-          <article id="recommendations-section" class="status-card section-card panel" aria-labelledby="recommendations-title">
-            <div class="section-header">
-              <div>
-                <p class="eyebrow">Decision Support</p>
-                <h2 id="recommendations-title">Recommended next checks</h2>
-              </div>
-              <span id="recommendations-badge" class="status-pill">Loading</span>
+        <section class="context-strip panel" aria-label="Global context">
+          <div class="context-cluster">
+            <p class="eyebrow">Context</p>
+            <div class="context-chips">
+              <span id="global-context-posture" class="status-pill">Loading</span>
+              <span id="global-context-blockers" class="status-pill">Loading</span>
+              <span id="global-context-project" class="status-pill">Project loading</span>
             </div>
-            <div id="recommendations-state" class="inline-state">Loading recommendations...</div>
-            <div id="recommendations-content" class="recommendations-content" hidden>
-              <section class="recommendation-primary">
-                <h3>Primary actions</h3>
-                <div id="recommendation-primary" class="recommendation-stack"></div>
-              </section>
-              <section class="recommendation-secondary">
-                <div class="group-header">
-                  <h3>Past notes</h3>
-                  <button id="recommendation-notes-toggle" class="text-button" type="button" hidden></button>
+          </div>
+          <p class="context-note">Read-only operator surface. Use CLI or API for mutations and remediation.</p>
+        </section>
+
+        <div class="route-frame">
+          <section id="route-overview" class="route-view" data-route-view="overview">
+            <section class="hero-band panel">
+              <div class="hero-copy">
+                <p class="eyebrow">Forge Control Plane</p>
+                <p class="hero-title">Operational posture without navigation debt.</p>
+                <p class="hero-note">Use this surface to orient, isolate blockers, inspect environment lanes, and hand work back to execution surfaces fast.</p>
+              </div>
+              <div class="hero-actions">
+                <a class="button button-secondary" href="#monitoring">View incidents</a>
+                <a class="button button-secondary" href="#infrastructure">Inspect inventory</a>
+              </div>
+            </section>
+
+            <section class="kpi-strip" aria-label="Operational summary">
+              <article class="kpi-card panel">
+                <p class="kpi-label">Control plane</p>
+                <p id="kpi-control-plane" class="kpi-value">Loading</p>
+                <p class="kpi-note">Overall service posture</p>
+              </article>
+              <article class="kpi-card panel">
+                <p class="kpi-label">Active blockers</p>
+                <p id="kpi-blockers" class="kpi-value">Loading</p>
+                <p class="kpi-note">Immediate readiness risks</p>
+              </article>
+              <article class="kpi-card panel">
+                <p class="kpi-label">Projects</p>
+                <p id="kpi-projects" class="kpi-value">Loading</p>
+                <p class="kpi-note">Registered identities</p>
+              </article>
+              <article class="kpi-card panel">
+                <p class="kpi-label">Degraded lanes</p>
+                <p id="kpi-environments" class="kpi-value">Loading</p>
+                <p class="kpi-note">Environment attention count</p>
+              </article>
+            </section>
+
+            <section class="overview-grid">
+              <div class="overview-primary">
+                <article id="readiness-section" class="status-card section-card panel" aria-labelledby="readiness-title">
+                  <div class="section-header">
+                    <div>
+                      <p class="eyebrow">Interpretation</p>
+                      <h3 id="readiness-title">Operator readiness brief</h3>
+                    </div>
+                    <span id="readiness-badge" class="status-pill">Loading</span>
+                  </div>
+                  <div id="readiness-state" class="inline-state">Loading readiness explanation...</div>
+                  <dl id="readiness-grid" class="key-value-stack" hidden></dl>
+                </article>
+
+                <article id="timeline-section" class="status-card section-card panel" aria-labelledby="timeline-title">
+                  <div class="section-header">
+                    <div>
+                      <p class="eyebrow">Incident Timeline</p>
+                      <h3 id="timeline-title">Readiness blockers and recovery history</h3>
+                    </div>
+                    <span id="timeline-badge" class="status-pill">Loading</span>
+                  </div>
+                  <div id="timeline-state" class="inline-state">Loading readiness timeline...</div>
+                  <div id="timeline-groups" class="timeline-groups" hidden>
+                    <section class="timeline-group">
+                      <h4>Requires action now</h4>
+                      <ul id="timeline-active" class="timeline-list"></ul>
+                    </section>
+                    <section class="timeline-group">
+                      <div class="group-header">
+                        <h4>Recovered recently</h4>
+                        <button id="timeline-cleared-toggle" class="text-button" type="button" hidden></button>
+                      </div>
+                      <ul id="timeline-cleared" class="timeline-list"></ul>
+                    </section>
+                    <section class="timeline-group">
+                      <div class="group-header">
+                        <h4>Historical pattern</h4>
+                        <button id="timeline-historical-toggle" class="text-button" type="button" hidden></button>
+                      </div>
+                      <ul id="timeline-historical" class="timeline-list"></ul>
+                    </section>
+                  </div>
+                </article>
+              </div>
+
+              <aside class="overview-side">
+                <article id="recommendations-section" class="status-card section-card panel" aria-labelledby="recommendations-title">
+                  <div class="section-header">
+                    <div>
+                      <p class="eyebrow">Decision Support</p>
+                      <h3 id="recommendations-title">Recommended next checks</h3>
+                    </div>
+                    <span id="recommendations-badge" class="status-pill">Loading</span>
+                  </div>
+                  <div id="recommendations-state" class="inline-state">Loading recommendations...</div>
+                  <div id="recommendations-content" class="recommendations-content" hidden>
+                    <section class="recommendation-primary">
+                      <h4>Primary actions</h4>
+                      <div id="recommendation-primary" class="recommendation-stack"></div>
+                    </section>
+                    <section class="recommendation-secondary">
+                      <div class="group-header">
+                        <h4>Past notes</h4>
+                        <button id="recommendation-notes-toggle" class="text-button" type="button" hidden></button>
+                      </div>
+                      <ul id="recommendation-list" class="recommendation-list"></ul>
+                    </section>
+                  </div>
+                </article>
+
+                <article class="status-card section-card panel" aria-labelledby="overview-traffic-title">
+                  <div class="section-header">
+                    <div>
+                      <p class="eyebrow">Fleet Snapshot</p>
+                      <h3 id="overview-traffic-title">Platform inventory posture</h3>
+                    </div>
+                  </div>
+                  <div id="overview-projects-summary" class="compact-stack">
+                    <div class="inline-state">Loading inventory posture...</div>
+                  </div>
+                </article>
+              </aside>
+            </section>
+          </section>
+
+          <section id="route-monitoring" class="route-view" data-route-view="monitoring" hidden>
+            <div class="monitoring-grid">
+              <article id="overview-section" class="status-card section-card panel" aria-labelledby="overview-title">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">System State</p>
+                    <h3 id="overview-title">Control plane overview</h3>
+                  </div>
+                  <span id="overview-badge" class="status-pill">Loading</span>
                 </div>
-                <ul id="recommendation-list" class="recommendation-list"></ul>
-              </section>
-            </div>
-          </article>
+                <div id="overview-state" class="inline-state">Loading current control-plane status...</div>
+                <dl id="overview-grid" class="key-value-grid" hidden></dl>
+              </article>
 
-          <article id="metrics-section" class="status-card section-card panel metrics-card" aria-labelledby="metrics-title">
-            <div class="section-header">
-              <div>
-                <p class="eyebrow">Signals</p>
-                <h2 id="metrics-title">Queue and probe metrics</h2>
-              </div>
-              <span id="metrics-badge" class="status-pill">Loading</span>
+              <article id="metrics-section" class="status-card section-card panel metrics-card" aria-labelledby="metrics-title">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Signals</p>
+                    <h3 id="metrics-title">Queue and probe metrics</h3>
+                  </div>
+                  <span id="metrics-badge" class="status-pill">Loading</span>
+                </div>
+                <div id="metrics-state" class="inline-state">Loading metrics summary...</div>
+                <dl id="metrics-grid" class="key-value-grid" hidden></dl>
+              </article>
+
+              <article class="status-card section-card panel monitoring-wide" aria-labelledby="monitoring-timeline-title">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Events</p>
+                    <h3 id="monitoring-timeline-title">Operational event stream</h3>
+                  </div>
+                  <a class="text-button" href="#logs">Open log-focused view</a>
+                </div>
+                <div id="monitoring-timeline-mirror" class="timeline-mirror">
+                  <div class="inline-state">Switching to Logs keeps the same timeline data but removes surrounding summary noise.</div>
+                </div>
+              </article>
             </div>
-            <div id="metrics-state" class="inline-state">Loading metrics summary...</div>
-            <dl id="metrics-grid" class="key-value-grid" hidden></dl>
-          </article>
-        </aside>
+          </section>
+
+          <section id="route-logs" class="route-view" data-route-view="logs" hidden>
+            <article class="status-card section-card panel" aria-labelledby="logs-title">
+              <div class="section-header">
+                <div>
+                  <p class="eyebrow">Logs</p>
+                  <h3 id="logs-title">Readiness event history</h3>
+                </div>
+                <a class="text-button" href="#monitoring">Back to monitoring</a>
+              </div>
+              <p class="page-note">This view keeps the timeline dominant and removes KPI pressure so operators can inspect history faster.</p>
+              <div id="logs-timeline-embed" class="logs-embed">
+                <div class="inline-state">Use Monitoring or Overview while timeline data loads.</div>
+              </div>
+            </article>
+          </section>
+
+          <section id="route-infrastructure" class="route-view" data-route-view="infrastructure" hidden>
+            <section class="infra-summary-grid">
+              <article class="status-card section-card panel">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Inventory Model</p>
+                    <h3>Project and routing posture</h3>
+                  </div>
+                </div>
+                <div id="infrastructure-summary" class="compact-stack">
+                  <div class="inline-state">Loading infrastructure overview...</div>
+                </div>
+              </article>
+              <article class="status-card section-card panel">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Selection</p>
+                    <h3>Active project context</h3>
+                  </div>
+                </div>
+                <div id="selected-project-summary" class="compact-stack">
+                  <div class="inline-state">Loading project context...</div>
+                </div>
+              </article>
+            </section>
+
+            <section class="workspace-grid" aria-label="Infrastructure workspace">
+              <article id="inventory-section" class="status-card section-card panel inventory-card" aria-labelledby="inventory-title">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Inventory Workbench</p>
+                    <h3 id="inventory-title">Projects, routing identity, and environment coverage</h3>
+                  </div>
+                  <span id="inventory-badge" class="status-pill">Loading</span>
+                </div>
+                <div class="inventory-toolbar">
+                  <p class="page-note inventory-model-note">
+                    Project ID is stable identity. Base domain is routing identity. Current generation is active intent. Previous generation is rollback target.
+                  </p>
+                  <label class="search-field" for="inventory-search">
+                    <span>Filter by project ID</span>
+                    <input id="inventory-search" name="inventory-search" type="search" placeholder="Press / to search">
+                  </label>
+                </div>
+                <div id="inventory-state" class="inline-state">Loading project inventory...</div>
+                <div id="inventory-list" class="inventory-list" hidden></div>
+              </article>
+
+              <article id="project-detail-section" class="status-card section-card panel inventory-card" aria-labelledby="project-detail-title">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Environment Lane</p>
+                    <h3 id="project-detail-title">Selected project execution lanes</h3>
+                  </div>
+                  <span id="project-detail-badge" class="status-pill">Loading</span>
+                </div>
+                <p class="page-note inventory-model-note">
+                  Control-plane readiness and environment readiness are separate signals. This pane isolates deployment lane state for the selected project.
+                </p>
+                <div id="project-detail-state" class="inline-state">Select a project to inspect its environments.</div>
+                <div id="project-detail" class="project-detail" hidden></div>
+              </article>
+            </section>
+          </section>
+
+          <section id="route-deployments" class="route-view" data-route-view="deployments" hidden>
+            <section class="detail-grid">
+              <article class="status-card section-card panel" aria-labelledby="deployment-summary-title">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Deployments</p>
+                    <h3 id="deployment-summary-title">Lane rollout summary</h3>
+                  </div>
+                </div>
+                <div id="deployment-summary" class="compact-stack">
+                  <div class="inline-state">Loading deployment posture...</div>
+                </div>
+              </article>
+              <article class="status-card section-card panel" aria-labelledby="deployment-project-title">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Rollback</p>
+                    <h3 id="deployment-project-title">Selected project release lane</h3>
+                  </div>
+                </div>
+                <div id="deployment-project-focus" class="compact-stack">
+                  <div class="inline-state">Loading selected deployment lane...</div>
+                </div>
+              </article>
+            </section>
+          </section>
+
+          <section id="route-runtime" class="route-view" data-route-view="runtime" hidden>
+            <section class="detail-grid">
+              <article class="status-card section-card panel">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Runtime</p>
+                    <h3>Execution surface health</h3>
+                  </div>
+                </div>
+                <div id="runtime-summary" class="compact-stack">
+                  <div class="inline-state">Loading runtime posture...</div>
+                </div>
+              </article>
+              <article class="status-card section-card panel">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Services</p>
+                    <h3>Active service routing</h3>
+                  </div>
+                </div>
+                <div id="runtime-services" class="compact-stack">
+                  <div class="inline-state">Loading active service map...</div>
+                </div>
+              </article>
+            </section>
+          </section>
+
+          <section id="route-ai-systems" class="route-view" data-route-view="ai-systems" hidden>
+            <article class="status-card section-card panel" aria-labelledby="ai-systems-title">
+              <div class="section-header">
+                <div>
+                  <p class="eyebrow">AI Systems</p>
+                  <h3 id="ai-systems-title">Retrieval and orchestration surfaces</h3>
+                </div>
+              </div>
+              <div class="empty-state">
+                <p class="empty-state-title">No AI-native module telemetry is exposed in the current app APIs.</p>
+                <p class="empty-state-note">This route is intentionally present in the shell to reserve information architecture for retrieval, orchestration, and model operations once those endpoints are available.</p>
+              </div>
+            </article>
+          </section>
+
+          <section id="route-settings" class="route-view" data-route-view="settings" hidden>
+            <section class="detail-grid">
+              <article class="status-card section-card panel">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Access</p>
+                    <h3>Operator access posture</h3>
+                  </div>
+                </div>
+                <div class="compact-stack">
+                  <div class="summary-field">
+                    <p class="summary-field-label">Surface mode</p>
+                    <p class="summary-field-value">Observe only</p>
+                  </div>
+                  <div class="summary-field">
+                    <p class="summary-field-label">Mutation path</p>
+                    <p class="summary-field-value">CLI or API</p>
+                  </div>
+                </div>
+              </article>
+              <article class="status-card section-card panel">
+                <div class="section-header">
+                  <div>
+                    <p class="eyebrow">Policy</p>
+                    <h3>Control-plane conventions</h3>
+                  </div>
+                </div>
+                <div class="empty-state compact-empty">
+                  <p class="empty-state-title">Settings are intentionally quiet in the app shell.</p>
+                  <p class="empty-state-note">Keep this route reserved for access policy, audit posture, integrations, and environment-wide controls as the surface expands.</p>
+                </div>
+              </article>
+            </section>
+          </section>
+        </div>
       </section>
     </main>
     <script src="/app.js"></script>

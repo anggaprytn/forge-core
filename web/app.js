@@ -14,6 +14,49 @@ const PANEL_STATE = {
   unavailable: "Unavailable",
 };
 
+const ROUTES = {
+  overview: {
+    group: "Operate",
+    title: "Overview",
+    description: "Current control-plane posture, blockers, and operator next actions.",
+  },
+  monitoring: {
+    group: "Operate",
+    title: "Monitoring",
+    description: "Readiness state, probe latency, queue pressure, and live health interpretation.",
+  },
+  logs: {
+    group: "Operate",
+    title: "Logs",
+    description: "Timeline-first view for historical readiness events and recovery patterns.",
+  },
+  deployments: {
+    group: "Build & Ship",
+    title: "Deployments",
+    description: "Environment lane state, rollback posture, and selected release context.",
+  },
+  runtime: {
+    group: "Build & Ship",
+    title: "Runtime",
+    description: "Execution lane health, active services, and environment runtime posture.",
+  },
+  infrastructure: {
+    group: "Platform",
+    title: "Infrastructure",
+    description: "Projects, routing identity, and environment inventory in a master-detail workspace.",
+  },
+  "ai-systems": {
+    group: "AI",
+    title: "AI Systems",
+    description: "Reserved shell surface for retrieval, orchestration, and model operations telemetry.",
+  },
+  settings: {
+    group: "Admin",
+    title: "Settings",
+    description: "Access posture, policy boundaries, and reserved control-plane administration surfaces.",
+  },
+};
+
 const SEVERITY_ORDER = {
   critical: 0,
   warning: 1,
@@ -29,16 +72,25 @@ const STATUS_ORDER = {
 const TIMELINE_DEFAULT_VISIBLE = 5;
 
 const uiState = {
+  route: "overview",
   showAllCleared: false,
   showHistorical: false,
   showPastRecommendations: false,
   projectQuery: "",
   selectedProjectId: "",
+  sidebarOpen: false,
 };
 
 const inventoryState = {
   projects: [],
   environmentsByProject: new Map(),
+};
+
+const consoleState = {
+  readyz: null,
+  metrics: null,
+  explain: null,
+  timeline: null,
 };
 
 let controlsBound = false;
@@ -67,48 +119,6 @@ async function fetchApiData(path) {
   return payload && Object.prototype.hasOwnProperty.call(payload, "data") ? payload.data : payload;
 }
 
-function setBadge(id, label, tone) {
-  const node = element(id);
-  if (!node) {
-    return;
-  }
-  node.textContent = label;
-  node.className = `status-pill ${tone}`;
-}
-
-function showState(id, message, tone) {
-  const node = element(id);
-  if (!node) {
-    return;
-  }
-  node.hidden = false;
-  node.textContent = message;
-  node.className = `inline-state ${tone}`;
-}
-
-function hideState(id) {
-  const node = element(id);
-  if (node) {
-    node.hidden = true;
-  }
-}
-
-function showContainer(id) {
-  const node = element(id);
-  if (node) {
-    node.hidden = false;
-  }
-}
-
-function setKpi(id, value, tone) {
-  const node = element(id);
-  if (!node) {
-    return;
-  }
-  node.textContent = value;
-  node.className = `kpi-value${tone ? ` ${tone}` : ""}`;
-}
-
 function text(value, fallback = "Unknown") {
   if (value === null || value === undefined || value === "") {
     return fallback;
@@ -116,29 +126,12 @@ function text(value, fallback = "Unknown") {
   return String(value);
 }
 
-function inventoryEnvironmentStats(projects) {
-  let total = 0;
-  let degraded = 0;
-
-  for (const project of projects || []) {
-    for (const environment of project.environments || []) {
-      total += 1;
-      const health = lower(environment.readiness_summary && environment.readiness_summary.health_state);
-      if (health && health !== "healthy") {
-        degraded += 1;
-      }
-    }
-  }
-
-  return { total, degraded };
+function lower(value) {
+  return text(value, "").trim().toLowerCase();
 }
 
 function boolLabel(value) {
   return value ? "Yes" : "No";
-}
-
-function lower(value) {
-  return text(value, "").trim().toLowerCase();
 }
 
 function isHealthy(readyzLike) {
@@ -209,19 +202,54 @@ function clearChildren(node) {
   }
 }
 
+function showContainer(id) {
+  const node = element(id);
+  if (node) {
+    node.hidden = false;
+  }
+}
+
+function hideState(id) {
+  const node = element(id);
+  if (node) {
+    node.hidden = true;
+  }
+}
+
+function showState(id, message, tone) {
+  const node = element(id);
+  if (!node) {
+    return;
+  }
+  node.hidden = false;
+  node.textContent = message;
+  node.className = `inline-state ${tone}`;
+}
+
+function setBadge(id, label, tone) {
+  const node = element(id);
+  if (!node) {
+    return;
+  }
+  node.textContent = label;
+  node.className = `status-pill ${tone}`;
+}
+
+function setKpi(id, value, tone) {
+  const node = element(id);
+  if (!node) {
+    return;
+  }
+  node.textContent = value;
+  node.className = `kpi-value${tone ? ` ${tone}` : ""}`;
+}
+
 function appendField(container, label, value) {
   const term = document.createElement("dt");
   term.textContent = label;
   const description = document.createElement("dd");
   description.textContent = value;
   container.append(term, description);
-}
-
-function createBadge(label, tone) {
-  const badge = document.createElement("span");
-  badge.className = `item-badge ${tone}`;
-  badge.textContent = label;
-  return badge;
 }
 
 function appendNote(node, message, className) {
@@ -234,81 +262,216 @@ function appendNote(node, message, className) {
   node.appendChild(note);
 }
 
-function appendTimelineItem(list, options) {
-  const item = document.createElement("li");
-  item.className = `timeline-item ${options.tone}${options.muted ? " muted" : ""}`;
-
-  const header = document.createElement("div");
-  header.className = "timeline-item-header";
-
-  const title = document.createElement("p");
-  title.className = "timeline-item-title";
-  title.textContent = options.title;
-  header.appendChild(title);
-
-  const badges = document.createElement("div");
-  badges.className = "timeline-item-badges";
-  badges.appendChild(createBadge(options.statusLabel, options.statusTone));
-  if (options.severityLabel) {
-    badges.appendChild(createBadge(options.severityLabel, options.severityTone));
-  }
-  header.appendChild(badges);
-
-  item.appendChild(header);
-
-  if (options.detail) {
-    const body = document.createElement("p");
-    body.className = "timeline-item-detail";
-    body.textContent = options.detail;
-    item.appendChild(body);
-  }
-
-  appendNote(item, options.note, "timeline-item-note");
-  list.appendChild(item);
+function createBadge(label, tone) {
+  const badge = document.createElement("span");
+  badge.className = `item-badge ${tone}`;
+  badge.textContent = label;
+  return badge;
 }
 
-function appendRecommendationCard(container, recommendation, options) {
-  const item = document.createElement("div");
-  item.className = `recommendation-item ${options.tone}${options.muted ? " muted" : ""}`;
-
-  const header = document.createElement("div");
-  header.className = "recommendation-item-header";
-
-  const title = document.createElement("p");
-  title.className = "recommendation-title";
-  title.textContent = recommendation.title;
-  header.appendChild(title);
-
-  const badges = document.createElement("div");
-  badges.className = "recommendation-item-badges";
-  badges.appendChild(createBadge(options.statusLabel, options.statusTone));
-  if (options.severityLabel) {
-    badges.appendChild(createBadge(options.severityLabel, options.severityTone));
-  }
-  header.appendChild(badges);
-
-  item.appendChild(header);
-
-  const body = document.createElement("p");
-  body.className = "recommendation-detail";
-  body.textContent = recommendation.description;
-  item.appendChild(body);
-
-  if (recommendation.commandHint) {
-    appendNote(item, `Command: ${recommendation.commandHint}`, "recommendation-note");
-  }
-
-  if (options.note) {
-    appendNote(item, options.note, "recommendation-note");
-  }
-
-  container.appendChild(item);
+function appendSummaryField(container, label, value) {
+  const row = document.createElement("div");
+  row.className = "summary-field";
+  const term = document.createElement("p");
+  term.className = "summary-field-label";
+  term.textContent = label;
+  const description = document.createElement("p");
+  description.className = "summary-field-value";
+  description.textContent = value;
+  row.append(term, description);
+  container.appendChild(row);
 }
 
-function appendRecommendationListItem(list, recommendation, options) {
-  const item = document.createElement("li");
-  appendRecommendationCard(item, recommendation, options);
-  list.appendChild(item);
+function appendSignalCard(container, title, value, note, tone = "") {
+  const card = document.createElement("div");
+  card.className = "signal-card";
+  const heading = document.createElement("p");
+  heading.className = "summary-field-label";
+  heading.textContent = title;
+  const strong = document.createElement("p");
+  strong.className = `summary-field-value${tone ? ` ${tone}` : ""}`;
+  strong.textContent = value;
+  card.append(heading, strong);
+  appendNote(card, note, "page-note");
+  container.appendChild(card);
+}
+
+function inventoryEnvironmentStats(projects) {
+  let total = 0;
+  let degraded = 0;
+
+  for (const project of projects || []) {
+    for (const environment of project.environments || []) {
+      total += 1;
+      const health = lower(environment.readiness_summary && environment.readiness_summary.health_state);
+      if (health && health !== "healthy") {
+        degraded += 1;
+      }
+    }
+  }
+
+  return { total, degraded };
+}
+
+function activeTimelineEntries() {
+  return consoleState.timeline && consoleState.timeline.entries
+    ? consoleState.timeline.entries.filter((entry) => normalizeStatus(entry.status) === "active")
+    : [];
+}
+
+function statusTone(status) {
+  const normalized = lower(status);
+  if (normalized === "healthy" || normalized === "promoted" || normalized === "live" || normalized === "ready") {
+    return "ok";
+  }
+  if (normalized === "missing" || normalized === "unavailable") {
+    return "stale";
+  }
+  return "warn";
+}
+
+function generationLabel(value) {
+  return value === null || value === undefined ? "None" : `Gen ${value}`;
+}
+
+function projectDomainSource(project) {
+  const mode = lower(project.domain_mode);
+  const baseDomain = lower(project.base_domain);
+  const prefix = `${lower(project.project_id)}.`;
+  if (mode === "explicit") {
+    return "explicit";
+  }
+  if (mode === "generated") {
+    return baseDomain.startsWith(prefix) ? "generated" : "generated fallback";
+  }
+  return "unknown";
+}
+
+function readinessTone(readiness) {
+  const state = lower(readiness && readiness.health_state);
+  if (state === "healthy") {
+    return "ok";
+  }
+  if (state === "degraded") {
+    return "warn";
+  }
+  if (state === "unavailable") {
+    return "stale";
+  }
+  return "neutral";
+}
+
+function readinessStateLabel(readiness) {
+  return readiness ? text(readiness.health_state) : "Unknown";
+}
+
+function environmentCardTone(environment) {
+  const readiness = lower(environment.readiness_summary && environment.readiness_summary.health_state);
+  if (readiness === "degraded") {
+    return "readiness-degraded";
+  }
+  if (readiness === "unavailable") {
+    return "readiness-unavailable";
+  }
+  if (readiness === "healthy") {
+    return "readiness-healthy";
+  }
+  return "readiness-unknown";
+}
+
+function selectedProject() {
+  return inventoryState.projects.find((project) => project.project_id === uiState.selectedProjectId) || null;
+}
+
+function selectedEnvironments() {
+  if (!uiState.selectedProjectId) {
+    return [];
+  }
+  if (inventoryState.environmentsByProject.has(uiState.selectedProjectId)) {
+    return inventoryState.environmentsByProject.get(uiState.selectedProjectId) || [];
+  }
+  const project = selectedProject();
+  return project ? project.environments || [] : [];
+}
+
+function updateRouteMeta() {
+  const meta = ROUTES[uiState.route] || ROUTES.overview;
+  const eyebrow = element("current-view-eyebrow");
+  const title = element("current-view-title");
+  const description = element("current-view-description");
+  if (eyebrow) {
+    eyebrow.textContent = meta.group;
+  }
+  if (title) {
+    title.textContent = meta.title;
+  }
+  if (description) {
+    description.textContent = meta.description;
+  }
+}
+
+function updateRouteVisibility() {
+  for (const view of document.querySelectorAll("[data-route-view]")) {
+    view.hidden = view.dataset.routeView !== uiState.route;
+  }
+
+  for (const button of document.querySelectorAll("[data-route]")) {
+    button.classList.toggle("is-active", button.dataset.route === uiState.route);
+  }
+
+  updateRouteMeta();
+}
+
+function syncRouteFromHash() {
+  const route = window.location.hash ? window.location.hash.slice(1) : "overview";
+  uiState.route = Object.prototype.hasOwnProperty.call(ROUTES, route) ? route : "overview";
+  updateRouteVisibility();
+  setSidebarOpen(false);
+}
+
+function setSidebarOpen(nextOpen) {
+  uiState.sidebarOpen = nextOpen;
+  const sidebar = element("app-sidebar");
+  const scrim = element("sidebar-scrim");
+  if (sidebar) {
+    sidebar.classList.toggle("is-open", nextOpen);
+  }
+  if (scrim) {
+    scrim.hidden = !nextOpen;
+  }
+}
+
+function navigate(route) {
+  if (!Object.prototype.hasOwnProperty.call(ROUTES, route)) {
+    return;
+  }
+  window.location.hash = route;
+}
+
+function focusInventorySearch() {
+  window.requestAnimationFrame(() => {
+    const search = element("inventory-search");
+    if (!search) {
+      return;
+    }
+    search.focus();
+    search.select();
+  });
+}
+
+function configureToggle(buttonId, visible, label, onClick) {
+  const button = element(buttonId);
+  if (!button) {
+    return;
+  }
+  button.hidden = !visible;
+  if (!visible) {
+    button.textContent = "";
+    button.onclick = null;
+    return;
+  }
+  button.textContent = label;
+  button.onclick = onClick;
 }
 
 function bindGlobalControls() {
@@ -329,6 +492,40 @@ function bindGlobalControls() {
     });
   }
 
+  const searchTrigger = element("utility-search-trigger");
+  if (searchTrigger) {
+    searchTrigger.addEventListener("click", () => {
+      navigate("infrastructure");
+      focusInventorySearch();
+    });
+  }
+
+  const sidebarToggle = element("sidebar-toggle");
+  if (sidebarToggle) {
+    sidebarToggle.addEventListener("click", () => {
+      setSidebarOpen(!uiState.sidebarOpen);
+    });
+  }
+
+  const sidebarScrim = element("sidebar-scrim");
+  if (sidebarScrim) {
+    sidebarScrim.addEventListener("click", () => setSidebarOpen(false));
+  }
+
+  for (const button of document.querySelectorAll("[data-route]")) {
+    button.addEventListener("click", () => navigate(button.dataset.route));
+  }
+
+  for (const button of document.querySelectorAll("[data-group-toggle]")) {
+    button.addEventListener("click", () => {
+      const expanded = button.getAttribute("aria-expanded") === "true";
+      button.setAttribute("aria-expanded", expanded ? "false" : "true");
+    });
+  }
+
+  window.addEventListener("hashchange", syncRouteFromHash);
+  syncRouteFromHash();
+
   document.addEventListener("keydown", (event) => {
     const target = event.target;
     const tagName = target && target.tagName ? target.tagName.toLowerCase() : "";
@@ -338,13 +535,9 @@ function bindGlobalControls() {
     }
 
     if (event.key === "/") {
-      const search = element("inventory-search");
-      if (!search) {
-        return;
-      }
+      navigate("infrastructure");
       event.preventDefault();
-      search.focus();
-      search.select();
+      focusInventorySearch();
     }
   });
 }
@@ -368,16 +561,28 @@ function renderOperationalSummary(readyz, explain, timeline, projects) {
     controlPlaneState,
     controlPlaneState === "Ready" ? "ok" : controlPlaneState === "Unavailable" ? "stale" : "warn",
   );
-  setKpi(
-    "kpi-blockers",
-    String(activeBlockers),
-    activeBlockers > 0 ? "warn" : "ok",
-  );
+  setKpi("kpi-blockers", String(activeBlockers), activeBlockers > 0 ? "warn" : "ok");
   setKpi("kpi-projects", String(projectCount), projectCount > 0 ? "" : "stale");
   setKpi(
     "kpi-environments",
     total ? `${degraded}/${total}` : "0/0",
     degraded > 0 ? "warn" : total > 0 ? "ok" : "stale",
+  );
+
+  setBadge(
+    "global-context-posture",
+    `Posture: ${controlPlaneState}`,
+    controlPlaneState === "Ready" ? "ok" : controlPlaneState === "Unavailable" ? "stale" : "warn",
+  );
+  setBadge(
+    "global-context-blockers",
+    activeBlockers ? `${activeBlockers} active blockers` : "No active blockers",
+    activeBlockers ? "warn" : "ok",
+  );
+  setBadge(
+    "global-context-project",
+    uiState.selectedProjectId ? `Project ${uiState.selectedProjectId}` : "Project context unset",
+    uiState.selectedProjectId ? "info" : "stale",
   );
 }
 
@@ -399,21 +604,13 @@ function renderOverview(readyz, metrics) {
   appendField(grid, "Follower mode", boolLabel(Boolean(metrics.follower_mode)));
   appendField(grid, "Replay in progress", boolLabel(Boolean(metrics.replay_in_progress)));
   appendField(grid, "Readiness cache age", formatDuration(metrics.readiness_cache_age_ms));
-  appendField(
-    grid,
-    "Convergence loop duration",
-    formatDuration(metrics.convergence_loop_duration_ms),
-  );
+  appendField(grid, "Convergence loop duration", formatDuration(metrics.convergence_loop_duration_ms));
 
   hideState("overview-state");
   showContainer("overview-grid");
 
   const degraded = readyz.status !== "ready" || readyz.active_failure;
-  setBadge(
-    "overview-badge",
-    degraded ? PANEL_STATE.degraded : PANEL_STATE.ok,
-    degraded ? "warn" : "ok",
-  );
+  setBadge("overview-badge", degraded ? PANEL_STATE.degraded : PANEL_STATE.ok, degraded ? "warn" : "ok");
 }
 
 function renderReadiness(explain, readyz) {
@@ -448,14 +645,14 @@ function renderReadiness(explain, readyz) {
     grid,
     "Historical note",
     explain.historical_failures
-      ? `Historical failure recorded. Review timeline only if investigating a past incident. Last recorded event: ${formatUnix(explain.last_historical_failure_unix)}`
+      ? `Historical failure recorded. Last recorded event: ${formatUnix(explain.last_historical_failure_unix)}`
       : "No historical failures reported.",
   );
 
   hideState("readiness-state");
   showContainer("readiness-grid");
 
-  const stale = explain.warning && explain.warning.toLowerCase().includes("stale");
+  const stale = explain.warning && lower(explain.warning).includes("stale");
   const degraded = explain.readiness_status !== "ready" || explain.active_failure;
   const label = stale ? PANEL_STATE.stale : degraded ? PANEL_STATE.degraded : PANEL_STATE.ok;
   const tone = stale ? "stale" : degraded ? "warn" : "ok";
@@ -654,6 +851,38 @@ function recommendationNote(recommendation) {
   return "Historical recommendation only. Not an active readiness blocker.";
 }
 
+function appendTimelineItem(list, options) {
+  const item = document.createElement("li");
+  item.className = `timeline-item ${options.tone}${options.muted ? " muted" : ""}`;
+
+  const header = document.createElement("div");
+  header.className = "timeline-item-header";
+
+  const title = document.createElement("p");
+  title.className = "timeline-item-title";
+  title.textContent = options.title;
+  header.appendChild(title);
+
+  const badges = document.createElement("div");
+  badges.className = "timeline-item-badges";
+  badges.appendChild(createBadge(options.statusLabel, options.statusTone));
+  if (options.severityLabel) {
+    badges.appendChild(createBadge(options.severityLabel, options.severityTone));
+  }
+  header.appendChild(badges);
+  item.appendChild(header);
+
+  if (options.detail) {
+    const body = document.createElement("p");
+    body.className = "timeline-item-detail";
+    body.textContent = options.detail;
+    item.appendChild(body);
+  }
+
+  appendNote(item, options.note, "timeline-item-note");
+  list.appendChild(item);
+}
+
 function renderTimelineEntry(list, entry) {
   const status = normalizeStatus(entry.status);
   const recommendation = entry.recommendation || null;
@@ -710,21 +939,6 @@ function renderTimelineEntry(list, entry) {
     severityLabel: "",
     severityTone: "",
   });
-}
-
-function configureToggle(buttonId, visible, label, onClick) {
-  const button = element(buttonId);
-  if (!button) {
-    return;
-  }
-  button.hidden = !visible;
-  if (!visible) {
-    button.textContent = "";
-    button.onclick = null;
-    return;
-  }
-  button.textContent = label;
-  button.onclick = onClick;
 }
 
 function renderTimeline(timeline) {
@@ -822,6 +1036,7 @@ function renderTimeline(timeline) {
     () => {
       uiState.showAllCleared = !uiState.showAllCleared;
       renderTimeline(timeline);
+      renderDerivedViews();
     },
   );
 
@@ -832,17 +1047,61 @@ function renderTimeline(timeline) {
     () => {
       uiState.showHistorical = !uiState.showHistorical;
       renderTimeline(timeline);
+      renderDerivedViews();
     },
   );
 
   hideState("timeline-state");
   showContainer("timeline-groups");
 
-  const stale = timeline.warning && timeline.warning.toLowerCase().includes("stale");
+  const stale = timeline.warning && lower(timeline.warning).includes("stale");
   const degraded = activeEntries.length > 0;
   const label = stale ? PANEL_STATE.stale : degraded ? PANEL_STATE.degraded : PANEL_STATE.ok;
   const tone = stale ? "stale" : degraded ? "warn" : "ok";
   setBadge("timeline-badge", label, tone);
+}
+
+function appendRecommendationCard(container, recommendation, options) {
+  const item = document.createElement("div");
+  item.className = `recommendation-item ${options.tone}${options.muted ? " muted" : ""}`;
+
+  const header = document.createElement("div");
+  header.className = "recommendation-item-header";
+
+  const title = document.createElement("p");
+  title.className = "recommendation-title";
+  title.textContent = recommendation.title;
+  header.appendChild(title);
+
+  const badges = document.createElement("div");
+  badges.className = "recommendation-item-badges";
+  badges.appendChild(createBadge(options.statusLabel, options.statusTone));
+  if (options.severityLabel) {
+    badges.appendChild(createBadge(options.severityLabel, options.severityTone));
+  }
+  header.appendChild(badges);
+  item.appendChild(header);
+
+  const body = document.createElement("p");
+  body.className = "recommendation-detail";
+  body.textContent = recommendation.description;
+  item.appendChild(body);
+
+  if (recommendation.commandHint) {
+    appendNote(item, `Command: ${recommendation.commandHint}`, "recommendation-note");
+  }
+
+  if (options.note) {
+    appendNote(item, options.note, "recommendation-note");
+  }
+
+  container.appendChild(item);
+}
+
+function appendRecommendationListItem(list, recommendation, options) {
+  const item = document.createElement("li");
+  appendRecommendationCard(item, recommendation, options);
+  list.appendChild(item);
 }
 
 function renderRecommendations(explain, timeline, readyz) {
@@ -990,6 +1249,7 @@ function renderRecommendations(explain, timeline, readyz) {
       () => {
         uiState.showPastRecommendations = !uiState.showPastRecommendations;
         renderRecommendations(explain, timeline, readyz);
+        renderDerivedViews();
       },
     );
   }
@@ -998,11 +1258,7 @@ function renderRecommendations(explain, timeline, readyz) {
   showContainer("recommendations-content");
 
   const degraded = explain.active_failure || deduped.active.length > 0;
-  setBadge(
-    "recommendations-badge",
-    degraded ? PANEL_STATE.degraded : PANEL_STATE.ok,
-    degraded ? "warn" : "ok",
-  );
+  setBadge("recommendations-badge", degraded ? PANEL_STATE.degraded : PANEL_STATE.ok, degraded ? "warn" : "ok");
 }
 
 function renderMetrics(metrics) {
@@ -1033,79 +1289,6 @@ function renderMetrics(metrics) {
   setBadge("metrics-badge", label, tone);
 }
 
-function statusTone(status) {
-  const normalized = lower(status);
-  if (normalized === "healthy" || normalized === "promoted") {
-    return "ok";
-  }
-  if (normalized === "missing" || normalized === "unavailable") {
-    return "stale";
-  }
-  return "warn";
-}
-
-function generationLabel(value) {
-  return value === null || value === undefined ? "None" : `Gen ${value}`;
-}
-
-function projectDomainSource(project) {
-  const mode = lower(project.domain_mode);
-  const baseDomain = lower(project.base_domain);
-  const prefix = `${lower(project.project_id)}.`;
-  if (mode === "explicit") {
-    return "explicit";
-  }
-  if (mode === "generated") {
-    return baseDomain.startsWith(prefix) ? "generated" : "generated fallback";
-  }
-  return "unknown";
-}
-
-function readinessTone(readiness) {
-  const state = lower(readiness && readiness.health_state);
-  if (state === "healthy") {
-    return "ok";
-  }
-  if (state === "degraded") {
-    return "warn";
-  }
-  if (state === "unavailable") {
-    return "stale";
-  }
-  return "neutral";
-}
-
-function readinessStateLabel(readiness) {
-  return readiness ? text(readiness.health_state) : "Unknown";
-}
-
-function environmentCardTone(environment) {
-  const readiness = lower(environment.readiness_summary && environment.readiness_summary.health_state);
-  if (readiness === "degraded") {
-    return "readiness-degraded";
-  }
-  if (readiness === "unavailable") {
-    return "readiness-unavailable";
-  }
-  if (readiness === "healthy") {
-    return "readiness-healthy";
-  }
-  return "readiness-unknown";
-}
-
-function appendSummaryField(container, label, value) {
-  const row = document.createElement("div");
-  row.className = "summary-field";
-  const term = document.createElement("p");
-  term.className = "summary-field-label";
-  term.textContent = label;
-  const description = document.createElement("p");
-  description.className = "summary-field-value";
-  description.textContent = value;
-  row.append(term, description);
-  container.appendChild(row);
-}
-
 function projectInventoryFilter(project) {
   if (!uiState.projectQuery) {
     return true;
@@ -1122,6 +1305,7 @@ function bindInventoryControls() {
   search.addEventListener("input", () => {
     uiState.projectQuery = search.value.trim();
     renderProjectInventory();
+    renderDerivedViews();
   });
 }
 
@@ -1138,10 +1322,8 @@ function renderProjectInventory() {
   if (!filtered.length) {
     showState(
       "inventory-state",
-      inventoryState.projects.length
-        ? "No projects match the current filter."
-        : "No projects registered yet.",
-      inventoryState.projects.length ? "stale" : "ok",
+      inventoryState.projects.length ? "No projects match the current filter." : "No projects registered yet.",
+      "stale",
     );
     list.hidden = true;
     showState(
@@ -1151,12 +1333,11 @@ function renderProjectInventory() {
         : "Select a project to inspect its environments.",
       inventoryState.projects.length ? "stale" : "ok",
     );
-    element("project-detail").hidden = true;
-    setBadge(
-      "inventory-badge",
-      inventoryState.projects.length ? PANEL_STATE.stale : PANEL_STATE.stale,
-      "stale",
-    );
+    const detail = element("project-detail");
+    if (detail) {
+      detail.hidden = true;
+    }
+    setBadge("inventory-badge", PANEL_STATE.stale, "stale");
     setBadge("project-detail-badge", PANEL_STATE.stale, "stale");
     return;
   }
@@ -1175,6 +1356,7 @@ function renderProjectInventory() {
     button.addEventListener("click", () => {
       uiState.selectedProjectId = project.project_id;
       renderProjectInventory();
+      renderDerivedViews();
       void loadProjectEnvironments(project.project_id);
     });
 
@@ -1269,6 +1451,7 @@ function renderProjectEnvironmentDetails(projectId, environments) {
     showState("project-detail-state", "No environments registered for this project.", "ok");
     container.hidden = true;
     setBadge("project-detail-badge", PANEL_STATE.stale, "stale");
+    renderDerivedViews();
     return;
   }
 
@@ -1301,7 +1484,7 @@ function renderProjectEnvironmentDetails(projectId, environments) {
     card.appendChild(header);
 
     const semanticNote = document.createElement("p");
-    semanticNote.className = "environment-card-note environment-card-note-strong";
+    semanticNote.className = "environment-card-note";
     semanticNote.textContent = "Status reflects deployment lifecycle. Readiness reflects the live environment lane and is separate from control-plane readiness.";
     card.appendChild(semanticNote);
 
@@ -1324,9 +1507,7 @@ function renderProjectEnvironmentDetails(projectId, environments) {
     appendField(
       grid,
       "Runtime policy",
-      environment.runtime_policy
-        ? `${text(environment.runtime_policy.restart_policy)} restart`
-        : "Unknown",
+      environment.runtime_policy ? `${text(environment.runtime_policy.restart_policy)} restart` : "Unknown",
     );
     appendField(
       grid,
@@ -1342,11 +1523,7 @@ function renderProjectEnvironmentDetails(projectId, environments) {
         ? environment.active_services.map((service) => service.service_id).join(", ")
         : "Service metadata not recorded for this generation.",
     );
-    appendField(
-      grid,
-      "Control-plane readiness",
-      "See the readiness panel above for operator and convergence state.",
-    );
+    appendField(grid, "Control-plane readiness", "See monitoring surfaces for operator and convergence state.");
     card.appendChild(grid);
 
     if (environment.active_services && environment.active_services.length) {
@@ -1369,6 +1546,262 @@ function renderProjectEnvironmentDetails(projectId, environments) {
   }
 
   setBadge("project-detail-badge", PANEL_STATE.ok, "ok");
+  renderDerivedViews();
+}
+
+function renderEmptySummary(containerId, title, note) {
+  const container = element(containerId);
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+  appendSignalCard(container, title, "Unavailable", note, "stale");
+}
+
+function renderOverviewInventorySummary() {
+  const container = element("overview-projects-summary");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  if (!inventoryState.projects.length) {
+    appendSignalCard(container, "Inventory", "No projects", "Project inventory is empty or unavailable.", "stale");
+    return;
+  }
+
+  const { total, degraded } = inventoryEnvironmentStats(inventoryState.projects);
+  appendSignalCard(container, "Projects", String(inventoryState.projects.length), "Registered stable identities.");
+  appendSignalCard(container, "Environment lanes", total ? String(total) : "0", "Total discovered execution lanes.");
+  appendSignalCard(
+    container,
+    "Attention required",
+    degraded ? String(degraded) : "0",
+    degraded ? "Environment lanes with degraded or unavailable readiness." : "No degraded environment lanes detected.",
+    degraded ? "warn" : "ok",
+  );
+}
+
+function renderInfrastructureSummary() {
+  const container = element("infrastructure-summary");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  if (!inventoryState.projects.length) {
+    appendSignalCard(container, "Infrastructure", "Unavailable", "Project inventory is not currently loaded.", "stale");
+    return;
+  }
+
+  const { total, degraded } = inventoryEnvironmentStats(inventoryState.projects);
+  appendSummaryField(container, "Projects", String(inventoryState.projects.length));
+  appendSummaryField(container, "Environment lanes", String(total));
+  appendSummaryField(container, "Degraded lanes", String(degraded));
+  appendSummaryField(
+    container,
+    "Routing model",
+    inventoryState.projects.some((project) => projectDomainSource(project) === "explicit")
+      ? "Mixed explicit and generated domains"
+      : "Generated routing identity",
+  );
+}
+
+function renderSelectedProjectSummary() {
+  const container = element("selected-project-summary");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  const project = selectedProject();
+  if (!project) {
+    appendSignalCard(container, "Selected project", "None", "Pick a project from inventory to inspect routing and lane state.", "stale");
+    return;
+  }
+
+  const environments = selectedEnvironments();
+  appendSummaryField(container, "Project ID", text(project.project_id));
+  appendSummaryField(container, "Base domain", text(project.base_domain, "Unknown"));
+  appendSummaryField(container, "Default branch", text(project.default_branch));
+  appendSummaryField(
+    container,
+    "Environment count",
+    environments.length ? String(environments.length) : String((project.environments || []).length),
+  );
+}
+
+function renderDeploymentSummary() {
+  const container = element("deployment-summary");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  const project = selectedProject();
+  const environments = selectedEnvironments();
+  if (!project) {
+    appendSignalCard(container, "Release lanes", "No project selected", "Select a project in Infrastructure to inspect deployment posture.", "stale");
+    return;
+  }
+
+  if (!environments.length) {
+    appendSignalCard(container, "Release lanes", "No environments", "Selected project has no loaded environment lanes.", "stale");
+    return;
+  }
+
+  for (const environment of environments) {
+    appendSignalCard(
+      container,
+      `${environment.environment} lane`,
+      text(environment.last_deployment_status, "Unknown"),
+      `${generationLabel(environment.current_generation)} current • ${generationLabel(environment.previous_generation)} previous`,
+      statusTone(environment.last_deployment_status),
+    );
+  }
+}
+
+function renderDeploymentProjectFocus() {
+  const container = element("deployment-project-focus");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  const project = selectedProject();
+  const environments = selectedEnvironments();
+  if (!project || !environments.length) {
+    appendSignalCard(container, "Rollback posture", "Unavailable", "Load a project environment lane to inspect rollback eligibility.", "stale");
+    return;
+  }
+
+  for (const environment of environments) {
+    const rollback = environment.rollback_eligibility
+      ? environment.rollback_eligibility.eligible
+        ? `Eligible: ${environment.rollback_eligibility.reason}`
+        : `Blocked: ${environment.rollback_eligibility.reason}`
+      : "Unknown";
+    appendSummaryField(container, `${environment.environment} rollback`, rollback);
+  }
+}
+
+function renderRuntimeSummary() {
+  const container = element("runtime-summary");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  if (!consoleState.metrics || !consoleState.readyz) {
+    appendSignalCard(container, "Runtime", "Unavailable", "Queue and runtime metrics have not loaded.", "stale");
+    return;
+  }
+
+  appendSummaryField(container, "Readiness", text(consoleState.readyz.status));
+  appendSummaryField(container, "Queue depth", text(consoleState.metrics.queue_depth, "0"));
+  appendSummaryField(container, "Pending intents", text(consoleState.metrics.pending_intents, "0"));
+  appendSummaryField(container, "Replay queue", text(consoleState.metrics.replay_queue_depth, "0"));
+}
+
+function renderRuntimeServices() {
+  const container = element("runtime-services");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  const environments = selectedEnvironments();
+  if (!environments.length) {
+    appendSignalCard(container, "Services", "No project context", "Select a project to inspect active service routing.", "stale");
+    return;
+  }
+
+  let serviceCount = 0;
+  for (const environment of environments) {
+    const services = environment.active_services || [];
+    if (!services.length) {
+      appendSummaryField(container, `${environment.environment} services`, "No active service metadata");
+      continue;
+    }
+
+    serviceCount += services.length;
+    appendSummaryField(
+      container,
+      `${environment.environment} services`,
+      services.map((service) => `${service.service_id}${service.route ? ` via ${service.route}` : ""}`).join(", "),
+    );
+  }
+
+  if (serviceCount === 0) {
+    appendSignalCard(container, "Services", "Unavailable", "Active service metadata is not recorded for the selected project.", "stale");
+  }
+}
+
+function renderMonitoringMirror() {
+  const container = element("monitoring-timeline-mirror");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  if (!consoleState.timeline) {
+    appendSignalCard(container, "Events", "Unavailable", "Timeline data has not loaded.", "stale");
+    return;
+  }
+
+  const active = activeTimelineEntries();
+  const clearedCount = (consoleState.timeline.entries || []).filter((entry) => normalizeStatus(entry.status) === "cleared").length;
+  const historicalCount = (consoleState.timeline.entries || []).filter((entry) => normalizeStatus(entry.status) === "historical").length;
+
+  appendSignalCard(container, "Active blockers", String(active.length), active.length ? "Action required now." : "No active readiness blockers.", active.length ? "warn" : "ok");
+  appendSignalCard(container, "Recovered recently", String(clearedCount), "Recently cleared entries from the event stream.");
+  appendSignalCard(container, "Historical pattern", String(historicalCount), "Older incidents preserved for investigation.");
+}
+
+function renderLogsEmbed() {
+  const container = element("logs-timeline-embed");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  if (!consoleState.timeline) {
+    appendSignalCard(container, "Timeline", "Unavailable", "Timeline data has not loaded.", "stale");
+    return;
+  }
+
+  const active = activeTimelineEntries();
+  if (!active.length) {
+    appendSignalCard(container, "Current stream", "Quiet", "No active readiness blockers in the event stream.", "ok");
+  } else {
+    for (const entry of active.slice(0, 4)) {
+      appendSignalCard(
+        container,
+        text(entry.blocker_type, "Blocker"),
+        text(entry.reason, "Unknown"),
+        entry.suggested_action ? `Suggested check: ${entry.suggested_action}` : `Recorded ${formatUnix(entry.timestamp_unix)}`,
+        "warn",
+      );
+    }
+  }
+}
+
+function renderDerivedViews() {
+  renderOverviewInventorySummary();
+  renderInfrastructureSummary();
+  renderSelectedProjectSummary();
+  renderDeploymentSummary();
+  renderDeploymentProjectFocus();
+  renderRuntimeSummary();
+  renderRuntimeServices();
+  renderMonitoringMirror();
+  renderLogsEmbed();
+  renderOperationalSummary(
+    consoleState.readyz,
+    consoleState.explain,
+    consoleState.timeline,
+    inventoryState.projects,
+  );
 }
 
 async function loadProjectEnvironments(projectId) {
@@ -1381,7 +1814,10 @@ async function loadProjectEnvironments(projectId) {
   }
 
   showState("project-detail-state", "Loading environment inventory...", "ok");
-  element("project-detail").hidden = true;
+  const detail = element("project-detail");
+  if (detail) {
+    detail.hidden = true;
+  }
 
   try {
     const payload = await fetchApiData(`${API_PATHS.projects}/${encodeURIComponent(projectId)}/environments`);
@@ -1392,11 +1828,15 @@ async function loadProjectEnvironments(projectId) {
     if (err && err.status === 404) {
       inventoryState.environmentsByProject.delete(projectId);
       showState("project-detail-state", "Project no longer exists or has no registered environments.", "ok");
-      element("project-detail").hidden = true;
+      if (detail) {
+        detail.hidden = true;
+      }
       setBadge("project-detail-badge", PANEL_STATE.stale, "stale");
+      renderDerivedViews();
       return;
     }
     renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
+    renderDerivedViews();
   }
 }
 
@@ -1405,16 +1845,13 @@ async function loadInventory(forceReload = false) {
   if (forceReload) {
     inventoryState.environmentsByProject.clear();
   }
-  try {
-    const payload = await fetchApiData(API_PATHS.projects);
-    inventoryState.projects = payload && payload.projects ? payload.projects : [];
-    renderProjectInventory();
-    if (uiState.selectedProjectId) {
-      await loadProjectEnvironments(uiState.selectedProjectId);
-    }
-  } catch (_err) {
-    renderUnavailable("inventory-state", "inventory-badge", "Project inventory unavailable.");
-    renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
+
+  const payload = await fetchApiData(API_PATHS.projects);
+  inventoryState.projects = payload && payload.projects ? payload.projects : [];
+  renderProjectInventory();
+  renderDerivedViews();
+  if (uiState.selectedProjectId) {
+    await loadProjectEnvironments(uiState.selectedProjectId);
   }
 }
 
@@ -1425,6 +1862,7 @@ function renderUnavailable(panel, badge, message) {
 
 async function loadConsole(forceReload = false) {
   bindGlobalControls();
+
   const [readyz, metrics, explain, timeline, inventory] = await Promise.allSettled([
     fetchJson(API_PATHS.readyz),
     fetchJson(API_PATHS.metrics),
@@ -1432,6 +1870,11 @@ async function loadConsole(forceReload = false) {
     fetchJson(API_PATHS.timeline),
     loadInventory(forceReload),
   ]);
+
+  consoleState.readyz = readyz.status === "fulfilled" ? readyz.value : null;
+  consoleState.metrics = metrics.status === "fulfilled" ? metrics.value : null;
+  consoleState.explain = explain.status === "fulfilled" ? explain.value : null;
+  consoleState.timeline = timeline.status === "fulfilled" ? timeline.value : null;
 
   if (readyz.status === "fulfilled" && metrics.status === "fulfilled") {
     renderOverview(readyz.value, metrics.value);
@@ -1476,14 +1919,12 @@ async function loadConsole(forceReload = false) {
   if (inventory.status === "rejected") {
     renderUnavailable("inventory-state", "inventory-badge", "Project inventory unavailable.");
     renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
+    renderEmptySummary("overview-projects-summary", "Inventory", "Project inventory is unavailable.");
+    renderEmptySummary("infrastructure-summary", "Infrastructure", "Project inventory is unavailable.");
+    renderEmptySummary("selected-project-summary", "Project context", "Project inventory is unavailable.");
   }
 
-  renderOperationalSummary(
-    readyz.status === "fulfilled" ? readyz.value : null,
-    explain.status === "fulfilled" ? explain.value : null,
-    timeline.status === "fulfilled" ? timeline.value : null,
-    inventory.status === "fulfilled" ? inventoryState.projects : [],
-  );
+  renderDerivedViews();
 }
 
 void loadConsole();
