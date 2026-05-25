@@ -5761,6 +5761,7 @@ pub mod metrics_endpoint_exposes_cached_json {
                 live: true,
                 generated_at_unix: 1779320528,
                 warning: None,
+                summary: None,
                 entries: vec![crate::api::ReadinessTimelineEntry {
                     timestamp_unix: 1779320528,
                     status: "active".into(),

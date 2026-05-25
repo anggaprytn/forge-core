@@ -1,6 +1,7 @@
 use crate::api::{
-    MetricsResponse, ReadinessExplainResponse, ReadinessRecommendation, ReadinessTimelineEntry,
-    ReadinessTimelineRelatedFields, ReadinessTimelineResponse, ReadyzResponse,
+    MetricsResponse, ReadinessExplainResponse, ReadinessRecommendation, ReadinessSummary,
+    ReadinessTimelineEntry, ReadinessTimelineRelatedFields, ReadinessTimelineResponse,
+    ReadyzResponse,
 };
 use crate::daemon::{ControlPlaneSnapshot, READYZ_CACHE_STALE_AFTER_MS};
 use std::fs;
@@ -47,6 +48,7 @@ pub fn timeline_snapshot(snapshot: &ControlPlaneSnapshot) -> ReadinessTimelineRe
             && entry.reason == "readiness cache stale")
     });
     timeline.entries.insert(0, cache_stale);
+    timeline.summary = readiness_summary_from_entries(&timeline.entries);
     timeline
 }
 
@@ -175,6 +177,7 @@ pub fn explain(readyz: &ReadyzResponse, metrics: &MetricsResponse) -> ReadinessE
         metrics,
         false,
     );
+    let summary = readiness_summary_from_recommendations(&recommendations);
 
     ReadinessExplainResponse {
         source: "daemon_api".into(),
@@ -201,6 +204,7 @@ pub fn explain(readyz: &ReadyzResponse, metrics: &MetricsResponse) -> ReadinessE
         warning: None,
         operator_interpretation,
         safe_next_action,
+        summary,
         recommendations,
     }
 }
@@ -482,12 +486,14 @@ fn explain_recommendations(
     if !active_failure && taxonomy == "ready_no_active_failure" {
         return Vec::new();
     }
-    vec![recommendation_for_state(
+    let mut recommendations = vec![recommendation_for_state(
         taxonomy,
         active_failure_reason.as_deref(),
         metrics,
         snapshot_based,
-    )]
+    )];
+    sort_recommendations(&mut recommendations);
+    recommendations
 }
 
 pub fn offline_recommendations(
@@ -665,17 +671,22 @@ pub fn build_timeline(
     entries.sort_by(|left, right| {
         timeline_status_rank(left.status.as_str())
             .cmp(&timeline_status_rank(right.status.as_str()))
+            .then_with(|| {
+                timeline_recommendation_rank(left).cmp(&timeline_recommendation_rank(right))
+            })
             .then_with(|| right.timestamp_unix.cmp(&left.timestamp_unix))
             .then_with(|| left.blocker_type.cmp(&right.blocker_type))
             .then_with(|| left.reason.cmp(&right.reason))
     });
     entries.truncate(8);
+    let summary = readiness_summary_from_entries(&entries);
 
     ReadinessTimelineResponse {
         source: source.into(),
         live,
         generated_at_unix: now_unix,
         warning,
+        summary,
         entries,
     }
 }
@@ -706,23 +717,25 @@ pub fn persist_timeline(
 }
 
 pub fn unknown_offline_timeline(reason: &str) -> ReadinessTimelineResponse {
+    let entries = vec![ReadinessTimelineEntry {
+        timestamp_unix: unix_now_ms() / 1_000,
+        status: "historical".into(),
+        blocker_type: "unknown".into(),
+        reason: reason.into(),
+        startup_phase: "unknown".into(),
+        source: "offline_snapshot".into(),
+        active_failure: false,
+        suggested_action: "query the live daemon when available".into(),
+        recommendation: Some(recommendation_for_unknown(true)),
+        related_fields: None,
+    }];
     ReadinessTimelineResponse {
         source: "offline_snapshot".into(),
         live: false,
         generated_at_unix: unix_now_ms() / 1_000,
         warning: Some("offline snapshot may be stale".into()),
-        entries: vec![ReadinessTimelineEntry {
-            timestamp_unix: unix_now_ms() / 1_000,
-            status: "historical".into(),
-            blocker_type: "unknown".into(),
-            reason: reason.into(),
-            startup_phase: "unknown".into(),
-            source: "offline_snapshot".into(),
-            active_failure: false,
-            suggested_action: "query the live daemon when available".into(),
-            recommendation: Some(recommendation_for_unknown(true)),
-            related_fields: None,
-        }],
+        summary: readiness_summary_from_entries(&entries),
+        entries,
     }
 }
 
@@ -867,6 +880,121 @@ fn leadership_uncertain(metrics: &MetricsResponse) -> bool {
         })
 }
 
+fn sort_recommendations(recommendations: &mut [ReadinessRecommendation]) {
+    recommendations.sort_by(|left, right| {
+        recommendation_rank(left)
+            .cmp(&recommendation_rank(right))
+            .then_with(|| {
+                left.action_id
+                    .cmp(&right.action_id)
+                    .then_with(|| left.title.cmp(&right.title))
+            })
+    });
+}
+
+fn recommendation_rank(recommendation: &ReadinessRecommendation) -> (u8, u8) {
+    let status_rank = if recommendation.action_id == "historical_convergence_failure" {
+        2
+    } else {
+        0
+    };
+    (status_rank, severity_rank(recommendation.severity.as_str()))
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "critical" => 0,
+        "warning" => 1,
+        "info" => 2,
+        _ => 3,
+    }
+}
+
+fn timeline_recommendation_rank(entry: &ReadinessTimelineEntry) -> u8 {
+    entry
+        .recommendation
+        .as_ref()
+        .map(|recommendation| severity_rank(recommendation.severity.as_str()))
+        .unwrap_or(3)
+}
+
+fn readiness_summary_from_recommendations(
+    recommendations: &[ReadinessRecommendation],
+) -> Option<ReadinessSummary> {
+    if recommendations.is_empty() {
+        return Some(ReadinessSummary {
+            active_count: 0,
+            cleared_count: 0,
+            historical_count: 0,
+            highest_severity: "info".into(),
+            primary_recommendation: None,
+        });
+    }
+    let mut ordered = recommendations.to_vec();
+    sort_recommendations(&mut ordered);
+    Some(ReadinessSummary {
+        active_count: ordered
+            .iter()
+            .filter(|recommendation| recommendation.action_id != "historical_convergence_failure")
+            .count(),
+        cleared_count: 0,
+        historical_count: ordered
+            .iter()
+            .filter(|recommendation| recommendation.action_id == "historical_convergence_failure")
+            .count(),
+        highest_severity: ordered
+            .first()
+            .map(|recommendation| recommendation.severity.clone())
+            .unwrap_or_else(|| "info".into()),
+        primary_recommendation: ordered.first().cloned(),
+    })
+}
+
+fn readiness_summary_from_entries(entries: &[ReadinessTimelineEntry]) -> Option<ReadinessSummary> {
+    let active_count = entries
+        .iter()
+        .filter(|entry| entry.status == "active")
+        .count();
+    let cleared_count = entries
+        .iter()
+        .filter(|entry| entry.status == "cleared")
+        .count();
+    let historical_count = entries
+        .iter()
+        .filter(|entry| entry.status == "historical")
+        .count();
+    let mut recommendations = entries
+        .iter()
+        .filter_map(|entry| entry.recommendation.clone())
+        .collect::<Vec<_>>();
+    dedupe_historical_no_action(&mut recommendations);
+    sort_recommendations(&mut recommendations);
+    Some(ReadinessSummary {
+        active_count,
+        cleared_count,
+        historical_count,
+        highest_severity: recommendations
+            .first()
+            .map(|recommendation| recommendation.severity.clone())
+            .unwrap_or_else(|| "info".into()),
+        primary_recommendation: recommendations.first().cloned(),
+    })
+}
+
+fn dedupe_historical_no_action(recommendations: &mut Vec<ReadinessRecommendation>) {
+    let mut seen_historical_no_action = false;
+    recommendations.retain(|recommendation| {
+        if recommendation.action_id != "historical_convergence_failure" {
+            return true;
+        }
+        if seen_historical_no_action {
+            return false;
+        }
+        seen_historical_no_action = true;
+        true
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +1043,21 @@ mod tests {
         assert_eq!(response.safe_next_action, "no action required");
         assert_eq!(response.recommendations[0].title, "No action required");
         assert_eq!(response.recommendations[0].scope, "convergence");
+        assert_eq!(
+            response
+                .summary
+                .as_ref()
+                .map(|summary| summary.historical_count),
+            Some(1)
+        );
+        assert_eq!(
+            response
+                .summary
+                .as_ref()
+                .and_then(|summary| summary.primary_recommendation.as_ref())
+                .map(|recommendation| recommendation.action_id.as_str()),
+            Some("historical_convergence_failure")
+        );
     }
 
     #[test]
@@ -1116,6 +1259,7 @@ mod tests {
             live: true,
             generated_at_unix: 100,
             warning: None,
+            summary: None,
             entries: vec![ReadinessTimelineEntry {
                 timestamp_unix: 100,
                 status: "active".into(),
@@ -1171,5 +1315,110 @@ mod tests {
         assert!(!timeline.entries.iter().any(|entry| {
             entry.status == "active" && entry.reason == "convergence failure counter incremented"
         }));
+    }
+
+    #[test]
+    fn timeline_prioritizes_active_critical_before_active_warning() {
+        let mut readyz = base_readyz();
+        readyz.status = "degraded".into();
+        readyz.active_failure = true;
+        readyz.reasons = vec![
+            crate::api::ReadyzReason {
+                project_id: String::new(),
+                environment: String::new(),
+                generation: None,
+                active: true,
+                unresolved: true,
+                source: "runtime_state_cache".into(),
+                marker: "route_activation_verification_failed".into(),
+                message: "route activation verification failed".into(),
+                last_checked_unix: Some(300),
+                cache_age_ms: 0,
+                diagnostics: None,
+            },
+            crate::api::ReadyzReason {
+                project_id: String::new(),
+                environment: String::new(),
+                generation: None,
+                active: true,
+                unresolved: true,
+                source: "runtime_state_cache".into(),
+                marker: "lease_epoch_divergence".into(),
+                message: "leadership uncertain".into(),
+                last_checked_unix: Some(200),
+                cache_age_ms: 0,
+                diagnostics: None,
+            },
+        ];
+        let mut metrics = base_metrics();
+        metrics.readiness_status = "degraded".into();
+        metrics.leader = false;
+        metrics.cluster.lease_epoch_divergence = true;
+
+        let timeline = build_timeline(&readyz, &metrics, None, 400, "daemon_api", true, None);
+        assert_eq!(
+            timeline.entries[0]
+                .recommendation
+                .as_ref()
+                .map(|recommendation| recommendation.severity.as_str()),
+            Some("critical")
+        );
+        assert_eq!(
+            timeline.entries[1]
+                .recommendation
+                .as_ref()
+                .map(|recommendation| recommendation.severity.as_str()),
+            Some("warning")
+        );
+    }
+
+    #[test]
+    fn active_warnings_sort_before_historical_info_and_summary_counts_match() {
+        let mut readyz = base_readyz();
+        readyz.status = "degraded".into();
+        readyz.active_failure = true;
+        readyz.reasons = vec![crate::api::ReadyzReason {
+            project_id: String::new(),
+            environment: String::new(),
+            generation: None,
+            active: true,
+            unresolved: true,
+            source: "runtime_state_cache".into(),
+            marker: "route_activation_verification_failed".into(),
+            message: "route activation verification failed".into(),
+            last_checked_unix: Some(300),
+            cache_age_ms: 0,
+            diagnostics: None,
+        }];
+        let mut metrics = base_metrics();
+        metrics.readiness_status = "degraded".into();
+        metrics.convergence_failures_total = 1;
+        metrics.convergence_last_failure_historical_unix = Some(150);
+
+        let timeline = build_timeline(&readyz, &metrics, None, 400, "daemon_api", true, None);
+        assert_eq!(timeline.entries[0].status, "active");
+        assert_eq!(timeline.entries[1].status, "historical");
+        assert_eq!(
+            timeline
+                .summary
+                .as_ref()
+                .map(|summary| summary.active_count),
+            Some(1)
+        );
+        assert_eq!(
+            timeline
+                .summary
+                .as_ref()
+                .map(|summary| summary.historical_count),
+            Some(1)
+        );
+        assert_eq!(
+            timeline
+                .summary
+                .as_ref()
+                .and_then(|summary| summary.primary_recommendation.as_ref())
+                .map(|recommendation| recommendation.action_id.as_str()),
+            Some("route_activation_verification_failed")
+        );
     }
 }

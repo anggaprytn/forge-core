@@ -14,10 +14,10 @@ use forge_core::api::{
     DeploymentHistoryResponse, DeploymentLogs, DeploymentRequest, DeploymentStatus,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
     EventList, ForgeSchemaVersions, ForgeVersionOutput, MetricsResponse, ProjectList,
-    ProjectRecord, ProjectUpsertRequest, ReadinessExplainResponse, ReadinessTimelineResponse,
-    ReadyzResponse, RestoreLineage, RetentionRole, SecretListResponse, SecretUnsetResponse,
-    ServiceRuntimeStatus, TokenCreateRequest, TokenCreateResponse, TokenListResponse,
-    TokenRevokeResponse,
+    ProjectRecord, ProjectUpsertRequest, ReadinessExplainResponse, ReadinessRecommendation,
+    ReadinessTimelineEntry, ReadinessTimelineResponse, ReadyzResponse, RestoreLineage,
+    RetentionRole, SecretListResponse, SecretUnsetResponse, ServiceRuntimeStatus,
+    TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenRevokeResponse,
 };
 use forge_core::caddy::CaddyApiRuntime;
 use forge_core::config::DaemonConfig;
@@ -4069,6 +4069,16 @@ fn build_offline_readiness_explain(storage_root: &Path) -> ReadinessExplainRespo
         warning: Some(OFFLINE_WARNING.into()),
         operator_interpretation,
         safe_next_action,
+        summary: Some(forge_core::api::ReadinessSummary {
+            active_count: usize::from(active_failure),
+            cleared_count: 0,
+            historical_count: usize::from(historical_failures),
+            highest_severity: recommendations
+                .first()
+                .map(|recommendation| recommendation.severity.clone())
+                .unwrap_or_else(|| "info".into()),
+            primary_recommendation: recommendations.first().cloned(),
+        }),
         recommendations,
     }
 }
@@ -4458,75 +4468,48 @@ fn render_readiness_explain(view: &ReadinessExplainResponse) -> String {
         }
     }
     output.push_str(&format!("Startup phase: {}\n", view.startup_phase));
-    output.push_str(&format!(
-        "Active failure: {}\n",
-        if view.active_failure { "yes" } else { "no" }
-    ));
+    output.push_str(&format!("Active failure: {}\n", active_failure_label(view)));
     if let Some(reason) = view.active_failure_reason.as_deref() {
         output.push_str(&format!("Reason: {reason}\n"));
     }
-    output.push_str(&format!("Failure scope: {}\n", view.failure_scope));
-    output.push_str(&format!(
-        "Historical failures: {}\n",
-        if view.historical_failures {
-            "yes"
-        } else {
-            "no"
-        }
-    ));
-    if let Some(timestamp) = view.last_historical_failure_unix {
-        output.push_str(&format!("Last historical failure: {timestamp}\n"));
-    }
-    output.push_str(&format!(
-        "Convergence: {}\n",
-        if view.convergence_blocked {
-            if view.active_failure {
-                "blocked by active control-plane condition"
-            } else {
-                "blocked"
-            }
-        } else {
-            "running normally"
-        }
-    ));
-    output.push_str(&format!(
-        "Leadership: {}\n",
-        match view.leadership_status.as_str() {
-            "active_leader" => "active leader",
-            "follower" => "read-only follower",
-            "uncertain" => "uncertain",
-            _ => "candidate",
-        }
-    ));
-    output.push_str(&format!(
-        "Replay: {}\n",
-        if view.replay_running {
-            "running"
-        } else {
-            "complete"
-        }
-    ));
-    output.push_str(&format!("Leader: {}\n", view.leader));
-    output.push_str(&format!("Follower mode: {}\n", view.follower_mode));
-    output.push_str(&format!("Node role: {}\n", view.node_role));
-    if let Some(timestamp) = view.last_successful_convergence_unix {
-        output.push_str(&format!("Last successful convergence: {timestamp}\n"));
-    }
-    output.push_str(&format!(
-        "Interpretation: {}\n",
-        view.operator_interpretation
-    ));
-    output.push_str(&format!("Operator action: {}\n", view.safe_next_action));
-    if let Some(recommendation) = view.recommendations.first() {
+    if let Some(recommendation) =
+        primary_recommendation(view.summary.as_ref(), &view.recommendations)
+    {
         output.push_str("Recommended action:\n");
-        output.push_str(&format!(
-            "  {} [{}]\n",
-            recommendation.title, recommendation.scope
-        ));
-        output.push_str(&format!("  Command: {}\n", recommendation.command_hint));
-        if !view.live {
-            output.push_str("  Basis: offline snapshot\n");
+        if !view.live
+            && !view.active_failure
+            && recommendation.action_id == "historical_convergence_failure"
+        {
+            output.push_str("  Query live readiness before acting on this snapshot [offline]\n");
+            output.push_str("  Command: forge readiness explain\n");
+        } else {
+            output.push_str(&format!(
+                "  {} [{}]\n",
+                recommendation.title, recommendation.scope
+            ));
+            output.push_str(&format!("  Command: {}\n", recommendation.command_hint));
+            if !view.live {
+                output.push_str("  Basis: offline snapshot\n");
+            }
         }
+    }
+    if !view.active_failure {
+        if view.live {
+            output.push_str("No active readiness blockers.\n");
+        } else {
+            output.push_str("No active blocker in last known snapshot.\n");
+        }
+    }
+    if view.historical_failures {
+        let historical_note = if !view.live {
+            "Historical note: prior blockers appear in the last known snapshot.".to_string()
+        } else if let Some(timestamp) = view.last_historical_failure_unix {
+            format!("Historical note: last historical failure at {timestamp}.")
+        } else {
+            "Historical note: prior blockers were observed earlier.".to_string()
+        };
+        output.push_str(&historical_note);
+        output.push('\n');
     }
     output
 }
@@ -4535,45 +4518,116 @@ fn render_readiness_timeline(view: &ReadinessTimelineResponse) -> String {
     let mut output = String::new();
     output.push_str("Readiness timeline:\n");
     if !view.live {
-        output
-            .push_str("Warning: offline snapshot may be stale and is not current live readiness\n");
+        output.push_str("Warning: Offline snapshot may be stale.\n");
     }
     if view.entries.is_empty() {
-        output.push_str("- HISTORICAL: no timeline entries available\n");
-        output.push_str("  Not an active readiness blocker\n");
+        output.push_str("Active blockers:\n");
+        output.push_str("  No active readiness blockers.\n");
         return output;
     }
-    for entry in &view.entries {
-        output.push_str(&format!(
-            "- {}: {}\n",
-            entry.status.to_uppercase(),
-            entry.reason
-        ));
-        output.push_str(&format!("  Scope: {}\n", entry.blocker_type));
-        match entry.status.as_str() {
-            "active" => {
-                if let Some(recommendation) = entry.recommendation.as_ref() {
-                    output.push_str(&format!(
-                        "  Action: {} [{}]\n",
-                        recommendation.title, recommendation.scope
-                    ));
-                    output.push_str(&format!("  Command: {}\n", recommendation.command_hint));
-                    if !view.live {
-                        output.push_str("  Basis: offline snapshot\n");
-                    }
-                } else {
-                    output.push_str(&format!("  Suggested action: {}\n", entry.suggested_action));
+    let active = view
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "active")
+        .collect::<Vec<_>>();
+    let cleared = view
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "cleared")
+        .collect::<Vec<_>>();
+    let historical = view
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "historical")
+        .collect::<Vec<_>>();
+
+    output.push_str("Active blockers:\n");
+    if active.is_empty() {
+        output.push_str("  No active readiness blockers.\n");
+    } else {
+        for entry in active {
+            render_timeline_entry(&mut output, entry, view.live);
+        }
+    }
+    if !cleared.is_empty() {
+        output.push_str("Recently cleared:\n");
+        for entry in cleared {
+            render_timeline_entry(&mut output, entry, view.live);
+        }
+    }
+    if !historical.is_empty() {
+        output.push_str("Historical:\n");
+        let mut historical_no_action_rendered = false;
+        for entry in historical {
+            if entry.recommendation.as_ref().is_some_and(|recommendation| {
+                recommendation.action_id == "historical_convergence_failure"
+            }) {
+                if historical_no_action_rendered {
+                    continue;
                 }
+                historical_no_action_rendered = true;
             }
-            "cleared" => {
-                output.push_str("  Cleared after fresh readiness refresh\n");
-            }
-            _ => {
-                output.push_str("  Not an active readiness blocker\n");
-            }
+            render_timeline_entry(&mut output, entry, view.live);
         }
     }
     output
+}
+
+fn active_failure_label(view: &ReadinessExplainResponse) -> &str {
+    if view.active_failure {
+        "yes"
+    } else if view.live {
+        "No active readiness blockers."
+    } else {
+        "No active blocker in last known snapshot."
+    }
+}
+
+fn primary_recommendation<'a>(
+    summary: Option<&'a forge_core::api::ReadinessSummary>,
+    recommendations: &'a [ReadinessRecommendation],
+) -> Option<&'a ReadinessRecommendation> {
+    summary
+        .and_then(|summary| summary.primary_recommendation.as_ref())
+        .or_else(|| recommendations.first())
+}
+
+fn render_timeline_entry(output: &mut String, entry: &ReadinessTimelineEntry, live: bool) {
+    output.push_str(&format!("  - {}\n", entry.reason));
+    output.push_str(&format!("    Scope: {}\n", entry.blocker_type));
+    match entry.status.as_str() {
+        "active" => {
+            if let Some(recommendation) = entry.recommendation.as_ref() {
+                output.push_str(&format!(
+                    "    Action: {} [{}]\n",
+                    recommendation.title, recommendation.scope
+                ));
+                output.push_str(&format!("    Command: {}\n", recommendation.command_hint));
+                if !live {
+                    output.push_str("    Basis: offline snapshot\n");
+                }
+            } else {
+                output.push_str(&format!(
+                    "    Suggested action: {}\n",
+                    entry.suggested_action
+                ));
+            }
+        }
+        "cleared" => output.push_str("    Cleared after fresh readiness refresh\n"),
+        _ => {
+            output.push_str("    Not an active readiness blocker\n");
+            if let Some(recommendation) = entry.recommendation.as_ref() {
+                output.push_str(&format!(
+                    "    Action: {} [{}]\n",
+                    recommendation.title, recommendation.scope
+                ));
+                output.push_str(&format!("    Command: {}\n", recommendation.command_hint));
+                if !live {
+                    output.push_str("    Basis: offline snapshot\n");
+                }
+            }
+        }
+    }
 }
 
 fn load_local_control_plane_state(
@@ -5090,6 +5144,21 @@ mod tests {
                 "Control-plane readiness is healthy. Historical failures exist, but there is no active blocker."
                     .into(),
             safe_next_action: "no action required".into(),
+            summary: Some(forge_core::api::ReadinessSummary {
+                active_count: 0,
+                cleared_count: 0,
+                historical_count: 1,
+                highest_severity: "info".into(),
+                primary_recommendation: Some(forge_core::api::ReadinessRecommendation {
+                    action_id: "historical_convergence_failure".into(),
+                    severity: "info".into(),
+                    title: "No action required".into(),
+                    description: "Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.".into(),
+                    command_hint: "forge readiness timeline".into(),
+                    safe_to_run: true,
+                    scope: "convergence".into(),
+                }),
+            }),
             recommendations: vec![forge_core::api::ReadinessRecommendation {
                 action_id: "historical_convergence_failure".into(),
                 severity: "info".into(),
@@ -5108,6 +5177,21 @@ mod tests {
             live: true,
             generated_at_unix: 200,
             warning: None,
+            summary: Some(forge_core::api::ReadinessSummary {
+                active_count: 1,
+                cleared_count: 0,
+                historical_count: 1,
+                highest_severity: "warning".into(),
+                primary_recommendation: Some(forge_core::api::ReadinessRecommendation {
+                    action_id: "route_activation_verification_failed".into(),
+                    severity: "warning".into(),
+                    title: "Inspect active route target".into(),
+                    description: "Cached readiness reports that route activation verification failed for the active environment target.".into(),
+                    command_hint: "forge diagnose <project> <environment>".into(),
+                    safe_to_run: true,
+                    scope: "routing".into(),
+                }),
+            }),
             entries: vec![
                 forge_core::api::ReadinessTimelineEntry {
                     timestamp_unix: 200,
@@ -5539,7 +5623,7 @@ mod tests {
         assert!(rendered.contains("Last known readiness: ready"));
         assert!(rendered.contains("Source: offline snapshot"));
         assert!(rendered.contains("Warning: daemon was not queried"));
-        assert!(rendered.contains("Basis: offline snapshot"));
+        assert!(rendered.contains("Query live readiness before acting on this snapshot [offline]"));
         assert!(!rendered.contains("Readiness: ready\n"));
     }
 
@@ -5648,15 +5732,11 @@ mod tests {
         let rendered = render_readiness_explain(&readiness_explain_fixture());
         assert!(rendered.contains("Readiness: ready"));
         assert!(rendered.contains("Startup phase: leader_active"));
-        assert!(rendered.contains("Active failure: no"));
-        assert!(rendered.contains("Failure scope: historical"));
-        assert!(rendered.contains("Historical failures: yes"));
-        assert!(rendered.contains("Last historical failure: 150"));
-        assert!(rendered.contains("Leader: true"));
-        assert!(rendered.contains("Follower mode: false"));
-        assert!(rendered.contains("Operator action: no action required"));
+        assert!(rendered.contains("Active failure: No active readiness blockers."));
         assert!(rendered.contains("Recommended action:"));
         assert!(rendered.contains("No action required [convergence]"));
+        assert!(rendered.contains("Historical note: last historical failure at 150."));
+        assert!(rendered.contains("No active readiness blockers."));
     }
 
     #[test]
@@ -5668,12 +5748,77 @@ mod tests {
 
         let rendered = render_readiness_timeline(&view);
         assert!(rendered.contains("Readiness timeline:"));
-        assert!(rendered.contains("ACTIVE: route activation verification failed"));
+        assert!(rendered.contains("Active blockers:"));
+        assert!(rendered.contains("- route activation verification failed"));
         assert!(rendered.contains("Scope: routing"));
         assert!(rendered.contains("Action: Inspect active route target [routing]"));
         assert!(rendered.contains("Command: forge diagnose <project> <environment>"));
-        assert!(rendered.contains("Warning: offline snapshot may be stale"));
+        assert!(rendered.contains("Warning: Offline snapshot may be stale."));
         assert!(rendered.contains("Basis: offline snapshot"));
+        assert!(rendered.contains("Historical:"));
+    }
+
+    #[test]
+    fn offline_ready_snapshot_does_not_claim_live_no_action_truth() {
+        let mut view = readiness_explain_fixture();
+        view.live = false;
+        view.source = "offline_snapshot".into();
+        view.warning = Some(OFFLINE_WARNING.into());
+
+        let rendered = render_readiness_explain(&view);
+        assert!(rendered.contains("Active failure: No active blocker in last known snapshot."));
+        assert!(rendered.contains("Query live readiness before acting on this snapshot [offline]"));
+        assert!(!rendered.contains("  No action required [convergence]\n"));
+    }
+
+    #[test]
+    fn ready_state_human_output_says_no_active_readiness_blockers() {
+        let mut view = readiness_explain_fixture();
+        view.historical_failures = false;
+        view.failure_scope = "none".into();
+        view.last_historical_failure_unix = None;
+        view.summary = Some(forge_core::api::ReadinessSummary {
+            active_count: 0,
+            cleared_count: 0,
+            historical_count: 0,
+            highest_severity: "info".into(),
+            primary_recommendation: None,
+        });
+        view.recommendations.clear();
+
+        let rendered = render_readiness_explain(&view);
+        assert!(rendered.contains("No active readiness blockers."));
+    }
+
+    #[test]
+    fn historical_no_action_renders_once_in_timeline() {
+        let mut view = readiness_timeline_fixture();
+        view.entries.push(forge_core::api::ReadinessTimelineEntry {
+            timestamp_unix: 140,
+            status: "historical".into(),
+            blocker_type: "convergence".into(),
+            reason: "convergence failure counter incremented".into(),
+            startup_phase: "leader_active".into(),
+            source: "daemon_api".into(),
+            active_failure: false,
+            suggested_action: "not an active readiness blocker".into(),
+            recommendation: Some(forge_core::api::ReadinessRecommendation {
+                action_id: "historical_convergence_failure".into(),
+                severity: "info".into(),
+                title: "No action required".into(),
+                description: "Only historical convergence failures remain in the cached readiness history; there is no active blocker to clear.".into(),
+                command_hint: "forge readiness timeline".into(),
+                safe_to_run: true,
+                scope: "convergence".into(),
+            }),
+            related_fields: None,
+        });
+
+        let rendered = render_readiness_timeline(&view);
+        assert_eq!(
+            rendered.matches("No action required [convergence]").count(),
+            1
+        );
     }
 
     #[test]

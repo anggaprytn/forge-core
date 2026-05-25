@@ -910,8 +910,24 @@ pub struct ReadinessExplainResponse {
     pub warning: Option<String>,
     pub operator_interpretation: String,
     pub safe_next_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReadinessSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recommendations: Vec<ReadinessRecommendation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReadinessSummary {
+    #[serde(default)]
+    pub active_count: usize,
+    #[serde(default)]
+    pub cleared_count: usize,
+    #[serde(default)]
+    pub historical_count: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub highest_severity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_recommendation: Option<ReadinessRecommendation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -984,6 +1000,8 @@ pub struct ReadinessTimelineResponse {
     pub generated_at_unix: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReadinessSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<ReadinessTimelineEntry>,
 }
