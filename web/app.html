@@ -26,6 +26,9 @@
         <p class="page-note">
           Browser console data comes from the existing control-plane APIs only. Offline or postmortem mode is not available here unless the server explicitly exposes it.
         </p>
+        <p class="page-note page-note-muted">
+          This console shows control-plane readiness only. Project and environment views are not enabled in this build.
+        </p>
 
         <section class="app-grid" aria-label="Operator console panels">
           <article class="status-card section-card" aria-labelledby="overview-title">
@@ -67,11 +70,17 @@
                 <ul id="timeline-active" class="timeline-list"></ul>
               </section>
               <section class="timeline-group">
-                <h3>Recently cleared</h3>
+                <div class="group-header">
+                  <h3>Recently cleared</h3>
+                  <button id="timeline-cleared-toggle" class="text-button" type="button" hidden></button>
+                </div>
                 <ul id="timeline-cleared" class="timeline-list"></ul>
               </section>
               <section class="timeline-group">
-                <h3>Historical</h3>
+                <div class="group-header">
+                  <h3>Historical</h3>
+                  <button id="timeline-historical-toggle" class="text-button" type="button" hidden></button>
+                </div>
                 <ul id="timeline-historical" class="timeline-list"></ul>
               </section>
             </div>
@@ -89,10 +98,13 @@
             <div id="recommendations-content" class="recommendations-content" hidden>
               <section class="recommendation-primary">
                 <h3>Primary recommendation</h3>
-                <div id="recommendation-primary"></div>
+                <div id="recommendation-primary" class="recommendation-stack"></div>
               </section>
               <section class="recommendation-secondary">
-                <h3>Additional recommendations</h3>
+                <div class="group-header">
+                  <h3>Timeline notes</h3>
+                  <button id="recommendation-notes-toggle" class="text-button" type="button" hidden></button>
+                </div>
                 <ul id="recommendation-list" class="recommendation-list"></ul>
               </section>
             </div>

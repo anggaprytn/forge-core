@@ -4928,6 +4928,12 @@ pub mod static_assets_do_not_expose_secrets {
             assert!(!body.contains("forge_session"));
             assert!(!body.contains("FORGE_SESSION_SECRET"));
             assert!(!body.contains("FORGE_GITHUB_OAUTH_CLIENT_SECRET"));
+            assert!(!body.contains("__SECRET__"));
+            assert!(!body.contains("__TOKEN__"));
+            assert!(!body.contains("__ENV__"));
+            assert!(!body.contains("${SECRET}"));
+            assert!(!body.contains("${TOKEN}"));
+            assert!(!body.contains("${ENV}"));
         }
     }
 }
@@ -5010,6 +5016,10 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("\"/metrics\""));
         assert!(body.contains("\"/readiness/explain\""));
         assert!(body.contains("\"/readiness/timeline\""));
+        assert!(!body.contains("/projects"));
+        assert!(!body.contains("/environments"));
+        assert!(!body.contains("/secrets"));
+        assert!(!body.contains("/tokens"));
     }
 }
 
@@ -5042,6 +5052,104 @@ pub mod app_js_ships_safe_error_states {
         assert!(body.contains("Timeline unavailable."));
         assert!(body.contains("Metrics unavailable."));
         assert!(body.contains("API unreachable for operator recommendations."));
+    }
+}
+
+#[cfg(test)]
+pub mod app_assets_ship_calm_readiness_copy {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn app_assets_ship_calm_readiness_copy() {
+        let state = build_cli_login_state();
+        let session_secret = state.web_auth.config.clone().unwrap().session_secret;
+        let session_cookie = encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &session_secret,
+        )
+        .unwrap();
+        let app = router(state);
+
+        let app_js = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(app_js.status(), StatusCode::OK);
+        let app_js = to_bytes(app_js.into_body(), usize::MAX).await.unwrap();
+        let app_js = String::from_utf8(app_js.to_vec()).unwrap();
+        assert!(app_js.contains("No active readiness blockers."));
+        assert!(app_js.contains("Previously observed, now cleared."));
+        assert!(app_js.contains("Past suggested check:"));
+        assert!(app_js.contains("Historical convergence failure recorded."));
+        assert!(app_js.contains("Not an active readiness blocker."));
+        assert!(app_js.contains("Review timeline only if investigating a past incident."));
+
+        let app_html = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/app")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(app_html.status(), StatusCode::OK);
+        let app_html = to_bytes(app_html.into_body(), usize::MAX).await.unwrap();
+        let app_html = String::from_utf8(app_html.to_vec()).unwrap();
+        assert!(app_html.contains(
+            "This console shows control-plane readiness only. Project and environment views are not enabled in this build."
+        ));
+    }
+}
+
+#[cfg(test)]
+pub mod app_js_dedupes_recommendations_and_mutes_history {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn app_js_dedupes_recommendations_and_mutes_history() {
+        let app = router(build_cli_login_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("function dedupeRecommendations("));
+        assert!(body.contains("action_id"));
+        assert!(body.contains("Also seen in cleared history."));
+        assert!(body.contains("Historical recommendation only. Not an active readiness blocker."));
+        assert!(body.contains("Show all"));
+        assert!(body.contains("Show history"));
     }
 }
 
