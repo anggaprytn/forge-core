@@ -2111,7 +2111,7 @@ async fn post_projects(
 
 async fn get_projects(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2138,7 +2138,7 @@ async fn get_project(
     AxumPath(project_id): AxumPath<String>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2173,7 +2173,7 @@ async fn get_project_environments(
     AxumPath(project_id): AxumPath<String>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2778,15 +2778,73 @@ fn ensure_authorized(
     headers: &HeaderMap,
     request_id: &str,
 ) -> Result<AuthenticatedPrincipal, Response> {
-    let Some(value) = header_value(headers, AUTHORIZATION) else {
-        return Err(error_response(
+    match authenticate_bearer_token(state, headers) {
+        Ok(principal) => Ok(principal),
+        Err(AuthFailure::MissingBearerToken) => Err(error_response(
             StatusCode::UNAUTHORIZED,
             request_id,
             ErrorResponse {
                 code: "unauthorized".into(),
                 message: "missing bearer token".into(),
             },
-        ));
+        )),
+        Err(AuthFailure::InvalidBearerToken) => Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            request_id,
+            ErrorResponse {
+                code: "unauthorized".into(),
+                message: "invalid bearer token".into(),
+            },
+        )),
+    }
+}
+
+fn ensure_inventory_read_authorized(
+    state: &HttpState,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<(), Response> {
+    if authenticate_bearer_token(state, headers).is_ok() {
+        return Ok(());
+    }
+
+    if state
+        .web_auth
+        .config
+        .as_ref()
+        .and_then(|config| read_session_cookie(headers, config))
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let message = if header_value(headers, AUTHORIZATION).is_some() {
+        "invalid bearer token or session"
+    } else {
+        "missing bearer token or session"
+    };
+
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
+        request_id,
+        ErrorResponse {
+            code: "unauthorized".into(),
+            message: message.into(),
+        },
+    ))
+}
+
+enum AuthFailure {
+    MissingBearerToken,
+    InvalidBearerToken,
+}
+
+fn authenticate_bearer_token(
+    state: &HttpState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedPrincipal, AuthFailure> {
+    let Some(value) = header_value(headers, AUTHORIZATION) else {
+        return Err(AuthFailure::MissingBearerToken);
     };
 
     let expected = format!("Bearer {}", state.bearer_token);
@@ -2808,14 +2866,7 @@ fn ensure_authorized(
         return Ok(principal);
     }
 
-    Err(error_response(
-        StatusCode::UNAUTHORIZED,
-        request_id,
-        ErrorResponse {
-            code: "unauthorized".into(),
-            message: "invalid bearer token".into(),
-        },
-    ))
+    Err(AuthFailure::InvalidBearerToken)
 }
 
 fn principal_can_access_token(
@@ -5116,6 +5167,7 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("\"/readiness/timeline\""));
         assert!(body.contains("\"/api/projects\""));
         assert!(body.contains("/environments"));
+        assert!(body.contains("credentials: \"same-origin\""));
         assert!(!body.contains("/secrets"));
         assert!(!body.contains("/tokens"));
     }
@@ -5153,6 +5205,7 @@ pub mod app_js_ships_safe_error_states {
         assert!(body.contains("Project inventory unavailable."));
         assert!(body.contains("Environment inventory unavailable."));
         assert!(body.contains("No projects registered yet."));
+        assert!(body.contains("Project no longer exists or has no registered environments."));
     }
 }
 
@@ -6868,6 +6921,105 @@ pub mod project_inventory_api_requires_authentication {
 }
 
 #[cfg(test)]
+pub mod project_inventory_api_accepts_web_session_authentication {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    fn session_cookie_value(state: &HttpState) -> String {
+        let session_secret = state.web_auth.config.clone().unwrap().session_secret;
+        encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &session_secret,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_web_session_can_list_projects() {
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authenticated_web_session_can_read_project_detail() {
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
+    }
+
+    #[tokio::test]
+    async fn authenticated_web_session_can_read_project_environments() {
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
+    }
+}
+
+#[cfg(test)]
 pub mod project_inventory_api_returns_safe_metadata {
     use super::*;
     use axum::body::{Body, to_bytes};
@@ -6909,6 +7061,10 @@ pub mod project_inventory_api_returns_safe_metadata {
             project["environments"][0]["last_deployment_status"],
             "healthy"
         );
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body_text.contains("Authorization"));
+        assert!(!body_text.contains("forge_session"));
+        assert!(!body_text.contains("Bearer "));
     }
 
     #[tokio::test]
@@ -6952,6 +7108,96 @@ pub mod project_inventory_api_returns_safe_metadata {
             "https://***@github.com/example/api.git"
         );
         assert!(!String::from_utf8(body.to_vec()).unwrap().contains("secret"));
+    }
+}
+
+#[cfg(test)]
+pub mod project_inventory_api_handles_empty_registry {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn empty_registry_returns_200_with_empty_list() {
+        let app = router(build_state(false));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["projects"], serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+pub mod project_inventory_api_handles_missing_project_safely {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::util::ServiceExt;
+
+    fn session_cookie_value(state: &HttpState) -> String {
+        let session_secret = state.web_auth.config.clone().unwrap().session_secret;
+        encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &session_secret,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_project_detail_returns_404_for_web_session_requests() {
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/missing")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+
+        let environments = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/missing/environments")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(environments.status(), StatusCode::NOT_FOUND);
     }
 }
 
@@ -7031,6 +7277,9 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         let body_text = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body_text.contains("DATABASE_URL"));
         assert!(!body_text.contains("postgres://super-secret"));
+        assert!(!body_text.contains("Authorization"));
+        assert!(!body_text.contains("forge_session"));
+        assert!(!body_text.contains("Bearer "));
     }
 }
 

@@ -52,7 +52,9 @@ async function fetchJson(path) {
   });
 
   if (!response.ok) {
-    throw new Error(`request failed: ${response.status}`);
+    const error = new Error(`request failed: ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
 
   return response.json();
@@ -1177,7 +1179,14 @@ async function loadProjectEnvironments(projectId) {
     const environments = payload && payload.environments ? payload.environments : [];
     inventoryState.environmentsByProject.set(projectId, environments);
     renderProjectEnvironmentDetails(projectId, environments);
-  } catch (_err) {
+  } catch (err) {
+    if (err && err.status === 404) {
+      inventoryState.environmentsByProject.delete(projectId);
+      showState("project-detail-state", "Project no longer exists or has no registered environments.", "ok");
+      element("project-detail").hidden = true;
+      setBadge("project-detail-badge", PANEL_STATE.stale, "stale");
+      return;
+    }
     renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
   }
 }
