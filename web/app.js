@@ -41,6 +41,8 @@ const inventoryState = {
   environmentsByProject: new Map(),
 };
 
+let controlsBound = false;
+
 function element(id) {
   return document.getElementById(id);
 }
@@ -98,11 +100,37 @@ function showContainer(id) {
   }
 }
 
+function setKpi(id, value, tone) {
+  const node = element(id);
+  if (!node) {
+    return;
+  }
+  node.textContent = value;
+  node.className = `kpi-value${tone ? ` ${tone}` : ""}`;
+}
+
 function text(value, fallback = "Unknown") {
   if (value === null || value === undefined || value === "") {
     return fallback;
   }
   return String(value);
+}
+
+function inventoryEnvironmentStats(projects) {
+  let total = 0;
+  let degraded = 0;
+
+  for (const project of projects || []) {
+    for (const environment of project.environments || []) {
+      total += 1;
+      const health = lower(environment.readiness_summary && environment.readiness_summary.health_state);
+      if (health && health !== "healthy") {
+        degraded += 1;
+      }
+    }
+  }
+
+  return { total, degraded };
 }
 
 function boolLabel(value) {
@@ -281,6 +309,76 @@ function appendRecommendationListItem(list, recommendation, options) {
   const item = document.createElement("li");
   appendRecommendationCard(item, recommendation, options);
   list.appendChild(item);
+}
+
+function bindGlobalControls() {
+  if (controlsBound) {
+    return;
+  }
+  controlsBound = true;
+
+  const refresh = element("action-refresh");
+  if (refresh) {
+    refresh.addEventListener("click", () => {
+      refresh.disabled = true;
+      refresh.textContent = "Refreshing...";
+      void loadConsole(true).finally(() => {
+        refresh.disabled = false;
+        refresh.textContent = "Refresh state";
+      });
+    });
+  }
+
+  document.addEventListener("keydown", (event) => {
+    const target = event.target;
+    const tagName = target && target.tagName ? target.tagName.toLowerCase() : "";
+    const editing = tagName === "input" || tagName === "textarea" || (target && target.isContentEditable);
+    if (editing) {
+      return;
+    }
+
+    if (event.key === "/") {
+      const search = element("inventory-search");
+      if (!search) {
+        return;
+      }
+      event.preventDefault();
+      search.focus();
+      search.select();
+    }
+  });
+}
+
+function renderOperationalSummary(readyz, explain, timeline, projects) {
+  const projectCount = (projects || []).length;
+  const { total, degraded } = inventoryEnvironmentStats(projects || []);
+  const activeBlockers = (timeline && timeline.entries
+    ? timeline.entries.filter((entry) => normalizeStatus(entry.status) === "active")
+    : []).length;
+  const controlPlaneState = readyz && readyz.status === "ready" && !readyz.active_failure
+    ? "Ready"
+    : explain && explain.active_failure
+      ? "Blocked"
+      : readyz
+        ? text(readyz.status)
+        : "Unavailable";
+
+  setKpi(
+    "kpi-control-plane",
+    controlPlaneState,
+    controlPlaneState === "Ready" ? "ok" : controlPlaneState === "Unavailable" ? "stale" : "warn",
+  );
+  setKpi(
+    "kpi-blockers",
+    String(activeBlockers),
+    activeBlockers > 0 ? "warn" : "ok",
+  );
+  setKpi("kpi-projects", String(projectCount), projectCount > 0 ? "" : "stale");
+  setKpi(
+    "kpi-environments",
+    total ? `${degraded}/${total}` : "0/0",
+    degraded > 0 ? "warn" : total > 0 ? "ok" : "stale",
+  );
 }
 
 function renderOverview(readyz, metrics) {
@@ -1038,11 +1136,27 @@ function renderProjectInventory() {
 
   const filtered = inventoryState.projects.filter(projectInventoryFilter);
   if (!filtered.length) {
-    showState("inventory-state", "No projects registered yet.", "ok");
+    showState(
+      "inventory-state",
+      inventoryState.projects.length
+        ? "No projects match the current filter."
+        : "No projects registered yet.",
+      inventoryState.projects.length ? "stale" : "ok",
+    );
     list.hidden = true;
-    showState("project-detail-state", "Select a project to inspect its environments.", "ok");
+    showState(
+      "project-detail-state",
+      inventoryState.projects.length
+        ? "Clear or change the filter to inspect an environment lane."
+        : "Select a project to inspect its environments.",
+      inventoryState.projects.length ? "stale" : "ok",
+    );
     element("project-detail").hidden = true;
-    setBadge("inventory-badge", inventoryState.projects.length ? PANEL_STATE.ok : PANEL_STATE.stale, inventoryState.projects.length ? "ok" : "stale");
+    setBadge(
+      "inventory-badge",
+      inventoryState.projects.length ? PANEL_STATE.stale : PANEL_STATE.stale,
+      "stale",
+    );
     setBadge("project-detail-badge", PANEL_STATE.stale, "stale");
     return;
   }
@@ -1286,8 +1400,11 @@ async function loadProjectEnvironments(projectId) {
   }
 }
 
-async function loadInventory() {
+async function loadInventory(forceReload = false) {
   bindInventoryControls();
+  if (forceReload) {
+    inventoryState.environmentsByProject.clear();
+  }
   try {
     const payload = await fetchApiData(API_PATHS.projects);
     inventoryState.projects = payload && payload.projects ? payload.projects : [];
@@ -1306,13 +1423,14 @@ function renderUnavailable(panel, badge, message) {
   setBadge(badge, PANEL_STATE.unavailable, "warn");
 }
 
-async function loadConsole() {
+async function loadConsole(forceReload = false) {
+  bindGlobalControls();
   const [readyz, metrics, explain, timeline, inventory] = await Promise.allSettled([
     fetchJson(API_PATHS.readyz),
     fetchJson(API_PATHS.metrics),
     fetchJson(API_PATHS.explain),
     fetchJson(API_PATHS.timeline),
-    loadInventory(),
+    loadInventory(forceReload),
   ]);
 
   if (readyz.status === "fulfilled" && metrics.status === "fulfilled") {
@@ -1359,6 +1477,13 @@ async function loadConsole() {
     renderUnavailable("inventory-state", "inventory-badge", "Project inventory unavailable.");
     renderUnavailable("project-detail-state", "project-detail-badge", "Environment inventory unavailable.");
   }
+
+  renderOperationalSummary(
+    readyz.status === "fulfilled" ? readyz.value : null,
+    explain.status === "fulfilled" ? explain.value : null,
+    timeline.status === "fulfilled" ? timeline.value : null,
+    inventory.status === "fulfilled" ? inventoryState.projects : [],
+  );
 }
 
 void loadConsole();

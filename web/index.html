@@ -3,22 +3,33 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="Forge Runtime landing page">
-    <title>Forge Runtime</title>
+    <meta name="description" content="Forge control-plane access gateway">
+    <title>Forge Runtime Gateway</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
-  <body>
-    <main class="page-shell">
-      <section class="panel hero-panel">
-        <p class="eyebrow">Forge Runtime</p>
-        <h1>Deterministic runtime convergence for AI-generated applications.</h1>
-        <p class="lede">
-          Forge keeps the Rust control plane authoritative for auth, deployment,
-          routing, rollback, and recovery.
-        </p>
-        <div class="actions">
-          <a class="button" href="/login">Open Login</a>
-        </div>
+  <body class="gateway-body">
+    <main class="gateway-shell">
+      <section class="gateway-grid">
+        <article class="panel gateway-primary">
+          <p class="eyebrow">Forge Runtime</p>
+          <h1>Control-plane gateway for runtime operations.</h1>
+          <p class="lede">
+            Deterministic convergence, readiness inspection, deployment-lane visibility, and operator authentication in one controlled surface.
+          </p>
+          <div class="gateway-actions">
+            <a class="button" href="/login">Authenticate operator</a>
+          </div>
+        </article>
+
+        <article class="panel gateway-secondary">
+          <p class="kpi-label">What this surface is for</p>
+          <ul class="gateway-list" aria-label="System intent">
+            <li>Inspect control-plane readiness and blocker state</li>
+            <li>Review queue depth, probe latency, and recovery signals</li>
+            <li>Traverse projects, environments, generations, and rollback posture</li>
+            <li>Hand off execution to CLI or API without losing context</li>
+          </ul>
+        </article>
       </section>
     </main>
   </body>
