@@ -1350,15 +1350,35 @@ pub struct GitHubRepoListResponse {
 pub struct RegisterProjectFromGitHubPreviewRequest {
     pub repo_url: String,
     pub default_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterProjectFromGitHubPreviewResponse {
+    pub valid: bool,
     pub project_id: String,
     pub repo_url: String,
     pub default_branch: String,
     pub base_domain: String,
+    pub domain_source: String,
+    pub project_id_status: String,
+    pub base_domain_status: String,
     pub environment_routes: ProjectRegistrationRoutePreview,
+    #[serde(default)]
+    pub project_id_alternatives: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_domain_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_domain_suggestion: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1373,7 +1393,8 @@ pub struct RegisterProjectFromGitHubRequest {
     pub project_id: String,
     pub repo_url: String,
     pub default_branch: String,
-    pub base_domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1383,6 +1404,8 @@ pub struct RegisterProjectFromGitHubResponse {
     pub repo_url: String,
     pub default_branch: String,
     pub base_domain: String,
+    pub domain_source: String,
+    pub environment_routes: ProjectRegistrationRoutePreview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

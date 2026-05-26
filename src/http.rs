@@ -421,6 +421,7 @@ impl WebAuthState {
                 fail: false,
                 repositories: Vec::new(),
                 scope: Some("read:user,repo".into()),
+                list_error: None,
             }),
             github_session_tokens: GitHubSessionTokenStore::new(root.join("github-oauth")).unwrap(),
             users: UserStore::new(root.join("users")).unwrap(),
@@ -687,6 +688,7 @@ struct MockGitHubOAuthProvider {
     fail: bool,
     repositories: Vec<crate::api::GitHubRepositorySummary>,
     scope: Option<String>,
+    list_error: Option<GitHubError>,
 }
 
 #[cfg(test)]
@@ -714,6 +716,9 @@ impl GitHubOAuthProvider for MockGitHubOAuthProvider {
         &self,
         _access_token: &str,
     ) -> Result<Vec<crate::api::GitHubRepositorySummary>, GitHubError> {
+        if let Some(err) = self.list_error.clone() {
+            return Err(err);
+        }
         Ok(self.repositories.clone())
     }
 }
@@ -2329,36 +2334,13 @@ async fn get_github_repos(State(state): State<HttpState>, headers: HeaderMap) ->
         Ok(session) => session,
         Err(response) => return response,
     };
-    let stored = match state.web_auth.read_oauth_session(session.github_id) {
-        Ok(Some(stored)) => stored,
-        Ok(None) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &request_id,
-                ErrorResponse {
-                    code: "github_authorization_required".into(),
-                    message: "GitHub repository access is unavailable for this session. Sign in with GitHub again.".into(),
-                },
-            );
-        }
-        Err(_) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &request_id,
-                ErrorResponse {
-                    code: "github_repo_list_unavailable".into(),
-                    message: "GitHub repository listing is unavailable right now.".into(),
-                },
-            );
-        }
-    };
-
-    match state
-        .web_auth
-        .github_oauth
-        .list_repositories(&stored.access_token)
-    {
+    match session_github_repositories(&state, &session, &request_id) {
         Ok(repositories) => {
+            let stored = match state.web_auth.read_oauth_session(session.github_id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => unreachable!(),
+                Err(_) => unreachable!(),
+            };
             let private_scope_missing =
                 !github_scope_supports_private_repositories(stored.scope.as_deref());
             let message = if repositories.is_empty() {
@@ -2382,20 +2364,69 @@ async fn get_github_repos(State(state): State<HttpState>, headers: HeaderMap) ->
                 }),
             )
         }
-        Err(GitHubError::Unauthorized) => {
-            let _ = state.web_auth.clear_oauth_session(session.github_id);
+        Err(response) => response,
+    }
+}
+
+fn session_github_repositories(
+    state: &HttpState,
+    session: &SessionCookie,
+    request_id: &str,
+) -> Result<Vec<crate::api::GitHubRepositorySummary>, Response> {
+    let stored = match state.web_auth.read_oauth_session(session.github_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                request_id,
+                ErrorResponse {
+                    code: "github_authorization_required".into(),
+                    message:
+                        "GitHub repository access is unavailable for this session. Sign in with GitHub again."
+                            .into(),
+                },
+            ));
+        }
+        Err(_) => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                request_id,
+                ErrorResponse {
+                    code: "github_repo_list_unavailable".into(),
+                    message: "GitHub repository listing is unavailable right now.".into(),
+                },
+            ));
+        }
+    };
+
+    state
+        .web_auth
+        .github_oauth
+        .list_repositories(&stored.access_token)
+        .map_err(|err| github_repo_response_error(request_id, session.github_id, state, err))
+}
+
+fn github_repo_response_error(
+    request_id: &str,
+    github_id: u64,
+    state: &HttpState,
+    err: GitHubError,
+) -> Response {
+    match err {
+        GitHubError::Unauthorized => {
+            let _ = state.web_auth.clear_oauth_session(github_id);
             error_response(
                 StatusCode::UNAUTHORIZED,
-                &request_id,
+                request_id,
                 ErrorResponse {
                     code: "github_token_expired".into(),
                     message: "GitHub authorization expired. Sign in with GitHub again.".into(),
                 },
             )
         }
-        Err(_) => error_response(
+        _ => error_response(
             StatusCode::BAD_GATEWAY,
-            &request_id,
+            request_id,
             ErrorResponse {
                 code: "github_repo_list_unavailable".into(),
                 message: "GitHub repository listing is unavailable right now.".into(),
@@ -2404,13 +2435,47 @@ async fn get_github_repos(State(state): State<HttpState>, headers: HeaderMap) ->
     }
 }
 
+fn ensure_repo_accessible(
+    request_id: &str,
+    repo_url: &str,
+    repositories: &[crate::api::GitHubRepositorySummary],
+) -> Result<(), Response> {
+    let normalized = repo_url.trim();
+
+    let accessible = repositories.iter().any(|repository| {
+        repository.clone_url.trim() == normalized || repository.html_url.trim() == normalized
+    });
+    if accessible {
+        return Ok(());
+    }
+
+    Err(error_response(
+        StatusCode::BAD_REQUEST,
+        request_id,
+        ErrorResponse {
+            code: "github_repo_not_accessible".into(),
+            message:
+                "Repository is not accessible from the current GitHub session. Reload repositories and select one from the list."
+                    .into(),
+        },
+    ))
+}
+
 async fn post_project_register_from_github_preview(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Json(request): Json<RegisterProjectFromGitHubPreviewRequest>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = require_web_session(&state, &headers, &request_id) {
+    let session = match require_web_session(&state, &headers, &request_id) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let repositories = match session_github_repositories(&state, &session, &request_id) {
+        Ok(repositories) => repositories,
+        Err(response) => return response,
+    };
+    if let Err(response) = ensure_repo_accessible(&request_id, &request.repo_url, &repositories) {
         return response;
     }
 
@@ -2441,11 +2506,23 @@ async fn post_project_register_from_github(
     Json(request): Json<RegisterProjectFromGitHubRequest>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = require_web_session(&state, &headers, &request_id) {
+    let session = match require_web_session(&state, &headers, &request_id) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let repositories = match session_github_repositories(&state, &session, &request_id) {
+        Ok(repositories) => repositories,
+        Err(response) => return response,
+    };
+    if let Err(response) = ensure_repo_accessible(&request_id, &request.repo_url, &repositories) {
         return response;
     }
 
-    match state.project_registry.register_from_github(request) {
+    let apps_domain = std::env::var("FORGE_APPS_DOMAIN").ok();
+    match state
+        .project_registry
+        .register_from_github(request, apps_domain.as_deref())
+    {
         Ok(registered) => json_response(
             StatusCode::OK,
             &request_id,
@@ -6080,9 +6157,7 @@ pub mod app_assets_ship_calm_readiness_copy {
         assert_eq!(app_html.status(), StatusCode::OK);
         let app_html = to_bytes(app_html.into_body(), usize::MAX).await.unwrap();
         let app_html = String::from_utf8(app_html.to_vec()).unwrap();
-        assert!(app_html.contains(
-            "Read-only surface. Deploy, rollback, secrets, and project changes stay in CLI or API."
-        ));
+        assert!(app_html.contains("Register a project only. No deployment starts automatically."));
     }
 }
 
@@ -8168,21 +8243,46 @@ pub mod github_repo_picker_api {
         }
     }
 
-    fn build_state_with_mock_repos() -> HttpState {
+    pub(super) fn build_state_with_mock_repos() -> HttpState {
         set_master_key();
         let mut state = build_cli_login_state();
         state.web_auth.github_oauth = Arc::new(MockGitHubOAuthProvider {
             login: "octocat".into(),
             user_id: 7,
             fail: false,
-            repositories: vec![crate::api::GitHubRepositorySummary {
-                full_name: "anggaprytn/aegis-quant".into(),
-                html_url: "https://github.com/anggaprytn/aegis-quant".into(),
-                clone_url: "https://github.com/anggaprytn/aegis-quant.git".into(),
-                default_branch: "main".into(),
-                private: false,
-            }],
+            repositories: vec![
+                crate::api::GitHubRepositorySummary {
+                    full_name: "example/Forge__Fullstack...API---Test".into(),
+                    html_url: "https://github.com/example/Forge__Fullstack...API---Test".into(),
+                    clone_url: "https://github.com/example/Forge__Fullstack...API---Test.git"
+                        .into(),
+                    default_branch: "main".into(),
+                    private: false,
+                },
+                crate::api::GitHubRepositorySummary {
+                    full_name: "anggaprytn/aegis-quant".into(),
+                    html_url: "https://github.com/anggaprytn/aegis-quant".into(),
+                    clone_url: "https://github.com/anggaprytn/aegis-quant.git".into(),
+                    default_branch: "main".into(),
+                    private: false,
+                },
+                crate::api::GitHubRepositorySummary {
+                    full_name: "example/api".into(),
+                    html_url: "https://github.com/example/api".into(),
+                    clone_url: "https://github.com/example/api.git".into(),
+                    default_branch: "main".into(),
+                    private: false,
+                },
+                crate::api::GitHubRepositorySummary {
+                    full_name: "example/web".into(),
+                    html_url: "https://github.com/example/web".into(),
+                    clone_url: "https://github.com/example/web.git".into(),
+                    default_branch: "main".into(),
+                    private: false,
+                },
+            ],
             scope: Some("read:user,repo".into()),
+            list_error: None,
         });
         state
             .web_auth
@@ -8226,11 +8326,11 @@ pub mod github_repo_picker_api {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json["data"]["repositories"][0]["full_name"],
-            "anggaprytn/aegis-quant"
-        );
-        assert_eq!(json["data"]["repositories"][0]["default_branch"], "main");
+        let repositories = json["data"]["repositories"].as_array().unwrap();
+        assert!(repositories.iter().any(|repository| {
+            repository["full_name"] == "anggaprytn/aegis-quant"
+                && repository["default_branch"] == "main"
+        }));
     }
 
     #[tokio::test]
@@ -8294,6 +8394,7 @@ pub mod github_repo_picker_api {
                 private: false,
             }],
             scope: Some("read:user".into()),
+            list_error: None,
         });
         state
             .web_auth
@@ -8341,6 +8442,7 @@ pub mod github_repo_picker_api {
 #[cfg(test)]
 pub mod register_project_from_github_api {
     use super::*;
+    use crate::http::github_repo_picker_api::build_state_with_mock_repos;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, header};
     use serde_json::Value;
@@ -8367,7 +8469,7 @@ pub mod register_project_from_github_api {
     #[tokio::test]
     async fn preview_derives_safe_fields() {
         configure_apps_domain();
-        let state = build_cli_login_state();
+        let state = build_state_with_mock_repos();
         let session_cookie = session_cookie_value(&state);
         let app = router(state);
 
@@ -8392,7 +8494,11 @@ pub mod register_project_from_github_api {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["valid"], true);
         assert_eq!(json["data"]["project_id"], "forge-fullstack-api-test");
+        assert_eq!(json["data"]["project_id_status"], "valid");
+        assert_eq!(json["data"]["base_domain_status"], "available");
+        assert_eq!(json["data"]["domain_source"], "generated");
         assert_eq!(
             json["data"]["base_domain"],
             "forge-fullstack-api-test.forge.anggaprytn.com"
@@ -8402,7 +8508,7 @@ pub mod register_project_from_github_api {
 
     #[tokio::test]
     async fn register_from_github_rejects_repo_urls_with_credentials() {
-        let state = build_cli_login_state();
+        let state = build_state_with_mock_repos();
         let session_cookie = session_cookie_value(&state);
         let app = router(state);
 
@@ -8425,12 +8531,15 @@ pub mod register_project_from_github_api {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!rendered.contains("mock-github-access-token"));
     }
 
     #[tokio::test]
     async fn register_from_github_writes_registry_without_triggering_deployment() {
         let mut state = build_cached_only_state(ControlPlaneSnapshot::default());
-        state.web_auth = build_cli_login_state().web_auth;
+        state.web_auth = build_state_with_mock_repos().web_auth;
         let session_cookie = session_cookie_value(&state);
         let app = router(state);
 
@@ -8484,7 +8593,7 @@ pub mod register_project_from_github_api {
 
     #[tokio::test]
     async fn register_from_github_rejects_project_id_collision() {
-        let state = build_cli_login_state();
+        let state = build_state_with_mock_repos();
         let session_cookie = session_cookie_value(&state);
         let app = router(state);
 
@@ -8511,7 +8620,7 @@ pub mod register_project_from_github_api {
 
     #[tokio::test]
     async fn register_from_github_rejects_base_domain_collision() {
-        let state = build_cli_login_state();
+        let state = build_state_with_mock_repos();
         let session_cookie = session_cookie_value(&state);
         let app = router(state);
 
@@ -8534,6 +8643,222 @@ pub mod register_project_from_github_api {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_preview_and_register_are_rejected() {
+        let app = router(build_state_with_mock_repos());
+
+        let preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"repo_url":"https://github.com/anggaprytn/aegis-quant.git","default_branch":"main"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::UNAUTHORIZED);
+
+        let register = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"aegis-quant","repo_url":"https://github.com/anggaprytn/aegis-quant.git","default_branch":"main","base_domain":"aegis-quant.forge.anggaprytn.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_repo_not_in_authenticated_github_inventory() {
+        configure_apps_domain();
+        let state = build_state_with_mock_repos();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"repo_url":"https://github.com/example/not-accessible.git","default_branch":"main"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn preview_reports_invalid_project_id_and_suggests_alternatives() {
+        configure_apps_domain();
+        let state = build_state_with_mock_repos();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"repo_url":"https://github.com/anggaprytn/aegis-quant.git","default_branch":"main","project_id":"Aegis!!"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["valid"], false);
+        assert_eq!(json["data"]["project_id"], "aegis");
+        assert_eq!(json["data"]["project_id_status"], "invalid");
+        assert_eq!(json["data"]["project_id_alternatives"][0], "aegis-2");
+    }
+
+    #[tokio::test]
+    async fn preview_reports_domain_collision_and_fallback_safely() {
+        configure_apps_domain();
+        let state = build_state_with_mock_repos();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"repo_url":"https://github.com/anggaprytn/aegis-quant.git","default_branch":"main","project_id":"aegis-quant","base_domain":"api.example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["valid"], false);
+        assert_eq!(json["data"]["base_domain_status"], "already_used");
+        assert!(
+            json["data"]["base_domain_suggestion"]
+                .as_str()
+                .unwrap()
+                .starts_with("aegis-quant-")
+        );
+    }
+
+    #[tokio::test]
+    async fn register_endpoint_revalidates_server_side() {
+        configure_apps_domain();
+        let state = build_state_with_mock_repos();
+        let session_cookie = session_cookie_value(&state);
+        state
+            .project_registry
+            .upsert(
+                crate::api::ProjectUpsertRequest {
+                    project_id: Some("aegis-quant".into()),
+                    repo_url: "https://github.com/example/existing.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("existing.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"project_id":"aegis-quant","repo_url":"https://github.com/anggaprytn/aegis-quant.git","default_branch":"main","base_domain":"aegis-quant.forge.anggaprytn.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn github_unavailable_state_renders_safe_error() {
+        configure_apps_domain();
+        let mut state = build_state_with_mock_repos();
+        state.web_auth.github_oauth = Arc::new(MockGitHubOAuthProvider {
+            login: "octocat".into(),
+            user_id: 7,
+            fail: false,
+            repositories: Vec::new(),
+            scope: Some("read:user,repo".into()),
+            list_error: Some(GitHubError::Api("upstream unavailable".into())),
+        });
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"repo_url":"https://github.com/anggaprytn/aegis-quant.git","default_branch":"main"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(rendered.contains("GitHub repository listing is unavailable right now."));
+        assert!(!rendered.contains("mock-github-access-token"));
     }
 }
 

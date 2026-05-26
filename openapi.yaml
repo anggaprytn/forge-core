@@ -1086,6 +1086,14 @@ components:
           type: string
         default_branch:
           type: string
+        project_id:
+          type:
+            - string
+            - 'null'
+        base_domain:
+          type:
+            - string
+            - 'null'
     ProjectRegistrationRoutePreview:
       type: object
       required:
@@ -1102,12 +1110,18 @@ components:
     RegisterProjectFromGitHubPreviewResponse:
       type: object
       required:
+        - valid
         - project_id
         - repo_url
         - default_branch
         - base_domain
+        - domain_source
+        - project_id_status
+        - base_domain_status
         - environment_routes
       properties:
+        valid:
+          type: boolean
         project_id:
           type: string
         repo_url:
@@ -1116,15 +1130,44 @@ components:
           type: string
         base_domain:
           type: string
+        domain_source:
+          type: string
+        project_id_status:
+          type: string
+        base_domain_status:
+          type: string
         environment_routes:
           $ref: '#/components/schemas/ProjectRegistrationRoutePreview'
+        project_id_alternatives:
+          type: array
+          items:
+            type: string
+        project_id_message:
+          type:
+            - string
+            - 'null'
+        base_domain_message:
+          type:
+            - string
+            - 'null'
+        base_domain_suggestion:
+          type:
+            - string
+            - 'null'
+        warnings:
+          type: array
+          items:
+            type: string
+        errors:
+          type: array
+          items:
+            type: string
     RegisterProjectFromGitHubRequest:
       type: object
       required:
         - project_id
         - repo_url
         - default_branch
-        - base_domain
       properties:
         project_id:
           type: string
@@ -1133,7 +1176,9 @@ components:
         default_branch:
           type: string
         base_domain:
-          type: string
+          type:
+            - string
+            - 'null'
     RegisterProjectFromGitHubResponse:
       type: object
       required:
@@ -1142,6 +1187,8 @@ components:
         - repo_url
         - default_branch
         - base_domain
+        - domain_source
+        - environment_routes
       properties:
         registered:
           type: boolean
@@ -1153,6 +1200,10 @@ components:
           type: string
         base_domain:
           type: string
+        domain_source:
+          type: string
+        environment_routes:
+          $ref: '#/components/schemas/ProjectRegistrationRoutePreview'
     Project:
       type: object
       required:

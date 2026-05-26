@@ -150,10 +150,47 @@
                   <dd id="github-selected-base-domain">Unknown</dd>
                 </div>
                 <div>
-                  <dt>Domain mode</dt>
-                  <dd>Registration-time config only</dd>
+                  <dt>Domain source</dt>
+                  <dd id="github-selected-domain-source">Unknown</dd>
                 </div>
               </dl>
+
+              <div class="env-preview-grid">
+                <label class="search-field env-preview-field" for="github-project-id-input">
+                  <span>Final project ID</span>
+                  <input id="github-project-id-input" type="text" placeholder="project-id">
+                </label>
+                <label class="search-field env-preview-field" for="github-base-domain-input">
+                  <span>Base domain override</span>
+                  <input id="github-base-domain-input" type="text" placeholder="Leave blank to generate">
+                </label>
+              </div>
+
+              <div class="meta-grid">
+                <div>
+                  <dt>Project ID status</dt>
+                  <dd id="github-project-id-status">Unknown</dd>
+                </div>
+                <div>
+                  <dt>Base domain status</dt>
+                  <dd id="github-base-domain-status">Unknown</dd>
+                </div>
+              </div>
+
+              <div class="env-preview-copy">
+                <p id="github-project-id-message">Choose a valid final project ID before registering.</p>
+                <p id="github-base-domain-message">Generated routes stay registration-time only. No deployment starts automatically.</p>
+              </div>
+
+              <div>
+                <p class="eyebrow">Suggested project IDs</p>
+                <div id="github-project-id-alternatives" class="project-list" hidden></div>
+              </div>
+
+              <div>
+                <p class="eyebrow">Preview warnings and errors</p>
+                <div id="github-register-messages" class="env-preview-result" hidden></div>
+              </div>
 
               <div class="env-preview-copy">
                 <p>Production uses the base domain directly. Staging and development routes are derived automatically.</p>
@@ -176,6 +213,11 @@
               </div>
 
               <div class="env-preview-actions">
+                <button id="github-preview-refresh" class="env-preview-button" type="button">Refresh Preview</button>
+                <label class="search-field env-search" for="github-project-id-confirm">
+                  <span>Confirmation</span>
+                  <input id="github-project-id-confirm" type="checkbox">
+                </label>
                 <button id="github-register-button" class="env-preview-button" type="button">Register Project</button>
               </div>
             </div>

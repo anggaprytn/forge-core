@@ -416,6 +416,121 @@ function setGitHubRegisterState(message, tone = "") {
   );
 }
 
+function githubPreviewIsRegisterable(preview) {
+  return Boolean(
+    preview
+    && preview.valid
+    && preview.project_id_status === "valid"
+    && preview.base_domain_status === "available",
+  );
+}
+
+function githubProjectIdInputValue() {
+  const field = element("github-project-id-input");
+  return field ? (field.value || "").trim() : "";
+}
+
+function githubBaseDomainInputValue() {
+  const field = element("github-base-domain-input");
+  return field ? (field.value || "").trim() : "";
+}
+
+function githubProjectIdConfirmed() {
+  const field = element("github-project-id-confirm");
+  return Boolean(field && field.checked);
+}
+
+function resetGitHubProjectConfirmation() {
+  const field = element("github-project-id-confirm");
+  if (field) {
+    field.checked = false;
+  }
+}
+
+function renderGitHubProjectIdAlternatives(preview) {
+  const list = element("github-project-id-alternatives");
+  if (!list) {
+    return;
+  }
+  clearChildren(list);
+  const alternatives = preview && Array.isArray(preview.project_id_alternatives)
+    ? preview.project_id_alternatives.filter((value) => value && value !== preview.project_id)
+    : [];
+  if (!alternatives.length) {
+    hide("github-project-id-alternatives");
+    return;
+  }
+
+  alternatives.forEach((projectId) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "project-item";
+    button.textContent = projectId;
+    button.addEventListener("click", () => {
+      const field = element("github-project-id-input");
+      if (field) {
+        field.value = projectId;
+      }
+      resetGitHubProjectConfirmation();
+      void refreshGitHubRegistrationPreview();
+    });
+    list.appendChild(button);
+  });
+  show("github-project-id-alternatives");
+}
+
+function renderGitHubRegistrationMessages(preview) {
+  const container = element("github-register-messages");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+  const warnings = preview && Array.isArray(preview.warnings) ? preview.warnings : [];
+  const errors = preview && Array.isArray(preview.errors) ? preview.errors : [];
+  if (!warnings.length && !errors.length) {
+    hide("github-register-messages");
+    return;
+  }
+
+  warnings.forEach((message) => {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = `Warning: ${message}`;
+    container.appendChild(item);
+  });
+  errors.forEach((message) => {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = `Error: ${message}`;
+    container.appendChild(item);
+  });
+  show("github-register-messages");
+}
+
+function syncGitHubPreviewInputs(preview) {
+  const projectIdField = element("github-project-id-input");
+  if (projectIdField && projectIdField.value.trim() !== preview.project_id) {
+    projectIdField.value = preview.project_id || "";
+  }
+
+  const baseDomainField = element("github-base-domain-input");
+  if (baseDomainField) {
+    if (preview.domain_source === "explicit") {
+      baseDomainField.value = preview.base_domain || "";
+    } else if (baseDomainField.value.trim()) {
+      baseDomainField.value = "";
+    }
+  }
+}
+
+function updateGitHubRegisterButton(preview) {
+  const button = element("github-register-button");
+  if (!button) {
+    return;
+  }
+  button.disabled = !githubPreviewIsRegisterable(preview) || !githubProjectIdConfirmed();
+}
+
 function renderGitHubRegistrationPreview() {
   const repository = dataState.selectedGithubRepo;
   const preview = dataState.githubRegistrationPreview;
@@ -429,10 +544,22 @@ function renderGitHubRegistrationPreview() {
   element("github-selected-clone-url").textContent = text(preview.repo_url);
   element("github-selected-project-id").textContent = text(preview.project_id);
   element("github-selected-base-domain").textContent = text(preview.base_domain);
+  element("github-selected-domain-source").textContent = text(preview.domain_source);
+  element("github-project-id-status").textContent = text(preview.project_id_status);
+  element("github-base-domain-status").textContent = text(preview.base_domain_status);
+  element("github-project-id-message").textContent = text(preview.project_id_message, "Choose and confirm a valid final project ID.");
+  element("github-base-domain-message").textContent = text(
+    preview.base_domain_message || preview.base_domain_suggestion,
+    "Production uses the base domain directly. Staging and development routes are derived automatically.",
+  );
   setChip("github-repo-visibility", repository.private ? "Private repo" : "Public repo", repository.private ? "warn" : "");
   element("github-route-production").textContent = text(preview.environment_routes && preview.environment_routes.production);
   element("github-route-staging").textContent = text(preview.environment_routes && preview.environment_routes.staging);
   element("github-route-development").textContent = text(preview.environment_routes && preview.environment_routes.development);
+  syncGitHubPreviewInputs(preview);
+  renderGitHubProjectIdAlternatives(preview);
+  renderGitHubRegistrationMessages(preview);
+  updateGitHubRegisterButton(preview);
   show("github-register-preview");
 }
 
@@ -539,10 +666,13 @@ async function loadGitHubRepositories() {
   }
 }
 
-async function selectGitHubRepository(repository) {
-  dataState.selectedGithubRepo = repository;
-  dataState.githubRegistrationPreview = null;
-  renderGitHubRepoList();
+async function refreshGitHubRegistrationPreview() {
+  const repository = dataState.selectedGithubRepo;
+  if (!repository) {
+    setGitHubRegisterState("Select a repository first.", "warn");
+    return;
+  }
+  resetGitHubProjectConfirmation();
   setGitHubRegisterState("Loading registration preview...");
 
   try {
@@ -552,11 +682,18 @@ async function selectGitHubRepository(repository) {
       body: JSON.stringify({
         repo_url: repository.clone_url,
         default_branch: repository.default_branch,
+        project_id: githubProjectIdInputValue() || null,
+        base_domain: githubBaseDomainInputValue() || null,
       }),
     });
     dataState.githubRegistrationPreview = preview;
     renderGitHubRepoList();
-    setGitHubRegisterState("Review the generated project_id, branch, and base_domain before registering.");
+    setGitHubRegisterState(
+      githubPreviewIsRegisterable(preview)
+        ? "Confirm the final project_id to register this project only."
+        : "Review validation errors before registering.",
+      githubPreviewIsRegisterable(preview) ? "" : "warn",
+    );
   } catch (error) {
     dataState.githubRegistrationPreview = null;
     hide("github-register-preview");
@@ -564,10 +701,34 @@ async function selectGitHubRepository(repository) {
   }
 }
 
+async function selectGitHubRepository(repository) {
+  dataState.selectedGithubRepo = repository;
+  dataState.githubRegistrationPreview = null;
+  resetGitHubProjectConfirmation();
+  const projectIdField = element("github-project-id-input");
+  if (projectIdField) {
+    projectIdField.value = "";
+  }
+  const baseDomainField = element("github-base-domain-input");
+  if (baseDomainField) {
+    baseDomainField.value = "";
+  }
+  renderGitHubRepoList();
+  await refreshGitHubRegistrationPreview();
+}
+
 async function registerProjectFromGitHub() {
   const preview = dataState.githubRegistrationPreview;
   if (!preview) {
     setGitHubRegisterState("Select a repository and wait for registration preview first.", "warn");
+    return;
+  }
+  if (!githubPreviewIsRegisterable(preview)) {
+    setGitHubRegisterState("Preview is not valid yet. Fix validation errors before registering.", "warn");
+    return;
+  }
+  if (!githubProjectIdConfirmed()) {
+    setGitHubRegisterState("Confirm the final project_id before registering.", "warn");
     return;
   }
 
@@ -586,14 +747,30 @@ async function registerProjectFromGitHub() {
         project_id: preview.project_id,
         repo_url: preview.repo_url,
         default_branch: preview.default_branch,
-        base_domain: preview.base_domain,
+        base_domain: githubBaseDomainInputValue() || null,
       }),
     });
     setGitHubRegisterState("Project registered. Deploy from CLI/API when ready.");
-    dataState.selectedProjectId = response.project_id;
+    dataState.githubRegistrationPreview = {
+      ...preview,
+      project_id: response.project_id,
+      repo_url: response.repo_url,
+      default_branch: response.default_branch,
+      base_domain: response.base_domain,
+      domain_source: response.domain_source,
+      environment_routes: response.environment_routes,
+      valid: true,
+      project_id_status: "valid",
+      base_domain_status: "available",
+      warnings: [],
+      errors: [],
+    };
+    resetGitHubProjectConfirmation();
+    uiState.selectedProjectId = response.project_id;
     dataState.environmentsByProject.delete(response.project_id);
     dataState.envInventoryByProject.delete(response.project_id);
     dataState.envAuditByProject.delete(response.project_id);
+    renderGitHubRegistrationPreview();
     await loadConsole();
   } catch (error) {
     setGitHubRegisterState(error.message || "Project registration failed.", "warn");
@@ -602,6 +779,7 @@ async function registerProjectFromGitHub() {
       button.disabled = false;
       button.textContent = "Register Project";
     }
+    updateGitHubRegisterButton(dataState.githubRegistrationPreview);
   }
 }
 
@@ -1634,6 +1812,36 @@ function bindControls() {
     });
   }
 
+  const githubPreviewButton = element("github-preview-refresh");
+  if (githubPreviewButton) {
+    githubPreviewButton.addEventListener("click", () => {
+      void refreshGitHubRegistrationPreview();
+    });
+  }
+
+  const githubProjectIdInput = element("github-project-id-input");
+  if (githubProjectIdInput) {
+    githubProjectIdInput.addEventListener("input", () => {
+      resetGitHubProjectConfirmation();
+      updateGitHubRegisterButton(dataState.githubRegistrationPreview);
+    });
+  }
+
+  const githubBaseDomainInput = element("github-base-domain-input");
+  if (githubBaseDomainInput) {
+    githubBaseDomainInput.addEventListener("input", () => {
+      resetGitHubProjectConfirmation();
+      updateGitHubRegisterButton(dataState.githubRegistrationPreview);
+    });
+  }
+
+  const githubProjectIdConfirm = element("github-project-id-confirm");
+  if (githubProjectIdConfirm) {
+    githubProjectIdConfirm.addEventListener("change", () => {
+      updateGitHubRegisterButton(dataState.githubRegistrationPreview);
+    });
+  }
+
   const search = element("project-search");
   if (search) {
     search.addEventListener("input", (event) => {
@@ -1706,4 +1914,5 @@ function bindControls() {
 
 bindControls();
 setPreviewPhase("no_preview");
+updateGitHubRegisterButton(null);
 void loadConsole();

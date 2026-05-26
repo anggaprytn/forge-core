@@ -234,35 +234,40 @@ impl ProjectRegistryStore {
         request: RegisterProjectFromGitHubPreviewRequest,
         apps_domain: Option<&str>,
     ) -> Result<RegisterProjectFromGitHubPreviewResponse, ProjectRegistryError> {
-        let repo_url = normalize_repo_url(&request.repo_url)?;
-        let project_id = infer_project_id_from_repo_url(&repo_url)?;
-        let default_branch = normalize_default_branch(&request.default_branch)?;
-        let (_, base_domain) = resolve_domain(self, &project_id, None, None, apps_domain)?;
-        Ok(RegisterProjectFromGitHubPreviewResponse {
-            project_id,
-            repo_url,
-            default_branch,
-            base_domain: base_domain.clone(),
-            environment_routes: ProjectRegistrationRoutePreview {
-                production: derive_environment_domain(&base_domain, "production"),
-                staging: derive_environment_domain(&base_domain, "staging"),
-                development: derive_environment_domain(&base_domain, "development"),
-            },
-        })
+        self.build_github_registration_preview(
+            request.project_id.as_deref(),
+            &request.repo_url,
+            &request.default_branch,
+            request.base_domain.as_deref(),
+            apps_domain,
+        )
     }
 
     pub fn register_from_github(
         &self,
         request: RegisterProjectFromGitHubRequest,
+        apps_domain: Option<&str>,
     ) -> Result<RegisterProjectFromGitHubResponse, ProjectRegistryError> {
-        let repo_url = normalize_repo_url(&request.repo_url)?;
-        let project_id = normalize_project_id(&request.project_id)?;
-        if self.get(&project_id)?.is_some() {
-            return Err(ProjectRegistryError::ProjectAlreadyExists(project_id));
+        let preview = self.build_github_registration_preview(
+            Some(&request.project_id),
+            &request.repo_url,
+            &request.default_branch,
+            request.base_domain.as_deref(),
+            apps_domain,
+        )?;
+        if !preview.valid {
+            return Err(preview_error(&preview));
         }
-        let default_branch = normalize_default_branch(&request.default_branch)?;
-        let base_domain = normalize_hostname(&request.base_domain)?;
-        ensure_domain_available(self, &project_id, &base_domain)?;
+
+        let repo_url = preview.repo_url.clone();
+        let project_id = preview.project_id.clone();
+        let default_branch = preview.default_branch.clone();
+        let base_domain = preview.base_domain.clone();
+        let domain_mode = if preview.domain_source == "explicit" {
+            "explicit"
+        } else {
+            "generated"
+        };
 
         let now = unix_now();
         let created = ProjectRecord {
@@ -270,7 +275,7 @@ impl ProjectRegistryStore {
             repo_url: repo_url.clone(),
             default_branch: default_branch.clone(),
             base_domain: base_domain.clone(),
-            domain_mode: "explicit".into(),
+            domain_mode: domain_mode.into(),
             created_at_unix: now,
             updated_at_unix: now,
             environments: Vec::new(),
@@ -282,7 +287,265 @@ impl ProjectRegistryStore {
             repo_url,
             default_branch,
             base_domain,
+            domain_source: preview.domain_source,
+            environment_routes: preview.environment_routes,
         })
+    }
+
+    fn build_github_registration_preview(
+        &self,
+        requested_project_id: Option<&str>,
+        repo_url_input: &str,
+        default_branch_input: &str,
+        requested_base_domain: Option<&str>,
+        apps_domain: Option<&str>,
+    ) -> Result<RegisterProjectFromGitHubPreviewResponse, ProjectRegistryError> {
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        let repo_url = match normalize_repo_url(repo_url_input) {
+            Ok(value) => value,
+            Err(ProjectRegistryError::InvalidRepoUrl(message)) => {
+                errors.push(message);
+                repo_url_input.trim().to_string()
+            }
+            Err(err) => return Err(err),
+        };
+
+        let default_branch = match normalize_default_branch(default_branch_input) {
+            Ok(value) => value,
+            Err(ProjectRegistryError::InvalidDefaultBranch) => {
+                errors.push("default_branch must not be empty".into());
+                default_branch_input.trim().to_string()
+            }
+            Err(err) => return Err(err),
+        };
+
+        let explicit_project_id = requested_project_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let inferred_project_id = infer_project_id_preview(explicit_project_id, &repo_url);
+        let project_id = inferred_project_id.normalized;
+        let project_id_status = match &inferred_project_id.strict {
+            Some(project_id) => {
+                if self.get(project_id)?.is_some() {
+                    errors.push(format!("project_id is already registered: {project_id}"));
+                    "already_exists".to_string()
+                } else {
+                    "valid".to_string()
+                }
+            }
+            None => {
+                let message = inferred_project_id.message.clone().unwrap_or_else(|| {
+                    "project_id must use lowercase letters, digits, and hyphens only".into()
+                });
+                errors.push(message);
+                "invalid".to_string()
+            }
+        };
+        let project_id_message = match project_id_status.as_str() {
+            "invalid" => Some(
+                inferred_project_id
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Use 1-63 lowercase letters, digits, or hyphens. It cannot start or end with a hyphen.".into()),
+            ),
+            "already_exists" => Some(format!(
+                "project_id is already registered: {}",
+                inferred_project_id.strict.as_deref().unwrap_or(project_id.as_str())
+            )),
+            _ => Some("Use 1-63 lowercase letters, digits, or hyphens. It cannot start or end with a hyphen.".into()),
+        };
+        let project_id_alternatives = suggested_project_ids(
+            inferred_project_id
+                .strict
+                .as_deref()
+                .unwrap_or(project_id.as_str()),
+        );
+
+        let domain_preview = self.evaluate_base_domain_preview(
+            requested_base_domain,
+            inferred_project_id.strict.as_deref(),
+            apps_domain,
+        )?;
+        warnings.extend(domain_preview.warnings.iter().cloned());
+        errors.extend(domain_preview.errors.iter().cloned());
+
+        let environment_routes = if domain_preview.base_domain_status == "available" {
+            ProjectRegistrationRoutePreview {
+                production: derive_environment_domain(&domain_preview.base_domain, "production"),
+                staging: derive_environment_domain(&domain_preview.base_domain, "staging"),
+                development: derive_environment_domain(&domain_preview.base_domain, "development"),
+            }
+        } else {
+            ProjectRegistrationRoutePreview {
+                production: String::new(),
+                staging: String::new(),
+                development: String::new(),
+            }
+        };
+
+        let valid = errors.is_empty()
+            && project_id_status == "valid"
+            && domain_preview.base_domain_status == "available";
+
+        Ok(RegisterProjectFromGitHubPreviewResponse {
+            valid,
+            project_id,
+            repo_url,
+            default_branch,
+            base_domain: domain_preview.base_domain,
+            domain_source: domain_preview.domain_source,
+            project_id_status,
+            base_domain_status: domain_preview.base_domain_status,
+            environment_routes,
+            project_id_alternatives,
+            project_id_message,
+            base_domain_message: domain_preview.base_domain_message,
+            base_domain_suggestion: domain_preview.base_domain_suggestion,
+            warnings,
+            errors,
+        })
+    }
+
+    fn evaluate_base_domain_preview(
+        &self,
+        requested_base_domain: Option<&str>,
+        project_id: Option<&str>,
+        apps_domain: Option<&str>,
+    ) -> Result<DomainPreview, ProjectRegistryError> {
+        let mut preview = DomainPreview::default();
+        let explicit_base_domain = requested_base_domain
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if let Some(base_domain) = explicit_base_domain {
+            preview.domain_source = "explicit".into();
+            preview.base_domain = base_domain.to_ascii_lowercase();
+            match normalize_hostname(base_domain) {
+                Ok(normalized) => {
+                    preview.base_domain = normalized.clone();
+                    if let Some(project_id) = project_id {
+                        if domain_available(self, project_id, &normalized)? {
+                            preview.base_domain_status = "available".into();
+                        } else {
+                            preview.base_domain_status = "already_used".into();
+                            preview.base_domain_message = Some(format!(
+                                "base_domain is already used by another project: {normalized}"
+                            ));
+                            preview.errors.push(format!(
+                                "base_domain is already used by another project: {normalized}"
+                            ));
+                            preview.base_domain_suggestion =
+                                self.generated_fallback_domain(project_id, apps_domain)?;
+                        }
+                    } else {
+                        preview.base_domain_status = "invalid".into();
+                        preview.base_domain_message = Some(
+                            "Choose a valid project_id before setting an explicit base_domain."
+                                .into(),
+                        );
+                    }
+                }
+                Err(ProjectRegistryError::InvalidBaseDomain(message)) => {
+                    preview.base_domain_status = "invalid".into();
+                    preview.base_domain_message = Some(message.clone());
+                    preview.errors.push(message);
+                    if let Some(project_id) = project_id {
+                        preview.base_domain_suggestion =
+                            self.generated_fallback_domain(project_id, apps_domain)?;
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+            return Ok(preview);
+        }
+
+        preview.domain_source = "generated".into();
+        let Some(project_id) = project_id else {
+            preview.base_domain_status = "invalid".into();
+            preview.base_domain_message =
+                Some("Choose a valid project_id before generating a base_domain.".into());
+            preview
+                .errors
+                .push("Choose a valid project_id before generating a base_domain.".into());
+            return Ok(preview);
+        };
+
+        let apps_domain = match apps_domain {
+            Some(value) => match normalize_hostname(value) {
+                Ok(normalized) => normalized,
+                Err(ProjectRegistryError::InvalidBaseDomain(message)) => {
+                    preview.base_domain_status = "invalid".into();
+                    preview.base_domain_message = Some(message.clone());
+                    preview.errors.push(message);
+                    return Ok(preview);
+                }
+                Err(err) => return Err(err),
+            },
+            None => {
+                preview.base_domain_status = "invalid".into();
+                preview.base_domain_message =
+                    Some("FORGE_APPS_DOMAIN is required when base_domain is not provided".into());
+                preview
+                    .errors
+                    .push("FORGE_APPS_DOMAIN is required when base_domain is not provided".into());
+                return Ok(preview);
+            }
+        };
+
+        let preferred = normalize_hostname(&format!("{project_id}.{apps_domain}"))?;
+        if domain_available(self, project_id, &preferred)? {
+            preview.base_domain = preferred;
+            preview.base_domain_status = "available".into();
+            return Ok(preview);
+        }
+
+        preview.base_domain_suggestion =
+            self.generated_fallback_domain(project_id, Some(&apps_domain))?;
+        match preview.base_domain_suggestion.clone() {
+            Some(generated) => {
+                preview.domain_source = "generated_fallback".into();
+                preview.base_domain = generated;
+                preview.base_domain_status = "available".into();
+                preview.warnings.push(format!(
+                    "Preferred domain {preferred} is already used. Generated fallback domain instead."
+                ));
+                preview.base_domain_message =
+                    Some(format!("Preferred domain {preferred} is already used."));
+                Ok(preview)
+            }
+            None => {
+                preview.base_domain = preferred.clone();
+                preview.base_domain_status = "already_used".into();
+                preview.base_domain_message = Some(format!(
+                    "base_domain is already used by another project: {preferred}"
+                ));
+                preview.errors.push(format!(
+                    "base_domain is already used by another project: {preferred}"
+                ));
+                Ok(preview)
+            }
+        }
+    }
+
+    fn generated_fallback_domain(
+        &self,
+        project_id: &str,
+        apps_domain: Option<&str>,
+    ) -> Result<Option<String>, ProjectRegistryError> {
+        let Some(apps_domain) = apps_domain else {
+            return Ok(None);
+        };
+        let apps_domain = normalize_hostname(apps_domain)?;
+        for attempt in 0..ProjectRegistryStore::GENERATED_DOMAIN_MAX_ATTEMPTS {
+            let shortid = generate_shortid(project_id, attempt);
+            let generated = normalize_hostname(&format!("{project_id}-{shortid}.{apps_domain}"))?;
+            if domain_available(self, project_id, &generated)? {
+                return Ok(Some(generated));
+            }
+        }
+        Ok(None)
     }
 
     fn write(&self, project: &ProjectRecord) -> Result<(), ProjectRegistryError> {
@@ -631,6 +894,128 @@ fn sanitize_repo_url(input: &str) -> String {
     input.to_string()
 }
 
+#[derive(Debug, Default)]
+struct DomainPreview {
+    base_domain: String,
+    domain_source: String,
+    base_domain_status: String,
+    base_domain_message: Option<String>,
+    base_domain_suggestion: Option<String>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ProjectIdPreview {
+    normalized: String,
+    strict: Option<String>,
+    message: Option<String>,
+}
+
+fn infer_project_id_preview(
+    requested_project_id: Option<&str>,
+    repo_url: &str,
+) -> ProjectIdPreview {
+    if let Some(project_id) = requested_project_id {
+        let normalized = normalize_inferred_project_id(project_id);
+        let strict = normalize_project_id(project_id).ok();
+        return ProjectIdPreview {
+            normalized,
+            strict,
+            message: Some(
+                "Use 1-63 lowercase letters, digits, or hyphens. It cannot start or end with a hyphen.".into(),
+            ),
+        };
+    }
+
+    match infer_project_id_from_repo_url(repo_url) {
+        Ok(project_id) => ProjectIdPreview {
+            normalized: project_id.clone(),
+            strict: Some(project_id),
+            message: Some(
+                "Use 1-63 lowercase letters, digits, or hyphens. It cannot start or end with a hyphen.".into(),
+            ),
+        },
+        Err(ProjectRegistryError::InvalidRepoUrl(message)) => {
+            let normalized = repo_url
+                .trim()
+                .trim_end_matches('/')
+                .rsplit(['/', ':'])
+                .next()
+                .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
+                .map(normalize_inferred_project_id)
+                .unwrap_or_default();
+            ProjectIdPreview {
+                normalized,
+                strict: None,
+                message: Some(message),
+            }
+        }
+        Err(_) => ProjectIdPreview {
+            normalized: String::new(),
+            strict: None,
+            message: Some(
+                "Use 1-63 lowercase letters, digits, or hyphens. It cannot start or end with a hyphen.".into(),
+            ),
+        },
+    }
+}
+
+fn suggested_project_ids(project_id: &str) -> Vec<String> {
+    let base = normalize_inferred_project_id(project_id);
+    if base.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("{base}-2"),
+        format!("{base}-{}", generate_shortid(&base, 0)),
+    ]
+}
+
+fn preview_error(preview: &RegisterProjectFromGitHubPreviewResponse) -> ProjectRegistryError {
+    if let Some(message) = preview
+        .errors
+        .iter()
+        .find(|message| message.contains("repo_url"))
+        .cloned()
+    {
+        return ProjectRegistryError::InvalidRepoUrl(message);
+    }
+    if preview.project_id_status == "already_exists" {
+        return ProjectRegistryError::ProjectAlreadyExists(preview.project_id.clone());
+    }
+    if preview.project_id_status == "invalid" {
+        return ProjectRegistryError::InvalidProjectId;
+    }
+    match preview.base_domain_status.as_str() {
+        "already_used" => {
+            return ProjectRegistryError::BaseDomainAlreadyInUse(preview.base_domain.clone());
+        }
+        "invalid" => {
+            if preview
+                .base_domain_message
+                .as_deref()
+                .is_some_and(|message| message.contains("FORGE_APPS_DOMAIN"))
+            {
+                return ProjectRegistryError::MissingAppsDomain;
+            }
+            return ProjectRegistryError::InvalidBaseDomain(
+                preview
+                    .base_domain_message
+                    .clone()
+                    .unwrap_or_else(|| "base_domain must be a valid DNS hostname".into()),
+            );
+        }
+        _ => {}
+    }
+    if preview.default_branch.trim().is_empty() {
+        return ProjectRegistryError::InvalidDefaultBranch;
+    }
+    ProjectRegistryError::Storage(StorageError::Io(std::io::Error::other(
+        "project registration preview validation failed",
+    )))
+}
+
 pub fn project_registry_error_response(
     err: ProjectRegistryError,
 ) -> (axum::http::StatusCode, ErrorResponse) {
@@ -888,23 +1273,13 @@ fn normalize_hostname(input: &str) -> Result<String, ProjectRegistryError> {
 }
 
 fn generate_shortid(project_id: &str, attempt: usize) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(project_id.as_bytes());
-    hasher.update(attempt.to_string().as_bytes());
     #[cfg(test)]
     if let Some(shortid) = take_test_shortid() {
         return shortid;
     }
-    hasher.update(unix_now().to_string().as_bytes());
-    hasher.update(std::process::id().to_string().as_bytes());
-    hasher.update(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .to_string()
-            .as_bytes(),
-    );
+    let mut hasher = Sha256::new();
+    hasher.update(project_id.as_bytes());
+    hasher.update(attempt.to_string().as_bytes());
     let digest = hasher.finalize();
     let mut shortid = String::with_capacity(8);
     for byte in &digest[..4] {
@@ -1057,7 +1432,7 @@ mod tests {
 
         let mut second = request("api");
         second.base_domain = None;
-        set_test_shortids(&["abcd1234"]);
+        set_test_shortids(&["abcd1234", "abcd1234"]);
 
         let created = store.upsert(second, Some("forge.example.com")).unwrap();
         assert_eq!(created.domain_mode, "generated");
@@ -1310,12 +1685,18 @@ mod tests {
                 RegisterProjectFromGitHubPreviewRequest {
                     repo_url: "https://github.com/example/Forge__Fullstack...API---Test.git".into(),
                     default_branch: "main".into(),
+                    project_id: None,
+                    base_domain: None,
                 },
                 Some("forge.example.com"),
             )
             .unwrap();
 
         assert_eq!(preview.project_id, "forge-fullstack-api-test");
+        assert!(preview.valid);
+        assert_eq!(preview.project_id_status, "valid");
+        assert_eq!(preview.base_domain_status, "available");
+        assert_eq!(preview.domain_source, "generated");
         assert_eq!(preview.default_branch, "main");
         assert_eq!(
             preview.base_domain,
@@ -1342,12 +1723,15 @@ mod tests {
         store.upsert(request("api"), None).unwrap();
 
         let err = store
-            .register_from_github(RegisterProjectFromGitHubRequest {
-                project_id: "api".into(),
-                repo_url: "https://github.com/example/api.git".into(),
-                default_branch: "main".into(),
-                base_domain: "api-2.example.com".into(),
-            })
+            .register_from_github(
+                RegisterProjectFromGitHubRequest {
+                    project_id: "api".into(),
+                    repo_url: "https://github.com/example/api.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api-2.example.com".into()),
+                },
+                None,
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -1363,12 +1747,15 @@ mod tests {
         store.upsert(request("api"), None).unwrap();
 
         let err = store
-            .register_from_github(RegisterProjectFromGitHubRequest {
-                project_id: "web".into(),
-                repo_url: "https://github.com/example/web.git".into(),
-                default_branch: "main".into(),
-                base_domain: "api.example.com".into(),
-            })
+            .register_from_github(
+                RegisterProjectFromGitHubRequest {
+                    project_id: "web".into(),
+                    repo_url: "https://github.com/example/web.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -1384,12 +1771,15 @@ mod tests {
         let store = ProjectRegistryStore::new(&root);
 
         let response = store
-            .register_from_github(RegisterProjectFromGitHubRequest {
-                project_id: "aegis-quant".into(),
-                repo_url: "https://github.com/anggaprytn/aegis-quant.git".into(),
-                default_branch: "main".into(),
-                base_domain: "aegis-quant.forge.example.com".into(),
-            })
+            .register_from_github(
+                RegisterProjectFromGitHubRequest {
+                    project_id: "aegis-quant".into(),
+                    repo_url: "https://github.com/anggaprytn/aegis-quant.git".into(),
+                    default_branch: "main".into(),
+                    base_domain: Some("aegis-quant.forge.example.com".into()),
+                },
+                None,
+            )
             .unwrap();
 
         assert!(response.registered);
@@ -1397,5 +1787,139 @@ mod tests {
         let project = store.get("aegis-quant").unwrap().unwrap();
         assert_eq!(project.default_branch, "main");
         assert!(!root.join("projects/aegis-quant/environments").exists());
+    }
+
+    #[test]
+    fn github_registration_preview_reports_project_id_collision_and_alternatives() {
+        let root = test_root("github-preview-project-id-collision");
+        let store = ProjectRegistryStore::new(&root);
+        store.upsert(request("api"), None).unwrap();
+        set_test_shortids(&["abcd1234"]);
+
+        let preview = store
+            .preview_registration_from_github(
+                RegisterProjectFromGitHubPreviewRequest {
+                    repo_url: "https://github.com/example/api.git".into(),
+                    default_branch: "main".into(),
+                    project_id: Some("api".into()),
+                    base_domain: None,
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+
+        assert!(!preview.valid);
+        assert_eq!(preview.project_id_status, "already_exists");
+        assert_eq!(
+            preview.project_id_alternatives,
+            vec!["api-2", "api-abcd1234"]
+        );
+    }
+
+    #[test]
+    fn github_registration_preview_reports_invalid_project_id() {
+        let root = test_root("github-preview-invalid-project-id");
+        let store = ProjectRegistryStore::new(&root);
+
+        let preview = store
+            .preview_registration_from_github(
+                RegisterProjectFromGitHubPreviewRequest {
+                    repo_url: "https://github.com/example/api.git".into(),
+                    default_branch: "main".into(),
+                    project_id: Some("Api!!".into()),
+                    base_domain: None,
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+
+        assert!(!preview.valid);
+        assert_eq!(preview.project_id, "api");
+        assert_eq!(preview.project_id_status, "invalid");
+    }
+
+    #[test]
+    fn github_registration_preview_reports_domain_collision_and_fallback() {
+        let root = test_root("github-preview-domain-collision");
+        let store = ProjectRegistryStore::new(&root);
+        store.upsert(request("api"), None).unwrap();
+        set_test_shortids(&["abcd1234"]);
+
+        let preview = store
+            .preview_registration_from_github(
+                RegisterProjectFromGitHubPreviewRequest {
+                    repo_url: "https://github.com/example/web.git".into(),
+                    default_branch: "main".into(),
+                    project_id: Some("web".into()),
+                    base_domain: Some("api.example.com".into()),
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+
+        assert!(!preview.valid);
+        assert_eq!(preview.base_domain_status, "already_used");
+        assert!(
+            preview
+                .base_domain_suggestion
+                .as_deref()
+                .is_some_and(
+                    |domain| domain.starts_with("web-") && domain.ends_with(".forge.example.com")
+                )
+        );
+    }
+
+    #[test]
+    fn github_registration_preview_reports_missing_apps_domain() {
+        let root = test_root("github-preview-missing-apps-domain");
+        let store = ProjectRegistryStore::new(&root);
+
+        let preview = store
+            .preview_registration_from_github(
+                RegisterProjectFromGitHubPreviewRequest {
+                    repo_url: "https://github.com/example/web.git".into(),
+                    default_branch: "main".into(),
+                    project_id: Some("web".into()),
+                    base_domain: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(!preview.valid);
+        assert_eq!(preview.base_domain_status, "invalid");
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|message| message.contains("FORGE_APPS_DOMAIN"))
+        );
+    }
+
+    #[test]
+    fn github_registration_preview_uses_generated_fallback_domain_when_preferred_is_taken() {
+        let root = test_root("github-preview-generated-fallback");
+        let store = ProjectRegistryStore::new(&root);
+        let mut existing = request("existing");
+        existing.base_domain = Some("web.forge.example.com".into());
+        store.upsert(existing, Some("forge.example.com")).unwrap();
+        set_test_shortids(&["abcd1234"]);
+
+        let preview = store
+            .preview_registration_from_github(
+                RegisterProjectFromGitHubPreviewRequest {
+                    repo_url: "https://github.com/example/web.git".into(),
+                    default_branch: "main".into(),
+                    project_id: Some("web".into()),
+                    base_domain: None,
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+
+        assert!(preview.valid);
+        assert_eq!(preview.domain_source, "generated_fallback");
+        assert!(preview.base_domain.starts_with("web-"));
+        assert!(preview.base_domain.ends_with(".forge.example.com"));
     }
 }

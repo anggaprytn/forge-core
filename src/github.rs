@@ -27,7 +27,7 @@ pub enum WebhookResolution {
     Ignore { reason: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum GitHubError {
     InvalidSignature,
     UnsupportedEvent(String),
