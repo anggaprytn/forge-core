@@ -50,9 +50,9 @@ use forge_core::reconciliation::{
 use forge_core::secrets::{SecretWriteRequest, SecretWriteResult};
 use forge_core::status::ProjectEnvironmentStatus;
 use forge_core::storage::{
-    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, ConvergenceCheckpointStore, EnvironmentPaths,
-    LeaderLeaseStore, NodeMetadataStore, PersistedEnvironmentCheckpoint, PersistedLeaderLease,
-    SNAPSHOT_SCHEMA_VERSION,
+    CHECKPOINT_SCHEMA_VERSION, ClusterTopologyStore, ConvergenceCheckpointStore,
+    DeploymentLifecycleState, EnvironmentPaths, LeaderLeaseStore, NodeMetadataStore,
+    PersistedEnvironmentCheckpoint, PersistedLeaderLease, SNAPSHOT_SCHEMA_VERSION,
 };
 use forge_core::upgrade::{
     MANIFEST_SCHEMA_VERSION, STORAGE_COMPATIBILITY_VERSION, UpgradeOptions, apply as apply_upgrade,
@@ -86,7 +86,9 @@ where
     let control_plane_remote_client = parsed.remote_client_if_logged_in()?;
     let api_credentials = if matches!(
         parsed.command,
-        Command::Doctor { .. }
+        Command::Help
+            | Command::AgentGuide { .. }
+            | Command::Doctor { .. }
             | Command::Daemon(_)
             | Command::Bench { .. }
             | Command::Gc { .. }
@@ -112,6 +114,9 @@ where
     };
 
     match parsed.command {
+        Command::Help => {
+            print!("{}", usage());
+        }
         Command::Doctor {
             config_path,
             caddy_admin_url,
@@ -282,6 +287,42 @@ where
                 source_ref,
             })?;
             print_json(&accepted)?;
+        }
+        Command::AgentGuide {
+            project_id,
+            environment,
+            markdown,
+            write_path,
+            force,
+        } => {
+            let project = control_plane_remote_client
+                .as_ref()
+                .and_then(|client| client.get_project(&project_id).ok());
+            let guide = build_agent_guide(project.as_ref(), &project_id, &environment);
+            let markdown_output = render_agent_guide_markdown(&guide);
+            if let Some(path) = write_path.as_ref() {
+                write_agent_guide(path, &markdown_output, force)?;
+            }
+            if markdown {
+                print!("{markdown_output}");
+            } else {
+                print!("{}", render_agent_guide_text(&guide));
+            }
+        }
+        Command::AgentVerifyDeploy { deployment_id } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let report = build_agent_verify_deploy(&client, &deployment_id)?;
+            print_json(&report)?;
+        }
+        Command::AgentVerifyEnv {
+            project_id,
+            environment,
+        } => {
+            let (base_url, token) = api_credentials.clone().unwrap();
+            let client = ForgeClient::new(base_url, token);
+            let report = build_agent_verify_env(&client, &project_id, &environment)?;
+            print_json(&report)?;
         }
         Command::Status { deployment_id } => {
             let (base_url, token) = api_credentials.clone().unwrap();
@@ -1076,6 +1117,7 @@ struct LocalConfigResolution {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
+    Help,
     Doctor {
         config_path: PathBuf,
         caddy_admin_url: String,
@@ -1157,6 +1199,20 @@ enum Command {
         environment: String,
         source_path: Option<PathBuf>,
         source_ref: Option<String>,
+    },
+    AgentGuide {
+        project_id: String,
+        environment: String,
+        markdown: bool,
+        write_path: Option<PathBuf>,
+        force: bool,
+    },
+    AgentVerifyDeploy {
+        deployment_id: String,
+    },
+    AgentVerifyEnv {
+        project_id: String,
+        environment: String,
     },
     Status {
         deployment_id: String,
@@ -1460,6 +1516,8 @@ fn parse_command(
     metrics_url: Option<String>,
 ) -> Result<Command, CliError> {
     match args.as_slice() {
+        [] => Ok(Command::Help),
+        [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Ok(Command::Help),
         [cmd] if cmd == "doctor" => Ok(Command::Doctor {
             config_path,
             caddy_admin_url,
@@ -1545,6 +1603,7 @@ fn parse_command(
                 resume: true,
             })
         }
+        [group, rest @ ..] if group == "agent" => parse_agent_command(rest),
         [cmd, rest @ ..] if cmd == "deploy" => parse_deploy_command(rest),
         [cmd, rest @ ..] if cmd == "bench" => parse_bench_command(rest),
         [cmd, rest @ ..] if cmd == "status" => parse_status_command(rest),
@@ -1608,54 +1667,832 @@ fn parse_command(
 
 fn usage() -> String {
     [
-        "usage:",
-        "  forge [--config PATH] [--caddy-admin-url URL] [--metrics-url URL] doctor",
-        "  forge [--config PATH] [--caddy-admin-url URL] [--metrics-url URL] doctor upgrade",
-        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] daemon",
-        "  forge init [--force]",
-        "  forge login <server_url>",
-        "  forge logout",
-        "  forge whoami",
-        "  forge version",
-        "  forge [--config PATH] [--caddy-admin-url URL] upgrade plan (--artifact <path> | --release <tag>) [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact]",
-        "  forge [--config PATH] [--caddy-admin-url URL] upgrade apply (--artifact <path> | --release <tag>) [--manifest <path>] [--signature <path>] [--allow-unsigned] [--allow-dirty-artifact] [--no-auto-rollback]",
-        "  forge [--config PATH] upgrade rollback",
-        "  forge [--url URL] [--token TOKEN] token list",
-        "  forge [--url URL] [--token TOKEN] token create --name <name>",
-        "  forge [--url URL] [--token TOKEN] token revoke <token_id>",
-        "  forge [--config PATH] control-plane leader",
-        "  forge [--config PATH] control-plane lease",
-        "  forge [--config PATH] [--url URL] [--token TOKEN] readiness explain [--json] [--offline]",
-        "  forge [--config PATH] [--url URL] [--token TOKEN] readiness timeline [--json] [--offline]",
-        "  forge [--config PATH] control-plane replay-status",
-        "  forge [--config PATH] control-plane intents",
-        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] control-plane replay --dry-run",
-        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] control-plane replay --resume",
-        "  forge [--url URL] [--token TOKEN] deploy [--from PATH] [--ref REF] <project_id> <environment>",
-        "  forge [--url URL] bench <readyz|leader|convergence|diagnostics|snapshots> [--samples N]",
-        "  forge [--url URL] [--token TOKEN] status <deployment_id>",
-        "  forge [--url URL] [--token TOKEN] logs [--json] [--service SERVICE] <deployment_id>",
-        "  forge [--url URL] [--token TOKEN] status [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] diagnose [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] history [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] deployments [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] env [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] env diff [--json] <project_id> <environment> --generation <from> --generation <to>",
-        "  forge [--url URL] [--token TOKEN] events",
-        "  forge [--config PATH] [--caddy-admin-url URL] [--caddy-public-url URL] gc [--dry-run] [--json]",
-        "  forge [--url URL] [--token TOKEN] rollback <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] backup create [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] backup list [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] backup inspect [--json] <backup_id>",
-        "  forge [--url URL] [--token TOKEN] backup restore [--json] <backup_id>",
-        "  forge [--url URL] [--token TOKEN] project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
-        "  forge [--url URL] [--token TOKEN] project list",
-        "  forge [--url URL] [--token TOKEN] project show <project_id>",
-        "  forge [--url URL] [--token TOKEN] secrets list [--json] <project_id> <environment>",
-        "  forge [--url URL] [--token TOKEN] secrets set <project_id> <environment> <key> <value>",
-        "  forge [--url URL] [--token TOKEN] secrets unset <project_id> <environment> <key>",
+        "Usage:",
+        "  forge <command> [options]",
+        "",
+        "Global options:",
+        "  --url <URL>              Forge server URL",
+        "  --token <TOKEN>          Bearer token for remote API calls",
+        "  --config <PATH>          Forge config path for local/server operations",
+        "  --caddy-admin-url <URL>  Override local Caddy admin URL",
+        "  --caddy-public-url <URL> Override local Caddy public URL",
+        "  --metrics-url <URL>      Override doctor metrics URL",
+        "",
+        "Commands:",
+        "  deploy <project_id> <environment> [--ref <ref>] [--from <path>]",
+        "  status <deployment_id>",
+        "  status [--json] <project_id> <environment>",
+        "  logs [--json] [--service <service_id>] <deployment_id>",
+        "  diagnose [--json] <project_id> <environment>",
+        "  history [--json] <project_id> <environment>",
+        "  env [--json] <project_id> <environment>",
+        "  env diff [--json] <project_id> <environment> --generation <from> --generation <to>",
+        "  rollback <project_id> <environment>",
+        "  backup create [--json] <project_id> <environment>",
+        "  backup list [--json] <project_id> <environment>",
+        "  backup inspect [--json] <backup_id>",
+        "  backup restore [--json] <backup_id>",
+        "  project add [<project_id>] --repo <repo_url> [--branch <branch>] [--domain <base_domain>]",
+        "  project list",
+        "  project show <project_id>",
+        "  secrets list [--json] <project_id> <environment>",
+        "  secrets set <project_id> <environment> <key> <value>",
+        "  secrets unset <project_id> <environment> <key>",
+        "  agent guide <project_id> <environment> [--markdown] [--write <path>] [--force]",
+        "  agent verify-deploy <deployment_id>",
+        "  agent verify-env <project_id> <environment>",
+        "  token list",
+        "  token create --name <name>",
+        "  token revoke <token_id>",
+        "  readiness explain [--json] [--offline]",
+        "  readiness timeline [--json] [--offline]",
+        "  control-plane leader",
+        "  control-plane lease",
+        "  control-plane replay-status",
+        "  control-plane intents",
+        "  control-plane replay --dry-run|--resume",
+        "  gc [--dry-run] [--json]",
+        "  doctor [upgrade]",
+        "  daemon",
+        "  bench <readyz|leader|convergence|diagnostics|snapshots> [--samples <n>]",
+        "  init [--force]",
+        "  login <server_url>",
+        "  logout",
+        "  whoami",
+        "  version",
+        "",
+        "Examples:",
+        "  forge deploy api production --ref main",
+        "  forge status api production",
+        "  forge logs dep-1234567890",
+        "  forge agent verify-deploy dep-1234567890",
     ]
     .join("\n")
+}
+
+fn parse_agent_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [action, rest @ ..] if action == "guide" => parse_agent_guide_command(rest),
+        [action, deployment_id] if action == "verify-deploy" => Ok(Command::AgentVerifyDeploy {
+            deployment_id: deployment_id.clone(),
+        }),
+        [action, project_id, environment] if action == "verify-env" => {
+            Ok(Command::AgentVerifyEnv {
+                project_id: project_id.clone(),
+                environment: environment.clone(),
+            })
+        }
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_agent_guide_command(args: &[String]) -> Result<Command, CliError> {
+    let mut markdown = false;
+    let mut write_path = None;
+    let mut force = false;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--markdown" => markdown = true,
+            "--force" => force = true,
+            "--write" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "agent guide requires --write <path>".into(),
+                    ));
+                };
+                write_path = Some(PathBuf::from(value));
+            }
+            value if value.starts_with("--") => return Err(CliError::Usage(usage())),
+            value => positionals.push(value.to_string()),
+        }
+        index += 1;
+    }
+
+    match positionals.as_slice() {
+        [project_id, environment] => Ok(Command::AgentGuide {
+            project_id: project_id.clone(),
+            environment: environment.clone(),
+            markdown,
+            write_path,
+            force,
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentGuide {
+    project_id: String,
+    environment: String,
+    expected_manifest_name: String,
+    deploy_by_ref_command: String,
+    deploy_from_local_command: String,
+    success_criteria: Vec<String>,
+    failure_criteria: Vec<String>,
+    verification_commands: Vec<String>,
+    common_failure_fixes: Vec<String>,
+    default_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentVerifyDeployReport {
+    deployment_id: String,
+    project_id: String,
+    environment: String,
+    deployment_succeeded: bool,
+    safe_to_report_live_url: bool,
+    state: String,
+    lifecycle_state: String,
+    route_active: bool,
+    failure_stage: String,
+    failure_reason: String,
+    details: String,
+    agent_summary: String,
+    agent_next_steps: Vec<String>,
+    do_not_claim_success_until: Vec<String>,
+    verification_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentVerifyEnvReport {
+    project_id: String,
+    environment: String,
+    environment_live: bool,
+    current_generation: Option<u64>,
+    lifecycle_state: String,
+    status_label: String,
+    route_active: bool,
+    app_health: String,
+    fallback_detected: bool,
+    safe_to_report_live_url: bool,
+    public_url: String,
+    agent_summary: String,
+    agent_next_steps: Vec<String>,
+}
+
+fn build_agent_guide(
+    project: Option<&ProjectRecord>,
+    project_id: &str,
+    environment: &str,
+) -> AgentGuide {
+    let default_branch = project
+        .map(|value| value.default_branch.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "main".into());
+    AgentGuide {
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        expected_manifest_name: project_id.to_string(),
+        deploy_by_ref_command: format!(
+            "forge deploy {project_id} {environment} --ref {default_branch}"
+        ),
+        deploy_from_local_command: format!("forge deploy {project_id} {environment} --from ."),
+        success_criteria: vec![
+            "deployment lifecycle is promoted".into(),
+            "route_active is true".into(),
+            "HTTP health probes passed".into(),
+            "public URL serves the application and not the Forge fallback".into(),
+        ],
+        failure_criteria: vec![
+            "forge status <deployment_id> alone says healthy but environment lifecycle is failed, warming, or degraded".into(),
+            "route_active is false".into(),
+            "public URL serves the Forge fallback marker".into(),
+            "manifest name does not match the deployment project".into(),
+        ],
+        verification_commands: vec![
+            format!("forge agent verify-deploy <deployment_id>"),
+            format!("forge agent verify-env {project_id} {environment}"),
+            format!("forge status {project_id} {environment}"),
+            "curl -i https://<public-url>/health".into(),
+        ],
+        common_failure_fixes: vec![
+            format!("Manifest project mismatch: change forge.yml name to {project_id}."),
+            format!(
+                "If using --ref {default_branch}, commit and push forge.yml before redeploying."
+            ),
+            format!(
+                "If local changes are intentional and not pushed yet, use `forge deploy {project_id} {environment} --from .`."
+            ),
+            "If the public URL shows the Forge fallback, do not claim success until route_active is true and the fallback marker is gone.".into(),
+        ],
+        default_branch,
+    }
+}
+
+fn render_agent_guide_text(guide: &AgentGuide) -> String {
+    let mut output = String::new();
+    output.push_str("Forge AI Agent Deployment Guide\n");
+    output.push_str(&format!("project_id: {}\n", guide.project_id));
+    output.push_str(&format!("environment: {}\n", guide.environment));
+    output.push_str(&format!(
+        "expected_manifest_name: {}\n\n",
+        guide.expected_manifest_name
+    ));
+    output.push_str("Deploy commands:\n");
+    output.push_str(&format!("  by_ref: {}\n", guide.deploy_by_ref_command));
+    output.push_str(&format!(
+        "  from_local: {}\n\n",
+        guide.deploy_from_local_command
+    ));
+    output.push_str("Source rules:\n");
+    output.push_str(&format!(
+        "  --ref {} reads forge.yml from the remote Git ref/commit. Local changes do not matter until committed and pushed.\n",
+        guide.default_branch
+    ));
+    output.push_str("  --from . reads forge.yml from the local working directory. Use it for local/dev deploys.\n\n");
+    output.push_str("Do not claim success from deployment_id status alone.\n");
+    output.push_str("Success criteria:\n");
+    for item in &guide.success_criteria {
+        output.push_str(&format!("  - {item}\n"));
+    }
+    output.push_str("Failure criteria:\n");
+    for item in &guide.failure_criteria {
+        output.push_str(&format!("  - {item}\n"));
+    }
+    output.push_str("Verify success with:\n");
+    for command in &guide.verification_commands {
+        output.push_str(&format!("  - {command}\n"));
+    }
+    output.push_str("Common failure fixes:\n");
+    for item in &guide.common_failure_fixes {
+        output.push_str(&format!("  - {item}\n"));
+    }
+    output.push_str("Manifest mismatch guidance:\n");
+    output.push_str(&format!(
+        "  1. Change forge.yml name to {}\n",
+        guide.project_id
+    ));
+    output.push_str(&format!(
+        "  2. If using --ref {}, commit and push the corrected forge.yml\n",
+        guide.default_branch
+    ));
+    output.push_str(&format!(
+        "  3. Re-run: forge deploy {} {} --ref {}\n",
+        guide.project_id, guide.environment, guide.default_branch
+    ));
+    output
+}
+
+fn render_agent_guide_markdown(guide: &AgentGuide) -> String {
+    let success = guide
+        .success_criteria
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let failure = guide
+        .failure_criteria
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let verify = guide
+        .verification_commands
+        .iter()
+        .map(|item| format!("- `{item}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fixes = guide
+        .common_failure_fixes
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# Forge AI Agent Deployment Guide\n\n\
+project_id: `{}`\n\n\
+environment: `{}`\n\n\
+expected manifest name: `{}`\n\n\
+## Deploy Commands\n\n\
+- By ref: `{}`\n\
+- From local: `{}`\n\n\
+## Source Rules\n\n\
+- `--ref {}` reads `forge.yml` from the remote Git ref/commit. Local changes do not matter until committed and pushed.\n\
+- `--from .` reads `forge.yml` from the local working directory. Use it for local/dev deploys.\n\n\
+## Do Not Claim Success From Deployment ID Alone\n\n\
+Verify the environment state before reporting success.\n\n\
+## Success Criteria\n\n\
+{}\n\n\
+## Failure Criteria\n\n\
+{}\n\n\
+## Verification Commands\n\n\
+{}\n\n\
+## Common Failure Fixes\n\n\
+{}\n\n\
+## Manifest Mismatch Guidance\n\n\
+1. Change `forge.yml` name to `{}`.\n\
+2. If using `--ref {}`, commit and push the corrected `forge.yml`.\n\
+3. Re-run `forge deploy {} {} --ref {}`.\n",
+        guide.project_id,
+        guide.environment,
+        guide.expected_manifest_name,
+        guide.deploy_by_ref_command,
+        guide.deploy_from_local_command,
+        guide.default_branch,
+        success,
+        failure,
+        verify,
+        fixes,
+        guide.project_id,
+        guide.default_branch,
+        guide.project_id,
+        guide.environment,
+        guide.default_branch
+    )
+}
+
+fn write_agent_guide(path: &Path, content: &str, force: bool) -> Result<(), CliError> {
+    let is_agents = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("AGENTS.md"));
+    if path.exists() && !force {
+        if is_agents {
+            return Err(CliError::Usage(
+                "AGENTS.md may contain project-specific instructions. Forge will not overwrite it unless --force is explicitly provided.".into(),
+            ));
+        }
+        return Err(CliError::Usage(format!(
+            "refusing to overwrite existing file {}; use --force to replace it",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|err| CliError::Usage(err.to_string()))?;
+    }
+    fs::write(path, content).map_err(|err| CliError::Usage(err.to_string()))?;
+    Ok(())
+}
+
+fn build_agent_verify_deploy(
+    client: &ForgeClient,
+    deployment_id: &str,
+) -> Result<AgentVerifyDeployReport, CliError> {
+    let status = client.get_status(deployment_id)?;
+    let env_status =
+        client.get_project_environment_status(&status.project_id, &status.environment)?;
+    let diagnostics =
+        client.get_project_environment_diagnostics(&status.project_id, &status.environment)?;
+    let logs = client.get_logs(deployment_id, None).ok();
+    let is_current = env_status.last_deployment_id.as_deref() == Some(deployment_id);
+    let matched_failure = diagnostics
+        .recent_failures
+        .iter()
+        .find(|failure| failure.deployment_id.as_deref() == Some(deployment_id));
+    let lifecycle_state = deployment_lifecycle_for_agent(
+        is_current,
+        env_status.lifecycle_state.as_ref(),
+        matched_failure.is_some(),
+        &status.state,
+    );
+    let route_active = is_current && env_status.route_active && lifecycle_state == "promoted";
+    let fallback_detected = diagnostics
+        .route
+        .mismatch_reason
+        .as_deref()
+        .is_some_and(|value| value.contains("Gateway reachable"));
+    let public_url = public_url_for_status(&env_status);
+    let safe_to_report_live_url = is_current
+        && env_status.status == "healthy"
+        && lifecycle_state == "promoted"
+        && route_active
+        && !fallback_detected
+        && public_url.is_some();
+    let deployment_succeeded = safe_to_report_live_url;
+    let (failure_stage, failure_reason, details) =
+        build_deployment_failure_details(&status, matched_failure, logs.as_ref(), &diagnostics);
+    let agent_summary = if deployment_succeeded {
+        "Deployment succeeded and the environment is safe to report live.".into()
+    } else if lifecycle_state == "warming" || status.state == "warming" {
+        build_warming_summary(&env_status)
+    } else {
+        format!(
+            "Deployment failed during {}.",
+            if failure_stage.is_empty() {
+                "verification"
+            } else {
+                &failure_stage
+            }
+        )
+    };
+    let agent_next_steps = build_deploy_next_steps(
+        &status.project_id,
+        &status.environment,
+        &failure_stage,
+        &failure_reason,
+        &details,
+        &env_status,
+        &diagnostics,
+    );
+    let verification_commands = build_verification_commands(
+        deployment_id,
+        &status.project_id,
+        &status.environment,
+        public_url.as_deref(),
+        env_status.probe_path.as_deref(),
+    );
+
+    Ok(AgentVerifyDeployReport {
+        deployment_id: deployment_id.to_string(),
+        project_id: status.project_id,
+        environment: status.environment,
+        deployment_succeeded,
+        safe_to_report_live_url,
+        state: deployment_state_for_agent(deployment_succeeded, &lifecycle_state, &status.state),
+        lifecycle_state,
+        route_active,
+        failure_stage,
+        failure_reason,
+        details,
+        agent_summary,
+        agent_next_steps,
+        do_not_claim_success_until: do_not_claim_success_until(),
+        verification_commands,
+    })
+}
+
+fn build_agent_verify_env(
+    client: &ForgeClient,
+    project_id: &str,
+    environment: &str,
+) -> Result<AgentVerifyEnvReport, CliError> {
+    let status = client.get_project_environment_status(project_id, environment)?;
+    let diagnostics = client.get_project_environment_diagnostics(project_id, environment)?;
+    let fallback_detected = diagnostics
+        .route
+        .mismatch_reason
+        .as_deref()
+        .is_some_and(|value| value.contains("Gateway reachable"));
+    let lifecycle_state = status
+        .lifecycle_state
+        .as_ref()
+        .map(DeploymentLifecycleState::as_str)
+        .unwrap_or_else(|| status.status.as_str())
+        .to_string();
+    let public_url = public_url_for_status(&status).unwrap_or_default();
+    let environment_live = status.status == "healthy"
+        && lifecycle_state == "promoted"
+        && status.route_active
+        && !fallback_detected;
+    let safe_to_report_live_url = environment_live && !public_url.is_empty();
+    let status_label =
+        environment_status_label(&status.status, &lifecycle_state, status.route_active);
+    let app_health = application_health_label(&status.status, &diagnostics.services);
+    let agent_summary = if environment_live {
+        "Environment is live and the public URL is safe to report.".into()
+    } else if lifecycle_state == "warming" {
+        build_warming_summary(&status)
+    } else if fallback_detected {
+        "Environment is not live. The public URL is serving the Forge fallback.".into()
+    } else if !status.route_active {
+        "Environment is not live because the route is not active.".into()
+    } else {
+        format!(
+            "Environment is not live. lifecycle_state={} status_label={status_label}.",
+            lifecycle_state
+        )
+    };
+    let agent_next_steps = build_env_next_steps(project_id, environment, &status, &diagnostics);
+
+    Ok(AgentVerifyEnvReport {
+        project_id: project_id.to_string(),
+        environment: environment.to_string(),
+        environment_live,
+        current_generation: status.active_generation,
+        lifecycle_state,
+        status_label,
+        route_active: status.route_active,
+        app_health,
+        fallback_detected,
+        safe_to_report_live_url,
+        public_url,
+        agent_summary,
+        agent_next_steps,
+    })
+}
+
+fn deployment_lifecycle_for_agent(
+    is_current: bool,
+    lifecycle_state: Option<&DeploymentLifecycleState>,
+    matched_failure: bool,
+    deployment_state: &str,
+) -> String {
+    if is_current {
+        return lifecycle_state
+            .map(DeploymentLifecycleState::as_str)
+            .unwrap_or(deployment_state)
+            .to_string();
+    }
+    if matched_failure {
+        return "failed".into();
+    }
+    deployment_state.to_string()
+}
+
+fn deployment_state_for_agent(
+    deployment_succeeded: bool,
+    lifecycle_state: &str,
+    deployment_state: &str,
+) -> String {
+    if deployment_succeeded {
+        "healthy".into()
+    } else if lifecycle_state == "promoted" && deployment_state == "healthy" {
+        "degraded".into()
+    } else {
+        lifecycle_state.to_string()
+    }
+}
+
+fn build_deployment_failure_details(
+    status: &DeploymentStatus,
+    matched_failure: Option<&forge_core::api::RecentDeploymentFailure>,
+    logs: Option<&DeploymentLogs>,
+    diagnostics: &EnvironmentDiagnostics,
+) -> (String, String, String) {
+    if let Some(failure) = matched_failure {
+        return normalize_failure(
+            Some(failure.failure_stage.clone()),
+            Some(failure.failure_reason.clone()),
+        );
+    }
+    if let Some(summary) = logs.and_then(|value| value.validation_failure_summary.as_deref()) {
+        let (stage, details) = parse_failure_summary(summary);
+        return normalize_failure(stage, Some(details));
+    }
+    if let Some(stage) = diagnostics.likely_failure_stage.clone() {
+        return normalize_failure(
+            Some(stage),
+            diagnostics
+                .route
+                .mismatch_reason
+                .clone()
+                .or_else(|| Some(status.state.clone())),
+        );
+    }
+    normalize_failure(Some(status.state.clone()), Some(status.state.clone()))
+}
+
+fn normalize_failure(
+    failure_stage: Option<String>,
+    details: Option<String>,
+) -> (String, String, String) {
+    let failure_stage = failure_stage.unwrap_or_else(|| "unknown".into());
+    let details = details.unwrap_or_else(|| "deployment verification failed".into());
+    if let Some((deployment_project, manifest_name)) = parse_manifest_project_mismatch(&details) {
+        return (
+            failure_stage,
+            "manifest_project_mismatch".into(),
+            format!(
+                "Manifest project mismatch:\n- deployment project: {deployment_project}\n- forge.yml name: {manifest_name}"
+            ),
+        );
+    }
+    let failure_reason = if failure_stage == "warming" {
+        "warming".into()
+    } else if failure_stage == "failed" {
+        "deployment_failed".into()
+    } else {
+        failure_stage.replace('-', "_")
+    };
+    (failure_stage, failure_reason, details)
+}
+
+fn parse_failure_summary(summary: &str) -> (Option<String>, String) {
+    if let Some((stage, details)) = summary.split_once(": ") {
+        return (Some(stage.to_string()), details.to_string());
+    }
+    (None, summary.to_string())
+}
+
+fn parse_manifest_project_mismatch(details: &str) -> Option<(String, String)> {
+    let marker = "forge.yml name `";
+    let rest = details.split_once(marker)?.1;
+    let (manifest_name, remainder) = rest.split_once("` does not match deployment project `")?;
+    let (deployment_project, _) = remainder.split_once('`')?;
+    Some((deployment_project.to_string(), manifest_name.to_string()))
+}
+
+fn build_deploy_next_steps(
+    project_id: &str,
+    environment: &str,
+    failure_stage: &str,
+    failure_reason: &str,
+    details: &str,
+    status: &ProjectEnvironmentStatus,
+    diagnostics: &EnvironmentDiagnostics,
+) -> Vec<String> {
+    if failure_reason == "manifest_project_mismatch" {
+        return vec![
+            format!("Update forge.yml name to {project_id}"),
+            "Commit and push if deploying with --ref main".into(),
+            format!("Run forge deploy {project_id} {environment} --ref main"),
+        ];
+    }
+    if failure_stage == "warming"
+        || status.lifecycle_state == Some(DeploymentLifecycleState::Warming)
+    {
+        return vec![
+            format!(
+                "Wait for warmup to finish, then run forge agent verify-deploy {} again",
+                status
+                    .last_deployment_id
+                    .as_deref()
+                    .unwrap_or("<deployment_id>")
+            ),
+            format!(
+                "Check probe progress: tcp={}/{} http={}/{} route_active={} health_path={}",
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.tcp_consecutive_passes)
+                    .unwrap_or(0),
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.required_consecutive_passes)
+                    .unwrap_or(0),
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.http_consecutive_passes)
+                    .unwrap_or(0),
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.required_consecutive_passes)
+                    .unwrap_or(0),
+                status.route_active,
+                status.probe_path.as_deref().unwrap_or("/health")
+            ),
+            format!("Run forge status {project_id} {environment}"),
+        ];
+    }
+    if diagnostics
+        .route
+        .mismatch_reason
+        .as_deref()
+        .is_some_and(|value| value.contains("Gateway reachable"))
+    {
+        return vec![
+            format!("Run forge status {project_id} {environment}"),
+            format!("Run forge diagnose {project_id} {environment}"),
+            "Do not claim success until the public URL stops serving the Forge fallback.".into(),
+        ];
+    }
+    vec![
+        format!("Run forge status {project_id} {environment}"),
+        format!(
+            "Run forge logs {}",
+            status
+                .last_deployment_id
+                .as_deref()
+                .unwrap_or("<deployment_id>")
+        ),
+        format!("Inspect failure details: {details}"),
+    ]
+}
+
+fn build_env_next_steps(
+    project_id: &str,
+    environment: &str,
+    status: &ProjectEnvironmentStatus,
+    diagnostics: &EnvironmentDiagnostics,
+) -> Vec<String> {
+    if status.lifecycle_state == Some(DeploymentLifecycleState::Warming) {
+        return vec![
+            format!(
+                "Wait and re-check: tcp={}/{} http={}/{} route_active={} health_path={}",
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.tcp_consecutive_passes)
+                    .unwrap_or(0),
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.required_consecutive_passes)
+                    .unwrap_or(0),
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.http_consecutive_passes)
+                    .unwrap_or(0),
+                status
+                    .validation_summary
+                    .as_ref()
+                    .map(|value| value.required_consecutive_passes)
+                    .unwrap_or(0),
+                status.route_active,
+                status.probe_path.as_deref().unwrap_or("/health")
+            ),
+            format!("Run forge agent verify-env {project_id} {environment}"),
+        ];
+    }
+    if diagnostics
+        .route
+        .mismatch_reason
+        .as_deref()
+        .is_some_and(|value| value.contains("Gateway reachable"))
+    {
+        return vec![
+            "Do not report the public URL yet.".into(),
+            format!("Run forge diagnose {project_id} {environment}"),
+            "Wait for route activation or fix the route target mismatch.".into(),
+        ];
+    }
+    if !status.route_active {
+        return vec![
+            "Do not report the public URL yet.".into(),
+            format!("Run forge status {project_id} {environment}"),
+            format!("Run forge diagnose {project_id} {environment}"),
+        ];
+    }
+    vec![format!("Run forge status {project_id} {environment}")]
+}
+
+fn build_verification_commands(
+    deployment_id: &str,
+    project_id: &str,
+    environment: &str,
+    public_url: Option<&str>,
+    probe_path: Option<&str>,
+) -> Vec<String> {
+    let mut commands = vec![
+        format!("forge status {deployment_id}"),
+        format!("forge logs {deployment_id}"),
+        format!("forge status {project_id} {environment}"),
+    ];
+    if let Some(url) = public_url {
+        let path = probe_path.unwrap_or("/health");
+        commands.push(format!("curl -i {}{}", url.trim_end_matches('/'), path));
+    }
+    commands
+}
+
+fn do_not_claim_success_until() -> Vec<String> {
+    vec![
+        "environment lifecycle is promoted".into(),
+        "route_active is true".into(),
+        "HTTP health probes passed".into(),
+        "public URL does not serve Forge fallback".into(),
+    ]
+}
+
+fn public_url_for_status(status: &ProjectEnvironmentStatus) -> Option<String> {
+    if status.domain.trim().is_empty() {
+        None
+    } else {
+        Some(format!("https://{}", status.domain))
+    }
+}
+
+fn build_warming_summary(status: &ProjectEnvironmentStatus) -> String {
+    let validation = status.validation_summary.as_ref();
+    format!(
+        "Deployment is still warming. tcp={}/{} http={}/{} route_active={} health_path={}. Do not claim success yet.",
+        validation
+            .map(|value| value.tcp_consecutive_passes)
+            .unwrap_or(0),
+        validation
+            .map(|value| value.required_consecutive_passes)
+            .unwrap_or(0),
+        validation
+            .map(|value| value.http_consecutive_passes)
+            .unwrap_or(0),
+        validation
+            .map(|value| value.required_consecutive_passes)
+            .unwrap_or(0),
+        status.route_active,
+        status.probe_path.as_deref().unwrap_or("/health")
+    )
+}
+
+fn environment_status_label(status: &str, lifecycle_state: &str, route_active: bool) -> String {
+    if lifecycle_state == "failed" {
+        "failed".into()
+    } else if lifecycle_state == "warming" {
+        "warming".into()
+    } else if status == "healthy" && route_active {
+        "healthy".into()
+    } else {
+        status.to_string()
+    }
+}
+
+fn application_health_label(status: &str, services: &[ServiceRuntimeStatus]) -> String {
+    if services.iter().any(|service| service.health == "failed") {
+        "failed".into()
+    } else if services.iter().any(|service| service.health == "warming") {
+        "warming".into()
+    } else if services.iter().any(|service| service.health == "running") {
+        "healthy".into()
+    } else {
+        status.to_string()
+    }
 }
 
 fn parse_upgrade_plan_command(

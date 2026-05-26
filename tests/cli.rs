@@ -1544,6 +1544,177 @@ fn cli_read_only_control_plane_commands_do_not_take_exclusive_lease_lock() {
     assert!(String::from_utf8_lossy(&lease_output.stdout).contains("lease_epoch"));
 }
 
+#[test]
+fn help_renders_global_options_once_and_examples() {
+    let root = test_root("help-renders-global-options-once");
+    let output = run_cli_in_dir(&root, &["--help"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Global options:"));
+    assert!(body.contains("Commands:"));
+    assert!(body.contains("Examples:"));
+    assert!(body.contains("forge agent verify-deploy dep-1234567890"));
+    assert!(!body.contains("[--url URL] [--token TOKEN] status <deployment_id>"));
+}
+
+#[test]
+fn agent_guide_prints_protocol_without_writing_files_by_default() {
+    let root = test_root("agent-guide-does-not-write-by-default");
+    let agents_path = root.join("AGENTS.md");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&agents_path, "existing instructions\n").unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &["agent", "guide", "forge-redis-fullstack-test", "production"],
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Do not claim success from deployment_id status alone."));
+    assert!(body.contains("forge deploy forge-redis-fullstack-test production --ref main"));
+    assert!(body.contains("--ref main reads forge.yml from the remote Git ref/commit."));
+    assert_eq!(
+        fs::read_to_string(&agents_path).unwrap(),
+        "existing instructions\n"
+    );
+    assert!(!root.join("FORGE_AGENT.md").exists());
+}
+
+#[test]
+fn agent_guide_markdown_output_works() {
+    let root = test_root("agent-guide-markdown-output");
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "agent",
+            "guide",
+            "forge-redis-fullstack-test",
+            "production",
+            "--markdown",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("# Forge AI Agent Deployment Guide"));
+    assert!(body.contains("## Success Criteria"));
+    assert!(body.contains("`--from .` reads `forge.yml` from the local working directory."));
+}
+
+#[test]
+fn agent_guide_write_refuses_overwrite_without_force() {
+    let root = test_root("agent-guide-write-refuses-overwrite");
+    let target = root.join("FORGE_AGENT.md");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&target, "keep me\n").unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "agent",
+            "guide",
+            "api",
+            "production",
+            "--write",
+            target.to_str().unwrap(),
+        ],
+    );
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to overwrite existing file"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep me\n");
+}
+
+#[test]
+fn agent_verify_deploy_reports_manifest_mismatch_failure() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"data":{"deployment_id":"dep-mm-1","project_id":"forge-redis-fullstack-test","environment":"production","state":"failed"}}"#,
+            r#"{"data":{"project_id":"forge-redis-fullstack-test","environment":"production","status":"failed","active_generation":1,"domain":"forge-redis-fullstack-test.example.com","container_running":false,"route_active":false,"last_deployment_id":"dep-mm-1","lifecycle_state":"failed","probe_path":"/health"}}"#,
+            r#"{"data":{"project_id":"forge-redis-fullstack-test","environment":"production","status":"failed","active_generation":1,"last_deployment_id":"dep-mm-1","container":{"running":false},"route":{"route_required":true,"route_active":false,"matches_expected":false,"domain":"forge-redis-fullstack-test.example.com","mismatch_reason":"Gateway reachable, but application route is not active."},"probe_target":{"host":"127.0.0.1","port":3000,"path":"/health"},"startup_order":[],"services":[],"recent_failures":[{"deployment_id":"dep-mm-1","generation":1,"failure_stage":"preparing","failure_reason":"forge.yml name `api` does not match deployment project `forge-redis-fullstack-test`","diagnostics_source":"projects/forge-redis-fullstack-test/environments/production/generations/1/diagnostics"}],"likely_failure_stage":"preparing","active_lifecycle_state":"failed"}}"#,
+            r#"{"data":{"deployment_id":"dep-mm-1","project_id":"forge-redis-fullstack-test","environment":"production","lines":[],"lifecycle":[],"container_logs":[],"validation_failure_summary":"preparing: forge.yml name `api` does not match deployment project `forge-redis-fullstack-test`","diagnostics_source":"projects/forge-redis-fullstack-test/environments/production/generations/1/diagnostics"}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["agent", "verify-deploy", "dep-mm-1"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["deployment_succeeded"], false);
+    assert_eq!(json["safe_to_report_live_url"], false);
+    assert_eq!(json["failure_stage"], "preparing");
+    assert_eq!(json["failure_reason"], "manifest_project_mismatch");
+    assert!(
+        json["details"]
+            .as_str()
+            .unwrap()
+            .contains("deployment project: forge-redis-fullstack-test")
+    );
+    assert!(body.contains("Update forge.yml name to forge-redis-fullstack-test"));
+    assert!(body.contains("Run forge deploy forge-redis-fullstack-test production --ref main"));
+    assert!(!body.contains("test-token"));
+}
+
+#[test]
+fn agent_verify_env_returns_false_when_route_inactive() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"data":{"project_id":"api","environment":"production","status":"failed","active_generation":7,"domain":"api.example.com","container_running":true,"route_active":false,"last_deployment_id":"dep-7","lifecycle_state":"failed","probe_path":"/health"}}"#,
+            r#"{"data":{"project_id":"api","environment":"production","status":"failed","active_generation":7,"last_deployment_id":"dep-7","container":{"running":true},"route":{"route_required":true,"route_active":false,"matches_expected":false,"domain":"api.example.com","mismatch_reason":"Gateway reachable, but application route is not active."},"startup_order":[],"services":[],"recent_failures":[],"active_lifecycle_state":"failed"}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["agent", "verify-env", "api", "production"]);
+    assert!(output.status.success(), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["environment_live"], false);
+    assert_eq!(json["route_active"], false);
+    assert_eq!(json["safe_to_report_live_url"], false);
+}
+
+#[test]
+fn agent_verify_env_warming_stays_not_safe_to_report() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"data":{"project_id":"api","environment":"production","status":"degraded","active_generation":8,"domain":"api.example.com","container_running":true,"route_active":false,"last_deployment_id":"dep-8","lifecycle_state":"warming","probe_path":"/health","validation_summary":{"tcp_consecutive_passes":1,"http_consecutive_passes":0,"required_consecutive_passes":3}}}"#,
+            r#"{"data":{"project_id":"api","environment":"production","status":"degraded","active_generation":8,"last_deployment_id":"dep-8","container":{"running":true},"route":{"route_required":true,"route_active":false,"matches_expected":false,"domain":"api.example.com","mismatch_reason":"Gateway reachable, but application route is not active."},"startup_order":[],"services":[],"recent_failures":[],"active_lifecycle_state":"warming"}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["agent", "verify-env", "api", "production"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["environment_live"], false);
+    assert_eq!(json["safe_to_report_live_url"], false);
+    assert!(body.contains("tcp=1/3 http=0/3 route_active=false health_path=/health"));
+}
+
+#[test]
+fn agent_verify_env_fallback_state_stays_not_safe_to_report() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"data":{"project_id":"api","environment":"production","status":"degraded","active_generation":9,"domain":"api.example.com","container_running":true,"route_active":false,"last_deployment_id":"dep-9","lifecycle_state":"promoted","probe_path":"/health"}}"#,
+            r#"{"data":{"project_id":"api","environment":"production","status":"degraded","active_generation":9,"last_deployment_id":"dep-9","container":{"running":true},"route":{"route_required":true,"route_active":false,"matches_expected":false,"domain":"api.example.com","mismatch_reason":"Gateway reachable, but application route is not active."},"startup_order":[],"services":[],"recent_failures":[],"active_lifecycle_state":"promoted"}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["agent", "verify-env", "api", "production"]);
+    assert!(output.status.success(), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["fallback_detected"], true);
+    assert_eq!(json["safe_to_report_live_url"], false);
+}
+
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forge"))
         .args(args)

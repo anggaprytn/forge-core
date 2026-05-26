@@ -41,12 +41,13 @@ use crate::status::{
 };
 use crate::storage::{
     CONTROL_PLANE_SNAPSHOT_RETENTION_LIMIT, ClusterTopologyStore, ControlPlaneSnapshotStore,
-    ConvergenceCheckpointStore, DiagnosticsStore, EnvironmentPaths, EventStore, LeaderLeaseStore,
-    LeaseAcquireOutcome, NodeMetadataStore, OperationalJournalEntry, OperationalJournalStore,
-    PersistedActivationMode, PersistedBreakerState, PersistedClusterNode,
+    ConvergenceCheckpointStore, DeploymentLifecycleState, DiagnosticsStore, EnvironmentPaths,
+    EventStore, LeaderLeaseStore, LeaseAcquireOutcome, NodeMetadataStore, OperationalJournalEntry,
+    OperationalJournalStore, PersistedActivationMode, PersistedBreakerState, PersistedClusterNode,
     PersistedControlPlaneSnapshot, PersistedDependencyState, PersistedEnvironmentCheckpoint,
     PersistedLeaderLease, PersistedNodeMetadata, PersistedRuntimeInfo, PersistedServiceRuntimeInfo,
-    RuntimeHealthState, RuntimeStateStore, current_unix_timestamp, load_generation_runtime_info,
+    RuntimeHealthState, RuntimeStateStore, current_unix_timestamp, load_generation_lifecycle,
+    load_generation_runtime_info,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -769,16 +770,24 @@ where
                     code: "status_lookup_failed".into(),
                     message: err.to_string(),
                 })?;
-                let state = match runtime_state.health_state {
-                    RuntimeHealthState::Healthy => "healthy",
-                    RuntimeHealthState::Degraded => "degraded",
-                    RuntimeHealthState::Unavailable => "unavailable",
-                };
+                let env = EnvironmentPaths::new(
+                    &self.config.storage_root,
+                    &entry.project_id,
+                    &entry.environment,
+                );
+                let lifecycle =
+                    load_generation_lifecycle(&env, entry.generation).map_err(|err| {
+                        ErrorResponse {
+                            code: "status_lookup_failed".into(),
+                            message: err.to_string(),
+                        }
+                    })?;
+                let state = deployment_status_state(lifecycle.as_ref(), runtime_state.health_state);
                 return Ok(Some(DeploymentStatus {
                     deployment_id: entry.deployment_id,
                     project_id: entry.project_id,
                     environment: entry.environment,
-                    state: state.into(),
+                    state: state.to_string(),
                 }));
             }
         }
@@ -2457,6 +2466,30 @@ where
         }
 
         RouteFailureState::Resolved
+    }
+}
+
+fn deployment_status_state(
+    lifecycle: Option<&crate::storage::PersistedDeploymentLifecycle>,
+    runtime_health_state: RuntimeHealthState,
+) -> &'static str {
+    match lifecycle.map(|value| &value.state) {
+        Some(DeploymentLifecycleState::Queued) => "queued",
+        Some(DeploymentLifecycleState::Building) => "building",
+        Some(DeploymentLifecycleState::Starting) => "starting",
+        Some(DeploymentLifecycleState::Warming) => "warming",
+        Some(DeploymentLifecycleState::Validating) => "validating",
+        Some(DeploymentLifecycleState::Unstable) => "unstable",
+        Some(DeploymentLifecycleState::CrashLoop) => "crash_loop",
+        Some(DeploymentLifecycleState::OomKilled) => "oom_killed",
+        Some(DeploymentLifecycleState::Rollback) => "rollback",
+        Some(DeploymentLifecycleState::Failed) => "failed",
+        Some(DeploymentLifecycleState::GcEligible) => "gc_eligible",
+        Some(DeploymentLifecycleState::Promoted) | None => match runtime_health_state {
+            RuntimeHealthState::Healthy => "healthy",
+            RuntimeHealthState::Degraded => "degraded",
+            RuntimeHealthState::Unavailable => "unavailable",
+        },
     }
 }
 
@@ -5464,8 +5497,8 @@ pub mod daemon_worker_leaves_no_active_queue_item_after_success_or_failure {
 pub mod deployment_status_reflects_runtime_state {
     use super::*;
     use crate::storage::{
-        EnvironmentPaths, RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState,
-        SnapshotWriter,
+        DeploymentLifecycleState, EnvironmentPaths, LifecycleStore, PersistedDeploymentLifecycle,
+        RuntimeHealthState, RuntimeState, RuntimeStateStore, SnapshotState, SnapshotWriter,
     };
 
     #[test]
@@ -5506,6 +5539,59 @@ pub mod deployment_status_reflects_runtime_state {
         let status = daemon.get_deployment("dep-persisted").unwrap().unwrap();
         assert_eq!(status.state, "degraded");
         assert_eq!(status.project_id, "api");
+    }
+
+    #[test]
+    fn failed_lifecycle_overrides_healthy_runtime_for_status_lookup() {
+        let root = test_root("deployment-status-failed-lifecycle-overrides-runtime");
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .write_artifact(
+                "build.json",
+                "{\n  \"deployment_id\": \"dep-failed\",\n  \"image_ref\": \"forge:test\"\n}\n",
+            )
+            .unwrap();
+        SnapshotWriter::new(env.clone(), 1)
+            .unwrap()
+            .finalize("api", "production", SnapshotState::Failed)
+            .unwrap();
+        LifecycleStore::new(env.clone(), 1)
+            .write(&PersistedDeploymentLifecycle {
+                lifecycle_version: 1,
+                project_id: "api".into(),
+                environment: "production".into(),
+                generation: 1,
+                state: DeploymentLifecycleState::Failed,
+                entered_at_unix: 100,
+                transition_reason: "preparing failed".into(),
+                validation_summary: None,
+                promotion_summary: None,
+                transitions: Vec::new(),
+            })
+            .unwrap();
+        RuntimeStateStore::new(env)
+            .save(&RuntimeState {
+                active_generation: Some(1),
+                health_state: RuntimeHealthState::Healthy,
+                failed_probe_count: 0,
+                successful_probe_count: 3,
+                restart_attempted: false,
+                degraded_since_unix: None,
+                last_transition: "healthy".into(),
+                last_error_code: None,
+            })
+            .unwrap();
+
+        let daemon = Daemon::new(
+            config_with_root(root),
+            NoopDockerRuntime,
+            NoopRoutingRuntime,
+            StaticDecider(true),
+        );
+
+        let status = daemon.get_deployment("dep-failed").unwrap().unwrap();
+        assert_eq!(status.state, "failed");
     }
 
     #[test]
