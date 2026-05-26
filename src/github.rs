@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hmac::{Hmac, Mac};
+use reqwest::blocking::Client;
+use reqwest::header;
 use serde::Deserialize;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::api::DeploymentRequest;
+use crate::api::GitHubRepositorySummary;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -31,6 +34,8 @@ pub enum GitHubError {
     InvalidPayload(String),
     GitCommand(String),
     Manifest(String),
+    Api(String),
+    Unauthorized,
 }
 
 impl Display for GitHubError {
@@ -41,6 +46,8 @@ impl Display for GitHubError {
             Self::InvalidPayload(message) => write!(f, "{message}"),
             Self::GitCommand(message) => write!(f, "{message}"),
             Self::Manifest(message) => write!(f, "{message}"),
+            Self::Api(message) => write!(f, "{message}"),
+            Self::Unauthorized => write!(f, "github authorization expired"),
         }
     }
 }
@@ -59,6 +66,15 @@ struct GitHubPushPayload {
 #[derive(Debug, Deserialize)]
 struct GitHubRepository {
     clone_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRepositoryApiRecord {
+    full_name: String,
+    html_url: String,
+    clone_url: String,
+    default_branch: String,
+    private: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +169,50 @@ pub fn resolve_webhook(
         source_path: None,
         source_ref: None,
     }))
+}
+
+pub fn list_accessible_repositories(
+    access_token: &str,
+) -> Result<Vec<GitHubRepositorySummary>, GitHubError> {
+    let client = Client::builder()
+        .user_agent("forge")
+        .build()
+        .map_err(|err| GitHubError::Api(err.to_string()))?;
+    let response = client
+        .get("https://api.github.com/user/repos")
+        .query(&[
+            ("per_page", "100"),
+            ("sort", "updated"),
+            ("affiliation", "owner,collaborator,organization_member"),
+        ])
+        .header(header::ACCEPT, "application/vnd.github+json")
+        .bearer_auth(access_token)
+        .send()
+        .map_err(|err| GitHubError::Api(err.to_string()))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(GitHubError::Unauthorized);
+    }
+    if !response.status().is_success() {
+        return Err(GitHubError::Api(format!(
+            "github repo list failed with {}",
+            response.status()
+        )));
+    }
+
+    let mut repositories = response
+        .json::<Vec<GitHubRepositoryApiRecord>>()
+        .map_err(|err| GitHubError::Api(err.to_string()))?
+        .into_iter()
+        .map(|repo| GitHubRepositorySummary {
+            full_name: repo.full_name,
+            html_url: repo.html_url,
+            clone_url: repo.clone_url,
+            default_branch: repo.default_branch,
+            private: repo.private,
+        })
+        .collect::<Vec<_>>();
+    repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+    Ok(repositories)
 }
 
 fn branch_to_environment(manifest: &ForgeManifest, branch: &str) -> Option<&'static str> {
@@ -257,6 +317,19 @@ fn sanitize_repository_id(clone_url: &str) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect()
+}
+
+#[cfg(test)]
+mod repo_listing_tests {
+    use super::*;
+
+    #[test]
+    fn github_error_formats_unauthorized() {
+        assert_eq!(
+            GitHubError::Unauthorized.to_string(),
+            "github authorization expired"
+        );
+    }
 }
 
 fn is_zero_commit(commit_sha: &str) -> bool {

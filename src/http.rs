@@ -25,8 +25,9 @@ use crate::api::{
     DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvApplyRequest, EnvApplyResponse,
     EnvAuditResponse, EnvInventoryResponse, EnvPreviewRequest, EnvPreviewResponse,
     EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, ProjectEnvironmentInventoryList, ProjectList, ProjectUpsertRequest,
-    ReadinessExplainResponse, ReadinessTimelineResponse, ReadyzResponse, SecretListResponse,
+    EventList, GitHubRepoListResponse, ProjectEnvironmentInventoryList, ProjectList,
+    ProjectUpsertRequest, ReadinessExplainResponse, ReadinessTimelineResponse, ReadyzResponse,
+    RegisterProjectFromGitHubPreviewRequest, RegisterProjectFromGitHubRequest, SecretListResponse,
     SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata,
     TokenRevokeResponse,
 };
@@ -35,12 +36,15 @@ use crate::auth::{
 };
 use crate::daemon::{ControlPlaneSnapshot, Daemon, DaemonReadyzCache, DaemonState};
 use crate::github::{
-    GitHubError, GitHubWebhookConfig, WebhookResolution, resolve_webhook, verify_signature,
+    GitHubError, GitHubWebhookConfig, WebhookResolution, list_accessible_repositories,
+    resolve_webhook, verify_signature,
 };
 use crate::projects::{ProjectRegistryStore, project_registry_error_response};
 use crate::readiness::{effective_snapshot, explain_snapshot, timeline_snapshot};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
-use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
+use crate::secrets::{
+    SealedValueRecord, SecretError, SecretStore, SecretWriteRequest, seal_value, unseal_value,
+};
 use crate::status::{
     ProjectEnvironmentStatus, apply_project_env_changes, load_project_env_audit_report,
     load_project_env_inventory_report, load_project_env_preview_report,
@@ -367,24 +371,30 @@ impl HttpState {
 pub struct WebAuthState {
     config: Option<WebAuthConfig>,
     github_oauth: Arc<dyn GitHubOAuthProvider>,
+    github_session_tokens: GitHubSessionTokenStore,
     users: UserStore,
 }
 
 impl WebAuthState {
     pub fn from_env(root: impl AsRef<Path>) -> Result<Self, String> {
+        let root = root.as_ref().to_path_buf();
         Ok(Self {
             config: load_web_auth_config_from_env()?,
             github_oauth: Arc::new(RealGitHubOAuthProvider),
-            users: UserStore::new(root.as_ref().join("users")).map_err(|err| err.to_string())?,
+            github_session_tokens: GitHubSessionTokenStore::new(root.join("github-oauth"))
+                .map_err(|err| err.to_string())?,
+            users: UserStore::new(root.join("users")).map_err(|err| err.to_string())?,
         })
     }
 
     #[cfg(test)]
     fn unconfigured(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref().to_path_buf();
         Self {
             config: None,
             github_oauth: Arc::new(MockGitHubOAuthProvider::default()),
-            users: UserStore::new(root.as_ref().join("users")).unwrap(),
+            github_session_tokens: GitHubSessionTokenStore::new(root.join("github-oauth")).unwrap(),
+            users: UserStore::new(root.join("users")).unwrap(),
         }
     }
 
@@ -395,6 +405,7 @@ impl WebAuthState {
         user_id: u64,
         allow_new_registration: bool,
     ) -> Self {
+        let root = root.as_ref().to_path_buf();
         Self {
             config: Some(WebAuthConfig {
                 public_url: "https://forge.example.com".into(),
@@ -408,8 +419,11 @@ impl WebAuthState {
                 login: login.into(),
                 user_id,
                 fail: false,
+                repositories: Vec::new(),
+                scope: Some("read:user,repo".into()),
             }),
-            users: UserStore::new(root.as_ref().join("users")).unwrap(),
+            github_session_tokens: GitHubSessionTokenStore::new(root.join("github-oauth")).unwrap(),
+            users: UserStore::new(root.join("users")).unwrap(),
         }
     }
 
@@ -429,6 +443,32 @@ impl WebAuthState {
 
     fn read_registered_user(&self, github_id: u64) -> Result<Option<UserRecord>, UserStoreError> {
         self.users.read_by_github_id(github_id)
+    }
+
+    fn store_oauth_session(
+        &self,
+        session: &GitHubOAuthSession,
+        github_login: &str,
+        github_id: u64,
+    ) -> Result<(), String> {
+        self.github_session_tokens
+            .write(github_id, github_login, session)
+            .map_err(|err| err.to_string())
+    }
+
+    fn read_oauth_session(
+        &self,
+        github_id: u64,
+    ) -> Result<Option<StoredGitHubOAuthSession>, String> {
+        self.github_session_tokens
+            .read(github_id)
+            .map_err(|err| err.to_string())
+    }
+
+    fn clear_oauth_session(&self, github_id: u64) -> Result<(), String> {
+        self.github_session_tokens
+            .delete(github_id)
+            .map_err(|err| err.to_string())
     }
 
     #[cfg(test)]
@@ -463,14 +503,133 @@ impl WebAuthConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GitHubOAuthSession {
+    user: GitHubUser,
+    access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredGitHubOAuthSession {
+    github_login: String,
+    github_id: u64,
+    access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    created_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedGitHubOAuthSession {
+    github_login: String,
+    github_id: u64,
+    access_token: SealedValueRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    created_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubSessionTokenStore {
+    root: PathBuf,
+}
+
+impl GitHubSessionTokenStore {
+    fn new(root: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    fn write(
+        &self,
+        github_id: u64,
+        github_login: &str,
+        session: &GitHubOAuthSession,
+    ) -> Result<(), SecretError> {
+        let persisted = PersistedGitHubOAuthSession {
+            github_login: github_login.into(),
+            github_id,
+            access_token: seal_value(&session.access_token)?,
+            scope: normalize_github_scope(session.scope.as_deref()),
+            created_at_unix: unix_now(),
+        };
+        let mut payload = serde_json::to_vec_pretty(&persisted)
+            .map_err(|err| SecretError::Crypto(err.to_string()))?;
+        payload.push(b'\n');
+        atomic_write(self.path_for(github_id), &payload)
+            .map_err(|err| SecretError::Io(std::io::Error::other(err.to_string())))
+    }
+
+    fn read(&self, github_id: u64) -> Result<Option<StoredGitHubOAuthSession>, SecretError> {
+        let path = self.path_for(github_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(path)?;
+        let persisted: PersistedGitHubOAuthSession =
+            serde_json::from_str(&raw).map_err(|err| SecretError::Crypto(err.to_string()))?;
+        Ok(Some(StoredGitHubOAuthSession {
+            github_login: persisted.github_login,
+            github_id: persisted.github_id,
+            access_token: unseal_value(&persisted.access_token)?,
+            scope: persisted.scope,
+            created_at_unix: persisted.created_at_unix,
+        }))
+    }
+
+    fn delete(&self, github_id: u64) -> Result<(), SecretError> {
+        let path = self.path_for(github_id);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn path_for(&self, github_id: u64) -> PathBuf {
+        self.root.join(format!("{github_id}.json"))
+    }
+}
+
+fn normalize_github_scope(scope: Option<&str>) -> Option<String> {
+    scope
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn github_scope_supports_private_repositories(scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    scope
+        .split(',')
+        .map(str::trim)
+        .any(|value| value == "repo" || value.starts_with("repo:"))
+}
+
 trait GitHubOAuthProvider: Send + Sync {
-    fn authenticate(&self, config: &WebAuthConfig, code: &str) -> Result<GitHubUser, String>;
+    fn authenticate(
+        &self,
+        config: &WebAuthConfig,
+        code: &str,
+    ) -> Result<GitHubOAuthSession, String>;
+    fn list_repositories(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<crate::api::GitHubRepositorySummary>, GitHubError>;
 }
 
 struct RealGitHubOAuthProvider;
 
 impl GitHubOAuthProvider for RealGitHubOAuthProvider {
-    fn authenticate(&self, config: &WebAuthConfig, code: &str) -> Result<GitHubUser, String> {
+    fn authenticate(
+        &self,
+        config: &WebAuthConfig,
+        code: &str,
+    ) -> Result<GitHubOAuthSession, String> {
         let client = reqwest::blocking::Client::builder()
             .user_agent("forge")
             .build()
@@ -498,14 +657,25 @@ impl GitHubOAuthProvider for RealGitHubOAuthProvider {
         let user = client
             .get(GITHUB_USER_URL)
             .header(header::ACCEPT, "application/json")
-            .bearer_auth(token.access_token)
+            .bearer_auth(&token.access_token)
             .send()
             .map_err(|err| err.to_string())?;
         if !user.status().is_success() {
             return Err(format!("github user lookup failed with {}", user.status()));
         }
 
-        user.json().map_err(|err| err.to_string())
+        Ok(GitHubOAuthSession {
+            user: user.json().map_err(|err| err.to_string())?,
+            access_token: token.access_token,
+            scope: normalize_github_scope(token.scope.as_deref()),
+        })
+    }
+
+    fn list_repositories(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<crate::api::GitHubRepositorySummary>, GitHubError> {
+        list_accessible_repositories(access_token)
     }
 }
 
@@ -515,25 +685,44 @@ struct MockGitHubOAuthProvider {
     login: String,
     user_id: u64,
     fail: bool,
+    repositories: Vec<crate::api::GitHubRepositorySummary>,
+    scope: Option<String>,
 }
 
 #[cfg(test)]
 impl GitHubOAuthProvider for MockGitHubOAuthProvider {
-    fn authenticate(&self, _config: &WebAuthConfig, _code: &str) -> Result<GitHubUser, String> {
+    fn authenticate(
+        &self,
+        _config: &WebAuthConfig,
+        _code: &str,
+    ) -> Result<GitHubOAuthSession, String> {
         if self.fail {
             return Err("mock oauth failure".into());
         }
 
-        Ok(GitHubUser {
-            login: self.login.clone(),
-            id: self.user_id,
+        Ok(GitHubOAuthSession {
+            user: GitHubUser {
+                login: self.login.clone(),
+                id: self.user_id,
+            },
+            access_token: "mock-github-access-token".into(),
+            scope: self.scope.clone(),
         })
+    }
+
+    fn list_repositories(
+        &self,
+        _access_token: &str,
+    ) -> Result<Vec<crate::api::GitHubRepositorySummary>, GitHubError> {
+        Ok(self.repositories.clone())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GitHubAccessTokenResponse {
     access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -984,7 +1173,16 @@ pub fn router(state: HttpState) -> Router {
         .route("/readiness/timeline", get(get_readiness_timeline))
         .route("/metrics", get(get_metrics))
         .route("/deployments", post(post_deployments))
+        .route("/api/github/repos", get(get_github_repos))
         .route("/api/projects", post(post_projects).get(get_projects))
+        .route(
+            "/api/projects/register-from-github/preview",
+            post(post_project_register_from_github_preview),
+        )
+        .route(
+            "/api/projects/register-from-github",
+            post(post_project_register_from_github),
+        )
         .route("/api/projects/{project_id}", get(get_project))
         .route(
             "/api/projects/{project_id}/env",
@@ -1240,7 +1438,7 @@ async fn get_oauth_github_start(
         &[
             ("client_id", config.client_id.as_str()),
             ("redirect_uri", config.callback_url().as_str()),
-            ("scope", "read:user"),
+            ("scope", "read:user repo"),
             ("state", nonce.as_str()),
         ],
     ) {
@@ -1311,27 +1509,27 @@ async fn get_oauth_github_callback(
     let provider = state.web_auth.github_oauth.clone();
     let code = query.code;
     let auth_config = config.clone();
-    let user = match tokio::task::spawn_blocking(move || provider.authenticate(&auth_config, &code))
-        .await
-    {
-        Ok(Ok(user)) => user,
-        Ok(Err(_)) | Err(_) => {
-            return html_response_with_cookies(
-                StatusCode::BAD_GATEWAY,
-                "github login failed",
-                &[clear_state_cookie, clear_session_cookie],
-            );
-        }
-    };
+    let github_session =
+        match tokio::task::spawn_blocking(move || provider.authenticate(&auth_config, &code)).await
+        {
+            Ok(Ok(user)) => user,
+            Ok(Err(_)) | Err(_) => {
+                return html_response_with_cookies(
+                    StatusCode::BAD_GATEWAY,
+                    "github login failed",
+                    &[clear_state_cookie, clear_session_cookie],
+                );
+            }
+        };
 
-    let registered = match state.web_auth.resolve_oauth_user(&user) {
+    let registered = match state.web_auth.resolve_oauth_user(&github_session.user) {
         Ok(RegistrationDecision::Existing(record)) | Ok(RegistrationDecision::Created(record)) => {
             record
         }
         Ok(RegistrationDecision::RegistrationClosed) => {
             eprintln!(
                 "registration_rejected reason=registration_closed github_id={} github_login={}",
-                user.id, user.login
+                github_session.user.id, github_session.user.login
             );
             return registration_closed_response(&[clear_state_cookie, clear_session_cookie]);
         }
@@ -1343,6 +1541,12 @@ async fn get_oauth_github_callback(
             );
         }
     };
+
+    let _ = state.web_auth.store_oauth_session(
+        &github_session,
+        &registered.github_login,
+        registered.github_id,
+    );
 
     let session_cookie = match encode_signed_value(
         &SessionCookie {
@@ -1440,12 +1644,12 @@ async fn get_app(State(state): State<HttpState>, headers: HeaderMap) -> Response
     )
 }
 
-async fn get_logout(State(state): State<HttpState>) -> Response {
-    logout_response(&state)
+async fn get_logout(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    logout_response(&state, &headers)
 }
 
-async fn post_logout(State(state): State<HttpState>) -> Response {
-    logout_response(&state)
+async fn post_logout(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    logout_response(&state, &headers)
 }
 
 async fn get_healthz() -> impl IntoResponse {
@@ -2116,6 +2320,145 @@ async fn post_secrets(
             }),
         ),
         Err(err) => secret_error_response(&request_id, err),
+    }
+}
+
+async fn get_github_repos(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    let request_id = next_request_id();
+    let session = match require_web_session(&state, &headers, &request_id) {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let stored = match state.web_auth.read_oauth_session(session.github_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &request_id,
+                ErrorResponse {
+                    code: "github_authorization_required".into(),
+                    message: "GitHub repository access is unavailable for this session. Sign in with GitHub again.".into(),
+                },
+            );
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &request_id,
+                ErrorResponse {
+                    code: "github_repo_list_unavailable".into(),
+                    message: "GitHub repository listing is unavailable right now.".into(),
+                },
+            );
+        }
+    };
+
+    match state
+        .web_auth
+        .github_oauth
+        .list_repositories(&stored.access_token)
+    {
+        Ok(repositories) => {
+            let private_scope_missing =
+                !github_scope_supports_private_repositories(stored.scope.as_deref());
+            let message = if repositories.is_empty() {
+                Some("No accessible GitHub repositories were found for this account.".into())
+            } else if private_scope_missing {
+                Some("Private repositories require additional GitHub authorization.".into())
+            } else {
+                None
+            };
+            json_response(
+                StatusCode::OK,
+                &request_id,
+                Json(SuccessEnvelope {
+                    request_id: request_id.clone(),
+                    correlation_id: request_id.clone(),
+                    data: GitHubRepoListResponse {
+                        repositories,
+                        private_repo_authorization_required: private_scope_missing,
+                        message,
+                    },
+                }),
+            )
+        }
+        Err(GitHubError::Unauthorized) => {
+            let _ = state.web_auth.clear_oauth_session(session.github_id);
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                &request_id,
+                ErrorResponse {
+                    code: "github_token_expired".into(),
+                    message: "GitHub authorization expired. Sign in with GitHub again.".into(),
+                },
+            )
+        }
+        Err(_) => error_response(
+            StatusCode::BAD_GATEWAY,
+            &request_id,
+            ErrorResponse {
+                code: "github_repo_list_unavailable".into(),
+                message: "GitHub repository listing is unavailable right now.".into(),
+            },
+        ),
+    }
+}
+
+async fn post_project_register_from_github_preview(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterProjectFromGitHubPreviewRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = require_web_session(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let apps_domain = std::env::var("FORGE_APPS_DOMAIN").ok();
+    match state
+        .project_registry
+        .preview_registration_from_github(request, apps_domain.as_deref())
+    {
+        Ok(preview) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: preview,
+            }),
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
+async fn post_project_register_from_github(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterProjectFromGitHubRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = require_web_session(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state.project_registry.register_from_github(request) {
+        Ok(registered) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: registered,
+            }),
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
+        }
     }
 }
 
@@ -3048,6 +3391,34 @@ fn ensure_inventory_read_authorized(
     ))
 }
 
+fn require_web_session(
+    state: &HttpState,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<SessionCookie, Response> {
+    let Some(config) = state.web_auth.config.as_ref() else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            request_id,
+            ErrorResponse {
+                code: "github_integration_unavailable".into(),
+                message: "GitHub integration is not configured.".into(),
+            },
+        ));
+    };
+    let Some(session) = read_session_cookie(headers, config) else {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            request_id,
+            ErrorResponse {
+                code: "unauthorized".into(),
+                message: "missing or invalid web session".into(),
+            },
+        ));
+    };
+    Ok(session)
+}
+
 fn authenticated_login(state: &HttpState, headers: &HeaderMap) -> Option<String> {
     if let Ok(principal) = authenticate_bearer_token(state, headers) {
         if principal.github_login.is_some() {
@@ -3204,6 +3575,22 @@ fn github_error_response(request_id: &str, err: GitHubError) -> Response {
             request_id,
             ErrorResponse {
                 code: "github_manifest_resolution_failed".into(),
+                message: err.to_string(),
+            },
+        ),
+        GitHubError::Api(_) => error_response(
+            StatusCode::BAD_GATEWAY,
+            request_id,
+            ErrorResponse {
+                code: "github_api_unavailable".into(),
+                message: err.to_string(),
+            },
+        ),
+        GitHubError::Unauthorized => error_response(
+            StatusCode::UNAUTHORIZED,
+            request_id,
+            ErrorResponse {
+                code: "github_authorization_expired".into(),
                 message: err.to_string(),
             },
         ),
@@ -3453,7 +3840,12 @@ fn build_clear_cookie(name: &str, secure: bool) -> String {
     build_cookie(name, "", secure, Some(0))
 }
 
-fn logout_response(state: &HttpState) -> Response {
+fn logout_response(state: &HttpState, headers: &HeaderMap) -> Response {
+    if let Some(config) = state.web_auth.config.as_ref() {
+        if let Some(session) = read_session_cookie(headers, config) {
+            let _ = state.web_auth.clear_oauth_session(session.github_id);
+        }
+    }
     let secure = state
         .web_auth
         .config
@@ -5529,6 +5921,10 @@ pub mod app_page_preserves_auth_gate {
         assert!(body.contains("/app.js"));
         assert!(body.contains("Status overview"));
         assert!(body.contains("What matters now."));
+        assert!(body.contains("Add Project from GitHub"));
+        assert!(body.contains("Register Project"));
+        assert!(!body.contains(">Deploy<"));
+        assert!(!body.contains("Deploy</button>"));
         assert!(!body.contains("test-session-secret"));
         assert!(!body.contains("FORGE_SESSION_SECRET"));
         assert!(!body.contains("FORGE_GITHUB_OAUTH_CLIENT_SECRET"));
@@ -5565,7 +5961,10 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("\"/metrics\""));
         assert!(body.contains("\"/readiness/explain\""));
         assert!(body.contains("\"/readiness/timeline\""));
+        assert!(body.contains("\"/api/github/repos\""));
         assert!(body.contains("\"/api/projects\""));
+        assert!(body.contains("\"/api/projects/register-from-github/preview\""));
+        assert!(body.contains("\"/api/projects/register-from-github\""));
         assert!(body.contains("/environments"));
         assert!(body.contains("/env"));
         assert!(body.contains("/env/preview"));
@@ -5581,6 +5980,8 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(!body.contains("/env/diff"));
         assert!(!body.contains("/backups"));
         assert!(!body.contains("/tokens"));
+        assert!(!body.contains("access_token"));
+        assert!(!body.contains("Authorization"));
     }
 }
 
@@ -7735,6 +8136,404 @@ pub mod project_inventory_api_accepts_web_session_authentication {
             .await
             .unwrap();
         assert_eq!(audit.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+pub mod github_repo_picker_api {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    fn session_cookie_value(state: &HttpState) -> String {
+        let session_secret = state.web_auth.config.clone().unwrap().session_secret;
+        encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &session_secret,
+        )
+        .unwrap()
+    }
+
+    fn set_master_key() {
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+    }
+
+    fn build_state_with_mock_repos() -> HttpState {
+        set_master_key();
+        let mut state = build_cli_login_state();
+        state.web_auth.github_oauth = Arc::new(MockGitHubOAuthProvider {
+            login: "octocat".into(),
+            user_id: 7,
+            fail: false,
+            repositories: vec![crate::api::GitHubRepositorySummary {
+                full_name: "anggaprytn/aegis-quant".into(),
+                html_url: "https://github.com/anggaprytn/aegis-quant".into(),
+                clone_url: "https://github.com/anggaprytn/aegis-quant.git".into(),
+                default_branch: "main".into(),
+                private: false,
+            }],
+            scope: Some("read:user,repo".into()),
+        });
+        state
+            .web_auth
+            .store_oauth_session(
+                &GitHubOAuthSession {
+                    user: GitHubUser {
+                        login: "octocat".into(),
+                        id: 7,
+                    },
+                    access_token: "mock-github-access-token".into(),
+                    scope: Some("read:user,repo".into()),
+                },
+                "octocat",
+                7,
+            )
+            .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn authenticated_user_can_list_repositories() {
+        let state = build_state_with_mock_repos();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/github/repos")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["repositories"][0]["full_name"],
+            "anggaprytn/aegis-quant"
+        );
+        assert_eq!(json["data"]["repositories"][0]["default_branch"], "main");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_repository_list_is_rejected() {
+        let app = router(build_cli_login_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/github/repos")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn github_access_token_never_appears_in_repo_response() {
+        let state = build_state_with_mock_repos();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/github/repos")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!rendered.contains("mock-github-access-token"));
+        assert!(!rendered.contains("Authorization"));
+        assert!(!rendered.contains("forge_session"));
+    }
+
+    #[tokio::test]
+    async fn private_repo_scope_warning_is_returned_when_scope_missing() {
+        set_master_key();
+        let mut state = build_cli_login_state();
+        state.web_auth.github_oauth = Arc::new(MockGitHubOAuthProvider {
+            login: "octocat".into(),
+            user_id: 7,
+            fail: false,
+            repositories: vec![crate::api::GitHubRepositorySummary {
+                full_name: "example/public-repo".into(),
+                html_url: "https://github.com/example/public-repo".into(),
+                clone_url: "https://github.com/example/public-repo.git".into(),
+                default_branch: "main".into(),
+                private: false,
+            }],
+            scope: Some("read:user".into()),
+        });
+        state
+            .web_auth
+            .store_oauth_session(
+                &GitHubOAuthSession {
+                    user: GitHubUser {
+                        login: "octocat".into(),
+                        id: 7,
+                    },
+                    access_token: "mock-github-access-token".into(),
+                    scope: Some("read:user".into()),
+                },
+                "octocat",
+                7,
+            )
+            .unwrap();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/github/repos")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["message"],
+            "Private repositories require additional GitHub authorization."
+        );
+    }
+}
+
+#[cfg(test)]
+pub mod register_project_from_github_api {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    fn session_cookie_value(state: &HttpState) -> String {
+        let session_secret = state.web_auth.config.clone().unwrap().session_secret;
+        encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &session_secret,
+        )
+        .unwrap()
+    }
+
+    fn configure_apps_domain() {
+        unsafe {
+            std::env::set_var("FORGE_APPS_DOMAIN", "forge.anggaprytn.com");
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_derives_safe_fields() {
+        configure_apps_domain();
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"repo_url":"https://github.com/example/Forge__Fullstack...API---Test.git","default_branch":"main"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["project_id"], "forge-fullstack-api-test");
+        assert_eq!(
+            json["data"]["base_domain"],
+            "forge-fullstack-api-test.forge.anggaprytn.com"
+        );
+        assert_eq!(json["data"]["default_branch"], "main");
+    }
+
+    #[tokio::test]
+    async fn register_from_github_rejects_repo_urls_with_credentials() {
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"project_id":"api","repo_url":"https://token@github.com/example/api.git","default_branch":"main","base_domain":"api.forge.example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_from_github_writes_registry_without_triggering_deployment() {
+        let mut state = build_cached_only_state(ControlPlaneSnapshot::default());
+        state.web_auth = build_cli_login_state().web_auth;
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"project_id":"aegis-quant","repo_url":"https://github.com/anggaprytn/aegis-quant.git","default_branch":"main","base_domain":"aegis-quant.forge.anggaprytn.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inventory = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(inventory.status(), StatusCode::OK);
+        let body = to_bytes(inventory.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["data"]["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|project| project["project_id"] == "aegis-quant")
+        );
+    }
+
+    #[tokio::test]
+    async fn register_from_github_rejects_project_id_collision() {
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"project_id":"api","repo_url":"https://github.com/example/api.git","default_branch":"main","base_domain":"api-alt.example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn register_from_github_rejects_base_domain_collision() {
+        let state = build_cli_login_state();
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/register-from-github")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"project_id":"web","repo_url":"https://github.com/example/web.git","default_branch":"main","base_domain":"api.example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }
 

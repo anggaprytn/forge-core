@@ -3,7 +3,10 @@ use crate::api::{
     ProjectEnvironmentReadinessSummary, ProjectEnvironmentRestoreSummary,
     ProjectEnvironmentRollbackSummary, ProjectEnvironmentRuntimePolicySummary,
     ProjectEnvironmentServiceRuntimePolicySummary, ProjectEnvironmentServiceSummary,
-    ProjectEnvironmentSummary, ProjectRecord, ProjectUpsertRequest,
+    ProjectEnvironmentSummary, ProjectRecord, ProjectRegistrationRoutePreview,
+    ProjectUpsertRequest, RegisterProjectFromGitHubPreviewRequest,
+    RegisterProjectFromGitHubPreviewResponse, RegisterProjectFromGitHubRequest,
+    RegisterProjectFromGitHubResponse,
 };
 use crate::backups::load_backup_restore_lineage;
 use crate::status::derive_environment_domain;
@@ -24,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum ProjectRegistryError {
     Storage(StorageError),
     InvalidProjectId,
+    ProjectAlreadyExists(String),
     InvalidRepoUrl(String),
     InvalidDefaultBranch,
     InvalidBaseDomain(String),
@@ -39,6 +43,9 @@ impl Display for ProjectRegistryError {
                 f,
                 "project_id must use lowercase letters, digits, and hyphens only"
             ),
+            Self::ProjectAlreadyExists(project_id) => {
+                write!(f, "project_id is already registered: {project_id}")
+            }
             Self::InvalidRepoUrl(message) => write!(f, "{message}"),
             Self::InvalidDefaultBranch => write!(f, "default_branch must not be empty"),
             Self::InvalidBaseDomain(message) => write!(f, "{message}"),
@@ -220,6 +227,62 @@ impl ProjectRegistryStore {
             project_id: project.project_id,
             environments,
         }))
+    }
+
+    pub fn preview_registration_from_github(
+        &self,
+        request: RegisterProjectFromGitHubPreviewRequest,
+        apps_domain: Option<&str>,
+    ) -> Result<RegisterProjectFromGitHubPreviewResponse, ProjectRegistryError> {
+        let repo_url = normalize_repo_url(&request.repo_url)?;
+        let project_id = infer_project_id_from_repo_url(&repo_url)?;
+        let default_branch = normalize_default_branch(&request.default_branch)?;
+        let (_, base_domain) = resolve_domain(self, &project_id, None, None, apps_domain)?;
+        Ok(RegisterProjectFromGitHubPreviewResponse {
+            project_id,
+            repo_url,
+            default_branch,
+            base_domain: base_domain.clone(),
+            environment_routes: ProjectRegistrationRoutePreview {
+                production: derive_environment_domain(&base_domain, "production"),
+                staging: derive_environment_domain(&base_domain, "staging"),
+                development: derive_environment_domain(&base_domain, "development"),
+            },
+        })
+    }
+
+    pub fn register_from_github(
+        &self,
+        request: RegisterProjectFromGitHubRequest,
+    ) -> Result<RegisterProjectFromGitHubResponse, ProjectRegistryError> {
+        let repo_url = normalize_repo_url(&request.repo_url)?;
+        let project_id = normalize_project_id(&request.project_id)?;
+        if self.get(&project_id)?.is_some() {
+            return Err(ProjectRegistryError::ProjectAlreadyExists(project_id));
+        }
+        let default_branch = normalize_default_branch(&request.default_branch)?;
+        let base_domain = normalize_hostname(&request.base_domain)?;
+        ensure_domain_available(self, &project_id, &base_domain)?;
+
+        let now = unix_now();
+        let created = ProjectRecord {
+            project_id: project_id.clone(),
+            repo_url: repo_url.clone(),
+            default_branch: default_branch.clone(),
+            base_domain: base_domain.clone(),
+            domain_mode: "explicit".into(),
+            created_at_unix: now,
+            updated_at_unix: now,
+            environments: Vec::new(),
+        };
+        self.write(&created)?;
+        Ok(RegisterProjectFromGitHubResponse {
+            registered: true,
+            project_id,
+            repo_url,
+            default_branch,
+            base_domain,
+        })
     }
 
     fn write(&self, project: &ProjectRecord) -> Result<(), ProjectRegistryError> {
@@ -586,6 +649,13 @@ pub fn project_registry_error_response(
                 message: "project_id must use lowercase letters, digits, and hyphens only".into(),
             },
         ),
+        ProjectRegistryError::ProjectAlreadyExists(project_id) => (
+            axum::http::StatusCode::CONFLICT,
+            ErrorResponse {
+                code: "project_id_conflict".into(),
+                message: format!("project_id is already registered: {project_id}"),
+            },
+        ),
         ProjectRegistryError::InvalidRepoUrl(message) => (
             axum::http::StatusCode::BAD_REQUEST,
             ErrorResponse {
@@ -608,7 +678,7 @@ pub fn project_registry_error_response(
             },
         ),
         ProjectRegistryError::BaseDomainAlreadyInUse(base_domain) => (
-            axum::http::StatusCode::BAD_REQUEST,
+            axum::http::StatusCode::CONFLICT,
             ErrorResponse {
                 code: "base_domain_conflict".into(),
                 message: format!("base_domain is already used by another project: {base_domain}"),
@@ -1228,5 +1298,104 @@ mod tests {
 
         let err = store.upsert(request, None).unwrap_err();
         assert!(matches!(err, ProjectRegistryError::InvalidRepoUrl(_)));
+    }
+
+    #[test]
+    fn github_registration_preview_derives_safe_project_id_and_domain() {
+        let root = test_root("github-preview");
+        let store = ProjectRegistryStore::new(&root);
+
+        let preview = store
+            .preview_registration_from_github(
+                RegisterProjectFromGitHubPreviewRequest {
+                    repo_url: "https://github.com/example/Forge__Fullstack...API---Test.git".into(),
+                    default_branch: "main".into(),
+                },
+                Some("forge.example.com"),
+            )
+            .unwrap();
+
+        assert_eq!(preview.project_id, "forge-fullstack-api-test");
+        assert_eq!(preview.default_branch, "main");
+        assert_eq!(
+            preview.base_domain,
+            "forge-fullstack-api-test.forge.example.com"
+        );
+        assert_eq!(
+            preview.environment_routes.production,
+            "forge-fullstack-api-test.forge.example.com"
+        );
+        assert_eq!(
+            preview.environment_routes.staging,
+            "staging-forge-fullstack-api-test.forge.example.com"
+        );
+        assert_eq!(
+            preview.environment_routes.development,
+            "development-forge-fullstack-api-test.forge.example.com"
+        );
+    }
+
+    #[test]
+    fn github_registration_rejects_project_id_collision() {
+        let root = test_root("github-register-project-collision");
+        let store = ProjectRegistryStore::new(&root);
+        store.upsert(request("api"), None).unwrap();
+
+        let err = store
+            .register_from_github(RegisterProjectFromGitHubRequest {
+                project_id: "api".into(),
+                repo_url: "https://github.com/example/api.git".into(),
+                default_branch: "main".into(),
+                base_domain: "api-2.example.com".into(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ProjectRegistryError::ProjectAlreadyExists(project_id) if project_id == "api"
+        ));
+    }
+
+    #[test]
+    fn github_registration_rejects_base_domain_collision() {
+        let root = test_root("github-register-domain-collision");
+        let store = ProjectRegistryStore::new(&root);
+        store.upsert(request("api"), None).unwrap();
+
+        let err = store
+            .register_from_github(RegisterProjectFromGitHubRequest {
+                project_id: "web".into(),
+                repo_url: "https://github.com/example/web.git".into(),
+                default_branch: "main".into(),
+                base_domain: "api.example.com".into(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ProjectRegistryError::BaseDomainAlreadyInUse(base_domain)
+            if base_domain == "api.example.com"
+        ));
+    }
+
+    #[test]
+    fn github_registration_persists_without_creating_environments() {
+        let root = test_root("github-register-create");
+        let store = ProjectRegistryStore::new(&root);
+
+        let response = store
+            .register_from_github(RegisterProjectFromGitHubRequest {
+                project_id: "aegis-quant".into(),
+                repo_url: "https://github.com/anggaprytn/aegis-quant.git".into(),
+                default_branch: "main".into(),
+                base_domain: "aegis-quant.forge.example.com".into(),
+            })
+            .unwrap();
+
+        assert!(response.registered);
+        assert_eq!(response.default_branch, "main");
+        let project = store.get("aegis-quant").unwrap().unwrap();
+        assert_eq!(project.default_branch, "main");
+        assert!(!root.join("projects/aegis-quant/environments").exists());
     }
 }

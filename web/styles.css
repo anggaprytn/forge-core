@@ -563,6 +563,10 @@ a:hover {
   margin-bottom: 18px;
 }
 
+.github-toolbar {
+  align-items: stretch;
+}
+
 .env-search {
   flex: 1;
   margin-bottom: 0;
@@ -628,6 +632,17 @@ a:hover {
 
 .env-preview-actions {
   margin-bottom: 18px;
+}
+
+.github-register-preview {
+  display: grid;
+  gap: 18px;
+}
+
+.github-route-preview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .env-audit-filters {
@@ -1080,6 +1095,7 @@ a:hover {
   .summary-grid,
   .meta-grid,
   .environment-facts,
+  .github-route-preview,
   .env-preview-grid,
   .env-preview-summary {
     grid-template-columns: 1fr;
@@ -1096,5 +1112,4 @@ a:hover {
   .signal-card-head {
     flex-direction: column;
   }
-}
 }

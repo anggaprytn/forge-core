@@ -3,7 +3,10 @@ const API_PATHS = {
   metrics: "/metrics",
   explain: "/readiness/explain",
   timeline: "/readiness/timeline",
+  githubRepos: "/api/github/repos",
   projects: "/api/projects",
+  projectRegisterFromGitHubPreview: "/api/projects/register-from-github/preview",
+  projectRegisterFromGitHub: "/api/projects/register-from-github",
   projectEnvironments(projectId) {
     return `/api/projects/${encodeURIComponent(projectId)}/environments`;
   },
@@ -24,6 +27,7 @@ const API_PATHS = {
 const uiState = {
   query: "",
   selectedProjectId: "",
+  githubRepoQuery: "",
   envQuery: "",
   envAuditEnvironment: "all",
   envAuditStatus: "all",
@@ -35,6 +39,10 @@ const dataState = {
   explain: null,
   timeline: null,
   projects: [],
+  githubRepos: [],
+  githubRepoListLoaded: false,
+  selectedGithubRepo: null,
+  githubRegistrationPreview: null,
   environmentsByProject: new Map(),
   envInventoryByProject: new Map(),
   envAuditByProject: new Map(),
@@ -241,6 +249,27 @@ function selectedProject() {
   return projectList().find((project) => project.project_id === uiState.selectedProjectId) || null;
 }
 
+function githubRepoList() {
+  return Array.isArray(dataState.githubRepos) ? dataState.githubRepos : [];
+}
+
+function filteredGithubRepos() {
+  const query = lower(uiState.githubRepoQuery);
+  if (!query) {
+    return githubRepoList();
+  }
+
+  return githubRepoList().filter((repository) => {
+    const haystacks = [
+      repository.full_name,
+      repository.clone_url,
+      repository.default_branch,
+      repository.private ? "private" : "public",
+    ];
+    return haystacks.some((value) => lower(value).includes(query));
+  });
+}
+
 function filteredEnvVariables(inventory) {
   const variables = inventory && Array.isArray(inventory.variables) ? inventory.variables : [];
   const query = lower(uiState.envQuery);
@@ -375,6 +404,204 @@ function renderProjects() {
 
     button.append(titleRow, meta, note);
     container.appendChild(button);
+  }
+}
+
+function setGitHubRegisterState(message, tone = "") {
+  showState("github-repo-state", message, tone);
+  setChip(
+    "github-register-chip",
+    tone === "warn" ? "Needs review" : dataState.githubRepoListLoaded ? "Ready" : "Idle",
+    tone || (dataState.githubRepoListLoaded ? "ok" : "stale"),
+  );
+}
+
+function renderGitHubRegistrationPreview() {
+  const repository = dataState.selectedGithubRepo;
+  const preview = dataState.githubRegistrationPreview;
+  if (!repository || !preview) {
+    hide("github-register-preview");
+    return;
+  }
+
+  element("github-selected-full-name").textContent = text(repository.full_name);
+  element("github-selected-default-branch").textContent = text(preview.default_branch);
+  element("github-selected-clone-url").textContent = text(preview.repo_url);
+  element("github-selected-project-id").textContent = text(preview.project_id);
+  element("github-selected-base-domain").textContent = text(preview.base_domain);
+  setChip("github-repo-visibility", repository.private ? "Private repo" : "Public repo", repository.private ? "warn" : "");
+  element("github-route-production").textContent = text(preview.environment_routes && preview.environment_routes.production);
+  element("github-route-staging").textContent = text(preview.environment_routes && preview.environment_routes.staging);
+  element("github-route-development").textContent = text(preview.environment_routes && preview.environment_routes.development);
+  show("github-register-preview");
+}
+
+function renderGitHubRepoList() {
+  const list = element("github-repo-list");
+  if (!list) {
+    return;
+  }
+  clearChildren(list);
+
+  if (!dataState.githubRepoListLoaded) {
+    hide("github-repo-list");
+    hide("github-register-preview");
+    return;
+  }
+
+  const repositories = filteredGithubRepos();
+  if (!githubRepoList().length) {
+    hide("github-repo-list");
+    hide("github-register-preview");
+    return;
+  }
+
+  if (!repositories.length) {
+    hide("github-repo-list");
+    hide("github-register-preview");
+    setGitHubRegisterState("No repository matches that search.", "warn");
+    return;
+  }
+
+  repositories.forEach((repository) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `project-item${dataState.selectedGithubRepo && dataState.selectedGithubRepo.full_name === repository.full_name ? " is-active" : ""}`;
+    button.addEventListener("click", () => {
+      void selectGitHubRepository(repository);
+    });
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "project-item-row";
+
+    const title = document.createElement("p");
+    title.className = "project-item-title";
+    title.textContent = repository.full_name;
+
+    const chip = document.createElement("span");
+    chip.className = `status-chip${repository.private ? " warn" : ""}`;
+    chip.textContent = repository.private ? "Private" : "Public";
+    titleRow.append(title, chip);
+
+    const meta = document.createElement("p");
+    meta.className = "project-item-meta";
+    meta.textContent = repository.html_url;
+
+    const note = document.createElement("p");
+    note.className = "project-item-note";
+    note.textContent = `Branch ${text(repository.default_branch)} • ${text(repository.clone_url)}`;
+
+    button.append(titleRow, meta, note);
+    list.appendChild(button);
+  });
+
+  hideState("github-repo-state");
+  show("github-repo-list");
+  renderGitHubRegistrationPreview();
+}
+
+async function loadGitHubRepositories() {
+  const button = element("github-repo-refresh");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Loading...";
+  }
+  hide("github-register-preview");
+  setGitHubRegisterState("Loading accessible GitHub repositories...");
+
+  try {
+    const payload = await fetchApiData(API_PATHS.githubRepos);
+    dataState.githubRepos = Array.isArray(payload.repositories) ? payload.repositories : [];
+    dataState.githubRepoListLoaded = true;
+    dataState.selectedGithubRepo = null;
+    dataState.githubRegistrationPreview = null;
+    renderGitHubRepoList();
+    if (payload.message) {
+      setGitHubRegisterState(payload.message, payload.private_repo_authorization_required ? "warn" : "");
+    } else if (!dataState.githubRepos.length) {
+      setGitHubRegisterState("No accessible GitHub repositories were found for this account.", "warn");
+    } else {
+      setGitHubRegisterState("Select a repository to preview project registration.");
+    }
+  } catch (error) {
+    dataState.githubRepos = [];
+    dataState.githubRepoListLoaded = false;
+    dataState.selectedGithubRepo = null;
+    dataState.githubRegistrationPreview = null;
+    hide("github-repo-list");
+    hide("github-register-preview");
+    setGitHubRegisterState(error.message || "GitHub repository listing is unavailable right now.", "warn");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Load Repositories";
+    }
+  }
+}
+
+async function selectGitHubRepository(repository) {
+  dataState.selectedGithubRepo = repository;
+  dataState.githubRegistrationPreview = null;
+  renderGitHubRepoList();
+  setGitHubRegisterState("Loading registration preview...");
+
+  try {
+    const preview = await fetchApiData(API_PATHS.projectRegisterFromGitHubPreview, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repo_url: repository.clone_url,
+        default_branch: repository.default_branch,
+      }),
+    });
+    dataState.githubRegistrationPreview = preview;
+    renderGitHubRepoList();
+    setGitHubRegisterState("Review the generated project_id, branch, and base_domain before registering.");
+  } catch (error) {
+    dataState.githubRegistrationPreview = null;
+    hide("github-register-preview");
+    setGitHubRegisterState(error.message || "Registration preview failed.", "warn");
+  }
+}
+
+async function registerProjectFromGitHub() {
+  const preview = dataState.githubRegistrationPreview;
+  if (!preview) {
+    setGitHubRegisterState("Select a repository and wait for registration preview first.", "warn");
+    return;
+  }
+
+  const button = element("github-register-button");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Registering...";
+  }
+  setGitHubRegisterState("Registering project without deployment...");
+
+  try {
+    const response = await fetchApiData(API_PATHS.projectRegisterFromGitHub, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: preview.project_id,
+        repo_url: preview.repo_url,
+        default_branch: preview.default_branch,
+        base_domain: preview.base_domain,
+      }),
+    });
+    setGitHubRegisterState("Project registered. Deploy from CLI/API when ready.");
+    dataState.selectedProjectId = response.project_id;
+    dataState.environmentsByProject.delete(response.project_id);
+    dataState.envInventoryByProject.delete(response.project_id);
+    dataState.envAuditByProject.delete(response.project_id);
+    await loadConsole();
+  } catch (error) {
+    setGitHubRegisterState(error.message || "Project registration failed.", "warn");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Register Project";
+    }
   }
 }
 
@@ -1385,6 +1612,28 @@ async function loadConsole() {
 }
 
 function bindControls() {
+  const githubSearch = element("github-repo-search");
+  if (githubSearch) {
+    githubSearch.addEventListener("input", (event) => {
+      uiState.githubRepoQuery = event.target.value || "";
+      renderGitHubRepoList();
+    });
+  }
+
+  const githubRefresh = element("github-repo-refresh");
+  if (githubRefresh) {
+    githubRefresh.addEventListener("click", () => {
+      void loadGitHubRepositories();
+    });
+  }
+
+  const githubRegisterButton = element("github-register-button");
+  if (githubRegisterButton) {
+    githubRegisterButton.addEventListener("click", () => {
+      void registerProjectFromGitHub();
+    });
+  }
+
   const search = element("project-search");
   if (search) {
     search.addEventListener("input", (event) => {

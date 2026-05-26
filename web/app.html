@@ -43,11 +43,11 @@
           <p class="eyebrow">Status overview</p>
           <h2>Simple view for posture, projects, and environments.</h2>
           <p class="app-hero-copy">
-            Focus on control-plane state, active blockers, and the environment lanes that need attention.
+            Focus on control-plane state, active blockers, project inventory, and registration without triggering deployment.
           </p>
         </div>
         <p class="app-hero-note">
-          Read-only surface. Deploy, rollback, secrets, and project changes stay in CLI or API.
+          Registration only. Deploy, rollback, secrets, and runtime mutation stay in CLI or API.
         </p>
       </section>
 
@@ -94,6 +94,93 @@
         </aside>
 
         <section class="detail-stack">
+          <article class="detail-panel panel-surface" aria-labelledby="github-register-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Add project</p>
+                <h2 id="github-register-title">Add Project from GitHub</h2>
+              </div>
+              <span id="github-register-chip" class="status-chip stale">Idle</span>
+            </div>
+
+            <div class="env-preview-copy">
+              <p>Register a project only. No deployment starts automatically.</p>
+              <p>Base domain is routing identity. Environment routes are derived from it at registration time.</p>
+            </div>
+
+            <div class="env-toolbar github-toolbar">
+              <label class="search-field env-search" for="github-repo-search">
+                <span>Search GitHub repository</span>
+                <input id="github-repo-search" type="search" placeholder="owner/repo">
+              </label>
+              <button id="github-repo-refresh" class="env-preview-button" type="button">Load Repositories</button>
+            </div>
+
+            <div id="github-repo-state" class="inline-state">Load repositories to start registration.</div>
+            <div id="github-repo-list" class="project-list" hidden></div>
+
+            <div id="github-register-preview" class="github-register-preview" hidden>
+              <div class="section-head compact">
+                <div>
+                  <p class="eyebrow">Registration preview</p>
+                  <h3>Selected repository</h3>
+                </div>
+                <span id="github-repo-visibility" class="status-chip">Repository</span>
+              </div>
+
+              <dl class="meta-grid">
+                <div>
+                  <dt>Repository</dt>
+                  <dd id="github-selected-full-name">Unknown</dd>
+                </div>
+                <div>
+                  <dt>Default branch</dt>
+                  <dd id="github-selected-default-branch">Unknown</dd>
+                </div>
+                <div>
+                  <dt>Clone URL</dt>
+                  <dd id="github-selected-clone-url">Unknown</dd>
+                </div>
+                <div>
+                  <dt>Project ID</dt>
+                  <dd id="github-selected-project-id">Unknown</dd>
+                </div>
+                <div>
+                  <dt>Base domain</dt>
+                  <dd id="github-selected-base-domain">Unknown</dd>
+                </div>
+                <div>
+                  <dt>Domain mode</dt>
+                  <dd>Registration-time config only</dd>
+                </div>
+              </dl>
+
+              <div class="env-preview-copy">
+                <p>Production uses the base domain directly. Staging and development routes are derived automatically.</p>
+                <p>Domain editing here configures registration only. It is not a casual runtime mutation surface.</p>
+              </div>
+
+              <div class="github-route-preview">
+                <article class="environment-card">
+                  <p class="environment-name">production</p>
+                  <p id="github-route-production" class="environment-route">Unknown</p>
+                </article>
+                <article class="environment-card">
+                  <p class="environment-name">staging</p>
+                  <p id="github-route-staging" class="environment-route">Unknown</p>
+                </article>
+                <article class="environment-card">
+                  <p class="environment-name">development</p>
+                  <p id="github-route-development" class="environment-route">Unknown</p>
+                </article>
+              </div>
+
+              <div class="env-preview-actions">
+                <button id="github-register-button" class="env-preview-button" type="button">Register Project</button>
+              </div>
+            </div>
+          </article>
+
           <article class="detail-panel panel-surface" aria-labelledby="project-detail-title">
             <div class="section-head">
               <div>

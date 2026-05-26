@@ -1328,6 +1328,64 @@ pub struct ProjectUpsertRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepositorySummary {
+    pub full_name: String,
+    pub html_url: String,
+    pub clone_url: String,
+    pub default_branch: String,
+    pub private: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepoListResponse {
+    #[serde(default)]
+    pub repositories: Vec<GitHubRepositorySummary>,
+    #[serde(default)]
+    pub private_repo_authorization_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterProjectFromGitHubPreviewRequest {
+    pub repo_url: String,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterProjectFromGitHubPreviewResponse {
+    pub project_id: String,
+    pub repo_url: String,
+    pub default_branch: String,
+    pub base_domain: String,
+    pub environment_routes: ProjectRegistrationRoutePreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRegistrationRoutePreview {
+    pub production: String,
+    pub staging: String,
+    pub development: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterProjectFromGitHubRequest {
+    pub project_id: String,
+    pub repo_url: String,
+    pub default_branch: String,
+    pub base_domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterProjectFromGitHubResponse {
+    pub registered: bool,
+    pub project_id: String,
+    pub repo_url: String,
+    pub default_branch: String,
+    pub base_domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRecord {
     pub project_id: String,
     pub repo_url: String,

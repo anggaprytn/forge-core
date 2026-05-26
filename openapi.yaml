@@ -123,6 +123,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MetricsSnapshot'
+  /api/github/repos:
+    get:
+      summary: List accessible GitHub repositories for the authenticated web session
+      operationId: listGithubRepositories
+      responses:
+        '200':
+          description: Accessible repositories for the current GitHub session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeGitHubRepoList'
+        '401':
+          description: Web session missing or GitHub authorization expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: GitHub integration unavailable or current session has no sealed GitHub token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/projects:
     post:
       summary: Create or update a project registry entry
@@ -164,6 +187,70 @@ paths:
                 $ref: '#/components/schemas/SuccessEnvelopeProjectList'
         '401':
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/register-from-github/preview:
+    post:
+      summary: Preview project registration fields derived from a GitHub repository
+      operationId: previewProjectRegistrationFromGithub
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterProjectFromGitHubPreviewRequest'
+      responses:
+        '200':
+          description: Derived project registration preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeRegisterProjectFromGitHubPreview'
+        '400':
+          description: Invalid repository URL or missing apps domain
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Missing web session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/register-from-github:
+    post:
+      summary: Register a project from a GitHub repository without deployment
+      operationId: registerProjectFromGithub
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterProjectFromGitHubRequest'
+      responses:
+        '200':
+          description: Project registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeRegisterProjectFromGitHub'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Missing web session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: Project ID or base domain collision
           content:
             application/json:
               schema:
@@ -954,6 +1041,118 @@ components:
             - string
             - 'null'
           description: Optional explicit base domain. When omitted, Forge generates and persists a stable domain using FORGE_APPS_DOMAIN, preferring `<project_id>.<FORGE_APPS_DOMAIN>` and falling back to a short suffix only on collision.
+    GitHubRepositorySummary:
+      type: object
+      required:
+        - full_name
+        - html_url
+        - clone_url
+        - default_branch
+        - private
+      properties:
+        full_name:
+          type: string
+        html_url:
+          type: string
+        clone_url:
+          type: string
+        default_branch:
+          type: string
+        private:
+          type: boolean
+    GitHubRepoListResponse:
+      type: object
+      required:
+        - repositories
+        - private_repo_authorization_required
+      properties:
+        repositories:
+          type: array
+          items:
+            $ref: '#/components/schemas/GitHubRepositorySummary'
+        private_repo_authorization_required:
+          type: boolean
+        message:
+          type:
+            - string
+            - 'null'
+    RegisterProjectFromGitHubPreviewRequest:
+      type: object
+      required:
+        - repo_url
+        - default_branch
+      properties:
+        repo_url:
+          type: string
+        default_branch:
+          type: string
+    ProjectRegistrationRoutePreview:
+      type: object
+      required:
+        - production
+        - staging
+        - development
+      properties:
+        production:
+          type: string
+        staging:
+          type: string
+        development:
+          type: string
+    RegisterProjectFromGitHubPreviewResponse:
+      type: object
+      required:
+        - project_id
+        - repo_url
+        - default_branch
+        - base_domain
+        - environment_routes
+      properties:
+        project_id:
+          type: string
+        repo_url:
+          type: string
+        default_branch:
+          type: string
+        base_domain:
+          type: string
+        environment_routes:
+          $ref: '#/components/schemas/ProjectRegistrationRoutePreview'
+    RegisterProjectFromGitHubRequest:
+      type: object
+      required:
+        - project_id
+        - repo_url
+        - default_branch
+        - base_domain
+      properties:
+        project_id:
+          type: string
+        repo_url:
+          type: string
+        default_branch:
+          type: string
+        base_domain:
+          type: string
+    RegisterProjectFromGitHubResponse:
+      type: object
+      required:
+        - registered
+        - project_id
+        - repo_url
+        - default_branch
+        - base_domain
+      properties:
+        registered:
+          type: boolean
+        project_id:
+          type: string
+        repo_url:
+          type: string
+        default_branch:
+          type: string
+        base_domain:
+          type: string
     Project:
       type: object
       required:
@@ -2013,6 +2212,27 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/ProjectList'}
+    SuccessEnvelopeGitHubRepoList:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/GitHubRepoListResponse'}
+    SuccessEnvelopeRegisterProjectFromGitHubPreview:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/RegisterProjectFromGitHubPreviewResponse'}
+    SuccessEnvelopeRegisterProjectFromGitHub:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/RegisterProjectFromGitHubResponse'}
     SuccessEnvelopeEnvInventory:
       type: object
       required: [request_id, correlation_id, data]
