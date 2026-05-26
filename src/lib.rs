@@ -33,3 +33,4 @@ pub mod storage;
 pub mod topology;
 pub mod upgrade;
 pub mod users;
+pub mod web_deploy;

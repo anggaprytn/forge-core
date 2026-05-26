@@ -429,6 +429,76 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/deploy/preview:
+    post:
+      summary: Preview a web deployment from the registered repository and git ref
+      operationId: postProjectDeployPreview
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebDeployPreviewRequest'
+      responses:
+        '200':
+          description: Deployment preflight result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeWebDeployPreview'
+        '400':
+          description: Invalid preview request or source resolution failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/deploy:
+    post:
+      summary: Revalidate and enqueue a deployment from the registered repository and git ref
+      operationId: postProjectDeploy
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebDeployRequest'
+      responses:
+        '202':
+          description: Deployment queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeWebDeploy'
+        '400':
+          description: Preview failed or deployment request invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/projects/{project_id}/env/audit:
     get:
       summary: Get masked environment audit history
@@ -1204,6 +1274,126 @@ components:
           type: string
         environment_routes:
           $ref: '#/components/schemas/ProjectRegistrationRoutePreview'
+    WebDeployPreviewRequest:
+      type: object
+      required: [environment, ref]
+      properties:
+        environment:
+          type: string
+          enum: [development, staging, production]
+        ref:
+          type: string
+    WebDeployPreviewResponse:
+      type: object
+      required:
+        - valid
+        - project_id
+        - environment
+        - repo_url
+        - ref
+        - manifest
+        - route
+        - env
+        - warnings
+        - errors
+      properties:
+        valid:
+          type: boolean
+        project_id:
+          type: string
+        environment:
+          type: string
+        repo_url:
+          type: string
+        ref:
+          type: string
+        commit_sha:
+          type: string
+          nullable: true
+        manifest:
+          $ref: '#/components/schemas/WebDeployManifestSummary'
+        route:
+          $ref: '#/components/schemas/WebDeployRouteSummary'
+        env:
+          $ref: '#/components/schemas/WebDeployEnvPreviewSummary'
+        warnings:
+          type: array
+          items:
+            type: string
+        errors:
+          type: array
+          items:
+            type: string
+    WebDeployManifestSummary:
+      type: object
+      required: [name, schema_version, services, exposed_services, healthchecks]
+      properties:
+        name:
+          type: string
+        schema_version:
+          type: integer
+        services:
+          type: array
+          items:
+            type: string
+        exposed_services:
+          type: array
+          items:
+            type: string
+        healthchecks:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebDeployHealthcheckSummary'
+    WebDeployHealthcheckSummary:
+      type: object
+      required: [service_id, path, expected_status]
+      properties:
+        service_id:
+          type: string
+        path:
+          type: string
+        expected_status:
+          type: integer
+    WebDeployRouteSummary:
+      type: object
+      required: [domain]
+      properties:
+        domain:
+          type: string
+    WebDeployEnvPreviewSummary:
+      type: object
+      required: [pending_desired_env, source, missing_required_secrets]
+      properties:
+        pending_desired_env:
+          type: boolean
+        source:
+          type: string
+        missing_required_secrets:
+          type: array
+          items:
+            type: string
+    WebDeployRequest:
+      type: object
+      required: [environment, ref]
+      properties:
+        environment:
+          type: string
+          enum: [development, staging, production]
+        ref:
+          type: string
+        preflight_token:
+          type: string
+          nullable: true
+    WebDeployResponse:
+      type: object
+      required: [deployment_id, queued, message]
+      properties:
+        deployment_id:
+          type: string
+        queued:
+          type: boolean
+        message:
+          type: string
     Project:
       type: object
       required:
@@ -2312,6 +2502,20 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/EnvAuditResponse'}
+    SuccessEnvelopeWebDeployPreview:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/WebDeployPreviewResponse'}
+    SuccessEnvelopeWebDeploy:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/WebDeployResponse'}
     SuccessEnvelopeDeploymentStatus:
       type: object
       required: [request_id, correlation_id, data]

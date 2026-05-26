@@ -22,6 +22,24 @@ const API_PATHS = {
   projectEnvAudit(projectId) {
     return `/api/projects/${encodeURIComponent(projectId)}/env/audit`;
   },
+  projectDeployPreview(projectId) {
+    return `/api/projects/${encodeURIComponent(projectId)}/deploy/preview`;
+  },
+  projectDeploy(projectId) {
+    return `/api/projects/${encodeURIComponent(projectId)}/deploy`;
+  },
+  deploymentStatus(deploymentId) {
+    return `/deployments/${encodeURIComponent(deploymentId)}`;
+  },
+  deploymentLogs(deploymentId) {
+    return `/api/deployments/${encodeURIComponent(deploymentId)}/logs`;
+  },
+  environmentStatus(projectId, environment) {
+    return `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environment)}`;
+  },
+  environmentDiagnostics(projectId, environment) {
+    return `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environment)}/diagnostics`;
+  },
 };
 
 const uiState = {
@@ -51,6 +69,12 @@ const dataState = {
   lastEnvApplyIdempotencyKey: "",
   envApplyInFlight: false,
   envPreviewPhase: "no_preview",
+  deployPreview: null,
+  deployPreviewSignature: "",
+  deployPreviewValid: false,
+  deployInFlight: false,
+  deployTrackingTimer: null,
+  deployTracking: null,
 };
 
 function element(id) {
@@ -215,6 +239,47 @@ function setPreviewPhase(phase) {
   };
   const [label, tone] = labels[phase] || [text(phase), ""];
   setChip("env-preview-phase-chip", label, tone);
+}
+
+function selectedDeployEnvironment() {
+  const field = element("deploy-environment-select");
+  return field ? (field.value || "staging") : "staging";
+}
+
+function deployRefValue() {
+  const field = element("deploy-ref-input");
+  return field ? (field.value || "").trim() : "";
+}
+
+function deployPreviewSignature(projectId, environment, gitRef) {
+  return `${projectId}::${environment}::${gitRef}`;
+}
+
+function clearDeployTrackingTimer() {
+  if (dataState.deployTrackingTimer) {
+    window.clearTimeout(dataState.deployTrackingTimer);
+    dataState.deployTrackingTimer = null;
+  }
+}
+
+function resetDeployCenterState(message, tone = "stale") {
+  dataState.deployPreview = null;
+  dataState.deployPreviewValid = false;
+  dataState.deployPreviewSignature = "";
+  if (!dataState.deployInFlight) {
+    clearDeployTrackingTimer();
+    dataState.deployTracking = null;
+  }
+  setChip("deploy-center-chip", tone === "warn" ? "Needs review" : tone === "ok" ? "Ready" : "Idle", tone);
+  showState("deploy-center-state", message, tone === "ok" ? "" : tone);
+  hide("deploy-preview-result");
+  if (!dataState.deployTracking) {
+    hide("deploy-tracking");
+  }
+  const confirmButton = element("deploy-confirm-button");
+  if (confirmButton) {
+    confirmButton.disabled = true;
+  }
 }
 
 function hide(id) {
@@ -1174,6 +1239,340 @@ async function renderSelectedProject() {
     showState("env-preview-state", "Preview unavailable until project inventory loads.", "warn");
     showState("env-audit-state", error.message || "Audit history unavailable.", "warn");
   }
+
+  syncDeployCenterForSelectedProject();
+}
+
+function syncDeployCenterForSelectedProject() {
+  const project = selectedProject();
+  const projectField = element("deploy-project-id");
+  if (projectField) {
+    projectField.value = project ? project.project_id : "";
+  }
+  if (!project) {
+    resetDeployCenterState("Select a project, choose an environment, enter a Git ref, then run preflight.");
+    return;
+  }
+  if (dataState.deployPreviewSignature) {
+    const expected = deployPreviewSignature(project.project_id, selectedDeployEnvironment(), deployRefValue());
+    if (expected !== dataState.deployPreviewSignature) {
+      resetDeployCenterState("Project, environment, or ref changed. Run preflight again.", "warn");
+    }
+  } else {
+    resetDeployCenterState("Choose an environment and Git ref, then run preflight.");
+  }
+}
+
+function renderDeployPreview(preview) {
+  const container = element("deploy-preview-result");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+
+  const lines = [
+    `Project: ${text(preview.project_id)}`,
+    `Environment: ${text(preview.environment)}`,
+    `Repository: ${text(preview.repo_url)}`,
+    `Ref: ${text(preview.git_ref)}`,
+    `Commit: ${text(preview.commit_sha, "unresolved")}`,
+    `Route: ${text(preview.route && preview.route.domain)}`,
+    `Services: ${(preview.manifest && preview.manifest.services || []).join(", ") || "none"}`,
+    `Exposed services: ${(preview.manifest && preview.manifest.exposed_services || []).join(", ") || "none"}`,
+    `Healthchecks: ${(preview.manifest && preview.manifest.healthchecks || []).map((entry) => `${entry.service_id}:${entry.path}`).join(", ") || "none"}`,
+    `Pending desired env: ${preview.env && preview.env.pending_desired_env ? "yes" : "no"}`,
+  ];
+
+  lines.forEach((line) => {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = line;
+    container.appendChild(item);
+  });
+
+  if (preview.env && Array.isArray(preview.env.missing_required_secrets) && preview.env.missing_required_secrets.length) {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = `Missing required secrets: ${preview.env.missing_required_secrets.join(", ")}`;
+    container.appendChild(item);
+  }
+
+  (preview.warnings || []).forEach((message) => {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = `Warning: ${message}`;
+    container.appendChild(item);
+  });
+  (preview.errors || []).forEach((message) => {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = `Error: ${message}`;
+    container.appendChild(item);
+  });
+
+  show("deploy-preview-result");
+}
+
+function deploymentStage(status, environmentStatus, diagnostics) {
+  const raw = lower(status && status.state);
+  if (raw === "queued") {
+    return "queued";
+  }
+  if (raw === "building") {
+    return "building";
+  }
+  if (raw === "starting" || raw === "active") {
+    return "preparing";
+  }
+  const lifecycle = lower(environmentStatus && environmentStatus.lifecycle_state);
+  if (lifecycle === "warming" || raw === "warming") {
+    return "warming";
+  }
+  if (lifecycle === "validating" || raw === "validating") {
+    return "validating";
+  }
+  if (lower(environmentStatus && environmentStatus.status) === "failed" || raw === "failed" || lower(diagnostics && diagnostics.status) === "failed") {
+    return "failed";
+  }
+  if (lifecycle === "promoted" && !(environmentStatus && environmentStatus.route_active)) {
+    return "route activating";
+  }
+  if (lifecycle === "promoted" || raw === "healthy") {
+    return "promoted";
+  }
+  return raw || lifecycle || "preparing";
+}
+
+function deployIsLive(environmentStatus, diagnostics) {
+  const lifecycle = lower(environmentStatus && environmentStatus.lifecycle_state);
+  const routeActive = Boolean(environmentStatus && environmentStatus.route_active);
+  const healthy = lower(environmentStatus && environmentStatus.status) === "healthy";
+  const fallbackKnown = Boolean(
+    diagnostics
+    && diagnostics.route
+    && diagnostics.route.route_active === false
+    && lower(diagnostics.route.mismatch_reason).includes("application route is not active"),
+  );
+  return lifecycle === "promoted" && routeActive && healthy && !fallbackKnown;
+}
+
+function deployNextAction(stage, live) {
+  if (live) {
+    return "Live";
+  }
+  if (stage === "queued") {
+    return "Waiting for the existing deployment queue.";
+  }
+  if (stage === "preparing" || stage === "building") {
+    return "Forge is preparing the candidate generation.";
+  }
+  if (stage === "warming") {
+    return "Not live yet. Warmup and validation must finish before promotion.";
+  }
+  if (stage === "validating") {
+    return "Not live yet. Validation and route activation are still in progress.";
+  }
+  if (stage === "route activating") {
+    return "Not live yet. Promotion exists, but the route is not active yet.";
+  }
+  if (stage === "failed") {
+    return "Inspect failure reason, diagnostics, and logs before retrying.";
+  }
+  return "Not live yet.";
+}
+
+function renderDeployTracking(tracking) {
+  const container = element("deploy-tracking");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+  if (!tracking) {
+    hide("deploy-tracking");
+    return;
+  }
+
+  const live = deployIsLive(tracking.environmentStatus, tracking.diagnostics);
+  const stage = deploymentStage(tracking.deploymentStatus, tracking.environmentStatus, tracking.diagnostics);
+  const lines = [
+    `Deployment: ${text(tracking.deploymentId)}`,
+    `Stage: ${stage}`,
+    `Live status: ${live ? "Live" : "Not live yet"}`,
+    `Next action: ${deployNextAction(stage, live)}`,
+    `Route active: ${tracking.environmentStatus && tracking.environmentStatus.route_active ? "true" : "false"}`,
+    `Lifecycle: ${text(tracking.environmentStatus && tracking.environmentStatus.lifecycle_state, "unknown")}`,
+  ];
+
+  const failure = tracking.diagnostics
+    && Array.isArray(tracking.diagnostics.recent_failures)
+    && tracking.diagnostics.recent_failures.find((entry) => entry.deployment_id === tracking.deploymentId)
+      || (tracking.diagnostics && tracking.diagnostics.recent_failures && tracking.diagnostics.recent_failures[0]);
+  if (failure) {
+    lines.push(`Failure stage: ${text(failure.failure_stage)}`);
+    lines.push(`Failure reason: ${text(failure.failure_reason)}`);
+  }
+  if (tracking.diagnostics && tracking.diagnostics.route && tracking.diagnostics.route.mismatch_reason) {
+    lines.push(`Route detail: ${tracking.diagnostics.route.mismatch_reason}`);
+  }
+  (tracking.logs && tracking.logs.validation_failure_summary ? [`Validation summary: ${tracking.logs.validation_failure_summary}`] : []).forEach((line) => lines.push(line));
+
+  lines.forEach((line) => {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = line;
+    container.appendChild(item);
+  });
+
+  if (stage === "failed") {
+    [
+      `forge logs ${tracking.deploymentId}`,
+      `forge diagnose ${tracking.projectId} ${tracking.environment}`,
+      `forge agent verify-deploy ${tracking.deploymentId}`,
+    ].forEach((command) => {
+      const item = document.createElement("p");
+      item.className = "env-preview-summary";
+      item.textContent = command;
+      container.appendChild(item);
+    });
+  }
+
+  show("deploy-tracking");
+  setChip("deploy-center-chip", live ? "Live" : stage === "failed" ? "Failed" : "Tracking", live ? "ok" : stage === "failed" ? "warn" : "");
+  showState("deploy-center-state", live ? "Deployment promoted and serving the expected route." : deployNextAction(stage, live), live ? "ok" : stage === "failed" ? "warn" : "");
+}
+
+async function pollDeploymentTracking(projectId, environment, deploymentId) {
+  clearDeployTrackingTimer();
+  try {
+    const [deploymentStatus, environmentStatus, diagnostics, logs] = await Promise.all([
+      fetchApiData(API_PATHS.deploymentStatus(deploymentId)),
+      fetchApiData(API_PATHS.environmentStatus(projectId, environment)),
+      fetchApiData(API_PATHS.environmentDiagnostics(projectId, environment)),
+      fetchApiData(API_PATHS.deploymentLogs(deploymentId)),
+    ]);
+    dataState.deployTracking = {
+      deploymentId,
+      projectId,
+      environment,
+      deploymentStatus,
+      environmentStatus,
+      diagnostics,
+      logs,
+    };
+    renderDeployTracking(dataState.deployTracking);
+    const stage = deploymentStage(deploymentStatus, environmentStatus, diagnostics);
+    const live = deployIsLive(environmentStatus, diagnostics);
+    if (!live && stage !== "failed") {
+      dataState.deployTrackingTimer = window.setTimeout(() => {
+        void pollDeploymentTracking(projectId, environment, deploymentId);
+      }, 3000);
+    } else {
+      dataState.deployInFlight = false;
+    }
+  } catch (error) {
+    setChip("deploy-center-chip", "Tracking warn", "warn");
+    showState("deploy-center-state", error.message || "Deployment tracking is unavailable right now.", "warn");
+  }
+}
+
+async function runDeployPreflight() {
+  const project = selectedProject();
+  if (!project) {
+    resetDeployCenterState("Select a project first.", "warn");
+    return;
+  }
+  const environment = selectedDeployEnvironment();
+  const gitRef = deployRefValue();
+  if (!gitRef) {
+    resetDeployCenterState("Enter a Git ref before preflight.", "warn");
+    return;
+  }
+
+  const button = element("deploy-preview-button");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Preflighting...";
+  }
+  showState("deploy-center-state", "Running deploy preflight...", "");
+
+  try {
+    const preview = await fetchApiData(API_PATHS.projectDeployPreview(project.project_id), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ environment, ref: gitRef }),
+    });
+    dataState.deployPreview = preview;
+    dataState.deployPreviewValid = Boolean(preview && preview.valid);
+    dataState.deployPreviewSignature = deployPreviewSignature(project.project_id, environment, gitRef);
+    renderDeployPreview(preview);
+    const confirmButton = element("deploy-confirm-button");
+    if (confirmButton) {
+      confirmButton.disabled = !dataState.deployPreviewValid;
+    }
+    setChip("deploy-center-chip", dataState.deployPreviewValid ? "Ready" : "Blocked", dataState.deployPreviewValid ? "ok" : "warn");
+    showState(
+      "deploy-center-state",
+      dataState.deployPreviewValid ? "Preflight valid. Review the plan, then confirm deploy." : "Preflight failed. Fix validation errors before deploy.",
+      dataState.deployPreviewValid ? "ok" : "warn",
+    );
+  } catch (error) {
+    resetDeployCenterState(error.message || "Deploy preflight failed.", "warn");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Run Preflight";
+    }
+  }
+}
+
+async function confirmDeploy() {
+  const project = selectedProject();
+  if (!project) {
+    resetDeployCenterState("Select a project first.", "warn");
+    return;
+  }
+  const environment = selectedDeployEnvironment();
+  const gitRef = deployRefValue();
+  const signature = deployPreviewSignature(project.project_id, environment, gitRef);
+  if (!dataState.deployPreviewValid || dataState.deployPreviewSignature !== signature) {
+    resetDeployCenterState("No deploy button enabled before valid preflight. Run preflight again.", "warn");
+    return;
+  }
+
+  const button = element("deploy-confirm-button");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Queueing...";
+  }
+  dataState.deployInFlight = true;
+  showState("deploy-center-state", "Queueing deployment through the existing deployment FSM...", "");
+
+  try {
+    const response = await fetchApiData(API_PATHS.projectDeploy(project.project_id), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ environment, ref: gitRef }),
+    });
+    dataState.deployTracking = {
+      deploymentId: response.deployment_id,
+      projectId: project.project_id,
+      environment,
+      deploymentStatus: { state: "queued" },
+      environmentStatus: null,
+      diagnostics: null,
+      logs: null,
+    };
+    renderDeployTracking(dataState.deployTracking);
+    await pollDeploymentTracking(project.project_id, environment, response.deployment_id);
+  } catch (error) {
+    dataState.deployInFlight = false;
+    resetDeployCenterState(error.message || "Deploy confirmation failed.", "warn");
+  } finally {
+    if (button) {
+      button.textContent = "Confirm Deploy";
+      button.disabled = !dataState.deployPreviewValid;
+    }
+  }
 }
 
 function previewTextArea(environment) {
@@ -1906,6 +2305,34 @@ function bindControls() {
     });
   }
 
+  const deployPreviewButton = element("deploy-preview-button");
+  if (deployPreviewButton) {
+    deployPreviewButton.addEventListener("click", () => {
+      void runDeployPreflight();
+    });
+  }
+
+  const deployConfirmButton = element("deploy-confirm-button");
+  if (deployConfirmButton) {
+    deployConfirmButton.addEventListener("click", () => {
+      void confirmDeploy();
+    });
+  }
+
+  const deployEnvironment = element("deploy-environment-select");
+  if (deployEnvironment) {
+    deployEnvironment.addEventListener("change", () => {
+      syncDeployCenterForSelectedProject();
+    });
+  }
+
+  const deployRef = element("deploy-ref-input");
+  if (deployRef) {
+    deployRef.addEventListener("input", () => {
+      syncDeployCenterForSelectedProject();
+    });
+  }
+
   ["development", "staging", "production"].forEach((environment) => {
     const field = previewTextArea(environment);
     if (!field) {
@@ -1930,4 +2357,5 @@ function bindControls() {
 bindControls();
 setPreviewPhase("no_preview");
 updateGitHubRegisterButton(null);
+resetDeployCenterState("Select a project, choose an environment, enter a Git ref, then run preflight.");
 void loadConsole();

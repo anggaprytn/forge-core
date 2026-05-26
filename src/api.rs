@@ -1409,6 +1409,80 @@ pub struct RegisterProjectFromGitHubResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployPreviewRequest {
+    pub environment: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployPreviewResponse {
+    pub valid: bool,
+    pub project_id: String,
+    pub environment: String,
+    pub repo_url: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    pub manifest: WebDeployManifestSummary,
+    pub route: WebDeployRouteSummary,
+    pub env: WebDeployEnvPreviewSummary,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployManifestSummary {
+    pub name: String,
+    pub schema_version: u64,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub exposed_services: Vec<String>,
+    #[serde(default)]
+    pub healthchecks: Vec<WebDeployHealthcheckSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployHealthcheckSummary {
+    pub service_id: String,
+    pub path: String,
+    pub expected_status: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployRouteSummary {
+    pub domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployEnvPreviewSummary {
+    pub pending_desired_env: bool,
+    pub source: String,
+    #[serde(default)]
+    pub missing_required_secrets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployRequest {
+    pub environment: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployResponse {
+    pub deployment_id: String,
+    pub queued: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRecord {
     pub project_id: String,
     pub repo_url: String,

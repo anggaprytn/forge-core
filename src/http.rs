@@ -29,7 +29,8 @@ use crate::api::{
     ProjectUpsertRequest, ReadinessExplainResponse, ReadinessTimelineResponse, ReadyzResponse,
     RegisterProjectFromGitHubPreviewRequest, RegisterProjectFromGitHubRequest, SecretListResponse,
     SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata,
-    TokenRevokeResponse,
+    TokenRevokeResponse, WebDeployPreviewRequest, WebDeployPreviewResponse, WebDeployRequest,
+    WebDeployResponse,
 };
 use crate::auth::{
     AuthSource, AuthenticatedPrincipal, CliTokenVerifier, TokenIssueRequest, TokenStoreError,
@@ -51,6 +52,7 @@ use crate::status::{
 };
 use crate::storage::atomic_write;
 use crate::users::{RegistrationDecision, UserRecord, UserStore, UserStoreError};
+use crate::web_deploy::{build_web_deploy_preview, validate_web_deploy_preview_request};
 
 const AUTHORIZATION: &str = "authorization";
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
@@ -1206,6 +1208,14 @@ pub fn router(state: HttpState) -> Router {
             get(get_project_env_audit),
         )
         .route(
+            "/api/projects/{project_id}/deploy/preview",
+            post(post_project_deploy_preview),
+        )
+        .route(
+            "/api/projects/{project_id}/deploy",
+            post(post_project_deploy),
+        )
+        .route(
             "/api/projects/{project_id}/env/{environment}",
             get(get_project_env_inventory_environment),
         )
@@ -2050,7 +2060,7 @@ async fn post_deployments(
     Json(request): Json<DeploymentRequest>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2310,7 +2320,7 @@ async fn post_secrets(
     Json(request): Json<SecretWriteRequest>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2545,7 +2555,7 @@ async fn post_projects(
     Json(request): Json<ProjectUpsertRequest>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2780,6 +2790,131 @@ async fn post_project_env_apply(
     }
 }
 
+async fn post_project_deploy_preview(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(project_id): AxumPath<String>,
+    Json(request): Json<WebDeployPreviewRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+    if let Err(err) = validate_web_deploy_preview_request(&request) {
+        return error_response(StatusCode::BAD_REQUEST, &request_id, err);
+    }
+
+    match build_web_deploy_preview(
+        state.project_registry.storage_root(),
+        &state.secret_store,
+        &project_id,
+        &request,
+    ) {
+        Ok(preview) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope::<WebDeployPreviewResponse> {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: preview,
+            }),
+        ),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, &request_id, err),
+    }
+}
+
+async fn post_project_deploy(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(project_id): AxumPath<String>,
+    Json(request): Json<WebDeployRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let preview_request = WebDeployPreviewRequest {
+        environment: request.environment.clone(),
+        git_ref: request.git_ref.clone(),
+    };
+    let preview = match build_web_deploy_preview(
+        state.project_registry.storage_root(),
+        &state.secret_store,
+        &project_id,
+        &preview_request,
+    ) {
+        Ok(preview) => preview,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, &request_id, err),
+    };
+    if !preview.valid {
+        let message = preview
+            .errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "deploy preview failed".into());
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &request_id,
+            ErrorResponse {
+                code: "deploy_preview_failed".into(),
+                message,
+            },
+        );
+    }
+
+    let deploy_request = DeploymentRequest {
+        project_id: project_id.clone(),
+        environment: request.environment,
+        intent: "deploy".into(),
+        source_path: None,
+        source_ref: Some(request.git_ref),
+    };
+
+    let accepted = {
+        let mut daemon = match state.daemon.lock() {
+            Ok(daemon) => daemon,
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &request_id,
+                    ErrorResponse {
+                        code: "daemon_lock_error".into(),
+                        message: "daemon lock poisoned".into(),
+                    },
+                );
+            }
+        };
+        match daemon.handle_post_deployments(deploy_request) {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                let status = if err.code == "daemon_not_ready" {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return error_response(status, &request_id, err);
+            }
+        }
+    };
+
+    json_response(
+        StatusCode::ACCEPTED,
+        &request_id,
+        Json(SuccessEnvelope::<WebDeployResponse> {
+            request_id: request_id.clone(),
+            correlation_id: request_id.clone(),
+            data: WebDeployResponse {
+                deployment_id: accepted.deployment_id,
+                queued: true,
+                message:
+                    "Deployment queued. Promotion will happen only after validation and route activation pass."
+                        .into(),
+            },
+        }),
+    )
+}
+
 async fn get_project_env_audit(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -2845,7 +2980,7 @@ async fn get_project_environment_status(
     AxumPath((project_id, environment)): AxumPath<(String, String)>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2890,7 +3025,7 @@ async fn get_deployment(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -2971,7 +3106,7 @@ async fn get_logs(
     Query(params): Query<DeploymentLogsQuery>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -3022,7 +3157,7 @@ async fn get_project_environment_diagnostics(
     AxumPath((project_id, environment)): AxumPath<(String, String)>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -3060,7 +3195,7 @@ async fn get_project_environment_history(
     AxumPath((project_id, environment)): AxumPath<(String, String)>,
 ) -> Response {
     let request_id = next_request_id();
-    if let Err(response) = ensure_authorized(&state, &headers, &request_id) {
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
         return response;
     }
 
@@ -4478,6 +4613,43 @@ fn seed_test_project(root: &Path) {
             None,
         )
         .unwrap();
+}
+
+#[cfg(test)]
+fn seed_deployable_project(root: &Path, forge_yml: &str) -> String {
+    use crate::api::ProjectUpsertRequest;
+
+    let repo = root.join("deployable-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_test(
+        root,
+        &["init", "--initial-branch=main", repo.to_str().unwrap()],
+    );
+    std::fs::write(repo.join("Dockerfile"), "FROM busybox\n").unwrap();
+    std::fs::write(repo.join("forge.yml"), forge_yml).unwrap();
+    git_test(&repo, &["add", "Dockerfile", "forge.yml"]);
+    git_test(&repo, &["commit", "-m", "initial deployable manifest"]);
+    let output = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let commit_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    ProjectRegistryStore::new(root)
+        .upsert(
+            ProjectUpsertRequest {
+                project_id: Some("api".into()),
+                repo_url: repo.to_str().unwrap().into(),
+                default_branch: "main".into(),
+                base_domain: Some("api.example.com".into()),
+            },
+            None,
+        )
+        .unwrap();
+
+    commit_sha
 }
 
 #[cfg(test)]
@@ -6000,8 +6172,10 @@ pub mod app_page_preserves_auth_gate {
         assert!(body.contains("What matters now."));
         assert!(body.contains("Add Project from GitHub"));
         assert!(body.contains("Register Project"));
-        assert!(!body.contains(">Deploy<"));
-        assert!(!body.contains("Deploy</button>"));
+        assert!(body.contains("Deploy Center"));
+        assert!(body.contains("Run Preflight"));
+        assert!(body.contains("Confirm Deploy"));
+        assert!(body.contains("Local path deploys remain CLI-only"));
         assert!(!body.contains("test-session-secret"));
         assert!(!body.contains("FORGE_SESSION_SECRET"));
         assert!(!body.contains("FORGE_GITHUB_OAUTH_CLIENT_SECRET"));
@@ -6047,11 +6221,17 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("/env/preview"));
         assert!(body.contains("/env/apply"));
         assert!(body.contains("/env/audit"));
+        assert!(body.contains("/deploy/preview"));
+        assert!(body.contains("/deploy"));
+        assert!(body.contains("/api/deployments/"));
         assert!(body.contains("projectEnvInventory(projectId)"));
         assert!(body.contains("projectEnvironments(projectId)"));
         assert!(body.contains("projectEnvPreview(projectId)"));
         assert!(body.contains("projectEnvApply(projectId)"));
         assert!(body.contains("projectEnvAudit(projectId)"));
+        assert!(body.contains("projectDeployPreview(projectId)"));
+        assert!(body.contains("projectDeploy(projectId)"));
+        assert!(body.contains("deploymentStatus(deploymentId)"));
         assert!(body.contains("credentials: \"same-origin\""));
         assert!(!body.contains("/secrets"));
         assert!(!body.contains("/env/diff"));
@@ -6096,6 +6276,10 @@ pub mod app_js_ships_safe_error_states {
         assert!(body.contains("Project no longer exists or has no registered environments."));
         assert!(body.contains("Preview only. No changes have been saved."));
         assert!(body.contains("Preview unavailable until project inventory loads."));
+        assert!(body.contains(
+            "Select a project, choose an environment, enter a Git ref, then run preflight."
+        ));
+        assert!(body.contains("No deploy button enabled before valid preflight."));
     }
 }
 
@@ -6158,6 +6342,9 @@ pub mod app_assets_ship_calm_readiness_copy {
         let app_html = to_bytes(app_html.into_body(), usize::MAX).await.unwrap();
         let app_html = String::from_utf8(app_html.to_vec()).unwrap();
         assert!(app_html.contains("Register a project only. No deployment starts automatically."));
+        assert!(
+            app_html.contains("Web deploys use the registered Git repository and selected ref.")
+        );
     }
 }
 
@@ -6216,6 +6403,10 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
                     "env-preview-development",
                     "env-preview-staging",
                     "env-preview-production",
+                    "Deploy Center",
+                    "Run Preflight",
+                    "Confirm Deploy",
+                    "Local path deploys remain CLI-only",
                 ]
             } else {
                 vec![
@@ -6236,12 +6427,18 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
                     "idempotency_key",
                     "expected_base_revisions",
                     "preview_hashes",
+                    "projectDeployPreview(projectId)",
+                    "projectDeploy(projectId)",
+                    "runDeployPreflight()",
+                    "confirmDeploy()",
+                    "Not live yet",
+                    "forge agent verify-deploy",
                 ]
             };
             for required in required {
                 assert!(body.contains(required));
             }
-            for forbidden in ["Reveal secret", "rollback-button", "deploy-button"] {
+            for forbidden in ["Reveal secret", "rollback-button"] {
                 assert!(!body.contains(forbidden));
             }
         }
@@ -8211,6 +8408,284 @@ pub mod project_inventory_api_accepts_web_session_authentication {
             .await
             .unwrap();
         assert_eq!(audit.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+pub mod web_deploy_api {
+    use super::*;
+    use crate::storage::{EnvironmentPaths, PointerStore};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use tower::util::ServiceExt;
+
+    fn session_cookie_value(state: &HttpState) -> String {
+        let session_secret = state.web_auth.config.clone().unwrap().session_secret;
+        encode_signed_value(
+            &SessionCookie {
+                github_login: "octocat".into(),
+                github_id: 7,
+            },
+            &session_secret,
+        )
+        .unwrap()
+    }
+
+    fn valid_forge_yml() -> &'static str {
+        concat!(
+            "version: 1\n",
+            "name: api\n",
+            "type: web\n",
+            "build:\n",
+            "  dockerfile: Dockerfile\n",
+            "  context: .\n",
+            "runtime:\n",
+            "  port: 3000\n",
+            "  healthcheck:\n",
+            "    path: /health\n",
+            "    expected_status: 200\n",
+            "invariants:\n",
+            "  - name: health\n",
+            "    path: /health\n",
+            "    expect_status: 200\n",
+        )
+    }
+
+    fn build_state_with_deployable_repo(forge_yml: &str) -> (HttpState, PathBuf, String) {
+        let (mut state, root) = build_state_with_root(true);
+        state.web_auth = WebAuthState::configured_for_tests(&root, "octocat", 7, false);
+        state.web_auth.seed_user("octocat", 7);
+        let commit_sha = seed_deployable_project(&root, forge_yml);
+        (state, root, commit_sha)
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_deploy_preview_is_rejected() {
+        let app = router(build_state(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/deploy/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"environment":"production","ref":"main"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_deploy_preview_works_and_resolves_commit() {
+        let (state, _root, commit_sha) = build_state_with_deployable_repo(valid_forge_yml());
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/deploy/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(r#"{"environment":"production","ref":"main"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["valid"], true);
+        assert_eq!(json["data"]["commit_sha"], commit_sha);
+        assert_eq!(
+            json["data"]["repo_url"]
+                .as_str()
+                .unwrap()
+                .contains("deployable-repo"),
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_preview_rejects_manifest_name_mismatch() {
+        let invalid = valid_forge_yml().replace("name: api", "name: wrong");
+        let (state, _root, _commit_sha) = build_state_with_deployable_repo(&invalid);
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/deploy/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(r#"{"environment":"production","ref":"main"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            rendered.contains("forge.yml name `wrong` does not match deployment project `api`")
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_preview_catches_unsupported_service_type_runtime_env_and_service_image() {
+        let forge_yml = concat!(
+            "version: 1\n",
+            "name: api\n",
+            "type: web\n",
+            "services:\n",
+            "  app:\n",
+            "    type: web\n",
+            "    runtime:\n",
+            "      port: 3000\n",
+            "      env:\n",
+            "        MODE: dev\n",
+            "      healthcheck:\n",
+            "        path: /health\n",
+            "        expected_status: 200\n",
+            "  redis:\n",
+            "    image: redis:7\n",
+            "    runtime:\n",
+            "      image: redis:7\n",
+        );
+        let (state, _root, _commit_sha) = build_state_with_deployable_repo(forge_yml);
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/deploy/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(r#"{"environment":"production","ref":"main"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(rendered.contains("services.app.type is not supported"));
+        assert!(rendered.contains("services.app.runtime.env is not supported"));
+        assert!(rendered.contains("services.redis.image is not supported"));
+        assert!(rendered.contains("services.redis.runtime.image"));
+    }
+
+    #[tokio::test]
+    async fn confirm_deploy_revalidates_server_side() {
+        let invalid = valid_forge_yml().replace("name: api", "name: mismatch");
+        let (state, _root, _commit_sha) = build_state_with_deployable_repo(&invalid);
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/deploy")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(r#"{"environment":"production","ref":"main"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(rendered.contains("deploy_preview_failed"));
+        assert!(rendered.contains("forge.yml name"));
+    }
+
+    #[tokio::test]
+    async fn confirm_deploy_enqueues_existing_fsm_and_does_not_promote_immediately() {
+        let (state, root, _commit_sha) = build_state_with_deployable_repo(valid_forge_yml());
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/deploy")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(r#"{"environment":"production","ref":"main"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let deployment_id = json["data"]["deployment_id"].as_str().unwrap().to_string();
+        assert_eq!(json["data"]["queued"], true);
+        assert!(
+            json["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("route activation")
+        );
+
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!("/deployments/{deployment_id}"))
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body = to_bytes(status.into_body(), usize::MAX).await.unwrap();
+        let status_json: Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(status_json["data"]["state"], "queued");
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        assert_eq!(
+            PointerStore::new(env).read_pointer("current").unwrap(),
+            None
+        );
     }
 }
 

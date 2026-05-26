@@ -43,11 +43,11 @@
           <p class="eyebrow">Status overview</p>
           <h2>Simple view for posture, projects, and environments.</h2>
           <p class="app-hero-copy">
-            Focus on control-plane state, active blockers, project inventory, and registration without triggering deployment.
+            Focus on control-plane state, active blockers, project inventory, safe registration, and queued deploy workflow.
           </p>
         </div>
         <p class="app-hero-note">
-          Registration only. Deploy, rollback, secrets, and runtime mutation stay in CLI or API.
+          Web deploys use the registered Git repository and selected ref. Local path deploys remain CLI-only.
         </p>
       </section>
 
@@ -266,6 +266,49 @@
               </div>
               <div id="environment-grid" class="environment-grid"></div>
             </div>
+          </article>
+
+          <article class="detail-panel panel-surface" aria-labelledby="deploy-center-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Deploy Center</p>
+                <h2 id="deploy-center-title">Preflight, review, confirm, track</h2>
+              </div>
+              <span id="deploy-center-chip" class="status-chip stale">Idle</span>
+            </div>
+
+            <div class="env-preview-copy">
+              <p>Web deploys use the registered Git repository and selected ref. Local path deploys remain CLI-only.</p>
+              <p>Preflight is required. Deploy uses the existing queue, deployment FSM, validation, route activation, and promotion flow.</p>
+            </div>
+
+            <div class="deploy-center-grid">
+              <label class="search-field" for="deploy-project-id" hidden>
+                <span>Project</span>
+                <input id="deploy-project-id" type="text" readonly>
+              </label>
+              <label class="search-field" for="deploy-environment-select">
+                <span>Environment</span>
+                <select id="deploy-environment-select">
+                  <option value="staging">staging</option>
+                  <option value="production">production</option>
+                  <option value="development">development</option>
+                </select>
+              </label>
+              <label class="search-field" for="deploy-ref-input">
+                <span>Git ref</span>
+                <input id="deploy-ref-input" type="text" placeholder="main, v1.2.3, a1b2c3d">
+              </label>
+            </div>
+
+            <div class="env-preview-actions">
+              <button id="deploy-preview-button" class="env-preview-button" type="button">Run Preflight</button>
+              <button id="deploy-confirm-button" class="env-preview-button" type="button" disabled>Confirm Deploy</button>
+            </div>
+
+            <div id="deploy-center-state" class="inline-state">Select a project, choose an environment, enter a Git ref, then run preflight.</div>
+            <div id="deploy-preview-result" class="env-preview-result" hidden></div>
+            <div id="deploy-tracking" class="env-preview-result" hidden></div>
           </article>
 
           <article class="detail-panel panel-surface" aria-labelledby="signals-title">
