@@ -68,19 +68,20 @@ pub fn detect_from_body(body: Option<&str>) -> Option<GatewayFallbackDetection> 
 }
 
 pub fn fallback_response_body(control_plane_url: Option<&str>) -> String {
-    let redirect_meta = control_plane_url.map(|url| {
+    let control_plane_url = control_plane_url.and_then(sanitize_control_plane_url);
+    let redirect_meta = control_plane_url.as_deref().map(|url| {
         format!(
             r#"<meta http-equiv="refresh" content="3;url={}">"#,
             escape_html(url)
         )
     });
-    let redirect_script = control_plane_url.map(|url| {
+    let redirect_script = control_plane_url.as_deref().map(|url| {
         format!(
             r#"<script>setTimeout(function(){{window.location.href={};}},3000);</script>"#,
             serde_json::to_string(url).expect("control-plane url should encode as json string")
         )
     });
-    let action_copy = control_plane_url.map_or_else(String::new, |_| {
+    let action_copy = control_plane_url.as_deref().map_or_else(String::new, |_| {
         "<p class=\"action\">Redirecting to Forge Control Plane in 3 seconds...</p>".into()
     });
     format!(
@@ -110,7 +111,7 @@ pub fn fallback_response_body(control_plane_url: Option<&str>) -> String {
 pub fn fallback_static_response_config(control_plane_url: Option<&str>) -> serde_json::Value {
     json!({
         "handler": "static_response",
-        "status_code": 200,
+        "status_code": 404,
         "headers": {
             FALLBACK_HEADER_NAME: ["true"],
             ROUTE_STATE_HEADER_NAME: [FALLBACK_ROUTE_STATE],
@@ -127,6 +128,15 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn sanitize_control_plane_url(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
 }
 
 #[cfg(test)]
@@ -146,6 +156,12 @@ mod tests {
     }
 
     #[test]
+    fn detects_fallback_headers() {
+        let detection = detect_from_headers_and_body(Some("true"), Some("fallback"), None).unwrap();
+        assert_eq!(detection.code, "gateway_fallback_response");
+    }
+
+    #[test]
     fn renders_redirect_only_when_url_present() {
         let with_redirect = fallback_response_body(Some("https://forge.example.com"));
         assert!(with_redirect.contains("Redirecting to Forge Control Plane in 3 seconds"));
@@ -154,5 +170,34 @@ mod tests {
         let without_redirect = fallback_response_body(None);
         assert!(!without_redirect.contains("http-equiv=\"refresh\""));
         assert!(!without_redirect.contains("Redirecting to Forge Control Plane in 3 seconds"));
+    }
+
+    #[test]
+    fn fallback_response_sanitizes_control_plane_url() {
+        let body = fallback_response_body(Some(
+            "https://operator:secret@forge.example.com/path?token=abc123#frag",
+        ));
+        assert!(body.contains("https://forge.example.com/path"));
+        assert!(!body.contains("operator"));
+        assert!(!body.contains("secret"));
+        assert!(!body.contains("abc123"));
+    }
+
+    #[test]
+    fn fallback_static_response_config_sets_headers_and_not_found_status() {
+        let config = fallback_static_response_config(Some("https://forge.example.com"));
+        assert_eq!(config["status_code"].as_u64(), Some(404));
+        assert_eq!(
+            config["headers"][FALLBACK_HEADER_NAME][0].as_str(),
+            Some("true")
+        );
+        assert_eq!(
+            config["headers"][ROUTE_STATE_HEADER_NAME][0].as_str(),
+            Some(FALLBACK_ROUTE_STATE)
+        );
+        let body = config["body"].as_str().unwrap();
+        assert!(body.contains(FALLBACK_TITLE));
+        assert!(body.contains(FALLBACK_META_MARKER));
+        assert!(!body.contains(LEGACY_FALLBACK_BODY));
     }
 }

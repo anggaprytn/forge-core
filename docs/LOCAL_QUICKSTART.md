@@ -19,9 +19,13 @@ Example minimal Caddy config for local use:
 }
 
 :80 {
-	respond "Forge route not assigned" 200
+	respond "Not Found" 404
 }
 ```
+
+Forge installs its own managed fallback route and marker headers under the `forge:ready`
+subtree. Keep bootstrap Caddy defaults fail-closed instead of copying a stale manual fallback
+page into the base Caddyfile.
 
 ## Important Current Limitation
 

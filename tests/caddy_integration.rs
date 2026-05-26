@@ -175,6 +175,48 @@ fn route_verification_sets_host_header() {
 }
 
 #[test]
+fn caddy_integration_generated_fallback_route_uses_managed_markers() {
+    let _guard = integration_lock();
+    let Some(mut harness) = CaddyHarness::start("generated-fallback-route") else {
+        return;
+    };
+    harness.start_sample_app("prod-api-gen-43b");
+    let mut routing = harness.routing();
+
+    routing
+        .update_route(RouteUpdateRequest {
+            subtree_id: "forge:api:production".into(),
+            target: "prod-api-gen-43b:3000".into(),
+            domain: Some("api.example.com".into()),
+            health_checks_enabled: false,
+            probe_path: Some("/health".into()),
+        })
+        .unwrap();
+
+    let response = reqwest::blocking::get(harness.public_url(""))
+        .expect("unmatched request should reach managed fallback");
+    assert_eq!(response.status().as_u16(), 404);
+    assert_eq!(
+        response
+            .headers()
+            .get(FALLBACK_HEADER_NAME)
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(ROUTE_STATE_HEADER_NAME)
+            .and_then(|value| value.to_str().ok()),
+        Some("fallback")
+    );
+    let body = response.text().unwrap();
+    assert!(body.contains(FALLBACK_TITLE));
+    assert!(body.contains("forge-route-state"));
+    assert!(!body.contains("forge caddy ready"));
+}
+
+#[test]
 fn caddy_integration_active_route_overrides_ready_placeholder() {
     let _guard = integration_lock();
     let Some(mut harness) = CaddyHarness::start("ready-placeholder-override") else {

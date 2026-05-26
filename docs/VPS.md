@@ -127,9 +127,12 @@ Example `/etc/caddy/Caddyfile`:
 }
 
 :80 {
-	respond "Forge route not assigned" 200
+	respond "Not Found" 404
 }
 ```
+
+Forge writes its own managed fallback route and machine-detectable markers through the Caddy admin
+API. Keep the bootstrap Caddyfile fail-closed instead of embedding a stale manual fallback body.
 
 Restart Caddy: `systemctl restart caddy`.
 

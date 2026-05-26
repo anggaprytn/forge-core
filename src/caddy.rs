@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::thread;
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use reqwest::header::HOST;
 
 use crate::gateway_fallback::{
     FALLBACK_HEADER_NAME, ROUTE_STATE_HEADER_NAME, detect_from_headers_and_body,
+    fallback_static_response_config,
 };
 use crate::runtime::{RouteInspection, RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError};
 
@@ -34,6 +36,26 @@ impl CaddyApiRuntime {
 
     fn ready_subtree_id() -> &'static str {
         "forge:ready"
+    }
+
+    fn control_plane_redirect_url() -> Option<String> {
+        env::var("FORGE_PUBLIC_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("FORGE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+    }
+
+    fn ready_route() -> serde_json::Value {
+        let control_plane_url = Self::control_plane_redirect_url();
+        serde_json::json!({
+            "@id": Self::ready_subtree_id(),
+            "terminal": true,
+            "handle": [fallback_static_response_config(control_plane_url.as_deref())]
+        })
     }
 
     pub fn new(admin_base_url: impl Into<String>, public_base_url: impl Into<String>) -> Self {
@@ -110,7 +132,7 @@ impl CaddyApiRuntime {
 
     fn write_routes(&self, routes: &[serde_json::Value]) -> Result<(), RoutingRuntimeError> {
         let mut config = self.read_full_config()?;
-        let route_value = serde_json::to_value(routes)
+        let route_value = serde_json::to_value(Self::ensure_ready_route(routes.to_vec()))
             .map_err(|err| RoutingRuntimeError::UpdateFailed(err.to_string()))?;
         config["apps"]["http"]["servers"]["forge"]["routes"] = route_value;
 
@@ -162,6 +184,14 @@ impl CaddyApiRuntime {
     fn order_updated_routes(mut routes: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         routes.sort_by_key(Self::route_order_bucket);
         routes
+    }
+
+    fn ensure_ready_route(mut routes: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        routes.retain(|route| {
+            route.get("@id").and_then(|id| id.as_str()) != Some(Self::ready_subtree_id())
+        });
+        routes.push(Self::ready_route());
+        Self::order_updated_routes(routes)
     }
 
     fn activation_probe_domain(&self, route: &serde_json::Value) -> Option<String> {
@@ -418,7 +448,6 @@ impl RoutingRuntime for CaddyApiRuntime {
             route.get("@id").and_then(|id| id.as_str()) != Some(request.subtree_id.as_str())
         });
         routes.push(Self::route_json(&request));
-        routes = Self::order_updated_routes(routes);
         self.write_routes(&routes)?;
         self.probe_paths.insert(
             request.subtree_id,
@@ -560,14 +589,9 @@ mod tests {
 
     #[test]
     fn caddy_routes_order_host_specific_before_fallback() {
-        let ordered = CaddyApiRuntime::order_updated_routes(vec![
+        let ordered = CaddyApiRuntime::ensure_ready_route(vec![
             proxy_route("forge:api:production", None),
             proxy_route("forge:staging:staging", Some("staging.example.com")),
-            serde_json::json!({
-                "@id": "forge:ready",
-                "terminal": true,
-                "handle": [{"handler": "static_response", "status_code": 200}]
-            }),
         ]);
 
         let ids: Vec<_> = ordered
@@ -633,5 +657,40 @@ mod tests {
                 .as_deref()
                 .is_some_and(|body| body.contains("Forge route not assigned"))
         );
+    }
+
+    #[test]
+    fn ensure_ready_route_injects_new_fallback_response() {
+        let routes = CaddyApiRuntime::ensure_ready_route(vec![
+            proxy_route("forge:api:production", Some("api.example.com")),
+            serde_json::json!({
+                "@id": "forge:ready",
+                "terminal": true,
+                "handle": [{
+                    "handler": "static_response",
+                    "status_code": 200,
+                    "body": "forge caddy ready"
+                }]
+            }),
+        ]);
+
+        let ready = routes
+            .iter()
+            .find(|route| route.get("@id").and_then(|id| id.as_str()) == Some("forge:ready"))
+            .unwrap();
+        let response = &ready["handle"][0];
+        assert_eq!(response["status_code"].as_u64(), Some(404));
+        assert_eq!(
+            response["headers"][FALLBACK_HEADER_NAME][0].as_str(),
+            Some("true")
+        );
+        assert_eq!(
+            response["headers"][ROUTE_STATE_HEADER_NAME][0].as_str(),
+            Some("fallback")
+        );
+        let body = response["body"].as_str().unwrap();
+        assert!(body.contains("Forge route not assigned"));
+        assert!(body.contains("forge-route-state"));
+        assert!(!body.contains("forge caddy ready"));
     }
 }
