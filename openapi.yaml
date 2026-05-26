@@ -260,6 +260,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/env/preview:
+    post:
+      summary: Preview masked environment changes without saving them
+      operationId: postProjectEnvPreview
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnvPreviewRequest'
+      responses:
+        '200':
+          description: Preview-only masked environment diff
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeEnvPreview'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/projects/{project_id}/environments/{environment}/status:
     get:
       summary: Get runtime status for one project environment
@@ -1262,6 +1297,112 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EnvInventoryEnvironmentSource'
+    EnvPreviewChanges:
+      type: object
+      required:
+        - development
+        - staging
+        - production
+      properties:
+        development:
+          type: string
+        staging:
+          type: string
+        production:
+          type: string
+    EnvPreviewRequest:
+      type: object
+      required:
+        - changes
+      properties:
+        changes:
+          $ref: '#/components/schemas/EnvPreviewChanges'
+    EnvPreviewError:
+      type: object
+      required:
+        - line
+        - reason
+      properties:
+        line:
+          type: integer
+        reason:
+          type: string
+    EnvPreviewDiffEntry:
+      type: object
+      required:
+        - key
+        - before_masked
+        - after_masked
+        - action
+      properties:
+        key:
+          type: string
+        before_masked:
+          type: string
+        after_masked:
+          type: string
+        action:
+          type: string
+          enum: [added, updated, deleted, unchanged]
+    EnvPreviewEnvironmentResponse:
+      type: object
+      required:
+        - environment
+        - valid
+        - added
+        - updated
+        - deleted
+        - unchanged
+        - errors
+      properties:
+        environment:
+          type: string
+        valid:
+          type: boolean
+        added:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        updated:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        deleted:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        unchanged:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewError'
+    EnvPreviewResponse:
+      type: object
+      required:
+        - project_id
+        - applies
+        - message
+        - partial_metadata
+        - environments
+      properties:
+        project_id:
+          type: string
+        applies:
+          type: boolean
+        message:
+          type: string
+        partial_metadata:
+          type: boolean
+        warning:
+          type: string
+          nullable: true
+        environments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewEnvironmentResponse'
     BackupVolumeRecord:
       type: object
       required:
@@ -1530,6 +1671,13 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/EnvInventoryResponse'}
+    SuccessEnvelopeEnvPreview:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/EnvPreviewResponse'}
     SuccessEnvelopeDeploymentStatus:
       type: object
       required: [request_id, correlation_id, data]

@@ -10,6 +10,9 @@ const API_PATHS = {
   projectEnvInventory(projectId) {
     return `/api/projects/${encodeURIComponent(projectId)}/env`;
   },
+  projectEnvPreview(projectId) {
+    return `/api/projects/${encodeURIComponent(projectId)}/env/preview`;
+  },
 };
 
 const uiState = {
@@ -77,22 +80,36 @@ function formatDuration(ms) {
   return `${hours}h ${remMinutes}m`;
 }
 
-function fetchJson(path) {
-  return fetch(path, {
+function fetchJson(path, options = {}) {
+  const init = {
     headers: { Accept: "application/json" },
     credentials: "same-origin",
-  }).then((response) => {
+    ...options,
+  };
+  init.headers = {
+    Accept: "application/json",
+    ...(options.headers || {}),
+  };
+  return fetch(path, init).then((response) => {
     if (!response.ok) {
       const error = new Error(`request failed: ${response.status}`);
       error.status = response.status;
+      response
+        .json()
+        .then((payload) => {
+          if (payload && payload.message) {
+            error.message = payload.message;
+          }
+        })
+        .catch(() => {});
       throw error;
     }
     return response.json();
   });
 }
 
-async function fetchApiData(path) {
-  const payload = await fetchJson(path);
+async function fetchApiData(path, options) {
+  const payload = await fetchJson(path, options);
   return payload && Object.prototype.hasOwnProperty.call(payload, "data") ? payload.data : payload;
 }
 
@@ -543,6 +560,7 @@ async function renderSelectedProject() {
     hide("env-inventory");
     hide("env-inventory-meta");
     setChip("env-total-chip", "0 vars", "stale");
+    resetEnvPreview("Select a project to preview masked environment changes.", true);
     return;
   }
 
@@ -558,6 +576,7 @@ async function renderSelectedProject() {
   hide("env-inventory");
   hide("env-inventory-meta");
   showState("env-inventory-state", "Loading masked environment inventory...");
+  resetEnvPreview("Preview only. No changes will be saved.", false);
 
   try {
     const [environments, inventory] = await Promise.all([
@@ -603,6 +622,193 @@ async function renderSelectedProject() {
     setChip("project-health-chip", "Unavailable", "stale");
     setChip("environment-count-chip", "0 env", "stale");
     setChip("env-total-chip", "0 vars", "stale");
+    showState("env-preview-state", "Preview unavailable until project inventory loads.", "warn");
+  }
+}
+
+function previewTextArea(environment) {
+  return element(`env-preview-${environment}`);
+}
+
+function previewInputValue(environment) {
+  const field = previewTextArea(environment);
+  return field ? field.value : "";
+}
+
+function resetEnvPreview(message, clearFields) {
+  hide("env-preview-result");
+  if (clearFields) {
+    ["development", "staging", "production"].forEach((environment) => {
+      const field = previewTextArea(environment);
+      if (field) {
+        field.value = "";
+      }
+    });
+  }
+  showState("env-preview-state", message);
+}
+
+function summaryMetric(label, count) {
+  const item = document.createElement("div");
+  const term = document.createElement("span");
+  term.textContent = label;
+  const value = document.createElement("strong");
+  value.textContent = String(count);
+  item.append(term, value);
+  return item;
+}
+
+function appendPreviewEntries(container, title, entries) {
+  if (!Array.isArray(entries) || !entries.length) {
+    return;
+  }
+  const section = document.createElement("section");
+  section.className = "env-preview-section";
+
+  const heading = document.createElement("p");
+  heading.className = "env-preview-section-title";
+  heading.textContent = title;
+  section.appendChild(heading);
+
+  const list = document.createElement("ul");
+  list.className = "env-preview-list";
+  entries.forEach((entry) => {
+    const item = document.createElement("li");
+    item.textContent = `${text(entry.key)} • ${text(entry.before_masked)} -> ${text(entry.after_masked)}`;
+    list.appendChild(item);
+  });
+  section.appendChild(list);
+  container.appendChild(section);
+}
+
+function appendPreviewErrors(container, errors) {
+  if (!Array.isArray(errors) || !errors.length) {
+    return;
+  }
+  const section = document.createElement("section");
+  section.className = "env-preview-section";
+
+  const heading = document.createElement("p");
+  heading.className = "env-preview-section-title";
+  heading.textContent = "Errors";
+  section.appendChild(heading);
+
+  const list = document.createElement("ul");
+  list.className = "env-preview-list errors";
+  errors.forEach((entry) => {
+    const item = document.createElement("li");
+    item.textContent = `Line ${entry.line}: ${text(entry.reason)}`;
+    list.appendChild(item);
+  });
+  section.appendChild(list);
+  container.appendChild(section);
+}
+
+function previewSummaryCard(environment) {
+  const card = document.createElement("article");
+  card.className = "env-preview-card";
+
+  const name = document.createElement("h3");
+  name.textContent = text(environment.environment);
+  card.appendChild(name);
+
+  const summary = document.createElement("div");
+  summary.className = "env-preview-summary";
+  summary.appendChild(summaryMetric("Added", environment.added.length));
+  summary.appendChild(summaryMetric("Updated", environment.updated.length));
+  summary.appendChild(summaryMetric("Deleted", environment.deleted.length));
+  summary.appendChild(summaryMetric("Errors", environment.errors.length));
+  card.appendChild(summary);
+
+  const validity = document.createElement("p");
+  validity.className = `env-preview-validity${environment.valid ? " ok" : " warn"}`;
+  validity.textContent = environment.valid ? "Valid preview." : "Preview invalid. Fix errors before retrying.";
+  card.appendChild(validity);
+
+  appendPreviewEntries(card, "Added keys", environment.added);
+  appendPreviewEntries(card, "Updated keys", environment.updated);
+  appendPreviewEntries(card, "Deleted keys", environment.deleted);
+  appendPreviewErrors(card, environment.errors);
+
+  if (Array.isArray(environment.unchanged) && environment.unchanged.length) {
+    const details = document.createElement("details");
+    details.className = "env-preview-details";
+    const summaryLabel = document.createElement("summary");
+    summaryLabel.textContent = `Unchanged (${environment.unchanged.length})`;
+    details.appendChild(summaryLabel);
+    appendPreviewEntries(details, "No effective masked change", environment.unchanged);
+    card.appendChild(details);
+  }
+
+  return card;
+}
+
+function renderEnvPreviewResult(preview) {
+  const result = element("env-preview-result");
+  if (!result) {
+    return;
+  }
+  clearChildren(result);
+
+  const note = document.createElement("div");
+  note.className = "env-preview-banner";
+
+  const message = document.createElement("p");
+  message.textContent = text(preview && preview.message, "Preview only. No changes have been saved.");
+  note.appendChild(message);
+
+  if (preview && preview.warning) {
+    const warning = document.createElement("p");
+    warning.textContent = preview.warning;
+    note.appendChild(warning);
+  }
+
+  result.appendChild(note);
+
+  const environments = preview && Array.isArray(preview.environments) ? preview.environments : [];
+  environments.forEach((environment) => {
+    result.appendChild(previewSummaryCard(environment));
+  });
+
+  hideState("env-preview-state");
+  show("env-preview-result");
+}
+
+async function submitEnvPreview() {
+  const project = selectedProject();
+  if (!project) {
+    resetEnvPreview("Select a project to preview masked environment changes.", false);
+    return;
+  }
+
+  const button = element("env-preview-button");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Previewing...";
+  }
+  hide("env-preview-result");
+  showState("env-preview-state", "Previewing masked environment changes...");
+
+  try {
+    const preview = await fetchApiData(API_PATHS.projectEnvPreview(project.project_id), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        changes: {
+          development: previewInputValue("development"),
+          staging: previewInputValue("staging"),
+          production: previewInputValue("production"),
+        },
+      }),
+    });
+    renderEnvPreviewResult(preview);
+  } catch (error) {
+    showState("env-preview-state", error.message || "Preview failed.", "warn");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Preview Changes";
+    }
   }
 }
 
@@ -780,6 +986,13 @@ function bindControls() {
     envSearch.addEventListener("input", (event) => {
       uiState.envQuery = event.target.value || "";
       renderEnvInventory(dataState.envInventoryByProject.get(uiState.selectedProjectId) || null);
+    });
+  }
+
+  const previewButton = element("env-preview-button");
+  if (previewButton) {
+    previewButton.addEventListener("click", () => {
+      void submitEnvPreview();
     });
   }
 }

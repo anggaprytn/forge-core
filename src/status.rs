@@ -9,8 +9,9 @@ use serde_json::Value;
 use crate::api::{
     ContainerRuntimeDiagnostics, ConvergenceDomainSummary, DeploymentHistoryEntry,
     DeploymentHistoryResponse, EnvInventoryCell, EnvInventoryEnvironmentSource,
-    EnvInventoryResponse, EnvInventoryVariable, EnvironmentDiagnostics, EnvironmentDiffEntry,
-    EnvironmentDiffResponse, EnvironmentDiffSummary, EnvironmentValueChange,
+    EnvInventoryResponse, EnvInventoryVariable, EnvPreviewDiffEntry, EnvPreviewEnvironmentResponse,
+    EnvPreviewError, EnvPreviewRequest, EnvPreviewResponse, EnvironmentDiagnostics,
+    EnvironmentDiffEntry, EnvironmentDiffResponse, EnvironmentDiffSummary, EnvironmentValueChange,
     EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse, NodeInfo,
     ProbeStabilityDiagnostics, ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction,
     RetentionRole, RouteDiagnostics, RuntimeEnvSnapshotMetadata, SecretMutationDiagnostic,
@@ -1398,7 +1399,13 @@ struct EnvironmentInventorySnapshot {
     source_label: String,
     generation: Option<u64>,
     deployment_id: Option<String>,
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, EnvironmentInventoryValue>,
+}
+
+#[derive(Debug, Clone)]
+struct EnvironmentInventoryValue {
+    masked: String,
+    raw: Option<String>,
 }
 
 pub fn mask_env_inventory_value(value: Option<&str>) -> String {
@@ -1473,7 +1480,7 @@ pub fn load_project_env_inventory_report(
                 let value = snapshot
                     .values
                     .get(&key)
-                    .cloned()
+                    .map(|entry| entry.masked.clone())
                     .unwrap_or_else(|| "missing".into());
                 cells.insert(env_name.clone(), EnvInventoryCell { exists, value });
             }
@@ -1534,6 +1541,52 @@ pub fn load_project_env_inventory_report(
         total_variables: variables.len(),
         variables,
         environment_sources,
+    })
+}
+
+pub fn load_project_env_preview_report(
+    storage_root: &Path,
+    secret_store: &SecretStore,
+    project_id: &str,
+    request: &EnvPreviewRequest,
+) -> Result<EnvPreviewResponse, ProjectStatusError> {
+    ProjectRegistryStore::new(storage_root)
+        .get(project_id)
+        .map_err(|err| {
+            ProjectStatusError::ProjectLookup(format!(
+                "project lookup failed for {project_id}: {err}"
+            ))
+        })?
+        .ok_or(ProjectStatusError::ProjectNotFound)?;
+
+    let requested = [
+        ("development", request.changes.development.as_str()),
+        ("staging", request.changes.staging.as_str()),
+        ("production", request.changes.production.as_str()),
+    ];
+    let mut environments = Vec::with_capacity(requested.len());
+    let mut partial_metadata = false;
+
+    for (environment, input) in requested {
+        let snapshot = load_environment_inventory_snapshot(
+            storage_root,
+            secret_store,
+            project_id,
+            environment,
+        )?;
+        partial_metadata |= snapshot.source_kind == SEALED_GENERATION_SNAPSHOT_SOURCE;
+        environments.push(preview_environment_changes(environment, input, snapshot));
+    }
+
+    Ok(EnvPreviewResponse {
+        project_id: project_id.to_string(),
+        applies: false,
+        message: "Preview only. No changes have been saved.".into(),
+        partial_metadata,
+        warning: partial_metadata.then(|| {
+            "Preview is based on currently available env inventory metadata. Changes are not applied in this version.".into()
+        }),
+        environments,
     })
 }
 
@@ -1605,8 +1658,14 @@ fn load_environment_inventory_snapshot(
                 key,
                 current
                     .as_deref()
-                    .map(|value| mask_env_inventory_value(Some(value)))
-                    .unwrap_or_else(|| "****".into()),
+                    .map(|value| EnvironmentInventoryValue {
+                        masked: mask_env_inventory_value(Some(value)),
+                        raw: Some(value.to_string()),
+                    })
+                    .unwrap_or_else(|| EnvironmentInventoryValue {
+                        masked: "****".into(),
+                        raw: None,
+                    }),
             );
         }
         return Ok(EnvironmentInventorySnapshot {
@@ -1634,22 +1693,31 @@ fn resolve_inventory_masked_value(
     key: &str,
     snapshot_entry: Option<&crate::storage::PersistedRuntimeEnvEntry>,
     resolved_entry: Option<&crate::storage::PersistedResolvedRuntimeEntry>,
-) -> Result<Option<String>, ProjectStatusError> {
+) -> Result<Option<EnvironmentInventoryValue>, ProjectStatusError> {
     if let Some(entry) = snapshot_entry {
         if let Some(value) = entry.value.as_deref() {
-            return Ok(Some(mask_env_inventory_value(Some(value))));
+            return Ok(Some(EnvironmentInventoryValue {
+                masked: mask_env_inventory_value(Some(value)),
+                raw: Some(value.to_string()),
+            }));
         }
     }
 
     if let Some(entry) = resolved_entry {
         if let Some(value) = entry.value.as_deref() {
             if value != "<secret>" {
-                return Ok(Some(mask_env_inventory_value(Some(value))));
+                return Ok(Some(EnvironmentInventoryValue {
+                    masked: mask_env_inventory_value(Some(value)),
+                    raw: Some(value.to_string()),
+                }));
             }
         }
         if let Some(sealed) = entry.sealed_value.as_ref() {
             if let Ok(value) = unseal_value(sealed) {
-                return Ok(Some(mask_env_inventory_value(Some(&value))));
+                return Ok(Some(EnvironmentInventoryValue {
+                    masked: mask_env_inventory_value(Some(&value)),
+                    raw: Some(value),
+                }));
             }
         }
     }
@@ -1674,11 +1742,17 @@ fn resolve_inventory_masked_value(
         .current_secret_value(project_id, environment, &secret_key)
         .map_err(secret_store_error)?;
     if let Some(value) = current.as_deref() {
-        return Ok(Some(mask_env_inventory_value(Some(value))));
+        return Ok(Some(EnvironmentInventoryValue {
+            masked: mask_env_inventory_value(Some(value)),
+            raw: Some(value.to_string()),
+        }));
     }
 
     if snapshot_entry.is_some() || resolved_entry.is_some() {
-        return Ok(Some("****".into()));
+        return Ok(Some(EnvironmentInventoryValue {
+            masked: "****".into(),
+            raw: None,
+        }));
     }
 
     Ok(None)
@@ -1686,6 +1760,174 @@ fn resolve_inventory_masked_value(
 
 fn secret_store_error(err: crate::secrets::SecretError) -> ProjectStatusError {
     ProjectStatusError::ProjectLookup(format!("env inventory unavailable: {err}"))
+}
+
+#[derive(Debug, Clone)]
+enum PreviewChangeKind {
+    Set(String),
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+struct PreviewChange {
+    line: usize,
+    key: String,
+    normalized_key: String,
+    kind: PreviewChangeKind,
+}
+
+fn preview_environment_changes(
+    environment: &str,
+    input: &str,
+    snapshot: EnvironmentInventorySnapshot,
+) -> EnvPreviewEnvironmentResponse {
+    let mut errors = Vec::new();
+    let parsed = parse_preview_input(input, &mut errors);
+    let mut current_by_key = BTreeMap::new();
+    for (key, value) in snapshot.values {
+        current_by_key.insert(key.to_ascii_lowercase(), (key, value));
+    }
+
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut deleted = Vec::new();
+    let mut unchanged = Vec::new();
+
+    for change in parsed {
+        let existing = current_by_key.get(&change.normalized_key);
+        match change.kind {
+            PreviewChangeKind::Set(value) => {
+                let after_masked = mask_env_inventory_value(Some(value.as_str()));
+                if let Some((existing_key, existing_value)) = existing {
+                    let same_value = existing_value
+                        .raw
+                        .as_deref()
+                        .map(|raw| raw == value)
+                        .unwrap_or(existing_value.masked == after_masked);
+                    let entry = EnvPreviewDiffEntry {
+                        key: existing_key.clone(),
+                        before_masked: existing_value.masked.clone(),
+                        after_masked,
+                        action: if same_value {
+                            "unchanged".into()
+                        } else {
+                            "updated".into()
+                        },
+                    };
+                    if same_value {
+                        unchanged.push(entry);
+                    } else {
+                        updated.push(entry);
+                    }
+                } else {
+                    added.push(EnvPreviewDiffEntry {
+                        key: change.key,
+                        before_masked: "NEW".into(),
+                        after_masked,
+                        action: "added".into(),
+                    });
+                }
+            }
+            PreviewChangeKind::Delete => {
+                if let Some((existing_key, existing_value)) = existing {
+                    deleted.push(EnvPreviewDiffEntry {
+                        key: existing_key.clone(),
+                        before_masked: existing_value.masked.clone(),
+                        after_masked: "DELETED".into(),
+                        action: "deleted".into(),
+                    });
+                } else {
+                    unchanged.push(EnvPreviewDiffEntry {
+                        key: change.key,
+                        before_masked: "missing".into(),
+                        after_masked: "missing".into(),
+                        action: "unchanged".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    EnvPreviewEnvironmentResponse {
+        environment: environment.to_string(),
+        valid: errors.is_empty(),
+        added,
+        updated,
+        deleted,
+        unchanged,
+        errors,
+    }
+}
+
+fn parse_preview_input(input: &str, errors: &mut Vec<EnvPreviewError>) -> Vec<PreviewChange> {
+    let mut changes = BTreeMap::<String, PreviewChange>::new();
+
+    for (index, raw_line) in input.lines().enumerate() {
+        let line = index + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+
+        if let Some(key) = trimmed.strip_prefix('-') {
+            let key = key.trim();
+            if !valid_preview_key(key) {
+                errors.push(EnvPreviewError {
+                    line,
+                    reason: "delete lines must use -KEY with a valid key name".into(),
+                });
+                continue;
+            }
+            let normalized_key = key.to_ascii_lowercase();
+            changes.insert(
+                normalized_key.clone(),
+                PreviewChange {
+                    line,
+                    key: key.to_string(),
+                    normalized_key,
+                    kind: PreviewChangeKind::Delete,
+                },
+            );
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = trimmed.split_once('=') else {
+            errors.push(EnvPreviewError {
+                line,
+                reason: "expected KEY=VALUE, KEY=, comment, blank line, or -KEY".into(),
+            });
+            continue;
+        };
+        let key = raw_key.trim();
+        if !valid_preview_key(key) {
+            errors.push(EnvPreviewError {
+                line,
+                reason: "invalid key name".into(),
+            });
+            continue;
+        }
+        let normalized_key = key.to_ascii_lowercase();
+        changes.insert(
+            normalized_key.clone(),
+            PreviewChange {
+                line,
+                key: key.to_string(),
+                normalized_key,
+                kind: PreviewChangeKind::Set(raw_value.trim().to_string()),
+            },
+        );
+    }
+
+    let mut ordered = changes.into_values().collect::<Vec<_>>();
+    ordered.sort_by_key(|change| change.line);
+    ordered
+}
+
+fn valid_preview_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '/'))
 }
 
 pub fn load_environment_diff(
@@ -5399,6 +5641,200 @@ mod tests {
         assert!(!rendered.contains("FLEETSTAG"));
         assert!(!rendered.contains("postgres://super-secret"));
         assert!(!rendered.contains("https://api.example.com"));
+    }
+
+    fn seed_env_preview_environment(
+        root: &Path,
+        environment: &str,
+        generation: u64,
+        entries: serde_json::Value,
+    ) {
+        let env = EnvironmentPaths::new(root, "api", environment);
+        env.ensure_exists().unwrap();
+        let generation_dir = env.generation_dir(generation);
+        fs::create_dir_all(&generation_dir).unwrap();
+
+        atomic_write(
+            generation_dir.join("runtime_env_snapshot.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"snapshot_version\": 1,\n",
+                    "  \"project_id\": \"api\",\n",
+                    "  \"environment\": \"{environment}\",\n",
+                    "  \"generation\": {generation},\n",
+                    "  \"deployment_id\": \"dep-{generation}\",\n",
+                    "  \"source_environment\": \"{environment}\",\n",
+                    "  \"entries\": {entries}\n",
+                    "}}\n"
+                ),
+                environment = environment,
+                generation = generation,
+                entries = serde_json::to_string_pretty(&entries).unwrap(),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        atomic_write(
+            generation_dir.join("resolved_runtime.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"snapshot_version\": 1,\n",
+                    "  \"project_id\": \"api\",\n",
+                    "  \"environment\": \"{environment}\",\n",
+                    "  \"generation\": {generation},\n",
+                    "  \"deployment_id\": \"dep-{generation}\",\n",
+                    "  \"source_environment\": \"{environment}\",\n",
+                    "  \"entries\": {entries}\n",
+                    "}}\n"
+                ),
+                environment = environment,
+                generation = generation,
+                entries = serde_json::to_string_pretty(&entries).unwrap(),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        atomic_write(env.current_pointer(), format!("{generation}\n").as_bytes()).unwrap();
+        atomic_write(env.promoted_pointer(), format!("{generation}\n").as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn env_preview_parser_handles_supported_lines_errors_duplicates_and_case() {
+        let mut errors = Vec::new();
+        let changes = parse_preview_input(
+            concat!(
+                "# comment\n",
+                "; second comment\n",
+                "\n",
+                "APP_NAME=MyService\n",
+                "DEBUG = true\n",
+                "EMPTY_KEY=\n",
+                "-OLD_TOKEN\n",
+                "debug=false\n",
+                "BROKEN\n"
+            ),
+            &mut errors,
+        );
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 9);
+        assert_eq!(
+            errors[0].reason,
+            "expected KEY=VALUE, KEY=, comment, blank line, or -KEY"
+        );
+        assert_eq!(changes.len(), 4);
+        assert_eq!(changes[0].key, "APP_NAME");
+        assert_eq!(changes[1].key, "EMPTY_KEY");
+        assert_eq!(changes[2].key, "OLD_TOKEN");
+        assert_eq!(changes[3].key, "debug");
+        match &changes[3].kind {
+            PreviewChangeKind::Set(value) => assert_eq!(value, "false"),
+            PreviewChangeKind::Delete => panic!("expected set change"),
+        }
+    }
+
+    #[test]
+    fn env_preview_report_masks_diffs_and_does_not_persist_changes() {
+        let root = test_root("env-preview-report-masks-diffs-and-does-not-persist-changes");
+        register_project(&root, "api", "api.example.com");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+
+        seed_env_preview_environment(
+            &root,
+            "development",
+            3,
+            serde_json::json!({
+                "APP_NAME": {
+                    "source": "forge_yaml",
+                    "value": "FLEETDEV",
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "DEBUG": {
+                    "source": "forge_yaml",
+                    "value": "false",
+                    "sensitive": false,
+                    "redacted": false
+                },
+                "OLD_TOKEN": {
+                    "source": "forge_yaml",
+                    "value": "legacy-token",
+                    "sensitive": true,
+                    "redacted": false
+                }
+            }),
+        );
+        for environment in ["staging", "production"] {
+            EnvironmentPaths::new(&root, "api", environment)
+                .ensure_exists()
+                .unwrap();
+        }
+
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        let before = serde_json::to_string(
+            &load_project_env_inventory_report(&root, &store, "api", None).unwrap(),
+        )
+        .unwrap();
+        let preview = load_project_env_preview_report(
+            &root,
+            &store,
+            "api",
+            &crate::api::EnvPreviewRequest {
+                changes: crate::api::EnvPreviewChanges {
+                    development: concat!(
+                        "app_name=FLEETDEV\n",
+                        "DEBUG=true\n",
+                        "NEW_FLAG=abcd\n",
+                        "-OLD_TOKEN\n",
+                        "BROKEN\n"
+                    )
+                    .into(),
+                    staging: String::new(),
+                    production: String::new(),
+                },
+            },
+        )
+        .unwrap();
+        let after = serde_json::to_string(
+            &load_project_env_inventory_report(&root, &store, "api", None).unwrap(),
+        )
+        .unwrap();
+        let rendered = serde_json::to_string(&preview).unwrap();
+
+        let development = preview
+            .environments
+            .iter()
+            .find(|entry| entry.environment == "development")
+            .unwrap();
+        assert!(!development.valid);
+        assert_eq!(development.added.len(), 1);
+        assert_eq!(development.added[0].key, "NEW_FLAG");
+        assert_eq!(development.added[0].before_masked, "NEW");
+        assert_eq!(development.added[0].after_masked, "****");
+        assert_eq!(development.updated.len(), 1);
+        assert_eq!(development.updated[0].key, "DEBUG");
+        assert_eq!(development.updated[0].before_masked, "f*****e");
+        assert_eq!(development.updated[0].after_masked, "****");
+        assert_eq!(development.deleted.len(), 1);
+        assert_eq!(development.deleted[0].key, "OLD_TOKEN");
+        assert_eq!(development.deleted[0].after_masked, "DELETED");
+        assert_eq!(development.unchanged.len(), 1);
+        assert_eq!(development.unchanged[0].key, "APP_NAME");
+        assert_eq!(development.errors.len(), 1);
+        assert_eq!(development.errors[0].line, 5);
+        assert!(preview.partial_metadata);
+        assert!(preview.warning.is_some());
+        assert_eq!(before, after);
+        assert!(!rendered.contains("FLEETDEV"));
+        assert!(!rendered.contains("legacy-token"));
+        assert!(!rendered.contains("DEBUG=true"));
     }
 
     #[test]

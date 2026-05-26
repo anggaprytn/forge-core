@@ -22,9 +22,9 @@ use subtle::ConstantTimeEq;
 use crate::api::{
     BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvInventoryResponse,
-    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
-    EventList, ProjectEnvironmentInventoryList, ProjectList, ProjectUpsertRequest,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvInventoryResponse, EnvPreviewRequest,
+    EnvPreviewResponse, EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport,
+    ErrorResponse, EventList, ProjectEnvironmentInventoryList, ProjectList, ProjectUpsertRequest,
     ReadinessExplainResponse, ReadinessTimelineResponse, ReadyzResponse, SecretListResponse,
     SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata,
     TokenRevokeResponse,
@@ -40,7 +40,9 @@ use crate::projects::{ProjectRegistryStore, project_registry_error_response};
 use crate::readiness::{effective_snapshot, explain_snapshot, timeline_snapshot};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
-use crate::status::{ProjectEnvironmentStatus, load_project_env_inventory_report};
+use crate::status::{
+    ProjectEnvironmentStatus, load_project_env_inventory_report, load_project_env_preview_report,
+};
 use crate::storage::atomic_write;
 use crate::users::{RegistrationDecision, UserRecord, UserStore, UserStoreError};
 
@@ -985,6 +987,10 @@ pub fn router(state: HttpState) -> Router {
         .route(
             "/api/projects/{project_id}/env",
             get(get_project_env_inventory),
+        )
+        .route(
+            "/api/projects/{project_id}/env/preview",
+            post(post_project_env_preview),
         )
         .route(
             "/api/projects/{project_id}/env/{environment}",
@@ -2264,6 +2270,39 @@ async fn get_project_env_inventory(
             StatusCode::OK,
             &request_id,
             Json(SuccessEnvelope::<EnvInventoryResponse> {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: report,
+            }),
+        ),
+        Err(err) => {
+            let (status, response) = crate::status::project_status_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
+async fn post_project_env_preview(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(project_id): AxumPath<String>,
+    Json(request): Json<EnvPreviewRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match load_project_env_preview_report(
+        state.project_registry.storage_root(),
+        &state.secret_store,
+        &project_id,
+        &request,
+    ) {
+        Ok(report) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope::<EnvPreviewResponse> {
                 request_id: request_id.clone(),
                 correlation_id: request_id.clone(),
                 data: report,
@@ -5442,8 +5481,10 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("\"/api/projects\""));
         assert!(body.contains("/environments"));
         assert!(body.contains("/env"));
+        assert!(body.contains("/env/preview"));
         assert!(body.contains("projectEnvInventory(projectId)"));
         assert!(body.contains("projectEnvironments(projectId)"));
+        assert!(body.contains("projectEnvPreview(projectId)"));
         assert!(body.contains("credentials: \"same-origin\""));
         assert!(!body.contains("/secrets"));
         assert!(!body.contains("/env/diff"));
@@ -5484,6 +5525,8 @@ pub mod app_js_ships_safe_error_states {
         assert!(body.contains("Environment inventory unavailable."));
         assert!(body.contains("No projects registered yet."));
         assert!(body.contains("Project no longer exists or has no registered environments."));
+        assert!(body.contains("Preview only. No changes will be saved."));
+        assert!(body.contains("Preview unavailable until project inventory loads."));
     }
 }
 
@@ -5559,7 +5602,7 @@ pub mod app_env_inventory_stays_read_only {
     use tower::util::ServiceExt;
 
     #[tokio::test]
-    async fn app_assets_do_not_ship_env_mutation_controls() {
+    async fn app_assets_ship_preview_only_env_change_controls() {
         let state = build_cli_login_state();
         let session_secret = state.web_auth.config.clone().unwrap().session_secret;
         let session_cookie = encode_signed_value(
@@ -5588,15 +5631,35 @@ pub mod app_env_inventory_stays_read_only {
             assert_eq!(response.status(), StatusCode::OK);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
+            let required = if path == "/app" {
+                vec![
+                    "Env change preview",
+                    "Preview only",
+                    "Preview Changes",
+                    "No changes will be saved",
+                    "Apply is not available in this build",
+                    "Changes will be supported in a future version",
+                    "env-preview-development",
+                    "env-preview-staging",
+                    "env-preview-production",
+                ]
+            } else {
+                vec![
+                    "Preview Changes",
+                    "Preview only. No changes will be saved.",
+                    "projectEnvPreview(projectId)",
+                    "submitEnvPreview()",
+                ]
+            };
+            for required in required {
+                assert!(body.contains(required));
+            }
             for forbidden in [
                 "Apply changes",
-                "Preview changes",
-                "Delete variable",
+                "Confirm Apply",
                 "Reveal secret",
                 "rollback-button",
                 "deploy-button",
-                "/secrets",
-                "/deployments",
             ] {
                 assert!(!body.contains(forbidden));
             }
@@ -7265,6 +7328,26 @@ pub mod project_inventory_api_requires_authentication {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn unauthenticated_env_preview_is_rejected() {
+        let app = router(build_state(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=MyService","staging":"","production":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[cfg(test)]
@@ -7383,6 +7466,35 @@ pub mod project_inventory_api_accepts_web_session_authentication {
                         format!("{SESSION_COOKIE_NAME}={session_cookie}"),
                     )
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authenticated_web_session_can_preview_env_changes() {
+        let (mut state, root) = build_state_with_root(true);
+        state.web_auth = build_cli_login_state().web_auth;
+        seed_env_inventory_fixture(&root);
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true","staging":"","production":""}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -7724,6 +7836,43 @@ pub mod project_environment_inventory_api_uses_persisted_state {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn env_preview_endpoint_supports_bearer_auth_and_masks_values() {
+        let (state, root) = build_state_with_root(true);
+        seed_env_inventory_fixture(&root);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/preview")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true\n-EMPTY_VALUE\nBROKEN","staging":"","production":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        let json: Value = serde_json::from_str(&body_text).unwrap();
+        assert_eq!(json["data"]["project_id"], "api");
+        assert_eq!(json["data"]["applies"], false);
+        assert_eq!(
+            json["data"]["message"],
+            "Preview only. No changes have been saved."
+        );
+        assert!(body_text.contains("DELETED"));
+        assert!(body_text.contains("F*****V"));
+        assert!(!body_text.contains("FLEETDEV"));
+        assert!(!body_text.contains("DEBUG=true"));
     }
 }
 

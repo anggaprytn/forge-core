@@ -559,6 +559,63 @@ pub struct EnvInventoryResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvPreviewChanges {
+    #[serde(default)]
+    pub development: String,
+    #[serde(default)]
+    pub staging: String,
+    #[serde(default)]
+    pub production: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvPreviewRequest {
+    pub changes: EnvPreviewChanges,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvPreviewError {
+    pub line: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvPreviewDiffEntry {
+    pub key: String,
+    pub before_masked: String,
+    pub after_masked: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvPreviewEnvironmentResponse {
+    pub environment: String,
+    pub valid: bool,
+    #[serde(default)]
+    pub added: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub updated: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub deleted: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub unchanged: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub errors: Vec<EnvPreviewError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvPreviewResponse {
+    pub project_id: String,
+    pub applies: bool,
+    pub message: String,
+    pub partial_metadata: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(default)]
+    pub environments: Vec<EnvPreviewEnvironmentResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventList {
     pub events: Vec<EventRecord>,
 }

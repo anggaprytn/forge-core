@@ -185,6 +185,43 @@
             </div>
           </article>
 
+          <article class="detail-panel panel-surface" aria-labelledby="env-preview-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Env change preview</p>
+                <h2 id="env-preview-title">Preview only</h2>
+              </div>
+              <span class="status-chip">No apply</span>
+            </div>
+
+            <div class="env-preview-copy">
+              <p>Preview only. No changes will be saved.</p>
+              <p>Apply is not available in this build. Changes will be supported in a future version.</p>
+            </div>
+
+            <div class="env-preview-grid">
+              <label class="search-field env-preview-field" for="env-preview-development">
+                <span>Development</span>
+                <textarea id="env-preview-development" rows="8" placeholder="# KEY=VALUE&#10;APP_NAME=MyService&#10;-OLD_TOKEN"></textarea>
+              </label>
+              <label class="search-field env-preview-field" for="env-preview-staging">
+                <span>Staging</span>
+                <textarea id="env-preview-staging" rows="8" placeholder="DEBUG=true"></textarea>
+              </label>
+              <label class="search-field env-preview-field" for="env-preview-production">
+                <span>Production</span>
+                <textarea id="env-preview-production" rows="8" placeholder="KEY="></textarea>
+              </label>
+            </div>
+
+            <div class="env-preview-actions">
+              <button id="env-preview-button" class="env-preview-button" type="button">Preview Changes</button>
+            </div>
+
+            <div id="env-preview-state" class="inline-state">Select a project to preview masked environment changes.</div>
+            <div id="env-preview-result" class="env-preview-result" hidden></div>
+          </article>
+
           <article class="detail-panel panel-surface" aria-labelledby="signals-title">
             <div class="section-head">
               <div>
