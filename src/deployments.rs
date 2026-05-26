@@ -8548,7 +8548,9 @@ pub mod runtime_environment_snapshots {
                 snapshot_version: 1,
                 project_id: "api".into(),
                 environment: environment.into(),
+                env_store_revision: 1,
                 updated_at_unix: 1,
+                updated_by: None,
                 entries: persisted_entries,
                 deleted_keys: persisted_deleted_keys,
             })

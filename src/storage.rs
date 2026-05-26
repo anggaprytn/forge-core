@@ -1252,7 +1252,11 @@ pub struct PersistedDesiredEnvConfig {
     #[serde(default)]
     pub environment: String,
     #[serde(default)]
+    pub env_store_revision: u64,
+    #[serde(default)]
     pub updated_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
     #[serde(default)]
     pub entries: Vec<PersistedDesiredEnvEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1307,14 +1311,39 @@ pub struct PersistedEnvAuditEntry {
     #[serde(default)]
     pub status: String,
     #[serde(default)]
+    pub env_store_revision_before: u64,
+    #[serde(default)]
+    pub env_store_revision_after: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key_hash: Option<String>,
+    #[serde(default)]
     pub summary: PersistedEnvAuditSummary,
     #[serde(default)]
     pub diff: Vec<PersistedEnvAuditDiffEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedEnvApplyIdempotencyRecord {
+    #[serde(default = "default_snapshot_version")]
+    pub snapshot_version: u64,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub idempotency_key_hash: String,
+    #[serde(default)]
+    pub request_hash: String,
+    #[serde(default)]
+    pub created_at_unix: u64,
+    pub response: serde_json::Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct EnvStore {
     root: PathBuf,
+}
+
+pub struct EnvProjectLockGuard {
+    _lock: FileLock,
 }
 
 impl EnvStore {
@@ -1346,6 +1375,14 @@ impl EnvStore {
             ))
         })?;
         atomic_write(env.desired_env_file(), &bytes)
+    }
+
+    pub fn acquire_project_lock(&self, project_id: &str) -> StorageResult<EnvProjectLockGuard> {
+        let project_root = self.root.join("projects").join(project_id);
+        fs::create_dir_all(&project_root)?;
+        Ok(EnvProjectLockGuard {
+            _lock: FileLock::acquire(project_root.join("env_store.lock"))?,
+        })
     }
 
     pub fn append_audit_entry(&self, entry: &PersistedEnvAuditEntry) -> StorageResult<()> {
@@ -1414,6 +1451,44 @@ impl EnvStore {
                 .then_with(|| left.audit_id.cmp(&right.audit_id))
         });
         Ok(entries)
+    }
+
+    pub fn read_apply_idempotency(
+        &self,
+        project_id: &str,
+        idempotency_key_hash: &str,
+    ) -> StorageResult<Option<PersistedEnvApplyIdempotencyRecord>> {
+        load_json_file(self.apply_idempotency_path(project_id, idempotency_key_hash))
+    }
+
+    pub fn write_apply_idempotency(
+        &self,
+        record: &PersistedEnvApplyIdempotencyRecord,
+    ) -> StorageResult<()> {
+        let dir = self.apply_idempotency_dir(&record.project_id);
+        fs::create_dir_all(&dir)?;
+        let bytes = serde_json::to_vec_pretty(record).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(
+            self.apply_idempotency_path(&record.project_id, &record.idempotency_key_hash),
+            &bytes,
+        )
+    }
+
+    fn apply_idempotency_dir(&self, project_id: &str) -> PathBuf {
+        self.root
+            .join("projects")
+            .join(project_id)
+            .join("env_apply_idempotency")
+    }
+
+    fn apply_idempotency_path(&self, project_id: &str, idempotency_key_hash: &str) -> PathBuf {
+        self.apply_idempotency_dir(project_id)
+            .join(format!("{idempotency_key_hash}.json"))
     }
 }
 

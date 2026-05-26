@@ -5745,6 +5745,11 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
                     "projectEnvPreview(projectId)",
                     "submitEnvPreview()",
                     "applyEnvChanges()",
+                    "Environment changed since preview. Refresh preview and try again.",
+                    "Preview cleared. Review the updated input and preview again before applying.",
+                    "idempotency_key",
+                    "expected_base_revisions",
+                    "preview_hashes",
                 ]
             };
             for required in required {
@@ -7644,6 +7649,29 @@ pub mod project_inventory_api_accepts_web_session_authentication {
         let session_cookie = session_cookie_value(&state);
         let app = router(state);
 
+        let preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/preview")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true","staging":"","production":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview_body = to_bytes(preview.into_body(), usize::MAX).await.unwrap();
+        let preview_json: Value = serde_json::from_slice(&preview_body).unwrap();
+        let development = &preview_json["data"]["environments"][0];
+
         let apply = app
             .clone()
             .oneshot(
@@ -7656,7 +7684,25 @@ pub mod project_inventory_api_accepts_web_session_authentication {
                         format!("{SESSION_COOKIE_NAME}={session_cookie}"),
                     )
                     .body(Body::from(
-                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true","staging":"","production":""}}"#,
+                        serde_json::json!({
+                            "changes": {
+                                "development": "APP_NAME=FLEETDEV\nDEBUG=true",
+                                "staging": "",
+                                "production": "",
+                            },
+                            "expected_base_revisions": {
+                                "development": development["base_revision"],
+                                "staging": preview_json["data"]["environments"][1]["base_revision"],
+                                "production": preview_json["data"]["environments"][2]["base_revision"],
+                            },
+                            "preview_hashes": {
+                                "development": development["preview_hash"],
+                                "staging": preview_json["data"]["environments"][1]["preview_hash"],
+                                "production": preview_json["data"]["environments"][2]["preview_hash"],
+                            },
+                            "idempotency_key": "web-session-apply",
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -8004,7 +8050,9 @@ pub mod project_environment_inventory_api_uses_persisted_state {
                 snapshot_version: 1,
                 project_id: "api".into(),
                 environment: "staging".into(),
+                env_store_revision: 1,
                 updated_at_unix: 1,
+                updated_by: None,
                 entries: vec![crate::storage::PersistedDesiredEnvEntry {
                     key: "APP_NAME".into(),
                     normalized_key: "app_name".into(),
@@ -8137,6 +8185,25 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         seed_env_inventory_fixture(&root);
         let app = router(state);
 
+        let preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/preview")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true\n-EMPTY_VALUE","staging":"","production":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview_body = to_bytes(preview.into_body(), usize::MAX).await.unwrap();
+        let preview_json: Value = serde_json::from_slice(&preview_body).unwrap();
+
         let apply = app
             .clone()
             .oneshot(
@@ -8146,7 +8213,25 @@ pub mod project_environment_inventory_api_uses_persisted_state {
                     .header("authorization", "Bearer test-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true\n-EMPTY_VALUE","staging":"","production":""}}"#,
+                        serde_json::json!({
+                            "changes": {
+                                "development": "APP_NAME=FLEETDEV\nDEBUG=true\n-EMPTY_VALUE",
+                                "staging": "",
+                                "production": "",
+                            },
+                            "expected_base_revisions": {
+                                "development": preview_json["data"]["environments"][0]["base_revision"],
+                                "staging": preview_json["data"]["environments"][1]["base_revision"],
+                                "production": preview_json["data"]["environments"][2]["base_revision"],
+                            },
+                            "preview_hashes": {
+                                "development": preview_json["data"]["environments"][0]["preview_hash"],
+                                "staging": preview_json["data"]["environments"][1]["preview_hash"],
+                                "production": preview_json["data"]["environments"][2]["preview_hash"],
+                            },
+                            "idempotency_key": "bearer-apply",
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )

@@ -37,6 +37,9 @@ const dataState = {
   envInventoryByProject: new Map(),
   envAuditByProject: new Map(),
   lastEnvPreview: null,
+  lastEnvPreviewSignature: "",
+  lastEnvApplyIdempotencyKey: "",
+  envApplyInFlight: false,
 };
 
 function element(id) {
@@ -88,7 +91,7 @@ function formatDuration(ms) {
   return `${hours}h ${remMinutes}m`;
 }
 
-function fetchJson(path, options = {}) {
+async function fetchJson(path, options = {}) {
   const init = {
     headers: { Accept: "application/json" },
     credentials: "same-origin",
@@ -98,22 +101,15 @@ function fetchJson(path, options = {}) {
     Accept: "application/json",
     ...(options.headers || {}),
   };
-  return fetch(path, init).then((response) => {
-    if (!response.ok) {
-      const error = new Error(`request failed: ${response.status}`);
-      error.status = response.status;
-      response
-        .json()
-        .then((payload) => {
-          if (payload && payload.message) {
-            error.message = payload.message;
-          }
-        })
-        .catch(() => {});
-      throw error;
-    }
-    return response.json();
-  });
+  const response = await fetch(path, init);
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error((payload && payload.message) || `request failed: ${response.status}`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
 }
 
 async function fetchApiData(path, options) {
@@ -684,6 +680,9 @@ function previewInputValue(environment) {
 
 function resetEnvPreview(message, clearFields) {
   dataState.lastEnvPreview = null;
+  dataState.lastEnvPreviewSignature = "";
+  dataState.lastEnvApplyIdempotencyKey = "";
+  dataState.envApplyInFlight = false;
   hide("env-preview-result");
   hide("env-apply-panel");
   hide("env-apply-confirmation");
@@ -700,12 +699,27 @@ function resetEnvPreview(message, clearFields) {
 
 function previewCanApply(preview) {
   const environments = preview && Array.isArray(preview.environments) ? preview.environments : [];
+  const signature = serializeEnvChanges(currentEnvChanges());
   return Boolean(
     preview
       && !preview.applied
+      && !dataState.envApplyInFlight
+      && dataState.lastEnvPreviewSignature
+      && dataState.lastEnvPreviewSignature === signature
       && environments.length
       && environments.every((environment) => environment && environment.valid)
   );
+}
+
+function serializeEnvChanges(changes) {
+  return JSON.stringify(changes || {});
+}
+
+function generateIdempotencyKey() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  return `env-apply-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function summaryMetric(label, count) {
@@ -778,6 +792,10 @@ function previewSummaryCard(environment) {
   summary.appendChild(summaryMetric("Updated", environment.updated.length));
   summary.appendChild(summaryMetric("Deleted", environment.deleted.length));
   summary.appendChild(summaryMetric("Errors", environment.errors.length));
+  summary.appendChild(summaryMetric(
+    "Revision",
+    environment.base_revision ?? environment.env_store_revision_after ?? 0,
+  ));
   card.appendChild(summary);
 
   const validity = document.createElement("p");
@@ -831,6 +849,13 @@ function renderEnvPreviewResult(preview) {
   });
 
   dataState.lastEnvPreview = preview || null;
+  if (preview && !preview.applied) {
+    dataState.lastEnvPreviewSignature = serializeEnvChanges(currentEnvChanges());
+    dataState.lastEnvApplyIdempotencyKey = generateIdempotencyKey();
+  } else {
+    dataState.lastEnvPreviewSignature = "";
+    dataState.lastEnvApplyIdempotencyKey = "";
+  }
   if (previewCanApply(preview)) {
     show("env-apply-panel");
     hide("env-apply-confirmation");
@@ -876,6 +901,9 @@ async function submitEnvPreview() {
     });
     renderEnvPreviewResult(preview);
   } catch (error) {
+    dataState.lastEnvPreview = null;
+    dataState.lastEnvPreviewSignature = "";
+    dataState.lastEnvApplyIdempotencyKey = "";
     showState("env-preview-state", error.message || "Preview failed.", "warn");
     hide("env-apply-panel");
     hide("env-apply-confirmation");
@@ -929,6 +957,10 @@ function renderEnvAuditHistory(audit) {
     summary.appendChild(summaryMetric("Added", entry.summary && entry.summary.added ? entry.summary.added : 0));
     summary.appendChild(summaryMetric("Updated", entry.summary && entry.summary.updated ? entry.summary.updated : 0));
     summary.appendChild(summaryMetric("Deleted", entry.summary && entry.summary.deleted ? entry.summary.deleted : 0));
+    summary.appendChild(summaryMetric(
+      "Revision",
+      `${text(entry.env_store_revision_before, 0)} -> ${text(entry.env_store_revision_after, 0)}`,
+    ));
     summary.appendChild(summaryMetric("Audit", text(entry.audit_id)));
     card.appendChild(summary);
 
@@ -963,12 +995,29 @@ async function applyEnvChanges() {
     return;
   }
 
+  const preview = dataState.lastEnvPreview;
+  const environments = preview && Array.isArray(preview.environments) ? preview.environments : [];
+  const expectedBaseRevisions = { development: 0, staging: 0, production: 0 };
+  const previewHashes = { development: "", staging: "", production: "" };
+  environments.forEach((environment) => {
+    if (!environment || !environment.environment) {
+      return;
+    }
+    expectedBaseRevisions[environment.environment] = environment.base_revision || 0;
+    previewHashes[environment.environment] = environment.preview_hash || "";
+  });
+
   const button = element("env-apply-confirm-button");
+  const openButton = element("env-apply-button");
+  dataState.envApplyInFlight = true;
   if (button) {
     button.disabled = true;
     button.textContent = "Applying...";
   }
-  showState("env-preview-state", "Saving masked environment changes...");
+  if (openButton) {
+    openButton.disabled = true;
+  }
+  showState("env-preview-state", "Applying masked environment changes...");
 
   try {
     const response = await fetchApiData(API_PATHS.projectEnvApply(project.project_id), {
@@ -976,13 +1025,16 @@ async function applyEnvChanges() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         changes: currentEnvChanges(),
+        expected_base_revisions: expectedBaseRevisions,
+        preview_hashes: previewHashes,
+        idempotency_key: dataState.lastEnvApplyIdempotencyKey,
       }),
     });
     dataState.envInventoryByProject.delete(project.project_id);
     dataState.envAuditByProject.delete(project.project_id);
     hide("env-apply-confirmation");
     renderEnvPreviewResult(response);
-    showState("env-preview-state", response.message || "Changes saved. They will apply on the next deployment.");
+    showState("env-preview-state", response.message || "Applied. These changes will affect the next deployment.");
     const [inventory, audit] = await Promise.all([
       ensureProjectEnvInventory(project.project_id),
       ensureProjectEnvAudit(project.project_id),
@@ -990,13 +1042,38 @@ async function applyEnvChanges() {
     renderEnvInventory(inventory);
     renderEnvAuditHistory(audit);
   } catch (error) {
-    showState("env-preview-state", error.message || "Apply failed.", "warn");
+    const message = error.status === 409
+      ? (error.message || "Environment changed since preview. Refresh preview and try again.")
+      : (error.message || "Apply failed.");
+    showState("env-preview-state", message, "warn");
+    if (error.status === 409) {
+      dataState.lastEnvPreview = null;
+      dataState.lastEnvPreviewSignature = "";
+      dataState.lastEnvApplyIdempotencyKey = "";
+      hide("env-apply-panel");
+      hide("env-apply-confirmation");
+    }
   } finally {
+    dataState.envApplyInFlight = false;
     if (button) {
       button.disabled = false;
       button.textContent = "Confirm Apply";
     }
+    if (openButton) {
+      openButton.disabled = false;
+    }
   }
+}
+
+function invalidateEnvPreviewIfDirty() {
+  if (!dataState.lastEnvPreviewSignature) {
+    return;
+  }
+  const signature = serializeEnvChanges(currentEnvChanges());
+  if (signature === dataState.lastEnvPreviewSignature && dataState.lastEnvPreview && !dataState.lastEnvPreview.applied) {
+    return;
+  }
+  resetEnvPreview("Preview cleared. Review the updated input and preview again before applying.", false);
 }
 
 function signalCard(title, body, tone, meta = "") {
@@ -1183,6 +1260,14 @@ function bindControls() {
       void submitEnvPreview();
     });
   }
+
+  ["development", "staging", "production"].forEach((environment) => {
+    const field = previewTextArea(environment);
+    if (!field) {
+      return;
+    }
+    field.addEventListener("input", invalidateEnvPreviewIfDirty);
+  });
 
   const applyButton = element("env-apply-button");
   if (applyButton) {

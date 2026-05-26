@@ -5,13 +5,15 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::api::{
     ContainerRuntimeDiagnostics, ConvergenceDomainSummary, DeploymentHistoryEntry,
-    DeploymentHistoryResponse, EnvApplyRequest, EnvApplyResponse, EnvAuditEntry, EnvAuditResponse,
-    EnvAuditSummary, EnvInventoryCell, EnvInventoryEnvironmentSource, EnvInventoryResponse,
-    EnvInventoryVariable, EnvPreviewDiffEntry, EnvPreviewEnvironmentResponse, EnvPreviewError,
-    EnvPreviewRequest, EnvPreviewResponse, EnvironmentDiagnostics, EnvironmentDiffEntry,
+    DeploymentHistoryResponse, EnvApplyEnvironmentResponse, EnvApplyRequest, EnvApplyResponse,
+    EnvAuditEntry, EnvAuditResponse, EnvAuditSummary, EnvInventoryCell,
+    EnvInventoryEnvironmentSource, EnvInventoryResponse, EnvInventoryVariable, EnvPreviewDiffEntry,
+    EnvPreviewEnvironmentResponse, EnvPreviewError, EnvPreviewHashVector, EnvPreviewRequest,
+    EnvPreviewResponse, EnvRevisionVector, EnvironmentDiagnostics, EnvironmentDiffEntry,
     EnvironmentDiffResponse, EnvironmentDiffSummary, EnvironmentValueChange,
     EnvironmentVariableReport, EnvironmentVariableValue, ErrorResponse, NodeInfo,
     ProbeStabilityDiagnostics, ProbeTargetDiagnostics, RecentDeploymentFailure, RecentGcAction,
@@ -39,14 +41,14 @@ use crate::storage::{
     DiagnosticsStore, EnvStore, EnvironmentPaths, GcStore, GenerationHistoryRecord,
     NodeMetadataStore, PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
     PersistedDesiredEnvConfig, PersistedDesiredEnvDeletedKey, PersistedDesiredEnvEntry,
-    PersistedEnvAuditDiffEntry, PersistedEnvAuditEntry, PersistedEnvAuditSummary,
-    PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary, PersistedResolvedRuntime,
-    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedRuntimePolicy,
-    PersistedRuntimeUsageSnapshot, PersistedServiceRuntimeInfo, PersistedServiceState,
-    PersistedSnapshotMetadata, PersistedTerminationInfo, PersistedValidationSummary,
-    PersistedVolumeRetention, PointerStore, RetentionMetadata, RetentionStore, StorageError,
-    current_unix_timestamp, load_generation_build_info, load_generation_lifecycle,
-    load_generation_probe_history, load_generation_resolved_runtime,
+    PersistedEnvApplyIdempotencyRecord, PersistedEnvAuditDiffEntry, PersistedEnvAuditEntry,
+    PersistedEnvAuditSummary, PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary,
+    PersistedResolvedRuntime, PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo,
+    PersistedRuntimePolicy, PersistedRuntimeUsageSnapshot, PersistedServiceRuntimeInfo,
+    PersistedServiceState, PersistedSnapshotMetadata, PersistedTerminationInfo,
+    PersistedValidationSummary, PersistedVolumeRetention, PointerStore, RetentionMetadata,
+    RetentionStore, StorageError, current_unix_timestamp, load_generation_build_info,
+    load_generation_lifecycle, load_generation_probe_history, load_generation_resolved_runtime,
     load_generation_runtime_env_snapshot, load_generation_runtime_info,
     load_generation_snapshot_metadata,
 };
@@ -66,6 +68,7 @@ const SEALED_GENERATION_SNAPSHOT_SOURCE: &str = "sealed_generation_snapshot";
 const LATEST_CONFIGURED_ENV_STORE_SOURCE: &str = "latest_configured_env_store";
 const UNKNOWN_ENV_SOURCE: &str = "unknown";
 const PARTIAL_METADATA_NOTICE: &str = "Only sealed generation snapshots are available. Values shown may reflect the latest deployed generation, not unapplied future configuration.";
+const ENV_PREVIEW_HASH_PARSER_VERSION: &str = "env-preview-v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RepairEventBuckets {
@@ -280,6 +283,7 @@ pub enum ProjectStatusError {
     ProjectNotFound,
     InvalidEnvironment,
     InvalidEnvChangeRequest(String),
+    EnvApplyConflict(String),
     RuntimeEnvSnapshotUnavailable(String),
 }
 
@@ -299,6 +303,7 @@ impl Display for ProjectStatusError {
                 )
             }
             Self::InvalidEnvChangeRequest(message) => write!(f, "{message}"),
+            Self::EnvApplyConflict(message) => write!(f, "{message}"),
             Self::RuntimeEnvSnapshotUnavailable(message) => write!(f, "{message}"),
         }
     }
@@ -814,6 +819,13 @@ pub fn project_status_error_response(
             axum::http::StatusCode::BAD_REQUEST,
             ErrorResponse {
                 code: "invalid_env_changes".into(),
+                message,
+            },
+        ),
+        ProjectStatusError::EnvApplyConflict(message) => (
+            axum::http::StatusCode::CONFLICT,
+            ErrorResponse {
+                code: "env_apply_conflict".into(),
                 message,
             },
         ),
@@ -1412,6 +1424,9 @@ pub fn load_project_environment_env_report(
 struct EnvironmentInventorySourceSnapshot {
     source_kind: String,
     source_label: String,
+    env_store_revision: u64,
+    updated_at_unix: Option<u64>,
+    updated_by: Option<String>,
     generation: Option<u64>,
     deployment_id: Option<String>,
     values: BTreeMap<String, EnvironmentInventoryValue>,
@@ -1437,6 +1452,7 @@ struct EvaluatedEnvironmentChanges {
     desired_values: BTreeMap<String, DesiredEnvValue>,
     deleted_keys: BTreeMap<String, String>,
     audit_diff: Vec<EnvPreviewDiffEntry>,
+    normalized_changes: Vec<String>,
     touched: bool,
 }
 
@@ -1444,6 +1460,138 @@ struct EvaluatedEnvironmentChanges {
 struct DesiredEnvValue {
     key: String,
     value: String,
+}
+
+fn sha256_hex(value: impl AsRef<[u8]>) -> String {
+    hex::encode(Sha256::digest(value.as_ref()))
+}
+
+fn preview_change_fingerprint_material(
+    parsed: &[PreviewChange],
+    errors: &[EnvPreviewError],
+) -> Vec<String> {
+    let mut material = parsed
+        .iter()
+        .map(|change| match &change.kind {
+            PreviewChangeKind::Set(value) => {
+                format!("set|{}|{}", change.normalized_key, value)
+            }
+            PreviewChangeKind::Delete => format!("delete|{}", change.normalized_key),
+        })
+        .collect::<Vec<_>>();
+    material.extend(
+        errors
+            .iter()
+            .map(|error| format!("error|{}|{}", error.line, error.reason)),
+    );
+    material
+}
+
+fn baseline_identity_hash(snapshot: &EnvironmentInventorySourceSnapshot) -> String {
+    let mut material = Vec::new();
+    material.push(snapshot.source_kind.clone());
+    material.push(snapshot.source_label.clone());
+    material.push(snapshot.env_store_revision.to_string());
+    material.push(
+        snapshot
+            .generation
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    material.push(snapshot.deployment_id.clone().unwrap_or_default());
+    material.extend(
+        snapshot
+            .values
+            .iter()
+            .map(|(key, value)| format!("{key}|{}", value.masked)),
+    );
+    sha256_hex(material.join("\n"))
+}
+
+fn compute_preview_hash(
+    project_id: &str,
+    environment: &str,
+    snapshot: &EnvironmentInventorySourceSnapshot,
+    evaluation: &EvaluatedEnvironmentChanges,
+) -> String {
+    let material = serde_json::json!({
+        "parser_version": ENV_PREVIEW_HASH_PARSER_VERSION,
+        "project_id": project_id,
+        "environment": environment,
+        "base_revision": snapshot.env_store_revision,
+        "baseline_identity_hash": baseline_identity_hash(snapshot),
+        "normalized_changes": evaluation.normalized_changes,
+    });
+    format!("sha256-{}", sha256_hex(material.to_string()))
+}
+
+fn build_preview_environment_response(
+    project_id: &str,
+    snapshot: &EnvironmentInventorySourceSnapshot,
+    mut evaluation: EvaluatedEnvironmentChanges,
+) -> EnvPreviewEnvironmentResponse {
+    evaluation.response.base_revision = snapshot.env_store_revision;
+    evaluation.response.preview_hash = compute_preview_hash(
+        project_id,
+        &evaluation.response.environment,
+        snapshot,
+        &evaluation,
+    );
+    evaluation.response
+}
+
+fn revision_from_vector(vector: &EnvRevisionVector, environment: &str) -> u64 {
+    match environment {
+        "development" => vector.development,
+        "staging" => vector.staging,
+        "production" => vector.production,
+        _ => 0,
+    }
+}
+
+fn preview_hash_from_vector<'a>(vector: &'a EnvPreviewHashVector, environment: &str) -> &'a str {
+    match environment {
+        "development" => &vector.development,
+        "staging" => &vector.staging,
+        "production" => &vector.production,
+        _ => "",
+    }
+}
+
+fn set_revision_in_vector(vector: &mut EnvRevisionVector, environment: &str, revision: u64) {
+    match environment {
+        "development" => vector.development = revision,
+        "staging" => vector.staging = revision,
+        "production" => vector.production = revision,
+        _ => {}
+    }
+}
+
+fn compute_apply_request_hash(project_id: &str, request: &EnvApplyRequest) -> String {
+    let environments = [
+        ("development", request.changes.development.as_str()),
+        ("staging", request.changes.staging.as_str()),
+        ("production", request.changes.production.as_str()),
+    ]
+    .into_iter()
+    .map(|(environment, input)| {
+        let mut errors = Vec::new();
+        let parsed = parse_preview_input(input, &mut errors);
+        serde_json::json!({
+            "environment": environment,
+            "base_revision": revision_from_vector(&request.expected_base_revisions, environment),
+            "preview_hash": preview_hash_from_vector(&request.preview_hashes, environment),
+            "normalized_changes": preview_change_fingerprint_material(&parsed, &errors),
+        })
+    })
+    .collect::<Vec<_>>();
+
+    let material = serde_json::json!({
+        "project_id": project_id,
+        "parser_version": ENV_PREVIEW_HASH_PARSER_VERSION,
+        "environments": environments,
+    });
+    sha256_hex(material.to_string())
 }
 
 pub fn mask_env_inventory_value(value: Option<&str>) -> String {
@@ -1561,6 +1709,19 @@ pub fn load_project_env_inventory_report(
             environment: env_name.clone(),
             source_kind: snapshot.source_kind.clone(),
             source_label: snapshot.source_label.clone(),
+            env_store_revision: snapshot
+                .configured
+                .as_ref()
+                .map(|value| value.env_store_revision)
+                .unwrap_or(0),
+            updated_at_unix: snapshot
+                .configured
+                .as_ref()
+                .and_then(|value| value.updated_at_unix),
+            updated_by: snapshot
+                .configured
+                .as_ref()
+                .and_then(|value| value.updated_by.clone()),
             configured_source_label: snapshot
                 .configured
                 .as_ref()
@@ -1688,7 +1849,10 @@ pub fn load_project_env_preview_report(
             environment,
         )?;
         partial_metadata |= snapshot.source_kind == SEALED_GENERATION_SNAPSHOT_SOURCE;
-        environments.push(evaluate_environment_changes(environment, input, snapshot).response);
+        let evaluation = evaluate_environment_changes(environment, input, &snapshot);
+        environments.push(build_preview_environment_response(
+            project_id, &snapshot, evaluation,
+        ));
     }
 
     Ok(EnvPreviewResponse {
@@ -1761,6 +1925,9 @@ fn load_environment_inventory_baseline_snapshot(
         return Ok(EnvironmentInventorySourceSnapshot {
             source_kind: SEALED_GENERATION_SNAPSHOT_SOURCE.into(),
             source_label: "Sealed generation snapshot".into(),
+            env_store_revision: 0,
+            updated_at_unix: None,
+            updated_by: None,
             generation: Some(snapshot.generation),
             deployment_id: Some(snapshot.deployment_id),
             values,
@@ -1790,6 +1957,9 @@ fn load_environment_inventory_baseline_snapshot(
         return Ok(EnvironmentInventorySourceSnapshot {
             source_kind: LATEST_CONFIGURED_ENV_STORE_SOURCE.into(),
             source_label: "Latest configured env store".into(),
+            env_store_revision: 0,
+            updated_at_unix: None,
+            updated_by: None,
             generation: None,
             deployment_id: None,
             values,
@@ -1799,6 +1969,9 @@ fn load_environment_inventory_baseline_snapshot(
     Ok(EnvironmentInventorySourceSnapshot {
         source_kind: UNKNOWN_ENV_SOURCE.into(),
         source_label: "Unknown source".into(),
+        env_store_revision: 0,
+        updated_at_unix: None,
+        updated_by: None,
         generation: generation,
         deployment_id: None,
         values: BTreeMap::new(),
@@ -1861,6 +2034,9 @@ fn load_desired_env_inventory_snapshot(
     Ok(Some(EnvironmentInventorySourceSnapshot {
         source_kind: LATEST_CONFIGURED_ENV_STORE_SOURCE.into(),
         source_label: "Latest configured env store".into(),
+        env_store_revision: config.env_store_revision,
+        updated_at_unix: Some(config.updated_at_unix),
+        updated_by: config.updated_by,
         generation: None,
         deployment_id: None,
         values,
@@ -1918,6 +2094,9 @@ fn load_deployed_env_inventory_snapshot(
         return Ok(Some(EnvironmentInventorySourceSnapshot {
             source_kind: SEALED_GENERATION_SNAPSHOT_SOURCE.into(),
             source_label: "Sealed generation snapshot".into(),
+            env_store_revision: 0,
+            updated_at_unix: None,
+            updated_by: None,
             generation: Some(snapshot.generation),
             deployment_id: Some(snapshot.deployment_id),
             values,
@@ -2020,13 +2199,14 @@ struct PreviewChange {
 fn evaluate_environment_changes(
     environment: &str,
     input: &str,
-    snapshot: EnvironmentInventorySourceSnapshot,
+    snapshot: &EnvironmentInventorySourceSnapshot,
 ) -> EvaluatedEnvironmentChanges {
     let mut errors = Vec::new();
     let parsed = parse_preview_input(input, &mut errors);
     let touched = !parsed.is_empty();
+    let normalized_changes = preview_change_fingerprint_material(&parsed, &errors);
     let mut current_by_key = BTreeMap::new();
-    for (key, value) in snapshot.values {
+    for (key, value) in &snapshot.values {
         current_by_key.insert(key.to_ascii_lowercase(), (key, value));
     }
     let mut desired_values = current_by_key
@@ -2036,7 +2216,7 @@ fn evaluate_environment_changes(
                 (
                     normalized_key.clone(),
                     DesiredEnvValue {
-                        key: key.clone(),
+                        key: key.to_string(),
                         value: raw.clone(),
                     },
                 )
@@ -2069,7 +2249,7 @@ fn evaluate_environment_changes(
                         .map(|raw| raw == value)
                         .unwrap_or(existing_value.masked == after_masked);
                     let entry = EnvPreviewDiffEntry {
-                        key: existing_key.clone(),
+                        key: existing_key.to_string(),
                         before_masked: existing_value.masked.clone(),
                         after_masked,
                         action: if same_value {
@@ -2111,7 +2291,7 @@ fn evaluate_environment_changes(
             PreviewChangeKind::Delete => {
                 if let Some((existing_key, existing_value)) = existing {
                     deleted.push(EnvPreviewDiffEntry {
-                        key: existing_key.clone(),
+                        key: existing_key.to_string(),
                         before_masked: existing_value.masked.clone(),
                         after_masked: "DELETED".into(),
                         action: "deleted".into(),
@@ -2144,6 +2324,8 @@ fn evaluate_environment_changes(
         response: EnvPreviewEnvironmentResponse {
             environment: environment.to_string(),
             valid: errors.is_empty(),
+            base_revision: snapshot.env_store_revision,
+            preview_hash: String::new(),
             added,
             updated,
             deleted,
@@ -2153,6 +2335,7 @@ fn evaluate_environment_changes(
         desired_values,
         deleted_keys,
         audit_diff,
+        normalized_changes,
         touched,
     }
 }
@@ -2173,11 +2356,45 @@ pub fn apply_project_env_changes(
         })?
         .ok_or(ProjectStatusError::ProjectNotFound)?;
 
+    if request.idempotency_key.trim().is_empty() {
+        return Err(ProjectStatusError::InvalidEnvChangeRequest(
+            "idempotency_key is required".into(),
+        ));
+    }
+
+    let request_hash = compute_apply_request_hash(project_id, request);
     let requested = [
         ("development", request.changes.development.as_str()),
         ("staging", request.changes.staging.as_str()),
         ("production", request.changes.production.as_str()),
     ];
+    let store = EnvStore::new(storage_root);
+    let _lock = store.acquire_project_lock(project_id)?;
+    let idempotency_key_hash = sha256_hex(request.idempotency_key.as_bytes());
+
+    if let Some(record) = store.read_apply_idempotency(project_id, &idempotency_key_hash)? {
+        if record.request_hash != request_hash {
+            return Err(ProjectStatusError::EnvApplyConflict(
+                "idempotency key already used with a different request".into(),
+            ));
+        }
+        let mut response: EnvApplyResponse = serde_json::from_value(record.response)
+            .map_err(|err| ProjectStatusError::ProjectLookup(err.to_string()))?;
+        response.status = "idempotent_replay".into();
+        response.message = "Already applied. Showing existing result.".into();
+        for environment in &mut response.environments {
+            environment.status = "idempotent_replay".into();
+            environment.message = "Already applied. Showing existing result.".into();
+        }
+        return Ok(response);
+    }
+
+    let now = current_unix_timestamp();
+    let audit_id = format!(
+        "env-audit-{}-{}",
+        &idempotency_key_hash[..idempotency_key_hash.len().min(12)],
+        &request_hash[..request_hash.len().min(12)]
+    );
     let mut evaluations = Vec::with_capacity(requested.len());
     for (environment, input) in requested {
         let snapshot = load_environment_inventory_baseline_snapshot(
@@ -2186,19 +2403,26 @@ pub fn apply_project_env_changes(
             project_id,
             environment,
         )?;
+        let evaluation = evaluate_environment_changes(environment, input, &snapshot);
+        let recomputed_preview_hash =
+            compute_preview_hash(project_id, environment, &snapshot, &evaluation);
         evaluations.push((
             environment.to_string(),
-            evaluate_environment_changes(environment, input, snapshot),
+            snapshot,
+            evaluation,
+            revision_from_vector(&request.expected_base_revisions, environment),
+            preview_hash_from_vector(&request.preview_hashes, environment).to_string(),
+            recomputed_preview_hash,
         ));
     }
 
     if evaluations
         .iter()
-        .any(|(_, evaluation)| !evaluation.response.valid)
+        .any(|(_, _, evaluation, _, _, _)| !evaluation.response.valid)
     {
         let reasons = evaluations
             .iter()
-            .flat_map(|(_, evaluation)| {
+            .flat_map(|(_, _, evaluation, _, _, _)| {
                 evaluation
                     .response
                     .errors
@@ -2220,11 +2444,85 @@ pub fn apply_project_env_changes(
         ));
     }
 
-    let now = current_unix_timestamp();
-    let audit_id = format!("env-audit-{now}-{project_id}");
-    let store = EnvStore::new(storage_root);
+    if let Some((
+        environment,
+        snapshot,
+        _,
+        expected_base_revision,
+        _provided_preview_hash,
+        _recomputed_preview_hash,
+    )) = evaluations.iter().find(
+        |(
+            _,
+            snapshot,
+            _,
+            expected_base_revision,
+            provided_preview_hash,
+            recomputed_preview_hash,
+        )| {
+            snapshot.env_store_revision != *expected_base_revision
+                || provided_preview_hash != recomputed_preview_hash
+        },
+    ) {
+        let message = if snapshot.env_store_revision != *expected_base_revision {
+            format!(
+                "Environment changed since preview. Refresh preview and try again: {environment}"
+            )
+        } else {
+            format!("Preview mismatch detected. Refresh preview and try again: {environment}")
+        };
+        for (conflict_environment, conflict_snapshot, conflict_evaluation, _, _, recomputed_hash) in
+            &evaluations
+        {
+            if conflict_environment == environment {
+                store.append_audit_entry(&PersistedEnvAuditEntry {
+                    snapshot_version: 1,
+                    audit_id: format!("{audit_id}-{conflict_environment}"),
+                    project_id: project_id.to_string(),
+                    environment: conflict_environment.clone(),
+                    requested_by: requested_by.map(|value| value.to_string()),
+                    modified_at_unix: now,
+                    status: "conflict".into(),
+                    env_store_revision_before: conflict_snapshot.env_store_revision,
+                    env_store_revision_after: conflict_snapshot.env_store_revision,
+                    idempotency_key_hash: Some(idempotency_key_hash.clone()),
+                    summary: PersistedEnvAuditSummary {
+                        added: conflict_evaluation.response.added.len(),
+                        updated: conflict_evaluation.response.updated.len(),
+                        deleted: conflict_evaluation.response.deleted.len(),
+                    },
+                    diff: conflict_evaluation
+                        .audit_diff
+                        .iter()
+                        .map(|entry| PersistedEnvAuditDiffEntry {
+                            key: entry.key.clone(),
+                            action: entry.action.clone(),
+                            before_masked: entry.before_masked.clone(),
+                            after_masked: entry.after_masked.clone(),
+                        })
+                        .collect(),
+                })?;
+                let _ = recomputed_hash;
+                break;
+            }
+        }
+        return Err(ProjectStatusError::EnvApplyConflict(message));
+    }
 
-    for (environment, evaluation) in &evaluations {
+    let mut env_store_revision_before = EnvRevisionVector::default();
+    let mut env_store_revision_after = EnvRevisionVector::default();
+    let mut environment_results = Vec::with_capacity(evaluations.len());
+
+    for (environment, snapshot, evaluation, _, _, recomputed_preview_hash) in &evaluations {
+        let revision_before = snapshot.env_store_revision;
+        let effective_change = !evaluation.audit_diff.is_empty();
+        let revision_after = if effective_change {
+            revision_before + 1
+        } else {
+            revision_before
+        };
+        set_revision_in_vector(&mut env_store_revision_before, environment, revision_before);
+        set_revision_in_vector(&mut env_store_revision_after, environment, revision_after);
         let mut entries = evaluation
             .desired_values
             .iter()
@@ -2247,24 +2545,31 @@ pub fn apply_project_env_changes(
             .collect::<Vec<_>>();
         deleted_keys.sort_by(|left, right| left.normalized_key.cmp(&right.normalized_key));
 
-        store.write_desired_environment(&PersistedDesiredEnvConfig {
-            snapshot_version: 1,
-            project_id: project_id.to_string(),
-            environment: environment.clone(),
-            updated_at_unix: now,
-            entries,
-            deleted_keys,
-        })?;
+        if effective_change {
+            store.write_desired_environment(&PersistedDesiredEnvConfig {
+                snapshot_version: 1,
+                project_id: project_id.to_string(),
+                environment: environment.clone(),
+                env_store_revision: revision_after,
+                updated_at_unix: now,
+                updated_by: requested_by.map(|value| value.to_string()),
+                entries,
+                deleted_keys,
+            })?;
+        }
 
-        if evaluation.touched {
+        if effective_change {
             store.append_audit_entry(&PersistedEnvAuditEntry {
                 snapshot_version: 1,
-                audit_id: audit_id.clone(),
+                audit_id: format!("{audit_id}-{environment}"),
                 project_id: project_id.to_string(),
                 environment: environment.clone(),
                 requested_by: requested_by.map(|value| value.to_string()),
                 modified_at_unix: now,
                 status: "applied".into(),
+                env_store_revision_before: revision_before,
+                env_store_revision_after: revision_after,
+                idempotency_key_hash: Some(idempotency_key_hash.clone()),
                 summary: PersistedEnvAuditSummary {
                     added: evaluation.response.added.len(),
                     updated: evaluation.response.updated.len(),
@@ -2282,18 +2587,54 @@ pub fn apply_project_env_changes(
                     .collect(),
             })?;
         }
+
+        environment_results.push(EnvApplyEnvironmentResponse {
+            environment: environment.clone(),
+            applied: effective_change,
+            valid: true,
+            status: if effective_change {
+                "applied".into()
+            } else {
+                "applied".into()
+            },
+            message: if effective_change {
+                "Applied. These changes will affect the next deployment.".into()
+            } else {
+                "No effective changes to apply.".into()
+            },
+            env_store_revision_before: revision_before,
+            env_store_revision_after: revision_after,
+            preview_hash: recomputed_preview_hash.clone(),
+            added: evaluation.response.added.clone(),
+            updated: evaluation.response.updated.clone(),
+            deleted: evaluation.response.deleted.clone(),
+            unchanged: evaluation.response.unchanged.clone(),
+            errors: Vec::new(),
+        });
     }
 
-    Ok(EnvApplyResponse {
+    let response = EnvApplyResponse {
         project_id: project_id.to_string(),
         applied: true,
-        message: "Changes saved. They will apply on the next deployment.".into(),
+        status: "applied".into(),
+        message: "Applied. These changes will affect the next deployment.".into(),
         audit_id,
-        environments: evaluations
-            .into_iter()
-            .map(|(_, evaluation)| evaluation.response)
-            .collect(),
-    })
+        env_store_revision_before,
+        env_store_revision_after,
+        environments: environment_results,
+    };
+
+    store.write_apply_idempotency(&PersistedEnvApplyIdempotencyRecord {
+        snapshot_version: 1,
+        project_id: project_id.to_string(),
+        idempotency_key_hash,
+        request_hash,
+        created_at_unix: now,
+        response: serde_json::to_value(&response)
+            .map_err(|err| ProjectStatusError::ProjectLookup(err.to_string()))?,
+    })?;
+
+    Ok(response)
 }
 
 pub fn load_project_env_audit_report(
@@ -2319,6 +2660,9 @@ pub fn load_project_env_audit_report(
             requested_by: entry.requested_by,
             modified_at_unix: entry.modified_at_unix,
             status: entry.status,
+            env_store_revision_before: entry.env_store_revision_before,
+            env_store_revision_after: entry.env_store_revision_after,
+            idempotency_key_hash: entry.idempotency_key_hash,
             summary: EnvAuditSummary {
                 added: entry.summary.added,
                 updated: entry.summary.updated,
@@ -6186,6 +6530,48 @@ mod tests {
         atomic_write(env.promoted_pointer(), format!("{generation}\n").as_bytes()).unwrap();
     }
 
+    fn previewed_apply_request(
+        root: &Path,
+        store: &SecretStore,
+        changes: crate::api::EnvPreviewChanges,
+        idempotency_key: &str,
+    ) -> crate::api::EnvApplyRequest {
+        let preview = load_project_env_preview_report(
+            root,
+            store,
+            "api",
+            &crate::api::EnvPreviewRequest {
+                changes: changes.clone(),
+            },
+        )
+        .unwrap();
+        let mut expected_base_revisions = crate::api::EnvRevisionVector::default();
+        let mut preview_hashes = crate::api::EnvPreviewHashVector::default();
+        for environment in preview.environments {
+            match environment.environment.as_str() {
+                "development" => {
+                    expected_base_revisions.development = environment.base_revision;
+                    preview_hashes.development = environment.preview_hash;
+                }
+                "staging" => {
+                    expected_base_revisions.staging = environment.base_revision;
+                    preview_hashes.staging = environment.preview_hash;
+                }
+                "production" => {
+                    expected_base_revisions.production = environment.base_revision;
+                    preview_hashes.production = environment.preview_hash;
+                }
+                _ => {}
+            }
+        }
+        crate::api::EnvApplyRequest {
+            changes,
+            expected_base_revisions,
+            preview_hashes,
+            idempotency_key: idempotency_key.into(),
+        }
+    }
+
     #[test]
     fn env_preview_parser_handles_supported_lines_errors_duplicates_and_case() {
         let mut errors = Vec::new();
@@ -6353,14 +6739,16 @@ mod tests {
             &root,
             &store,
             "api",
-            &crate::api::EnvApplyRequest {
-                changes: crate::api::EnvPreviewChanges {
+            &previewed_apply_request(
+                &root,
+                &store,
+                crate::api::EnvPreviewChanges {
                     development: "BROKEN".into(),
                     staging: String::new(),
                     production: String::new(),
                 },
-                preview_token: None,
-            },
+                "invalid-request",
+            ),
             Some("octocat"),
         )
         .unwrap_err();
@@ -6386,14 +6774,16 @@ mod tests {
             &root,
             &store,
             "api",
-            &crate::api::EnvApplyRequest {
-                changes: crate::api::EnvPreviewChanges {
+            &previewed_apply_request(
+                &root,
+                &store,
+                crate::api::EnvPreviewChanges {
                     development: "FORGE_PROJECT_ID=bad\n-FORGE_ENVIRONMENT\n".into(),
                     staging: String::new(),
                     production: String::new(),
                 },
-                preview_token: None,
-            },
+                "reserved-request",
+            ),
             Some("octocat"),
         )
         .unwrap_err();
@@ -6448,8 +6838,10 @@ mod tests {
             &root,
             &store,
             "api",
-            &crate::api::EnvApplyRequest {
-                changes: crate::api::EnvPreviewChanges {
+            &previewed_apply_request(
+                &root,
+                &store,
+                crate::api::EnvPreviewChanges {
                     development: concat!(
                         "app_name=FLEETDEV\n",
                         "DEBUG=true\n",
@@ -6461,22 +6853,27 @@ mod tests {
                     staging: "APP_NAME=Stage".into(),
                     production: String::new(),
                 },
-                preview_token: None,
-            },
+                "apply-request",
+            ),
             Some("octocat"),
         )
         .unwrap();
 
         assert!(response.applied);
+        assert_eq!(response.status, "applied");
         assert_eq!(
             response.message,
-            "Changes saved. They will apply on the next deployment."
+            "Applied. These changes will affect the next deployment."
         );
+        assert_eq!(response.env_store_revision_before.development, 0);
+        assert_eq!(response.env_store_revision_after.development, 1);
 
         let desired = EnvStore::new(&root)
             .load_desired_environment("api", "development")
             .unwrap()
             .unwrap();
+        assert_eq!(desired.env_store_revision, 1);
+        assert_eq!(desired.updated_by.as_deref(), Some("octocat"));
         assert_eq!(desired.entries.len(), 4);
         assert_eq!(desired.entries[0].key, "app_name");
         assert_eq!(desired.entries[0].normalized_key, "app_name");
@@ -6499,6 +6896,7 @@ mod tests {
             .find(|entry| entry.environment == "development")
             .unwrap();
         assert_eq!(development_source.source_kind, "configured_and_deployed");
+        assert_eq!(development_source.env_store_revision, 1);
         assert_eq!(
             development_source.configured_source_label.as_deref(),
             Some("Latest configured env store")
@@ -6519,6 +6917,8 @@ mod tests {
         );
         assert!(audit.entries.iter().any(|entry| {
             entry.environment == "development"
+                && entry.env_store_revision_before == 0
+                && entry.env_store_revision_after == 1
                 && entry.summary.added == 1
                 && entry.summary.updated == 1
                 && entry.summary.deleted == 1
@@ -6536,6 +6936,238 @@ mod tests {
         assert_eq!(current_before, current_after);
         assert_eq!(previous_before, previous_after);
         assert_eq!(promoted_before, promoted_after);
+    }
+
+    #[test]
+    fn env_preview_exposes_base_revision_and_stable_preview_hash() {
+        let root = test_root("env-preview-exposes-base-revision-and-stable-preview-hash");
+        register_project(&root, "api", "api.example.com");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        seed_env_preview_environment(
+            &root,
+            "development",
+            3,
+            serde_json::json!({
+                "APP_NAME": {"source":"forge_yaml","value":"FLEETDEV","sensitive":false,"redacted":false}
+            }),
+        );
+        for environment in ["staging", "production"] {
+            EnvironmentPaths::new(&root, "api", environment)
+                .ensure_exists()
+                .unwrap();
+        }
+
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        let changes = crate::api::EnvPreviewChanges {
+            development: "APP_NAME=FLEETDEV\nDEBUG=true".into(),
+            staging: String::new(),
+            production: String::new(),
+        };
+        let preview_one = load_project_env_preview_report(
+            &root,
+            &store,
+            "api",
+            &crate::api::EnvPreviewRequest {
+                changes: changes.clone(),
+            },
+        )
+        .unwrap();
+        let preview_two = load_project_env_preview_report(
+            &root,
+            &store,
+            "api",
+            &crate::api::EnvPreviewRequest { changes },
+        )
+        .unwrap();
+        let one = preview_one
+            .environments
+            .iter()
+            .find(|entry| entry.environment == "development")
+            .unwrap();
+        let two = preview_two
+            .environments
+            .iter()
+            .find(|entry| entry.environment == "development")
+            .unwrap();
+        assert_eq!(one.base_revision, 0);
+        assert_eq!(one.preview_hash, two.preview_hash);
+        assert!(one.preview_hash.starts_with("sha256-"));
+    }
+
+    #[test]
+    fn stale_preview_is_rejected_without_partial_write() {
+        let root = test_root("stale-preview-is-rejected-without-partial-write");
+        register_project(&root, "api", "api.example.com");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        seed_env_preview_environment(
+            &root,
+            "development",
+            3,
+            serde_json::json!({
+                "APP_NAME": {"source":"forge_yaml","value":"FLEETDEV","sensitive":false,"redacted":false}
+            }),
+        );
+        for environment in ["staging", "production"] {
+            EnvironmentPaths::new(&root, "api", environment)
+                .ensure_exists()
+                .unwrap();
+        }
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        let stale_request = previewed_apply_request(
+            &root,
+            &store,
+            crate::api::EnvPreviewChanges {
+                development: "APP_NAME=First".into(),
+                staging: String::new(),
+                production: String::new(),
+            },
+            "stale-preview",
+        );
+        let fresh_request = previewed_apply_request(
+            &root,
+            &store,
+            crate::api::EnvPreviewChanges {
+                development: "APP_NAME=Second".into(),
+                staging: String::new(),
+                production: String::new(),
+            },
+            "fresh-preview",
+        );
+
+        apply_project_env_changes(&root, &store, "api", &fresh_request, Some("tab-b")).unwrap();
+        let err = apply_project_env_changes(&root, &store, "api", &stale_request, Some("tab-a"))
+            .unwrap_err();
+        match err {
+            ProjectStatusError::EnvApplyConflict(message) => {
+                assert!(message.contains("Environment changed since preview"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let desired = EnvStore::new(&root)
+            .load_desired_environment("api", "development")
+            .unwrap()
+            .unwrap();
+        assert_eq!(desired.env_store_revision, 1);
+        assert_eq!(
+            unseal_value(&desired.entries[0].sealed_value).unwrap(),
+            "Second"
+        );
+    }
+
+    #[test]
+    fn env_apply_replays_same_idempotency_result_without_duplicate_audit() {
+        let root = test_root("env-apply-replays-same-idempotency-result-without-duplicate-audit");
+        register_project(&root, "api", "api.example.com");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        seed_env_preview_environment(
+            &root,
+            "development",
+            3,
+            serde_json::json!({
+                "APP_NAME": {"source":"forge_yaml","value":"FLEETDEV","sensitive":false,"redacted":false}
+            }),
+        );
+        for environment in ["staging", "production"] {
+            EnvironmentPaths::new(&root, "api", environment)
+                .ensure_exists()
+                .unwrap();
+        }
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        let request = previewed_apply_request(
+            &root,
+            &store,
+            crate::api::EnvPreviewChanges {
+                development: "APP_NAME=Replay".into(),
+                staging: String::new(),
+                production: String::new(),
+            },
+            "same-key",
+        );
+
+        let first =
+            apply_project_env_changes(&root, &store, "api", &request, Some("octocat")).unwrap();
+        let second =
+            apply_project_env_changes(&root, &store, "api", &request, Some("octocat")).unwrap();
+
+        assert_eq!(first.audit_id, second.audit_id);
+        assert_eq!(second.status, "idempotent_replay");
+        assert_eq!(second.message, "Already applied. Showing existing result.");
+        let audit = load_project_env_audit_report(&root, "api").unwrap();
+        assert_eq!(audit.entries.len(), 1);
+        let audit_json = serde_json::to_string(&audit).unwrap();
+        assert!(!audit_json.contains("Replay"));
+    }
+
+    #[test]
+    fn env_apply_rejects_idempotency_key_reuse_for_different_request() {
+        let root = test_root("env-apply-rejects-idempotency-key-reuse-for-different-request");
+        register_project(&root, "api", "api.example.com");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        seed_env_preview_environment(
+            &root,
+            "development",
+            3,
+            serde_json::json!({
+                "APP_NAME": {"source":"forge_yaml","value":"FLEETDEV","sensitive":false,"redacted":false}
+            }),
+        );
+        for environment in ["staging", "production"] {
+            EnvironmentPaths::new(&root, "api", environment)
+                .ensure_exists()
+                .unwrap();
+        }
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+        let first_request = previewed_apply_request(
+            &root,
+            &store,
+            crate::api::EnvPreviewChanges {
+                development: "APP_NAME=One".into(),
+                staging: String::new(),
+                production: String::new(),
+            },
+            "same-key",
+        );
+        let second_request = previewed_apply_request(
+            &root,
+            &store,
+            crate::api::EnvPreviewChanges {
+                development: "APP_NAME=Two".into(),
+                staging: String::new(),
+                production: String::new(),
+            },
+            "same-key",
+        );
+
+        apply_project_env_changes(&root, &store, "api", &first_request, Some("octocat")).unwrap();
+        let err = apply_project_env_changes(&root, &store, "api", &second_request, Some("octocat"))
+            .unwrap_err();
+        match err {
+            ProjectStatusError::EnvApplyConflict(message) => {
+                assert!(message.contains("idempotency key already used"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

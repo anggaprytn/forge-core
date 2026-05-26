@@ -541,6 +541,12 @@ pub struct EnvInventoryEnvironmentSource {
     pub environment: String,
     pub source_kind: String,
     pub source_label: String,
+    #[serde(default)]
+    pub env_store_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_source_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -585,11 +591,32 @@ pub struct EnvPreviewRequest {
     pub changes: EnvPreviewChanges,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EnvRevisionVector {
+    #[serde(default)]
+    pub development: u64,
+    #[serde(default)]
+    pub staging: u64,
+    #[serde(default)]
+    pub production: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EnvPreviewHashVector {
+    #[serde(default)]
+    pub development: String,
+    #[serde(default)]
+    pub staging: String,
+    #[serde(default)]
+    pub production: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvApplyRequest {
     pub changes: EnvPreviewChanges,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_token: Option<String>,
+    pub expected_base_revisions: EnvRevisionVector,
+    pub preview_hashes: EnvPreviewHashVector,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,6 +637,10 @@ pub struct EnvPreviewDiffEntry {
 pub struct EnvPreviewEnvironmentResponse {
     pub environment: String,
     pub valid: bool,
+    #[serde(default)]
+    pub base_revision: u64,
+    #[serde(default)]
+    pub preview_hash: String,
     #[serde(default)]
     pub added: Vec<EnvPreviewDiffEntry>,
     #[serde(default)]
@@ -638,10 +669,38 @@ pub struct EnvPreviewResponse {
 pub struct EnvApplyResponse {
     pub project_id: String,
     pub applied: bool,
+    pub status: String,
     pub message: String,
     pub audit_id: String,
+    pub env_store_revision_before: EnvRevisionVector,
+    pub env_store_revision_after: EnvRevisionVector,
     #[serde(default)]
-    pub environments: Vec<EnvPreviewEnvironmentResponse>,
+    pub environments: Vec<EnvApplyEnvironmentResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvApplyEnvironmentResponse {
+    pub environment: String,
+    pub applied: bool,
+    pub valid: bool,
+    pub status: String,
+    pub message: String,
+    #[serde(default)]
+    pub env_store_revision_before: u64,
+    #[serde(default)]
+    pub env_store_revision_after: u64,
+    #[serde(default)]
+    pub preview_hash: String,
+    #[serde(default)]
+    pub added: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub updated: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub deleted: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub unchanged: Vec<EnvPreviewDiffEntry>,
+    #[serde(default)]
+    pub errors: Vec<EnvPreviewError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -663,6 +722,12 @@ pub struct EnvAuditEntry {
     pub requested_by: Option<String>,
     pub modified_at_unix: u64,
     pub status: String,
+    #[serde(default)]
+    pub env_store_revision_before: u64,
+    #[serde(default)]
+    pub env_store_revision_after: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key_hash: Option<String>,
     pub summary: EnvAuditSummary,
     #[serde(default)]
     pub diff: Vec<EnvPreviewDiffEntry>,

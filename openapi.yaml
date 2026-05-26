@@ -324,6 +324,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: Stale preview, concurrent change, or idempotency conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '401':
           description: Unauthorized
           content:
@@ -1320,7 +1326,7 @@ components:
             $ref: '#/components/schemas/EnvInventoryCell'
     EnvInventoryEnvironmentSource:
       type: object
-      required: [environment, source_kind, source_label]
+      required: [environment, source_kind, source_label, env_store_revision]
       properties:
         environment:
           type: string
@@ -1328,6 +1334,16 @@ components:
           type: string
         source_label:
           type: string
+        env_store_revision:
+          type: integer
+          format: int64
+        updated_at_unix:
+          type: integer
+          format: int64
+          nullable: true
+        updated_by:
+          type: string
+          nullable: true
         configured_source_label:
           type: string
           nullable: true
@@ -1403,16 +1419,45 @@ components:
       properties:
         changes:
           $ref: '#/components/schemas/EnvPreviewChanges'
+    EnvRevisionVector:
+      type: object
+      required: [development, staging, production]
+      properties:
+        development:
+          type: integer
+          format: int64
+        staging:
+          type: integer
+          format: int64
+        production:
+          type: integer
+          format: int64
+    EnvPreviewHashVector:
+      type: object
+      required: [development, staging, production]
+      properties:
+        development:
+          type: string
+        staging:
+          type: string
+        production:
+          type: string
     EnvApplyRequest:
       type: object
       required:
         - changes
+        - expected_base_revisions
+        - preview_hashes
+        - idempotency_key
       properties:
         changes:
           $ref: '#/components/schemas/EnvPreviewChanges'
-        preview_token:
+        expected_base_revisions:
+          $ref: '#/components/schemas/EnvRevisionVector'
+        preview_hashes:
+          $ref: '#/components/schemas/EnvPreviewHashVector'
+        idempotency_key:
           type: string
-          nullable: true
     EnvPreviewError:
       type: object
       required:
@@ -1445,6 +1490,8 @@ components:
       required:
         - environment
         - valid
+        - base_revision
+        - preview_hash
         - added
         - updated
         - deleted
@@ -1455,6 +1502,11 @@ components:
           type: string
         valid:
           type: boolean
+        base_revision:
+          type: integer
+          format: int64
+        preview_hash:
+          type: string
         added:
           type: array
           items:
@@ -1504,22 +1556,86 @@ components:
       required:
         - project_id
         - applied
+        - status
         - message
         - audit_id
+        - env_store_revision_before
+        - env_store_revision_after
         - environments
       properties:
         project_id:
           type: string
         applied:
           type: boolean
+        status:
+          type: string
         message:
           type: string
         audit_id:
           type: string
+        env_store_revision_before:
+          $ref: '#/components/schemas/EnvRevisionVector'
+        env_store_revision_after:
+          $ref: '#/components/schemas/EnvRevisionVector'
         environments:
           type: array
           items:
-            $ref: '#/components/schemas/EnvPreviewEnvironmentResponse'
+            $ref: '#/components/schemas/EnvApplyEnvironmentResponse'
+    EnvApplyEnvironmentResponse:
+      type: object
+      required:
+        - environment
+        - applied
+        - valid
+        - status
+        - message
+        - env_store_revision_before
+        - env_store_revision_after
+        - preview_hash
+        - added
+        - updated
+        - deleted
+        - unchanged
+        - errors
+      properties:
+        environment:
+          type: string
+        applied:
+          type: boolean
+        valid:
+          type: boolean
+        status:
+          type: string
+        message:
+          type: string
+        env_store_revision_before:
+          type: integer
+          format: int64
+        env_store_revision_after:
+          type: integer
+          format: int64
+        preview_hash:
+          type: string
+        added:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        updated:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        deleted:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        unchanged:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewError'
     EnvAuditSummary:
       type: object
       required:
@@ -1541,6 +1657,8 @@ components:
         - environment
         - modified_at_unix
         - status
+        - env_store_revision_before
+        - env_store_revision_after
         - summary
         - diff
       properties:
@@ -1558,6 +1676,15 @@ components:
           format: int64
         status:
           type: string
+        env_store_revision_before:
+          type: integer
+          format: int64
+        env_store_revision_after:
+          type: integer
+          format: int64
+        idempotency_key_hash:
+          type: string
+          nullable: true
         summary:
           $ref: '#/components/schemas/EnvAuditSummary'
         diff:
