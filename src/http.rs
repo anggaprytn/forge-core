@@ -5729,10 +5729,14 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
                     "Preview Changes",
                     "Apply Changes",
                     "Confirm Apply",
-                    "Current generation is not mutated",
+                    "Current running generation is unchanged",
                     "Rollback uses sealed historical snapshots",
                     "Secret values are never revealed",
+                    "No preview yet",
                     "Audit history",
+                    "Show Diff expands masked diff only",
+                    "All environments",
+                    "All statuses",
                     "env-preview-development",
                     "env-preview-staging",
                     "env-preview-production",
@@ -5746,7 +5750,13 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
                     "submitEnvPreview()",
                     "applyEnvChanges()",
                     "Environment changed since preview. Refresh preview and try again.",
-                    "Preview cleared. Review the updated input and preview again before applying.",
+                    "No changes were saved.",
+                    "Edit detected. Preview again before applying.",
+                    "Preview is based on revision",
+                    "No env changes recorded yet.",
+                    "No effective changes.",
+                    "pending next deploy",
+                    "matches deployed",
                     "idempotency_key",
                     "expected_base_revisions",
                     "preview_hashes",
@@ -7454,7 +7464,7 @@ pub mod project_inventory_api_requires_authentication {
                     .uri("/api/projects/api/env/apply")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"changes":{"development":"APP_NAME=MyService","staging":"","production":""}}"#,
+                        r#"{"changes":{"development":"APP_NAME=MyService","staging":"","production":""},"expected_base_revisions":{"development":0,"staging":0,"production":0},"preview_hashes":{"development":"sha256-test","staging":"sha256-test","production":"sha256-test"},"idempotency_key":"unauthenticated-test"}"#,
                     ))
                     .unwrap(),
             )
@@ -8030,7 +8040,11 @@ pub mod project_environment_inventory_api_uses_persisted_state {
                 .unwrap()
                 .iter()
                 .any(|entry| entry["key"] == "SERVER_PORT"
-                    && entry["environments"]["production"]["value"] == "missing")
+                    && entry["environments"]["production"]["value"] == "not configured")
+        );
+        assert_eq!(
+            json["data"]["environment_sources"][0]["revision_label"],
+            "Revision 0"
         );
         assert!(body_text.contains("F*****V"));
         assert!(body_text.contains("****"));
@@ -8091,6 +8105,7 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         );
         let source = &json["data"]["environment_sources"][0];
         assert_eq!(source["source_kind"], "configured_and_deployed");
+        assert_eq!(source["revision_label"], "Revision 1");
         assert_eq!(
             source["configured_source_label"],
             "Latest configured env store"
@@ -8112,6 +8127,32 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         assert_eq!(
             app_name["environments"]["staging"]["deployed_value"],
             "FLE*****AG"
+        );
+        assert_eq!(
+            app_name["environments"]["staging"]["pending_next_deploy"],
+            true
+        );
+        assert_eq!(
+            app_name["environments"]["staging"]["matches_deployed"],
+            false
+        );
+        assert_eq!(
+            app_name["environments"]["staging"]["next_deploy_label"],
+            "Sta*****xt"
+        );
+        let server_port = json["data"]["variables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "SERVER_PORT")
+            .unwrap();
+        assert_eq!(
+            server_port["environments"]["staging"]["value_state"],
+            "deleted_next_deploy"
+        );
+        assert_eq!(
+            server_port["environments"]["staging"]["next_deploy_label"],
+            "will be removed on next deployment"
         );
     }
 
@@ -8166,6 +8207,14 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         assert_eq!(
             json["data"]["message"],
             "Preview only. No changes have been saved."
+        );
+        assert_eq!(
+            json["data"]["environments"][0]["revision_label"],
+            "Revision 0"
+        );
+        assert_eq!(
+            json["data"]["environments"][0]["state"],
+            "preview_has_errors"
         );
         assert!(body_text.contains("DELETED"));
         assert!(body_text.contains("F*****V"));
@@ -8240,6 +8289,11 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         assert_eq!(apply.status(), StatusCode::OK);
         let apply_body = to_bytes(apply.into_body(), usize::MAX).await.unwrap();
         let apply_text = String::from_utf8(apply_body.to_vec()).unwrap();
+        let apply_json: Value = serde_json::from_str(&apply_text).unwrap();
+        assert_eq!(
+            apply_json["data"]["environments"][0]["revision_label"],
+            "Revision 1"
+        );
         assert!(!apply_text.contains("FLEETDEV"));
         assert!(!apply_text.contains("DEBUG=true"));
 
@@ -8257,6 +8311,11 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         assert_eq!(audit.status(), StatusCode::OK);
         let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
         let audit_text = String::from_utf8(audit_body.to_vec()).unwrap();
+        let audit_json: Value = serde_json::from_str(&audit_text).unwrap();
+        assert_eq!(
+            audit_json["data"]["entries"][0]["revision_label"],
+            "Revision 0 -> Revision 1"
+        );
         assert!(!audit_text.contains("FLEETDEV"));
         assert!(!audit_text.contains("DEBUG=true"));
     }

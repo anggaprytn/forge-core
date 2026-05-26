@@ -1284,6 +1284,8 @@ pub struct PersistedEnvAuditSummary {
     pub updated: usize,
     #[serde(default)]
     pub deleted: usize,
+    #[serde(default)]
+    pub unchanged: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

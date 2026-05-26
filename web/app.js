@@ -25,6 +25,8 @@ const uiState = {
   query: "",
   selectedProjectId: "",
   envQuery: "",
+  envAuditEnvironment: "all",
+  envAuditStatus: "all",
 };
 
 const dataState = {
@@ -40,6 +42,7 @@ const dataState = {
   lastEnvPreviewSignature: "",
   lastEnvApplyIdempotencyKey: "",
   envApplyInFlight: false,
+  envPreviewPhase: "no_preview",
 };
 
 function element(id) {
@@ -184,6 +187,26 @@ function show(id) {
   if (node) {
     node.hidden = false;
   }
+}
+
+function setPreviewPhase(phase) {
+  dataState.envPreviewPhase = phase || "no_preview";
+  const node = element("env-preview-phase-chip");
+  if (!node) {
+    return;
+  }
+  const labels = {
+    no_preview: ["No preview yet", "stale"],
+    preview_valid: ["Preview valid", "ok"],
+    preview_has_errors: ["Preview has errors", "warn"],
+    preview_stale: ["Preview stale", "warn"],
+    applying: ["Applying", "warn"],
+    applied: ["Applied", "ok"],
+    apply_failed: ["Apply failed", "warn"],
+    idempotent_replay: ["Idempotent replay", "ok"],
+  };
+  const [label, tone] = labels[phase] || [text(phase), ""];
+  setChip("env-preview-phase-chip", label, tone);
 }
 
 function hide(id) {
@@ -475,13 +498,56 @@ function envColumnNames(inventory) {
 }
 
 function setEnvSourceMeta(inventory) {
+  const wrapper = element("env-inventory-meta");
+  if (!wrapper) {
+    return;
+  }
+  clearChildren(wrapper);
   const note = inventory && inventory.partial_metadata_note
     ? inventory.partial_metadata_note
     : inventory && inventory.partial_metadata_notice
       ? inventory.partial_metadata_notice
       : "Masked values only.";
-  element("env-source-label").textContent = inventory ? text(inventory.source_label) : "Unknown source";
-  element("env-source-note").textContent = note;
+  const title = document.createElement("p");
+  title.id = "env-source-label";
+  title.className = "env-source-label";
+  title.textContent = inventory ? text(inventory.source_label) : "Unknown source";
+  wrapper.appendChild(title);
+
+  const detail = document.createElement("p");
+  detail.id = "env-source-note";
+  detail.className = "env-source-note";
+  detail.textContent = note;
+  wrapper.appendChild(detail);
+
+  const copy = document.createElement("p");
+  copy.className = "env-source-note";
+  copy.textContent = "Applies on next deployment. Current running generation is unchanged. Rollback uses sealed historical snapshots.";
+  wrapper.appendChild(copy);
+
+  const sources = inventory && Array.isArray(inventory.environment_sources) ? inventory.environment_sources : [];
+  if (sources.length) {
+    const grid = document.createElement("div");
+    grid.className = "env-source-grid";
+    sources.forEach((source) => {
+      const card = document.createElement("article");
+      card.className = "env-source-card";
+
+      const name = document.createElement("h3");
+      name.textContent = text(source.environment);
+      card.appendChild(name);
+
+      const facts = document.createElement("dl");
+      facts.className = "env-source-facts";
+      appendMeta(facts, "Source", text(source.source_label));
+      appendMeta(facts, "Revision", text(source.revision_label || `Revision ${source.env_store_revision}`, "Revision 0"));
+      appendMeta(facts, "Last updated", formatUnix(source.updated_at_unix));
+      appendMeta(facts, "Updated by", text(source.updated_by, "Unknown"));
+      card.appendChild(facts);
+      grid.appendChild(card);
+    });
+    wrapper.appendChild(grid);
+  }
   show("env-inventory-meta");
 }
 
@@ -533,34 +599,55 @@ function renderEnvInventory(inventory) {
 
       const cell = row.environments && row.environments[environment]
         ? row.environments[environment]
-        : { exists: false, value: "missing" };
+        : { exists: false, value: "not configured", value_state: "missing" };
 
       const presence = document.createElement("div");
       presence.className = `env-presence ${cell.exists ? "exists" : "missing"}`;
       const dot = document.createElement("span");
       dot.className = "env-presence-dot";
       const label = document.createElement("span");
-      label.textContent = cell.exists ? "present" : "missing";
+      label.textContent = cell.exists ? "present" : "not configured";
       presence.append(dot, label);
 
       const value = document.createElement("p");
       value.className = `env-value${cell.exists ? "" : " missing"}`;
-      value.textContent = text(cell.value, "missing");
+      value.textContent = text(cell.value, "not configured");
       wrapper.append(presence, value);
 
-      if (cell.configured_exists || cell.deployed_exists) {
-        if (cell.configured_exists) {
-          const configured = document.createElement("p");
-          configured.className = "env-value";
-          configured.textContent = `Next deploy: ${text(cell.configured_value, "missing")}`;
-          wrapper.appendChild(configured);
-        }
-        if (cell.deployed_exists) {
-          const deployed = document.createElement("p");
-          deployed.className = "env-value";
-          deployed.textContent = `Last deployed: ${text(cell.deployed_value, "missing")}`;
-          wrapper.appendChild(deployed);
-        }
+      const statusRow = document.createElement("div");
+      statusRow.className = "env-inline-badges";
+      if (cell.pending_next_deploy) {
+        const badge = document.createElement("span");
+        badge.className = "status-chip warn";
+        badge.textContent = "pending next deploy";
+        statusRow.appendChild(badge);
+      } else if (cell.matches_deployed) {
+        const badge = document.createElement("span");
+        badge.className = "status-chip";
+        badge.textContent = "matches deployed";
+        statusRow.appendChild(badge);
+      }
+      if (statusRow.childNodes.length) {
+        wrapper.appendChild(statusRow);
+      }
+
+      if (cell.next_deploy_label !== undefined && cell.next_deploy_label !== null) {
+        const configured = document.createElement("p");
+        configured.className = "env-value env-detail-line";
+        configured.textContent = `Next deploy: ${text(cell.next_deploy_label, "not configured")}`;
+        wrapper.appendChild(configured);
+      }
+      if (cell.deployed_label !== undefined && cell.deployed_label !== null) {
+        const deployed = document.createElement("p");
+        deployed.className = "env-value env-detail-line";
+        deployed.textContent = `Last deployed: ${text(cell.deployed_label, "not configured")}`;
+        wrapper.appendChild(deployed);
+      }
+      if (!cell.configured_exists && !cell.pending_next_deploy && cell.deployed_exists) {
+        const note = document.createElement("p");
+        note.className = "env-value missing";
+        note.textContent = "No configured override exists.";
+        wrapper.appendChild(note);
       }
 
       td.appendChild(wrapper);
@@ -678,11 +765,12 @@ function previewInputValue(environment) {
   return field ? field.value : "";
 }
 
-function resetEnvPreview(message, clearFields) {
+function resetEnvPreview(message, clearFields, phase = "no_preview") {
   dataState.lastEnvPreview = null;
   dataState.lastEnvPreviewSignature = "";
   dataState.lastEnvApplyIdempotencyKey = "";
   dataState.envApplyInFlight = false;
+  setPreviewPhase(phase);
   hide("env-preview-result");
   hide("env-apply-panel");
   hide("env-apply-confirmation");
@@ -746,9 +834,21 @@ function appendPreviewEntries(container, title, entries) {
 
   const list = document.createElement("ul");
   list.className = "env-preview-list";
+  const actionCopy = {
+    added: "will be added on next deployment",
+    updated: "will change on next deployment",
+    deleted: "will be removed on next deployment",
+    unchanged: "unchanged",
+  };
   entries.forEach((entry) => {
     const item = document.createElement("li");
-    item.textContent = `${text(entry.key)} • ${text(entry.before_masked)} -> ${text(entry.after_masked)}`;
+    const beforeValue = entry.before_masked === "<empty>" ? "set to empty string" : text(entry.before_masked, "not configured");
+    const afterValue = entry.action === "deleted"
+      ? "will be removed on next deployment"
+      : entry.after_masked === "<empty>"
+        ? "set to empty string"
+        : text(entry.after_masked, "not configured");
+    item.textContent = `${text(entry.key)} • ${beforeValue} -> ${afterValue} • ${actionCopy[entry.action] || text(entry.action)}`;
     list.appendChild(item);
   });
   section.appendChild(list);
@@ -791,10 +891,11 @@ function previewSummaryCard(environment) {
   summary.appendChild(summaryMetric("Added", environment.added.length));
   summary.appendChild(summaryMetric("Updated", environment.updated.length));
   summary.appendChild(summaryMetric("Deleted", environment.deleted.length));
+  summary.appendChild(summaryMetric("Unchanged", environment.unchanged.length));
   summary.appendChild(summaryMetric("Errors", environment.errors.length));
   summary.appendChild(summaryMetric(
     "Revision",
-    environment.base_revision ?? environment.env_store_revision_after ?? 0,
+    text(environment.revision_label || `Revision ${environment.base_revision ?? environment.env_store_revision_after ?? 0}`),
   ));
   card.appendChild(summary);
 
@@ -802,6 +903,11 @@ function previewSummaryCard(environment) {
   validity.className = `env-preview-validity${environment.valid ? " ok" : " warn"}`;
   validity.textContent = environment.valid ? "Valid preview." : "Preview invalid. Fix errors before retrying.";
   card.appendChild(validity);
+
+  const meta = document.createElement("p");
+  meta.className = "env-audit-meta";
+  meta.textContent = `Preview is based on revision ${text(environment.base_revision, 0)}. Source ${text(environment.source_label)}. Last updated ${formatUnix(environment.updated_at_unix)}. Updated by ${text(environment.updated_by, "Unknown")}.`;
+  card.appendChild(meta);
 
   appendPreviewEntries(card, "Added keys", environment.added);
   appendPreviewEntries(card, "Updated keys", environment.updated);
@@ -835,6 +941,10 @@ function renderEnvPreviewResult(preview) {
   message.textContent = text(preview && preview.message, "Preview only. No changes have been saved.");
   note.appendChild(message);
 
+  const operatorCopy = document.createElement("p");
+  operatorCopy.textContent = "Applies on next deployment. Current running generation is unchanged. Rollback uses sealed historical snapshots.";
+  note.appendChild(operatorCopy);
+
   if (preview && preview.warning) {
     const warning = document.createElement("p");
     warning.textContent = preview.warning;
@@ -844,12 +954,25 @@ function renderEnvPreviewResult(preview) {
   result.appendChild(note);
 
   const environments = preview && Array.isArray(preview.environments) ? preview.environments : [];
+  const isApplyResult = preview
+    && typeof preview.status === "string"
+    && (preview.status === "applied" || preview.status === "idempotent_replay");
+  const allValid = environments.length && environments.every((environment) => environment && environment.valid);
+  if (preview && preview.status === "idempotent_replay") {
+    setPreviewPhase("idempotent_replay");
+  } else if (isApplyResult) {
+    setPreviewPhase("applied");
+  } else if (allValid) {
+    setPreviewPhase("preview_valid");
+  } else {
+    setPreviewPhase("preview_has_errors");
+  }
   environments.forEach((environment) => {
     result.appendChild(previewSummaryCard(environment));
   });
 
   dataState.lastEnvPreview = preview || null;
-  if (preview && !preview.applied) {
+  if (preview && !isApplyResult && !preview.applied) {
     dataState.lastEnvPreviewSignature = serializeEnvChanges(currentEnvChanges());
     dataState.lastEnvApplyIdempotencyKey = generateIdempotencyKey();
   } else {
@@ -889,6 +1012,7 @@ async function submitEnvPreview() {
     button.textContent = "Previewing...";
   }
   hide("env-preview-result");
+  setPreviewPhase("no_preview");
   showState("env-preview-state", "Previewing masked environment changes...");
 
   try {
@@ -904,6 +1028,7 @@ async function submitEnvPreview() {
     dataState.lastEnvPreview = null;
     dataState.lastEnvPreviewSignature = "";
     dataState.lastEnvApplyIdempotencyKey = "";
+    setPreviewPhase("preview_has_errors");
     showState("env-preview-state", error.message || "Preview failed.", "warn");
     hide("env-apply-panel");
     hide("env-apply-confirmation");
@@ -918,8 +1043,27 @@ async function submitEnvPreview() {
 function renderAuditDiff(diff) {
   const wrapper = document.createElement("div");
   wrapper.className = "env-audit-diff";
-  appendPreviewEntries(wrapper, "Masked diff", Array.isArray(diff) ? diff : []);
+  const entries = Array.isArray(diff) ? diff : [];
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.className = "env-audit-meta";
+    empty.textContent = "No effective changes.";
+    wrapper.appendChild(empty);
+    return wrapper;
+  }
+  appendPreviewEntries(wrapper, "Masked diff", entries);
   return wrapper;
+}
+
+function filteredAuditEntries(audit) {
+  const entries = audit && Array.isArray(audit.entries) ? audit.entries.slice() : [];
+  return entries
+    .sort((left, right) => (right.modified_at_unix || 0) - (left.modified_at_unix || 0))
+    .filter((entry) => {
+      const envMatch = uiState.envAuditEnvironment === "all" || entry.environment === uiState.envAuditEnvironment;
+      const statusMatch = uiState.envAuditStatus === "all" || entry.status === uiState.envAuditStatus;
+      return envMatch && statusMatch;
+    });
 }
 
 function renderEnvAuditHistory(audit) {
@@ -929,26 +1073,34 @@ function renderEnvAuditHistory(audit) {
   }
   clearChildren(list);
 
-  const total = audit && typeof audit.total === "number" ? audit.total : 0;
-  setChip("env-audit-total-chip", `${total} events`, total ? "" : "stale");
+  const allEntries = audit && Array.isArray(audit.entries) ? audit.entries : [];
+  const total = audit && typeof audit.total === "number" ? audit.total : allEntries.length;
+  const filtered = filteredAuditEntries(audit);
+  setChip("env-audit-total-chip", `${filtered.length}/${total} events`, total ? "" : "stale");
 
-  if (!audit || !Array.isArray(audit.entries) || !audit.entries.length) {
+  if (!allEntries.length) {
     hide("env-audit-history");
-    showState("env-audit-state", "No masked audit history recorded for this project yet.");
+    showState("env-audit-state", "No env changes recorded yet.");
     return;
   }
 
-  audit.entries.forEach((entry) => {
+  if (!filtered.length) {
+    hide("env-audit-history");
+    showState("env-audit-state", "No env changes match the current filters.");
+    return;
+  }
+
+  filtered.forEach((entry) => {
     const card = document.createElement("article");
     card.className = "env-audit-card";
 
     const head = document.createElement("div");
     head.className = "env-audit-head";
     const title = document.createElement("h3");
-    title.textContent = `${text(entry.environment)} • ${text(entry.status)}`;
+    title.textContent = `${text(entry.environment)} • ${text(entry.audit_status_label || entry.status)}`;
     const meta = document.createElement("p");
     meta.className = "env-audit-meta";
-    meta.textContent = `Requested by ${text(entry.requested_by, "Unknown")} • ${formatUnix(entry.modified_at_unix)}`;
+    meta.textContent = `Requested by ${text(entry.requested_by, "Unknown")} • ${formatUnix(entry.modified_at_unix)} • ${text(entry.source_label, "Latest configured env store")}`;
     head.append(title, meta);
     card.appendChild(head);
 
@@ -957,9 +1109,12 @@ function renderEnvAuditHistory(audit) {
     summary.appendChild(summaryMetric("Added", entry.summary && entry.summary.added ? entry.summary.added : 0));
     summary.appendChild(summaryMetric("Updated", entry.summary && entry.summary.updated ? entry.summary.updated : 0));
     summary.appendChild(summaryMetric("Deleted", entry.summary && entry.summary.deleted ? entry.summary.deleted : 0));
+    if (entry.summary && entry.summary.unchanged) {
+      summary.appendChild(summaryMetric("Unchanged", entry.summary.unchanged));
+    }
     summary.appendChild(summaryMetric(
       "Revision",
-      `${text(entry.env_store_revision_before, 0)} -> ${text(entry.env_store_revision_after, 0)}`,
+      text(entry.revision_label || `${text(entry.env_store_revision_before, 0)} -> ${text(entry.env_store_revision_after, 0)}`),
     ));
     summary.appendChild(summaryMetric("Audit", text(entry.audit_id)));
     card.appendChild(summary);
@@ -1017,6 +1172,7 @@ async function applyEnvChanges() {
   if (openButton) {
     openButton.disabled = true;
   }
+  setPreviewPhase("applying");
   showState("env-preview-state", "Applying masked environment changes...");
 
   try {
@@ -1043,8 +1199,9 @@ async function applyEnvChanges() {
     renderEnvAuditHistory(audit);
   } catch (error) {
     const message = error.status === 409
-      ? (error.message || "Environment changed since preview. Refresh preview and try again.")
+      ? "Environment changed since preview. Refresh preview and try again. No changes were saved."
       : (error.message || "Apply failed.");
+    setPreviewPhase(error.status === 409 ? "preview_stale" : "apply_failed");
     showState("env-preview-state", message, "warn");
     if (error.status === 409) {
       dataState.lastEnvPreview = null;
@@ -1073,7 +1230,7 @@ function invalidateEnvPreviewIfDirty() {
   if (signature === dataState.lastEnvPreviewSignature && dataState.lastEnvPreview && !dataState.lastEnvPreview.applied) {
     return;
   }
-  resetEnvPreview("Preview cleared. Review the updated input and preview again before applying.", false);
+  resetEnvPreview("Edit detected. Preview again before applying.", false, "no_preview");
 }
 
 function signalCard(title, body, tone, meta = "") {
@@ -1254,6 +1411,22 @@ function bindControls() {
     });
   }
 
+  const auditEnvironment = element("env-audit-environment-filter");
+  if (auditEnvironment) {
+    auditEnvironment.addEventListener("change", (event) => {
+      uiState.envAuditEnvironment = event.target.value || "all";
+      renderEnvAuditHistory(dataState.envAuditByProject.get(uiState.selectedProjectId) || null);
+    });
+  }
+
+  const auditStatus = element("env-audit-status-filter");
+  if (auditStatus) {
+    auditStatus.addEventListener("change", (event) => {
+      uiState.envAuditStatus = event.target.value || "all";
+      renderEnvAuditHistory(dataState.envAuditByProject.get(uiState.selectedProjectId) || null);
+    });
+  }
+
   const previewButton = element("env-preview-button");
   if (previewButton) {
     previewButton.addEventListener("click", () => {
@@ -1283,4 +1456,5 @@ function bindControls() {
 }
 
 bindControls();
+setPreviewPhase("no_preview");
 void loadConsole();

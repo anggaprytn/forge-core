@@ -528,6 +528,16 @@ pub struct EnvInventoryCell {
     pub deployed_exists: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployed_value: Option<String>,
+    #[serde(default)]
+    pub pending_next_deploy: bool,
+    #[serde(default)]
+    pub matches_deployed: bool,
+    #[serde(default)]
+    pub value_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_deploy_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployed_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +553,8 @@ pub struct EnvInventoryEnvironmentSource {
     pub source_label: String,
     #[serde(default)]
     pub env_store_revision: u64,
+    #[serde(default)]
+    pub revision_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -640,7 +652,17 @@ pub struct EnvPreviewEnvironmentResponse {
     #[serde(default)]
     pub base_revision: u64,
     #[serde(default)]
+    pub revision_label: String,
+    #[serde(default)]
     pub preview_hash: String,
+    #[serde(default)]
+    pub source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    #[serde(default)]
+    pub state: String,
     #[serde(default)]
     pub added: Vec<EnvPreviewDiffEntry>,
     #[serde(default)]
@@ -690,7 +712,15 @@ pub struct EnvApplyEnvironmentResponse {
     #[serde(default)]
     pub env_store_revision_after: u64,
     #[serde(default)]
+    pub revision_label: String,
+    #[serde(default)]
     pub preview_hash: String,
+    #[serde(default)]
+    pub source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
     #[serde(default)]
     pub added: Vec<EnvPreviewDiffEntry>,
     #[serde(default)]
@@ -711,6 +741,8 @@ pub struct EnvAuditSummary {
     pub updated: usize,
     #[serde(default)]
     pub deleted: usize,
+    #[serde(default)]
+    pub unchanged: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,9 +755,15 @@ pub struct EnvAuditEntry {
     pub modified_at_unix: u64,
     pub status: String,
     #[serde(default)]
+    pub audit_status_label: String,
+    #[serde(default)]
     pub env_store_revision_before: u64,
     #[serde(default)]
     pub env_store_revision_after: u64,
+    #[serde(default)]
+    pub revision_label: String,
+    #[serde(default)]
+    pub source_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key_hash: Option<String>,
     pub summary: EnvAuditSummary,

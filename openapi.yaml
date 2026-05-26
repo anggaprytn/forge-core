@@ -1314,6 +1314,18 @@ components:
         deployed_value:
           type: string
           nullable: true
+        pending_next_deploy:
+          type: boolean
+        matches_deployed:
+          type: boolean
+        value_state:
+          type: string
+        next_deploy_label:
+          type: string
+          nullable: true
+        deployed_label:
+          type: string
+          nullable: true
     EnvInventoryVariable:
       type: object
       required: [key, environments]
@@ -1337,6 +1349,8 @@ components:
         env_store_revision:
           type: integer
           format: int64
+        revision_label:
+          type: string
         updated_at_unix:
           type: integer
           format: int64
@@ -1505,7 +1519,20 @@ components:
         base_revision:
           type: integer
           format: int64
+        revision_label:
+          type: string
         preview_hash:
+          type: string
+        source_label:
+          type: string
+        updated_at_unix:
+          type: integer
+          format: int64
+          nullable: true
+        updated_by:
+          type: string
+          nullable: true
+        state:
           type: string
         added:
           type: array
@@ -1614,8 +1641,19 @@ components:
         env_store_revision_after:
           type: integer
           format: int64
+        revision_label:
+          type: string
         preview_hash:
           type: string
+        source_label:
+          type: string
+        updated_at_unix:
+          type: integer
+          format: int64
+          nullable: true
+        updated_by:
+          type: string
+          nullable: true
         added:
           type: array
           items:
@@ -1649,6 +1687,8 @@ components:
           type: integer
         deleted:
           type: integer
+        unchanged:
+          type: integer
     EnvAuditEntry:
       type: object
       required:
@@ -1676,12 +1716,18 @@ components:
           format: int64
         status:
           type: string
+        audit_status_label:
+          type: string
         env_store_revision_before:
           type: integer
           format: int64
         env_store_revision_after:
           type: integer
           format: int64
+        revision_label:
+          type: string
+        source_label:
+          type: string
         idempotency_key_hash:
           type: string
           nullable: true

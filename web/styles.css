@@ -586,6 +586,8 @@ a:hover {
 
 .env-meta {
   margin-bottom: 18px;
+  display: grid;
+  gap: 12px;
 }
 
 .env-preview-copy {
@@ -625,6 +627,13 @@ a:hover {
 }
 
 .env-preview-actions {
+  margin-bottom: 18px;
+}
+
+.env-audit-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
   margin-bottom: 18px;
 }
 
@@ -691,7 +700,7 @@ a:hover {
 
 .env-preview-summary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -778,6 +787,45 @@ a:hover {
   font-size: 0.92rem;
 }
 
+.env-source-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.env-source-card {
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 14px;
+}
+
+.env-source-card h3 {
+  text-transform: capitalize;
+  margin-bottom: 10px;
+}
+
+.env-source-facts {
+  display: grid;
+  gap: 8px;
+}
+
+.env-source-facts div {
+  display: grid;
+  gap: 2px;
+}
+
+.env-source-facts dt {
+  color: var(--zinc-500);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.env-source-facts dd {
+  margin: 0;
+}
+
 .env-table-scroll {
   overflow-x: auto;
 }
@@ -812,6 +860,16 @@ a:hover {
 .env-cell {
   display: grid;
   gap: 8px;
+}
+
+.env-inline-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.env-detail-line {
+  color: var(--zinc-300);
 }
 
 .env-presence {

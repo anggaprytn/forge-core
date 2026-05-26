@@ -1430,6 +1430,7 @@ struct EnvironmentInventorySourceSnapshot {
     generation: Option<u64>,
     deployment_id: Option<String>,
     values: BTreeMap<String, EnvironmentInventoryValue>,
+    deleted_keys: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1453,7 +1454,6 @@ struct EvaluatedEnvironmentChanges {
     deleted_keys: BTreeMap<String, String>,
     audit_diff: Vec<EnvPreviewDiffEntry>,
     normalized_changes: Vec<String>,
-    touched: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1505,7 +1505,106 @@ fn baseline_identity_hash(snapshot: &EnvironmentInventorySourceSnapshot) -> Stri
             .iter()
             .map(|(key, value)| format!("{key}|{}", value.masked)),
     );
+    material.extend(
+        snapshot
+            .deleted_keys
+            .iter()
+            .map(|key| format!("deleted|{key}")),
+    );
     sha256_hex(material.join("\n"))
+}
+
+fn revision_label(revision: u64) -> String {
+    format!("Revision {revision}")
+}
+
+fn audit_status_label(status: &str) -> String {
+    match status {
+        "applied" => "Applied".into(),
+        "conflict" => "Conflict".into(),
+        "failed" => "Failed".into(),
+        "idempotent_replay" => "Idempotent replay".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn inventory_value_state(
+    configured: Option<&EnvironmentInventoryValue>,
+    deployed: Option<&EnvironmentInventoryValue>,
+    configured_deleted: bool,
+) -> (bool, bool, String, Option<String>, Option<String>, String) {
+    let configured_exists = configured.is_some();
+    let deployed_exists = deployed.is_some();
+    let configured_raw = configured.and_then(|value| value.raw.as_deref());
+    let deployed_raw = deployed.and_then(|value| value.raw.as_deref());
+    let pending_next_deploy = configured_deleted
+        || match (configured_raw, deployed_raw) {
+            (Some(left), Some(right)) => left != right,
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
+    let matches_deployed = configured_exists
+        && deployed_exists
+        && !configured_deleted
+        && configured_raw == deployed_raw;
+    let value_state = if configured_deleted {
+        "deleted_next_deploy".to_string()
+    } else if configured_exists {
+        if configured_raw == Some("") {
+            "empty".to_string()
+        } else {
+            "configured".to_string()
+        }
+    } else if deployed_exists {
+        if deployed_raw == Some("") {
+            "empty".to_string()
+        } else {
+            "deployed".to_string()
+        }
+    } else {
+        "missing".to_string()
+    };
+    let next_deploy_label = if configured_deleted {
+        Some("will be removed on next deployment".into())
+    } else if let Some(value) = configured {
+        Some(if value.raw.as_deref() == Some("") {
+            "set to empty string".into()
+        } else {
+            value.masked.clone()
+        })
+    } else if deployed_exists {
+        Some("not configured".into())
+    } else {
+        None
+    };
+    let deployed_label = if let Some(value) = deployed {
+        Some(if value.raw.as_deref() == Some("") {
+            "set to empty string".into()
+        } else {
+            value.masked.clone()
+        })
+    } else {
+        None
+    };
+    let value = if configured_deleted || configured_exists {
+        next_deploy_label
+            .clone()
+            .unwrap_or_else(|| "not configured".into())
+    } else if deployed_exists {
+        deployed_label
+            .clone()
+            .unwrap_or_else(|| "not configured".into())
+    } else {
+        "not configured".into()
+    };
+    (
+        pending_next_deploy,
+        matches_deployed,
+        value_state,
+        next_deploy_label,
+        deployed_label,
+        value,
+    )
 }
 
 fn compute_preview_hash(
@@ -1531,12 +1630,21 @@ fn build_preview_environment_response(
     mut evaluation: EvaluatedEnvironmentChanges,
 ) -> EnvPreviewEnvironmentResponse {
     evaluation.response.base_revision = snapshot.env_store_revision;
+    evaluation.response.revision_label = revision_label(snapshot.env_store_revision);
     evaluation.response.preview_hash = compute_preview_hash(
         project_id,
         &evaluation.response.environment,
         snapshot,
         &evaluation,
     );
+    evaluation.response.source_label = snapshot.source_label.clone();
+    evaluation.response.updated_at_unix = snapshot.updated_at_unix;
+    evaluation.response.updated_by = snapshot.updated_by.clone();
+    evaluation.response.state = if evaluation.response.valid {
+        "preview_valid".into()
+    } else {
+        "preview_has_errors".into()
+    };
     evaluation.response
 }
 
@@ -1675,14 +1783,22 @@ pub fn load_project_env_inventory_report(
                     .deployed
                     .as_ref()
                     .and_then(|value| value.values.get(&key));
+                let configured_deleted = snapshot
+                    .configured
+                    .as_ref()
+                    .is_some_and(|value| value.deleted_keys.contains(&key));
                 let configured_exists = configured.is_some();
                 let deployed_exists = deployed.is_some();
                 let configured_value = configured.map(|value| value.masked.clone());
                 let deployed_value = deployed.map(|value| value.masked.clone());
-                let value = configured_value
-                    .clone()
-                    .or_else(|| deployed_value.clone())
-                    .unwrap_or_else(|| "missing".into());
+                let (
+                    pending_next_deploy,
+                    matches_deployed,
+                    value_state,
+                    next_deploy_label,
+                    deployed_label,
+                    value,
+                ) = inventory_value_state(configured, deployed, configured_deleted);
                 let exists = configured_exists || deployed_exists;
                 cells.insert(
                     env_name.clone(),
@@ -1693,6 +1809,11 @@ pub fn load_project_env_inventory_report(
                         configured_value,
                         deployed_exists,
                         deployed_value,
+                        pending_next_deploy,
+                        matches_deployed,
+                        value_state,
+                        next_deploy_label,
+                        deployed_label,
                     },
                 );
             }
@@ -1714,6 +1835,13 @@ pub fn load_project_env_inventory_report(
                 .as_ref()
                 .map(|value| value.env_store_revision)
                 .unwrap_or(0),
+            revision_label: revision_label(
+                snapshot
+                    .configured
+                    .as_ref()
+                    .map(|value| value.env_store_revision)
+                    .unwrap_or(0),
+            ),
             updated_at_unix: snapshot
                 .configured
                 .as_ref()
@@ -1931,6 +2059,7 @@ fn load_environment_inventory_baseline_snapshot(
             generation: Some(snapshot.generation),
             deployment_id: Some(snapshot.deployment_id),
             values,
+            deleted_keys: BTreeSet::new(),
         });
     }
 
@@ -1963,6 +2092,7 @@ fn load_environment_inventory_baseline_snapshot(
             generation: None,
             deployment_id: None,
             values,
+            deleted_keys: BTreeSet::new(),
         });
     }
 
@@ -1975,6 +2105,7 @@ fn load_environment_inventory_baseline_snapshot(
         generation: generation,
         deployment_id: None,
         values: BTreeMap::new(),
+        deleted_keys: BTreeSet::new(),
     })
 }
 
@@ -2018,12 +2149,20 @@ fn load_desired_env_inventory_snapshot(
     let Some(config) = store.load_desired_environment(project_id, environment)? else {
         return Ok(None);
     };
+    let env_store_revision = config.env_store_revision;
+    let updated_at_unix = config.updated_at_unix;
+    let updated_by = config.updated_by.clone();
+    let deleted_keys = config
+        .deleted_keys
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect::<BTreeSet<_>>();
 
     let mut values = BTreeMap::new();
-    for entry in config.entries {
+    for entry in &config.entries {
         let value = unseal_value(&entry.sealed_value).map_err(secret_store_error)?;
         values.insert(
-            entry.key,
+            entry.key.clone(),
             EnvironmentInventoryValue {
                 masked: mask_env_inventory_value(Some(&value)),
                 raw: Some(value),
@@ -2034,12 +2173,13 @@ fn load_desired_env_inventory_snapshot(
     Ok(Some(EnvironmentInventorySourceSnapshot {
         source_kind: LATEST_CONFIGURED_ENV_STORE_SOURCE.into(),
         source_label: "Latest configured env store".into(),
-        env_store_revision: config.env_store_revision,
-        updated_at_unix: Some(config.updated_at_unix),
-        updated_by: config.updated_by,
+        env_store_revision,
+        updated_at_unix: Some(updated_at_unix),
+        updated_by,
         generation: None,
         deployment_id: None,
         values,
+        deleted_keys,
     }))
 }
 
@@ -2100,6 +2240,7 @@ fn load_deployed_env_inventory_snapshot(
             generation: Some(snapshot.generation),
             deployment_id: Some(snapshot.deployment_id),
             values,
+            deleted_keys: BTreeSet::new(),
         }));
     }
 
@@ -2203,7 +2344,6 @@ fn evaluate_environment_changes(
 ) -> EvaluatedEnvironmentChanges {
     let mut errors = Vec::new();
     let parsed = parse_preview_input(input, &mut errors);
-    let touched = !parsed.is_empty();
     let normalized_changes = preview_change_fingerprint_material(&parsed, &errors);
     let mut current_by_key = BTreeMap::new();
     for (key, value) in &snapshot.values {
@@ -2325,7 +2465,12 @@ fn evaluate_environment_changes(
             environment: environment.to_string(),
             valid: errors.is_empty(),
             base_revision: snapshot.env_store_revision,
+            revision_label: String::new(),
             preview_hash: String::new(),
+            source_label: String::new(),
+            updated_at_unix: None,
+            updated_by: None,
+            state: String::new(),
             added,
             updated,
             deleted,
@@ -2336,7 +2481,6 @@ fn evaluate_environment_changes(
         deleted_keys,
         audit_diff,
         normalized_changes,
-        touched,
     }
 }
 
@@ -2490,6 +2634,7 @@ pub fn apply_project_env_changes(
                         added: conflict_evaluation.response.added.len(),
                         updated: conflict_evaluation.response.updated.len(),
                         deleted: conflict_evaluation.response.deleted.len(),
+                        unchanged: conflict_evaluation.response.unchanged.len(),
                     },
                     diff: conflict_evaluation
                         .audit_diff
@@ -2574,6 +2719,7 @@ pub fn apply_project_env_changes(
                     added: evaluation.response.added.len(),
                     updated: evaluation.response.updated.len(),
                     deleted: evaluation.response.deleted.len(),
+                    unchanged: evaluation.response.unchanged.len(),
                 },
                 diff: evaluation
                     .audit_diff
@@ -2600,11 +2746,15 @@ pub fn apply_project_env_changes(
             message: if effective_change {
                 "Applied. These changes will affect the next deployment.".into()
             } else {
-                "No effective changes to apply.".into()
+                "No changes saved.".into()
             },
             env_store_revision_before: revision_before,
             env_store_revision_after: revision_after,
+            revision_label: revision_label(revision_after),
             preview_hash: recomputed_preview_hash.clone(),
+            source_label: "Latest configured env store".into(),
+            updated_at_unix: effective_change.then_some(now),
+            updated_by: requested_by.map(|value| value.to_string()),
             added: evaluation.response.added.clone(),
             updated: evaluation.response.updated.clone(),
             deleted: evaluation.response.deleted.clone(),
@@ -2613,11 +2763,18 @@ pub fn apply_project_env_changes(
         });
     }
 
+    let applied_any = environment_results
+        .iter()
+        .any(|environment| environment.applied);
     let response = EnvApplyResponse {
         project_id: project_id.to_string(),
-        applied: true,
+        applied: applied_any,
         status: "applied".into(),
-        message: "Applied. These changes will affect the next deployment.".into(),
+        message: if applied_any {
+            "Applied. These changes will affect the next deployment.".into()
+        } else {
+            "No changes saved.".into()
+        },
         audit_id,
         env_store_revision_before,
         env_store_revision_after,
@@ -2653,31 +2810,42 @@ pub fn load_project_env_audit_report(
     let entries = EnvStore::new(storage_root)
         .list_project_audit_entries(project_id)?
         .into_iter()
-        .map(|entry| EnvAuditEntry {
-            audit_id: entry.audit_id,
-            project_id: entry.project_id,
-            environment: entry.environment,
-            requested_by: entry.requested_by,
-            modified_at_unix: entry.modified_at_unix,
-            status: entry.status,
-            env_store_revision_before: entry.env_store_revision_before,
-            env_store_revision_after: entry.env_store_revision_after,
-            idempotency_key_hash: entry.idempotency_key_hash,
-            summary: EnvAuditSummary {
-                added: entry.summary.added,
-                updated: entry.summary.updated,
-                deleted: entry.summary.deleted,
-            },
-            diff: entry
-                .diff
-                .into_iter()
-                .map(|diff| EnvPreviewDiffEntry {
-                    key: diff.key,
-                    action: diff.action,
-                    before_masked: diff.before_masked,
-                    after_masked: diff.after_masked,
-                })
-                .collect(),
+        .map(|entry| {
+            let status = entry.status.clone();
+            EnvAuditEntry {
+                audit_id: entry.audit_id,
+                project_id: entry.project_id,
+                environment: entry.environment,
+                requested_by: entry.requested_by,
+                modified_at_unix: entry.modified_at_unix,
+                status,
+                audit_status_label: audit_status_label(&entry.status),
+                env_store_revision_before: entry.env_store_revision_before,
+                env_store_revision_after: entry.env_store_revision_after,
+                revision_label: format!(
+                    "{} -> {}",
+                    revision_label(entry.env_store_revision_before),
+                    revision_label(entry.env_store_revision_after)
+                ),
+                source_label: "Latest configured env store".into(),
+                idempotency_key_hash: entry.idempotency_key_hash,
+                summary: EnvAuditSummary {
+                    added: entry.summary.added,
+                    updated: entry.summary.updated,
+                    deleted: entry.summary.deleted,
+                    unchanged: entry.summary.unchanged,
+                },
+                diff: entry
+                    .diff
+                    .into_iter()
+                    .map(|diff| EnvPreviewDiffEntry {
+                        key: diff.key,
+                        action: diff.action,
+                        before_masked: diff.before_masked,
+                        after_masked: diff.after_masked,
+                    })
+                    .collect(),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -6445,7 +6613,7 @@ mod tests {
                 .variables
                 .iter()
                 .any(|entry| entry.key == "EMPTY_VALUE"
-                    && entry.environments["staging"].value == "<empty>")
+                    && entry.environments["staging"].value == "set to empty string")
         );
         assert!(
             inventory
@@ -6471,6 +6639,10 @@ mod tests {
         assert!(!rendered.contains("FLEETSTAG"));
         assert!(!rendered.contains("postgres://super-secret"));
         assert!(!rendered.contains("https://api.example.com"));
+        assert_eq!(
+            inventory.environment_sources[0].revision_label,
+            "Revision 0"
+        );
     }
 
     fn seed_env_preview_environment(
@@ -6905,6 +7077,30 @@ mod tests {
             development_source.deployed_source_label.as_deref(),
             Some("Sealed generation snapshot")
         );
+        assert_eq!(development_source.revision_label, "Revision 1");
+        let development_variables = inventory
+            .variables
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.environments["development"].clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(development_variables["DEBUG"].pending_next_deploy);
+        assert!(!development_variables["DEBUG"].matches_deployed);
+        assert_eq!(
+            development_variables["EMPTY_VALUE"]
+                .next_deploy_label
+                .as_deref(),
+            Some("set to empty string")
+        );
+        assert_eq!(
+            development_variables["OLD_TOKEN"].value_state,
+            "deleted_next_deploy"
+        );
+        assert_eq!(
+            development_variables["OLD_TOKEN"]
+                .next_deploy_label
+                .as_deref(),
+            Some("will be removed on next deployment")
+        );
 
         let audit = load_project_env_audit_report(&root, "api").unwrap();
         let rendered_audit = serde_json::to_string(&audit).unwrap();
@@ -6919,9 +7115,11 @@ mod tests {
             entry.environment == "development"
                 && entry.env_store_revision_before == 0
                 && entry.env_store_revision_after == 1
+                && entry.revision_label == "Revision 0 -> Revision 1"
                 && entry.summary.added == 1
                 && entry.summary.updated == 1
                 && entry.summary.deleted == 1
+                && entry.summary.unchanged == 2
         }));
         assert!(!rendered_audit.contains("legacy-token"));
         assert!(!rendered_audit.contains("DEBUG=true"));
@@ -6995,6 +7193,9 @@ mod tests {
             .find(|entry| entry.environment == "development")
             .unwrap();
         assert_eq!(one.base_revision, 0);
+        assert_eq!(one.revision_label, "Revision 0");
+        assert_eq!(one.state, "preview_valid");
+        assert_eq!(one.source_label, "Sealed generation snapshot");
         assert_eq!(one.preview_hash, two.preview_hash);
         assert!(one.preview_hash.starts_with("sha256-"));
     }

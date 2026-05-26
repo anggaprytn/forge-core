@@ -191,11 +191,11 @@
                 <p class="eyebrow">Env change preview</p>
                 <h2 id="env-preview-title">Applies on next deployment</h2>
               </div>
-              <span class="status-chip">Masked only</span>
+              <span id="env-preview-phase-chip" class="status-chip stale">No preview yet</span>
             </div>
 
             <div class="env-preview-copy">
-              <p>Applies on next deployment. Current generation is not mutated.</p>
+              <p>Applies on next deployment. Current running generation is unchanged.</p>
               <p>Rollback uses sealed historical snapshots. Secret values are never revealed.</p>
             </div>
 
@@ -223,7 +223,7 @@
             </div>
 
             <div id="env-apply-confirmation" class="env-apply-confirmation" hidden>
-              <p>These changes will be saved for the next deployment. Current running containers will not be changed.</p>
+              <p>These changes will be saved for the next deployment. Current running generation is unchanged.</p>
               <button id="env-apply-confirm-button" class="env-preview-button" type="button">Confirm Apply</button>
             </div>
 
@@ -241,7 +241,30 @@
             </div>
 
             <div class="env-preview-copy">
-              <p>Total activity, environment, requested by, status, modified time, and masked before/after only.</p>
+              <p>Latest entries first. Show Diff expands masked diff only.</p>
+              <p>Requested by, revision, modified time, and masked before/after only.</p>
+            </div>
+
+            <div class="env-audit-filters">
+              <label class="search-field" for="env-audit-environment-filter">
+                <span>Environment</span>
+                <select id="env-audit-environment-filter">
+                  <option value="all">All environments</option>
+                  <option value="development">Development</option>
+                  <option value="staging">Staging</option>
+                  <option value="production">Production</option>
+                </select>
+              </label>
+              <label class="search-field" for="env-audit-status-filter">
+                <span>Status</span>
+                <select id="env-audit-status-filter">
+                  <option value="all">All statuses</option>
+                  <option value="applied">Applied</option>
+                  <option value="conflict">Conflict</option>
+                  <option value="failed">Failed</option>
+                  <option value="idempotent_replay">Idempotent replay</option>
+                </select>
+              </label>
             </div>
 
             <div id="env-audit-state" class="inline-state">Select a project to inspect masked audit history.</div>
