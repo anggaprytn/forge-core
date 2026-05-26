@@ -189,14 +189,14 @@
             <div class="section-head">
               <div>
                 <p class="eyebrow">Env change preview</p>
-                <h2 id="env-preview-title">Preview only</h2>
+                <h2 id="env-preview-title">Applies on next deployment</h2>
               </div>
-              <span class="status-chip">No apply</span>
+              <span class="status-chip">Masked only</span>
             </div>
 
             <div class="env-preview-copy">
-              <p>Preview only. No changes will be saved.</p>
-              <p>Apply is not available in this build. Changes will be supported in a future version.</p>
+              <p>Applies on next deployment. Current generation is not mutated.</p>
+              <p>Rollback uses sealed historical snapshots. Secret values are never revealed.</p>
             </div>
 
             <div class="env-preview-grid">
@@ -218,8 +218,34 @@
               <button id="env-preview-button" class="env-preview-button" type="button">Preview Changes</button>
             </div>
 
+            <div id="env-apply-panel" class="env-apply-panel" hidden>
+              <button id="env-apply-button" class="env-preview-button" type="button">Apply Changes</button>
+            </div>
+
+            <div id="env-apply-confirmation" class="env-apply-confirmation" hidden>
+              <p>These changes will be saved for the next deployment. Current running containers will not be changed.</p>
+              <button id="env-apply-confirm-button" class="env-preview-button" type="button">Confirm Apply</button>
+            </div>
+
             <div id="env-preview-state" class="inline-state">Select a project to preview masked environment changes.</div>
             <div id="env-preview-result" class="env-preview-result" hidden></div>
+          </article>
+
+          <article class="detail-panel panel-surface" aria-labelledby="env-audit-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Audit history</p>
+                <h2 id="env-audit-title">Masked env changes</h2>
+              </div>
+              <span id="env-audit-total-chip" class="status-chip">0 events</span>
+            </div>
+
+            <div class="env-preview-copy">
+              <p>Total activity, environment, requested by, status, modified time, and masked before/after only.</p>
+            </div>
+
+            <div id="env-audit-state" class="inline-state">Select a project to inspect masked audit history.</div>
+            <div id="env-audit-history" class="env-preview-result" hidden></div>
           </article>
 
           <article class="detail-panel panel-surface" aria-labelledby="signals-title">

@@ -1077,6 +1077,14 @@ impl EnvironmentPaths {
         self.root.join("runtime_state.json")
     }
 
+    pub fn desired_env_file(&self) -> PathBuf {
+        self.root.join("desired_env.json")
+    }
+
+    pub fn env_audit_dir(&self) -> PathBuf {
+        self.root.join("env_audits")
+    }
+
     pub fn retention_file(&self) -> PathBuf {
         self.root.join("retention.json")
     }
@@ -1232,6 +1240,172 @@ pub struct PointerStore {
 
 pub struct RuntimeStateStore {
     env: EnvironmentPaths,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedDesiredEnvConfig {
+    #[serde(default = "default_snapshot_version")]
+    pub snapshot_version: u64,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub updated_at_unix: u64,
+    #[serde(default)]
+    pub entries: Vec<PersistedDesiredEnvEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDesiredEnvEntry {
+    pub key: String,
+    pub normalized_key: String,
+    pub sealed_value: SealedValueRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedEnvAuditSummary {
+    #[serde(default)]
+    pub added: usize,
+    #[serde(default)]
+    pub updated: usize,
+    #[serde(default)]
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedEnvAuditDiffEntry {
+    pub key: String,
+    pub action: String,
+    pub before_masked: String,
+    pub after_masked: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistedEnvAuditEntry {
+    #[serde(default = "default_snapshot_version")]
+    pub snapshot_version: u64,
+    #[serde(default)]
+    pub audit_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(default)]
+    pub modified_at_unix: u64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: PersistedEnvAuditSummary,
+    #[serde(default)]
+    pub diff: Vec<PersistedEnvAuditDiffEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvStore {
+    root: PathBuf,
+}
+
+impl EnvStore {
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn load_desired_environment(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> StorageResult<Option<PersistedDesiredEnvConfig>> {
+        let env = EnvironmentPaths::new(&self.root, project_id, environment);
+        load_json_file(env.desired_env_file())
+    }
+
+    pub fn write_desired_environment(
+        &self,
+        config: &PersistedDesiredEnvConfig,
+    ) -> StorageResult<()> {
+        let env = EnvironmentPaths::new(&self.root, &config.project_id, &config.environment);
+        env.ensure_exists()?;
+        let bytes = serde_json::to_vec_pretty(config).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(env.desired_env_file(), &bytes)
+    }
+
+    pub fn append_audit_entry(&self, entry: &PersistedEnvAuditEntry) -> StorageResult<()> {
+        let env = EnvironmentPaths::new(&self.root, &entry.project_id, &entry.environment);
+        env.ensure_exists()?;
+        fs::create_dir_all(env.env_audit_dir())?;
+        let bytes = serde_json::to_vec_pretty(entry).map_err(|err| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            ))
+        })?;
+        atomic_write(
+            env.env_audit_dir().join(format!("{}.json", entry.audit_id)),
+            &bytes,
+        )
+    }
+
+    pub fn list_project_audit_entries(
+        &self,
+        project_id: &str,
+    ) -> StorageResult<Vec<PersistedEnvAuditEntry>> {
+        let project_root = self
+            .root
+            .join("projects")
+            .join(project_id)
+            .join("environments");
+        let mut entries = Vec::new();
+        if !project_root.exists() {
+            return Ok(entries);
+        }
+
+        for environment_entry in fs::read_dir(project_root)? {
+            let environment_entry = environment_entry?;
+            if !environment_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let audit_dir = environment_entry.path().join("env_audits");
+            if !audit_dir.exists() {
+                continue;
+            }
+            for file_entry in fs::read_dir(audit_dir)? {
+                let file_entry = file_entry?;
+                if !file_entry.file_type()?.is_file() {
+                    continue;
+                }
+                if file_entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    != Some("json")
+                {
+                    continue;
+                }
+                if let Some(entry) = load_json_file::<PersistedEnvAuditEntry>(file_entry.path())? {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        entries.sort_by(|left, right| {
+            right
+                .modified_at_unix
+                .cmp(&left.modified_at_unix)
+                .then_with(|| left.environment.cmp(&right.environment))
+                .then_with(|| left.audit_id.cmp(&right.audit_id))
+        });
+        Ok(entries)
+    }
 }
 
 pub struct EventStore {

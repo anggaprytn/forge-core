@@ -574,6 +574,13 @@ pub struct EnvPreviewRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvApplyRequest {
+    pub changes: EnvPreviewChanges,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvPreviewError {
     pub line: usize,
     pub reason: String,
@@ -613,6 +620,48 @@ pub struct EnvPreviewResponse {
     pub warning: Option<String>,
     #[serde(default)]
     pub environments: Vec<EnvPreviewEnvironmentResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvApplyResponse {
+    pub project_id: String,
+    pub applied: bool,
+    pub message: String,
+    pub audit_id: String,
+    #[serde(default)]
+    pub environments: Vec<EnvPreviewEnvironmentResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EnvAuditSummary {
+    #[serde(default)]
+    pub added: usize,
+    #[serde(default)]
+    pub updated: usize,
+    #[serde(default)]
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvAuditEntry {
+    pub audit_id: String,
+    pub project_id: String,
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    pub modified_at_unix: u64,
+    pub status: String,
+    pub summary: EnvAuditSummary,
+    #[serde(default)]
+    pub diff: Vec<EnvPreviewDiffEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvAuditResponse {
+    pub project_id: String,
+    pub total: usize,
+    #[serde(default)]
+    pub entries: Vec<EnvAuditEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

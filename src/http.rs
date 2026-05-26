@@ -22,9 +22,10 @@ use subtle::ConstantTimeEq;
 use crate::api::{
     BackupListResponse, BackupRecord, BackupRestoreResponse, CliLoginPollRequest,
     CliLoginPollResponse, CliLoginStartResponse, DeploymentAccepted, DeploymentHistoryResponse,
-    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvInventoryResponse, EnvPreviewRequest,
-    EnvPreviewResponse, EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport,
-    ErrorResponse, EventList, ProjectEnvironmentInventoryList, ProjectList, ProjectUpsertRequest,
+    DeploymentLogs, DeploymentRequest, DeploymentStatus, EnvApplyRequest, EnvApplyResponse,
+    EnvAuditResponse, EnvInventoryResponse, EnvPreviewRequest, EnvPreviewResponse,
+    EnvironmentDiagnostics, EnvironmentDiffResponse, EnvironmentVariableReport, ErrorResponse,
+    EventList, ProjectEnvironmentInventoryList, ProjectList, ProjectUpsertRequest,
     ReadinessExplainResponse, ReadinessTimelineResponse, ReadyzResponse, SecretListResponse,
     SecretUnsetResponse, TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenMetadata,
     TokenRevokeResponse,
@@ -41,7 +42,8 @@ use crate::readiness::{effective_snapshot, explain_snapshot, timeline_snapshot};
 use crate::runtime::{DockerRuntime, RoutingRuntime};
 use crate::secrets::{SecretError, SecretStore, SecretWriteRequest};
 use crate::status::{
-    ProjectEnvironmentStatus, load_project_env_inventory_report, load_project_env_preview_report,
+    ProjectEnvironmentStatus, apply_project_env_changes, load_project_env_audit_report,
+    load_project_env_inventory_report, load_project_env_preview_report,
 };
 use crate::storage::atomic_write;
 use crate::users::{RegistrationDecision, UserRecord, UserStore, UserStoreError};
@@ -991,6 +993,14 @@ pub fn router(state: HttpState) -> Router {
         .route(
             "/api/projects/{project_id}/env/preview",
             post(post_project_env_preview),
+        )
+        .route(
+            "/api/projects/{project_id}/env/apply",
+            post(post_project_env_apply),
+        )
+        .route(
+            "/api/projects/{project_id}/env/audit",
+            get(get_project_env_audit),
         )
         .route(
             "/api/projects/{project_id}/env/{environment}",
@@ -2315,6 +2325,68 @@ async fn post_project_env_preview(
     }
 }
 
+async fn post_project_env_apply(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(project_id): AxumPath<String>,
+    Json(request): Json<EnvApplyRequest>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    let requested_by = authenticated_login(&state, &headers);
+    match apply_project_env_changes(
+        state.project_registry.storage_root(),
+        &state.secret_store,
+        &project_id,
+        &request,
+        requested_by.as_deref(),
+    ) {
+        Ok(report) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope::<EnvApplyResponse> {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: report,
+            }),
+        ),
+        Err(err) => {
+            let (status, response) = crate::status::project_status_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
+async fn get_project_env_audit(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath(project_id): AxumPath<String>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match load_project_env_audit_report(state.project_registry.storage_root(), &project_id) {
+        Ok(report) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope::<EnvAuditResponse> {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: report,
+            }),
+        ),
+        Err(err) => {
+            let (status, response) = crate::status::project_status_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
 async fn get_project_env_inventory_environment(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -2974,6 +3046,21 @@ fn ensure_inventory_read_authorized(
             message: message.into(),
         },
     ))
+}
+
+fn authenticated_login(state: &HttpState, headers: &HeaderMap) -> Option<String> {
+    if let Ok(principal) = authenticate_bearer_token(state, headers) {
+        if principal.github_login.is_some() {
+            return principal.github_login;
+        }
+    }
+
+    state
+        .web_auth
+        .config
+        .as_ref()
+        .and_then(|config| read_session_cookie(headers, config))
+        .map(|session| session.github_login)
 }
 
 enum AuthFailure {
@@ -5482,9 +5569,13 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("/environments"));
         assert!(body.contains("/env"));
         assert!(body.contains("/env/preview"));
+        assert!(body.contains("/env/apply"));
+        assert!(body.contains("/env/audit"));
         assert!(body.contains("projectEnvInventory(projectId)"));
         assert!(body.contains("projectEnvironments(projectId)"));
         assert!(body.contains("projectEnvPreview(projectId)"));
+        assert!(body.contains("projectEnvApply(projectId)"));
+        assert!(body.contains("projectEnvAudit(projectId)"));
         assert!(body.contains("credentials: \"same-origin\""));
         assert!(!body.contains("/secrets"));
         assert!(!body.contains("/env/diff"));
@@ -5525,7 +5616,7 @@ pub mod app_js_ships_safe_error_states {
         assert!(body.contains("Environment inventory unavailable."));
         assert!(body.contains("No projects registered yet."));
         assert!(body.contains("Project no longer exists or has no registered environments."));
-        assert!(body.contains("Preview only. No changes will be saved."));
+        assert!(body.contains("Preview only. No changes have been saved."));
         assert!(body.contains("Preview unavailable until project inventory loads."));
     }
 }
@@ -5595,14 +5686,14 @@ pub mod app_assets_ship_calm_readiness_copy {
 }
 
 #[cfg(test)]
-pub mod app_env_inventory_stays_read_only {
+pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
 
     #[tokio::test]
-    async fn app_assets_ship_preview_only_env_change_controls() {
+    async fn app_assets_ship_masked_env_apply_and_audit_controls() {
         let state = build_cli_login_state();
         let session_secret = state.web_auth.config.clone().unwrap().session_secret;
         let session_cookie = encode_signed_value(
@@ -5634,11 +5725,14 @@ pub mod app_env_inventory_stays_read_only {
             let required = if path == "/app" {
                 vec![
                     "Env change preview",
-                    "Preview only",
+                    "Applies on next deployment",
                     "Preview Changes",
-                    "No changes will be saved",
-                    "Apply is not available in this build",
-                    "Changes will be supported in a future version",
+                    "Apply Changes",
+                    "Confirm Apply",
+                    "Current generation is not mutated",
+                    "Rollback uses sealed historical snapshots",
+                    "Secret values are never revealed",
+                    "Audit history",
                     "env-preview-development",
                     "env-preview-staging",
                     "env-preview-production",
@@ -5646,21 +5740,17 @@ pub mod app_env_inventory_stays_read_only {
             } else {
                 vec![
                     "Preview Changes",
-                    "Preview only. No changes will be saved.",
+                    "projectEnvApply(projectId)",
+                    "projectEnvAudit(projectId)",
                     "projectEnvPreview(projectId)",
                     "submitEnvPreview()",
+                    "applyEnvChanges()",
                 ]
             };
             for required in required {
                 assert!(body.contains(required));
             }
-            for forbidden in [
-                "Apply changes",
-                "Confirm Apply",
-                "Reveal secret",
-                "rollback-button",
-                "deploy-button",
-            ] {
+            for forbidden in ["Reveal secret", "rollback-button", "deploy-button"] {
                 assert!(!body.contains(forbidden));
             }
         }
@@ -7348,6 +7438,43 @@ pub mod project_inventory_api_requires_authentication {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn unauthenticated_env_apply_is_rejected() {
+        let app = router(build_state(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=MyService","staging":"","production":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_env_audit_is_rejected() {
+        let app = router(build_state(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/env/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[cfg(test)]
@@ -7501,6 +7628,57 @@ pub mod project_inventory_api_accepts_web_session_authentication {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authenticated_web_session_can_apply_env_changes_and_read_audit() {
+        let (mut state, root) = build_state_with_root(true);
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        state.web_auth = build_cli_login_state().web_auth;
+        seed_env_inventory_fixture(&root);
+        let session_cookie = session_cookie_value(&state);
+        let app = router(state);
+
+        let apply = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/apply")
+                    .header("content-type", "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true","staging":"","production":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply.status(), StatusCode::OK);
+
+        let audit = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/env/audit")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
     }
 }
 
@@ -7873,6 +8051,57 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         assert!(body_text.contains("F*****V"));
         assert!(!body_text.contains("FLEETDEV"));
         assert!(!body_text.contains("DEBUG=true"));
+    }
+
+    #[tokio::test]
+    async fn env_apply_and_audit_support_bearer_auth_and_mask_values() {
+        let (state, root) = build_state_with_root(true);
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        seed_env_inventory_fixture(&root);
+        let app = router(state);
+
+        let apply = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/projects/api/env/apply")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"changes":{"development":"APP_NAME=FLEETDEV\nDEBUG=true\n-EMPTY_VALUE","staging":"","production":""}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply.status(), StatusCode::OK);
+        let apply_body = to_bytes(apply.into_body(), usize::MAX).await.unwrap();
+        let apply_text = String::from_utf8(apply_body.to_vec()).unwrap();
+        assert!(!apply_text.contains("FLEETDEV"));
+        assert!(!apply_text.contains("DEBUG=true"));
+
+        let audit = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/env/audit")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
+        let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
+        let audit_text = String::from_utf8(audit_body.to_vec()).unwrap();
+        assert!(!audit_text.contains("FLEETDEV"));
+        assert!(!audit_text.contains("DEBUG=true"));
     }
 }
 

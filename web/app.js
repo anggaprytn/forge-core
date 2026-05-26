@@ -13,6 +13,12 @@ const API_PATHS = {
   projectEnvPreview(projectId) {
     return `/api/projects/${encodeURIComponent(projectId)}/env/preview`;
   },
+  projectEnvApply(projectId) {
+    return `/api/projects/${encodeURIComponent(projectId)}/env/apply`;
+  },
+  projectEnvAudit(projectId) {
+    return `/api/projects/${encodeURIComponent(projectId)}/env/audit`;
+  },
 };
 
 const uiState = {
@@ -29,6 +35,8 @@ const dataState = {
   projects: [],
   environmentsByProject: new Map(),
   envInventoryByProject: new Map(),
+  envAuditByProject: new Map(),
+  lastEnvPreview: null,
 };
 
 function element(id) {
@@ -386,6 +394,23 @@ async function ensureProjectEnvInventory(projectId) {
   }
 }
 
+async function ensureProjectEnvAudit(projectId) {
+  if (!projectId) {
+    return null;
+  }
+  if (dataState.envAuditByProject.has(projectId)) {
+    return dataState.envAuditByProject.get(projectId) || null;
+  }
+
+  try {
+    const payload = await fetchApiData(API_PATHS.projectEnvAudit(projectId));
+    dataState.envAuditByProject.set(projectId, payload);
+    return payload;
+  } catch (_error) {
+    throw new Error("Env audit unavailable.");
+  }
+}
+
 function appendMeta(container, label, value) {
   const wrapper = document.createElement("div");
   const term = document.createElement("dt");
@@ -561,6 +586,7 @@ async function renderSelectedProject() {
     hide("env-inventory-meta");
     setChip("env-total-chip", "0 vars", "stale");
     resetEnvPreview("Select a project to preview masked environment changes.", true);
+    renderEnvAuditHistory(null);
     return;
   }
 
@@ -577,17 +603,21 @@ async function renderSelectedProject() {
   hide("env-inventory-meta");
   showState("env-inventory-state", "Loading masked environment inventory...");
   resetEnvPreview("Preview only. No changes will be saved.", false);
+  showState("env-audit-state", "Loading masked audit history...");
+  hide("env-audit-history");
 
   try {
-    const [environments, inventory] = await Promise.all([
+    const [environments, inventory, audit] = await Promise.all([
       ensureProjectEnvironments(project.project_id),
       ensureProjectEnvInventory(project.project_id),
+      ensureProjectEnvAudit(project.project_id),
     ]);
     if (!environments.length) {
       showState("project-detail-state", "Project no longer exists or has no registered environments.");
       setChip("project-health-chip", "No environments", "stale");
       setChip("environment-count-chip", "0 env", "stale");
       renderEnvInventory(inventory);
+      renderEnvAuditHistory(audit);
       return;
     }
 
@@ -616,6 +646,7 @@ async function renderSelectedProject() {
     hideState("project-detail-state");
     show("project-detail");
     renderEnvInventory(inventory);
+    renderEnvAuditHistory(audit);
   } catch (error) {
     showState("project-detail-state", error.message || "Environment inventory unavailable.", "warn");
     showState("env-inventory-state", error.message || "Env inventory unavailable.", "warn");
@@ -623,6 +654,7 @@ async function renderSelectedProject() {
     setChip("environment-count-chip", "0 env", "stale");
     setChip("env-total-chip", "0 vars", "stale");
     showState("env-preview-state", "Preview unavailable until project inventory loads.", "warn");
+    showState("env-audit-state", error.message || "Audit history unavailable.", "warn");
   }
 }
 
@@ -636,7 +668,10 @@ function previewInputValue(environment) {
 }
 
 function resetEnvPreview(message, clearFields) {
+  dataState.lastEnvPreview = null;
   hide("env-preview-result");
+  hide("env-apply-panel");
+  hide("env-apply-confirmation");
   if (clearFields) {
     ["development", "staging", "production"].forEach((environment) => {
       const field = previewTextArea(environment);
@@ -646,6 +681,16 @@ function resetEnvPreview(message, clearFields) {
     });
   }
   showState("env-preview-state", message);
+}
+
+function previewCanApply(preview) {
+  const environments = preview && Array.isArray(preview.environments) ? preview.environments : [];
+  return Boolean(
+    preview
+      && !preview.applied
+      && environments.length
+      && environments.every((environment) => environment && environment.valid)
+  );
 }
 
 function summaryMetric(label, count) {
@@ -770,8 +815,25 @@ function renderEnvPreviewResult(preview) {
     result.appendChild(previewSummaryCard(environment));
   });
 
+  dataState.lastEnvPreview = preview || null;
+  if (previewCanApply(preview)) {
+    show("env-apply-panel");
+    hide("env-apply-confirmation");
+  } else {
+    hide("env-apply-panel");
+    hide("env-apply-confirmation");
+  }
+
   hideState("env-preview-state");
   show("env-preview-result");
+}
+
+function currentEnvChanges() {
+  return {
+    development: previewInputValue("development"),
+    staging: previewInputValue("staging"),
+    production: previewInputValue("production"),
+  };
 }
 
 async function submitEnvPreview() {
@@ -794,20 +856,130 @@ async function submitEnvPreview() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        changes: {
-          development: previewInputValue("development"),
-          staging: previewInputValue("staging"),
-          production: previewInputValue("production"),
-        },
+        changes: currentEnvChanges(),
       }),
     });
     renderEnvPreviewResult(preview);
   } catch (error) {
     showState("env-preview-state", error.message || "Preview failed.", "warn");
+    hide("env-apply-panel");
+    hide("env-apply-confirmation");
   } finally {
     if (button) {
       button.disabled = false;
       button.textContent = "Preview Changes";
+    }
+  }
+}
+
+function renderAuditDiff(diff) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "env-audit-diff";
+  appendPreviewEntries(wrapper, "Masked diff", Array.isArray(diff) ? diff : []);
+  return wrapper;
+}
+
+function renderEnvAuditHistory(audit) {
+  const list = element("env-audit-history");
+  if (!list) {
+    return;
+  }
+  clearChildren(list);
+
+  const total = audit && typeof audit.total === "number" ? audit.total : 0;
+  setChip("env-audit-total-chip", `${total} events`, total ? "" : "stale");
+
+  if (!audit || !Array.isArray(audit.entries) || !audit.entries.length) {
+    hide("env-audit-history");
+    showState("env-audit-state", "No masked audit history recorded for this project yet.");
+    return;
+  }
+
+  audit.entries.forEach((entry) => {
+    const card = document.createElement("article");
+    card.className = "env-audit-card";
+
+    const head = document.createElement("div");
+    head.className = "env-audit-head";
+    const title = document.createElement("h3");
+    title.textContent = `${text(entry.environment)} • ${text(entry.status)}`;
+    const meta = document.createElement("p");
+    meta.className = "env-audit-meta";
+    meta.textContent = `Requested by ${text(entry.requested_by, "Unknown")} • ${formatUnix(entry.modified_at_unix)}`;
+    head.append(title, meta);
+    card.appendChild(head);
+
+    const summary = document.createElement("div");
+    summary.className = "env-preview-summary";
+    summary.appendChild(summaryMetric("Added", entry.summary && entry.summary.added ? entry.summary.added : 0));
+    summary.appendChild(summaryMetric("Updated", entry.summary && entry.summary.updated ? entry.summary.updated : 0));
+    summary.appendChild(summaryMetric("Deleted", entry.summary && entry.summary.deleted ? entry.summary.deleted : 0));
+    summary.appendChild(summaryMetric("Audit", text(entry.audit_id)));
+    card.appendChild(summary);
+
+    const details = document.createElement("details");
+    details.className = "env-preview-details";
+    const summaryLabel = document.createElement("summary");
+    summaryLabel.textContent = "Show Diff";
+    details.append(summaryLabel, renderAuditDiff(entry.diff));
+    card.appendChild(details);
+
+    list.appendChild(card);
+  });
+
+  hideState("env-audit-state");
+  show("env-audit-history");
+}
+
+function toggleApplyConfirmation() {
+  if (!previewCanApply(dataState.lastEnvPreview)) {
+    return;
+  }
+  const confirmation = element("env-apply-confirmation");
+  if (!confirmation) {
+    return;
+  }
+  confirmation.hidden = !confirmation.hidden;
+}
+
+async function applyEnvChanges() {
+  const project = selectedProject();
+  if (!project || !previewCanApply(dataState.lastEnvPreview)) {
+    return;
+  }
+
+  const button = element("env-apply-confirm-button");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Applying...";
+  }
+  showState("env-preview-state", "Saving masked environment changes...");
+
+  try {
+    const response = await fetchApiData(API_PATHS.projectEnvApply(project.project_id), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        changes: currentEnvChanges(),
+      }),
+    });
+    dataState.envInventoryByProject.delete(project.project_id);
+    dataState.envAuditByProject.delete(project.project_id);
+    hide("env-apply-confirmation");
+    renderEnvPreviewResult(response);
+    showState("env-preview-state", response.message || "Changes saved. They will apply on the next deployment.");
+    const [inventory, audit] = await Promise.all([
+      ensureProjectEnvInventory(project.project_id),
+      ensureProjectEnvAudit(project.project_id),
+    ]);
+    renderEnvInventory(inventory);
+    renderEnvAuditHistory(audit);
+  } catch (error) {
+    showState("env-preview-state", error.message || "Apply failed.", "warn");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Confirm Apply";
     }
   }
 }
@@ -977,6 +1149,7 @@ function bindControls() {
     refreshButton.addEventListener("click", () => {
       dataState.envInventoryByProject.clear();
       dataState.environmentsByProject.clear();
+      dataState.envAuditByProject.clear();
       void loadConsole();
     });
   }
@@ -993,6 +1166,18 @@ function bindControls() {
   if (previewButton) {
     previewButton.addEventListener("click", () => {
       void submitEnvPreview();
+    });
+  }
+
+  const applyButton = element("env-apply-button");
+  if (applyButton) {
+    applyButton.addEventListener("click", toggleApplyConfirmation);
+  }
+
+  const applyConfirmButton = element("env-apply-confirm-button");
+  if (applyConfirmButton) {
+    applyConfirmButton.addEventListener("click", () => {
+      void applyEnvChanges();
     });
   }
 }

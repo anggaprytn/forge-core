@@ -628,6 +628,11 @@ a:hover {
   margin-bottom: 18px;
 }
 
+.env-apply-panel,
+.env-apply-confirmation {
+  margin-bottom: 18px;
+}
+
 .env-preview-button {
   min-height: 44px;
   padding: 0 16px;
@@ -651,7 +656,9 @@ a:hover {
 }
 
 .env-preview-banner,
-.env-preview-card {
+.env-preview-card,
+.env-apply-confirmation,
+.env-audit-card {
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.03);
@@ -664,6 +671,17 @@ a:hover {
 
 .env-preview-card {
   padding: 16px;
+}
+
+.env-apply-confirmation,
+.env-audit-card {
+  padding: 16px;
+}
+
+.env-apply-confirmation {
+  display: grid;
+  gap: 12px;
+  color: var(--zinc-300);
 }
 
 .env-preview-card h3 {
@@ -696,6 +714,24 @@ a:hover {
 .env-preview-validity {
   margin-bottom: 12px;
   color: var(--zinc-400);
+}
+
+.env-audit-head {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.env-audit-head h3 {
+  text-transform: capitalize;
+}
+
+.env-audit-meta {
+  color: var(--zinc-400);
+}
+
+.env-audit-diff {
+  margin-top: 12px;
 }
 
 .env-preview-validity.ok {

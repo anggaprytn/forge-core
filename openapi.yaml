@@ -295,6 +295,76 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/env/apply:
+    post:
+      summary: Apply validated masked environment changes for the next deployment
+      operationId: postProjectEnvApply
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnvApplyRequest'
+      responses:
+        '200':
+          description: Masked environment changes saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeEnvApply'
+        '400':
+          description: Invalid changes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/projects/{project_id}/env/audit:
+    get:
+      summary: Get masked environment audit history
+      operationId: getProjectEnvAudit
+      parameters:
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Masked environment audit history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelopeEnvAudit'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Project not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/projects/{project_id}/environments/{environment}/status:
     get:
       summary: Get runtime status for one project environment
@@ -1317,6 +1387,16 @@ components:
       properties:
         changes:
           $ref: '#/components/schemas/EnvPreviewChanges'
+    EnvApplyRequest:
+      type: object
+      required:
+        - changes
+      properties:
+        changes:
+          $ref: '#/components/schemas/EnvPreviewChanges'
+        preview_token:
+          type: string
+          nullable: true
     EnvPreviewError:
       type: object
       required:
@@ -1403,6 +1483,86 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EnvPreviewEnvironmentResponse'
+    EnvApplyResponse:
+      type: object
+      required:
+        - project_id
+        - applied
+        - message
+        - audit_id
+        - environments
+      properties:
+        project_id:
+          type: string
+        applied:
+          type: boolean
+        message:
+          type: string
+        audit_id:
+          type: string
+        environments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewEnvironmentResponse'
+    EnvAuditSummary:
+      type: object
+      required:
+        - added
+        - updated
+        - deleted
+      properties:
+        added:
+          type: integer
+        updated:
+          type: integer
+        deleted:
+          type: integer
+    EnvAuditEntry:
+      type: object
+      required:
+        - audit_id
+        - project_id
+        - environment
+        - modified_at_unix
+        - status
+        - summary
+        - diff
+      properties:
+        audit_id:
+          type: string
+        project_id:
+          type: string
+        environment:
+          type: string
+        requested_by:
+          type: string
+          nullable: true
+        modified_at_unix:
+          type: integer
+          format: int64
+        status:
+          type: string
+        summary:
+          $ref: '#/components/schemas/EnvAuditSummary'
+        diff:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvPreviewDiffEntry'
+    EnvAuditResponse:
+      type: object
+      required:
+        - project_id
+        - total
+        - entries
+      properties:
+        project_id:
+          type: string
+        total:
+          type: integer
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvAuditEntry'
     BackupVolumeRecord:
       type: object
       required:
@@ -1678,6 +1838,20 @@ components:
         request_id: {type: string}
         correlation_id: {type: string}
         data: {$ref: '#/components/schemas/EnvPreviewResponse'}
+    SuccessEnvelopeEnvApply:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/EnvApplyResponse'}
+    SuccessEnvelopeEnvAudit:
+      type: object
+      required: [request_id, correlation_id, data]
+      properties:
+        request_id: {type: string}
+        correlation_id: {type: string}
+        data: {$ref: '#/components/schemas/EnvAuditResponse'}
     SuccessEnvelopeDeploymentStatus:
       type: object
       required: [request_id, correlation_id, data]
