@@ -533,7 +533,23 @@ a:hover {
   outline: none;
 }
 
+.search-field select {
+  width: 100%;
+  height: 46px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--fg);
+  padding: 0 14px;
+  outline: none;
+}
+
 .search-field input:focus {
+  border-color: rgba(255, 255, 255, 0.22);
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.04);
+}
+
+.search-field select:focus {
   border-color: rgba(255, 255, 255, 0.22);
   box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.04);
 }
@@ -679,6 +695,17 @@ a:hover {
   gap: 12px;
 }
 
+.truth-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.truth-panel {
+  display: grid;
+  gap: 12px;
+}
+
 .env-preview-banner,
 .env-preview-card,
 .env-apply-confirmation,
@@ -695,6 +722,61 @@ a:hover {
 
 .env-preview-card {
   padding: 16px;
+}
+
+.truth-card {
+  padding: 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  display: grid;
+  gap: 10px;
+}
+
+.truth-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+
+.truth-card-title {
+  font-size: 0.98rem;
+  font-weight: 700;
+}
+
+.truth-card-subtitle {
+  color: var(--zinc-400);
+  font-size: 0.86rem;
+}
+
+.truth-facts {
+  display: grid;
+  gap: 8px;
+}
+
+.truth-facts div {
+  display: grid;
+  grid-template-columns: minmax(110px, 140px) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.truth-facts dt {
+  color: var(--zinc-500);
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.truth-facts dd {
+  margin: 0;
+  color: var(--zinc-100);
+  word-break: break-word;
+}
+
+.truth-copy {
+  color: var(--zinc-400);
+  font-size: 0.9rem;
 }
 
 .env-apply-confirmation,
@@ -1108,7 +1190,9 @@ a:hover {
   .github-route-preview,
   .env-preview-grid,
   .env-preview-summary,
-  .deploy-center-grid {
+  .deploy-center-grid,
+  .truth-grid,
+  .truth-facts div {
     grid-template-columns: 1fr;
   }
 

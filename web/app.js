@@ -40,6 +40,12 @@ const API_PATHS = {
   environmentDiagnostics(projectId, environment) {
     return `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environment)}/diagnostics`;
   },
+  environmentDeployments(projectId, environment) {
+    return `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environment)}/deployments`;
+  },
+  environmentGenerations(projectId, environment) {
+    return `/api/projects/${encodeURIComponent(projectId)}/environments/${encodeURIComponent(environment)}/generations`;
+  },
 };
 
 const uiState = {
@@ -64,6 +70,8 @@ const dataState = {
   environmentsByProject: new Map(),
   envInventoryByProject: new Map(),
   envAuditByProject: new Map(),
+  deploymentHistoryByEnvironment: new Map(),
+  generationTruthByEnvironment: new Map(),
   lastEnvPreview: null,
   lastEnvPreviewSignature: "",
   lastEnvApplyIdempotencyKey: "",
@@ -243,6 +251,11 @@ function setPreviewPhase(phase) {
 
 function selectedDeployEnvironment() {
   const field = element("deploy-environment-select");
+  return field ? (field.value || "staging") : "staging";
+}
+
+function selectedTruthEnvironment() {
+  const field = element("history-environment-select");
   return field ? (field.value || "staging") : "staging";
 }
 
@@ -835,6 +848,8 @@ async function registerProjectFromGitHub() {
     dataState.environmentsByProject.delete(response.project_id);
     dataState.envInventoryByProject.delete(response.project_id);
     dataState.envAuditByProject.delete(response.project_id);
+    dataState.deploymentHistoryByEnvironment.clear();
+    dataState.generationTruthByEnvironment.clear();
     renderGitHubRegistrationPreview();
     await loadConsole();
   } catch (error) {
@@ -900,6 +915,46 @@ async function ensureProjectEnvAudit(projectId) {
   }
 }
 
+function truthCacheKey(projectId, environment) {
+  return `${projectId}::${environment}`;
+}
+
+async function ensureEnvironmentDeployments(projectId, environment) {
+  if (!projectId || !environment) {
+    return null;
+  }
+  const key = truthCacheKey(projectId, environment);
+  if (dataState.deploymentHistoryByEnvironment.has(key)) {
+    return dataState.deploymentHistoryByEnvironment.get(key) || null;
+  }
+
+  try {
+    const payload = await fetchApiData(API_PATHS.environmentDeployments(projectId, environment));
+    dataState.deploymentHistoryByEnvironment.set(key, payload);
+    return payload;
+  } catch (_error) {
+    throw new Error("Deployment history unavailable.");
+  }
+}
+
+async function ensureEnvironmentGenerations(projectId, environment) {
+  if (!projectId || !environment) {
+    return null;
+  }
+  const key = truthCacheKey(projectId, environment);
+  if (dataState.generationTruthByEnvironment.has(key)) {
+    return dataState.generationTruthByEnvironment.get(key) || null;
+  }
+
+  try {
+    const payload = await fetchApiData(API_PATHS.environmentGenerations(projectId, environment));
+    dataState.generationTruthByEnvironment.set(key, payload);
+    return payload;
+  } catch (_error) {
+    throw new Error("Generation truth unavailable.");
+  }
+}
+
 function appendMeta(container, label, value) {
   const wrapper = document.createElement("div");
   const term = document.createElement("dt");
@@ -908,6 +963,257 @@ function appendMeta(container, label, value) {
   description.textContent = value;
   wrapper.append(term, description);
   container.appendChild(wrapper);
+}
+
+function setSelectOptions(id, environments, selectedValue) {
+  const field = element(id);
+  if (!field) {
+    return;
+  }
+  const values = Array.isArray(environments) && environments.length
+    ? environments
+    : ["staging", "production", "development"];
+  clearChildren(field);
+  values.forEach((environment) => {
+    const option = document.createElement("option");
+    option.value = environment;
+    option.textContent = environment;
+    if (environment === selectedValue) {
+      option.selected = true;
+    }
+    field.appendChild(option);
+  });
+}
+
+function truthCard(title, subtitle, tone = "") {
+  const card = document.createElement("article");
+  card.className = "truth-card";
+
+  const head = document.createElement("div");
+  head.className = "truth-card-head";
+
+  const copy = document.createElement("div");
+  const name = document.createElement("p");
+  name.className = "truth-card-title";
+  name.textContent = title;
+  const note = document.createElement("p");
+  note.className = "truth-card-subtitle";
+  note.textContent = subtitle;
+  copy.append(name, note);
+  head.appendChild(copy);
+
+  if (tone) {
+    const chip = document.createElement("span");
+    chip.className = `status-chip ${tone}`;
+    chip.textContent = tone === "ok" ? "Clear" : tone === "warn" ? "Review" : "Partial";
+    head.appendChild(chip);
+  }
+
+  card.appendChild(head);
+  return card;
+}
+
+function appendTruthFacts(card, facts) {
+  const list = document.createElement("dl");
+  list.className = "truth-facts";
+  facts.forEach(([label, value]) => {
+    appendMeta(list, label, value);
+  });
+  card.appendChild(list);
+}
+
+function appendTruthCopy(card, message) {
+  const copy = document.createElement("p");
+  copy.className = "truth-copy";
+  copy.textContent = message;
+  card.appendChild(copy);
+}
+
+function routeTruthTone(routeTruth) {
+  if (routeTruth && routeTruth.fallback_detected === true) {
+    return "warn";
+  }
+  if (routeTruth && routeTruth.route_expected && routeTruth.route_active === true && routeTruth.app_route_healthy === true) {
+    return "ok";
+  }
+  if (routeTruth && routeTruth.route_active === false) {
+    return "warn";
+  }
+  return "stale";
+}
+
+function renderRouteTruth(routeTruth) {
+  const container = element("route-truth-result");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+  const truth = routeTruth || {};
+  const tone = routeTruthTone(truth);
+  const card = truthCard(
+    text(truth.domain, "Route not assigned"),
+    truth.fallback_detected === true ? "Gateway fallback" : "Cached route truth",
+    tone,
+  );
+  appendTruthFacts(card, [
+    ["Expected route", truth.route_expected ? text(truth.domain, "Unknown") : "No HTTP route required"],
+    ["Route active", truth.route_active === undefined || truth.route_active === null ? "Unknown" : truth.route_active ? "true" : "false"],
+    ["Fallback detected", truth.fallback_detected === undefined || truth.fallback_detected === null ? "Unknown" : truth.fallback_detected ? "true" : "false"],
+    ["App route healthy", truth.app_route_healthy === undefined || truth.app_route_healthy === null ? "Unknown" : truth.app_route_healthy ? "true" : "false"],
+  ]);
+  appendTruthCopy(
+    card,
+    truth.fallback_detected === true
+      ? "Gateway fallback. Application route is not active. Gateway healthy is not app healthy."
+      : text(truth.detail, "Partial metadata available."),
+  );
+  container.appendChild(card);
+}
+
+function renderRollbackEligibility(rollback) {
+  const container = element("rollback-eligibility-result");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+  const item = rollback || { state: "unknown", message: "Unknown: metadata unavailable" };
+  const tone = item.state === "eligible" ? "ok" : item.state === "not_eligible" ? "warn" : "stale";
+  const card = truthCard(
+    item.state === "eligible" ? "Rollback target retained" : "Rollback not available",
+    text(item.message),
+    tone,
+  );
+  appendTruthFacts(card, [
+    ["State", text(item.state)],
+    ["Generation", item.generation === undefined || item.generation === null ? "None" : `Gen ${item.generation}`],
+  ]);
+  appendTruthCopy(card, "Read-only only. No rollback button is exposed yet.");
+  container.appendChild(card);
+}
+
+function renderDeploymentHistory(deployments) {
+  const container = element("deployment-history-result");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+  const entries = deployments && Array.isArray(deployments.entries) ? deployments.entries : [];
+  setChip("deployment-history-count-chip", `${entries.length} ${entries.length === 1 ? "entry" : "entries"}`, entries.length ? "" : "stale");
+  if (!entries.length) {
+    const card = truthCard("No deployments recorded", "No deployment attempts are stored for this environment yet.", "stale");
+    appendTruthCopy(card, "No deployments recorded.");
+    container.appendChild(card);
+    return;
+  }
+
+  entries.forEach((entry) => {
+    const tone = lower(entry.status_label) === "live" ? "ok" : entry.failure_reason ? "warn" : "stale";
+    const card = truthCard(
+      `${text(entry.deployment_id, `Generation ${entry.generation}`)}`,
+      `Gen ${entry.generation} • ${text(entry.status_label)}`,
+      tone,
+    );
+    appendTruthFacts(card, [
+      ["State", text(entry.state)],
+      ["Lifecycle", text(entry.lifecycle_state)],
+      ["Source ref", text(entry.source_ref, "Unknown")],
+      ["Commit", text(entry.commit_sha, "Unknown")],
+      ["Started", formatUnix(entry.started_at_unix)],
+      ["Completed", formatUnix(entry.completed_at_unix)],
+      ["Route", text(entry.route, "Unknown")],
+      ["Route active", entry.route_active === undefined || entry.route_active === null ? "Unknown" : entry.route_active ? "true" : "false"],
+      ["Health", text(entry.health_summary, "Unknown")],
+      ["Failure stage", text(entry.failure_stage, "None")],
+      ["Failure reason", text(entry.failure_reason, "None")],
+      ["Live URL safe", entry.safe_to_report_live_url === undefined || entry.safe_to_report_live_url === null ? "Unknown" : entry.safe_to_report_live_url ? "true" : "false"],
+    ]);
+    appendTruthCopy(card, `Next action: ${text(entry.recommended_next_action)}`);
+    container.appendChild(card);
+  });
+}
+
+function renderGenerationTruth(generations) {
+  const container = element("generation-truth-result");
+  if (!container) {
+    return;
+  }
+  clearChildren(container);
+  const entries = generations && Array.isArray(generations.entries) ? generations.entries : [];
+  setChip("generation-truth-count-chip", `${entries.length} ${entries.length === 1 ? "generation" : "generations"}`, entries.length ? "" : "stale");
+  if (!entries.length) {
+    const card = truthCard("No active generation", "No generations are retained for this environment yet.", "stale");
+    appendTruthCopy(card, "No active generation.");
+    container.appendChild(card);
+    return;
+  }
+
+  entries.forEach((entry) => {
+    const roles = Array.isArray(entry.roles) && entry.roles.length ? entry.roles.join(", ") : "retained";
+    const tone = Array.isArray(entry.roles) && entry.roles.includes("current")
+      ? "ok"
+      : Array.isArray(entry.roles) && entry.roles.includes("failed")
+        ? "warn"
+        : "stale";
+    const card = truthCard(`Generation ${entry.generation}`, roles, tone);
+    appendTruthFacts(card, [
+      ["Roles", roles],
+      ["Lifecycle", text(entry.lifecycle)],
+      ["Route state", text(entry.route_state)],
+      ["Services", String(entry.service_count || 0)],
+      ["Runtime policy", text(entry.runtime_policy_summary, "Unknown")],
+      ["Created", formatUnix(entry.created_at_unix)],
+      ["Finalized", formatUnix(entry.finalized_at_unix)],
+      ["Promoted", formatUnix(entry.promoted_at_unix)],
+      ["Failure reason", text(entry.failure_reason, "None")],
+      ["Env snapshot", entry.env_snapshot ? (entry.env_snapshot.exists ? "true" : "false") : "Unknown"],
+      ["Env key count", entry.env_snapshot && entry.env_snapshot.key_count !== undefined && entry.env_snapshot.key_count !== null ? String(entry.env_snapshot.key_count) : "Unknown"],
+      ["Env source", entry.env_snapshot ? text(entry.env_snapshot.source) : "Unknown"],
+    ]);
+    if (entry.env_snapshot) {
+      appendTruthCopy(card, text(entry.env_snapshot.copy));
+    } else {
+      appendTruthCopy(card, "Partial metadata available.");
+    }
+    container.appendChild(card);
+  });
+}
+
+async function renderDeploymentTruth(projectId, environments) {
+  const selectedEnvironment = selectedTruthEnvironment();
+  setSelectOptions("history-environment-select", environments, selectedEnvironment);
+  const environment = selectedTruthEnvironment();
+  const state = element("deployment-truth-state");
+  if (!projectId) {
+    setChip("deployment-truth-chip", "Idle", "stale");
+    showState("deployment-truth-state", "Select a project and environment to inspect deployment truth.");
+    hide("deployment-truth-panels");
+    return;
+  }
+  showState("deployment-truth-state", "Loading deployment truth...");
+  hide("deployment-truth-panels");
+
+  try {
+    const [deployments, generations] = await Promise.all([
+      ensureEnvironmentDeployments(projectId, environment),
+      ensureEnvironmentGenerations(projectId, environment),
+    ]);
+    renderRouteTruth((deployments && deployments.route_truth) || (generations && generations.route_truth) || null);
+    renderRollbackEligibility((deployments && deployments.rollback_eligibility) || (generations && generations.rollback_eligibility) || null);
+    renderDeploymentHistory(deployments);
+    renderGenerationTruth(generations);
+    hideState("deployment-truth-state");
+    show("deployment-truth-panels");
+    const routeTruth = (deployments && deployments.route_truth) || (generations && generations.route_truth) || null;
+    setChip(
+      "deployment-truth-chip",
+      routeTruth && routeTruth.fallback_detected === true ? "Fallback" : "Read-only",
+      routeTruth && routeTruth.fallback_detected === true ? "warn" : "ok",
+    );
+  } catch (error) {
+    setChip("deployment-truth-chip", "Unavailable", "stale");
+    showState("deployment-truth-state", error.message || "Deployment truth unavailable.", "warn");
+    hide("deployment-truth-panels");
+  }
 }
 
 function environmentCard(environment) {
@@ -1170,6 +1476,7 @@ async function renderSelectedProject() {
     setChip("env-total-chip", "0 vars", "stale");
     resetEnvPreview("Select a project to preview masked environment changes.", true);
     renderEnvAuditHistory(null);
+    await renderDeploymentTruth("", []);
     return;
   }
 
@@ -1201,6 +1508,7 @@ async function renderSelectedProject() {
       setChip("environment-count-chip", "0 env", "stale");
       renderEnvInventory(inventory);
       renderEnvAuditHistory(audit);
+      await renderDeploymentTruth(project.project_id, []);
       return;
     }
 
@@ -1230,6 +1538,10 @@ async function renderSelectedProject() {
     show("project-detail");
     renderEnvInventory(inventory);
     renderEnvAuditHistory(audit);
+    await renderDeploymentTruth(
+      project.project_id,
+      environments.map((entry) => entry.environment),
+    );
   } catch (error) {
     showState("project-detail-state", error.message || "Environment inventory unavailable.", "warn");
     showState("env-inventory-state", error.message || "Env inventory unavailable.", "warn");
@@ -1238,6 +1550,7 @@ async function renderSelectedProject() {
     setChip("env-total-chip", "0 vars", "stale");
     showState("env-preview-state", "Preview unavailable until project inventory loads.", "warn");
     showState("env-audit-state", error.message || "Audit history unavailable.", "warn");
+    await renderDeploymentTruth(project.project_id, []);
   }
 
   syncDeployCenterForSelectedProject();
@@ -2270,6 +2583,8 @@ function bindControls() {
       dataState.envInventoryByProject.clear();
       dataState.environmentsByProject.clear();
       dataState.envAuditByProject.clear();
+      dataState.deploymentHistoryByEnvironment.clear();
+      dataState.generationTruthByEnvironment.clear();
       void loadConsole();
     });
   }
@@ -2323,6 +2638,16 @@ function bindControls() {
   if (deployEnvironment) {
     deployEnvironment.addEventListener("change", () => {
       syncDeployCenterForSelectedProject();
+    });
+  }
+
+  const truthEnvironment = element("history-environment-select");
+  if (truthEnvironment) {
+    truthEnvironment.addEventListener("change", () => {
+      const project = selectedProject();
+      if (project) {
+        void renderDeploymentTruth(project.project_id, []);
+      }
     });
   }
 

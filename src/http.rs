@@ -1236,6 +1236,14 @@ pub fn router(state: HttpState) -> Router {
             get(get_project_environment_history),
         )
         .route(
+            "/api/projects/{project_id}/environments/{environment}/deployments",
+            get(get_project_environment_deployments),
+        )
+        .route(
+            "/api/projects/{project_id}/environments/{environment}/generations",
+            get(get_project_environment_generations),
+        )
+        .route(
             "/api/projects/{project_id}/environments/{environment}/env",
             get(get_project_environment_env),
         )
@@ -3230,6 +3238,82 @@ async fn get_project_environment_history(
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             error_response(status, &request_id, err)
+        }
+    }
+}
+
+async fn get_project_environment_deployments(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state
+        .project_registry
+        .get_environment_deployments(&project_id, &environment)
+    {
+        Ok(Some(deployments)) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: deployments,
+            }),
+        ),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            &request_id,
+            ErrorResponse {
+                code: "project_not_found".into(),
+                message: "project not found".into(),
+            },
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
+        }
+    }
+}
+
+async fn get_project_environment_generations(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    AxumPath((project_id, environment)): AxumPath<(String, String)>,
+) -> Response {
+    let request_id = next_request_id();
+    if let Err(response) = ensure_inventory_read_authorized(&state, &headers, &request_id) {
+        return response;
+    }
+
+    match state
+        .project_registry
+        .get_environment_generations(&project_id, &environment)
+    {
+        Ok(Some(generations)) => json_response(
+            StatusCode::OK,
+            &request_id,
+            Json(SuccessEnvelope {
+                request_id: request_id.clone(),
+                correlation_id: request_id.clone(),
+                data: generations,
+            }),
+        ),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            &request_id,
+            ErrorResponse {
+                code: "project_not_found".into(),
+                message: "project not found".into(),
+            },
+        ),
+        Err(err) => {
+            let (status, response) = project_registry_error_response(err);
+            error_response(status, &request_id, response)
         }
     }
 }
@@ -6173,6 +6257,11 @@ pub mod app_page_preserves_auth_gate {
         assert!(body.contains("Add Project from GitHub"));
         assert!(body.contains("Register Project"));
         assert!(body.contains("Deploy Center"));
+        assert!(body.contains("Deployment Truth"));
+        assert!(body.contains("Deployment History"));
+        assert!(body.contains("Generation Truth"));
+        assert!(body.contains("Route Truth"));
+        assert!(body.contains("Rollback Eligibility"));
         assert!(body.contains("Run Preflight"));
         assert!(body.contains("Confirm Deploy"));
         assert!(body.contains("Local path deploys remain CLI-only"));
@@ -6223,9 +6312,13 @@ pub mod app_js_references_existing_readiness_apis {
         assert!(body.contains("/env/audit"));
         assert!(body.contains("/deploy/preview"));
         assert!(body.contains("/deploy"));
+        assert!(body.contains("/deployments"));
+        assert!(body.contains("/generations"));
         assert!(body.contains("/api/deployments/"));
         assert!(body.contains("projectEnvInventory(projectId)"));
         assert!(body.contains("projectEnvironments(projectId)"));
+        assert!(body.contains("environmentDeployments(projectId, environment)"));
+        assert!(body.contains("environmentGenerations(projectId, environment)"));
         assert!(body.contains("projectEnvPreview(projectId)"));
         assert!(body.contains("projectEnvApply(projectId)"));
         assert!(body.contains("projectEnvAudit(projectId)"));
@@ -6404,6 +6497,12 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
                     "env-preview-staging",
                     "env-preview-production",
                     "Deploy Center",
+                    "Deployment Truth",
+                    "Deployment History",
+                    "Generation Truth",
+                    "Route Truth",
+                    "Rollback Eligibility",
+                    "Read-only only",
                     "Run Preflight",
                     "Confirm Deploy",
                     "Local path deploys remain CLI-only",
@@ -6429,6 +6528,8 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
                     "preview_hashes",
                     "projectDeployPreview(projectId)",
                     "projectDeploy(projectId)",
+                    "environmentDeployments(projectId, environment)",
+                    "environmentGenerations(projectId, environment)",
                     "runDeployPreflight()",
                     "confirmDeploy()",
                     "Not live yet",
@@ -6438,7 +6539,12 @@ pub mod app_env_inventory_ships_masked_apply_and_audit_controls {
             for required in required {
                 assert!(body.contains(required));
             }
-            for forbidden in ["Reveal secret", "rollback-button"] {
+            for forbidden in [
+                "Reveal secret",
+                "rollback-button",
+                "retry-button",
+                "delete-generation",
+            ] {
                 assert!(!body.contains(forbidden));
             }
         }
@@ -9917,6 +10023,267 @@ pub mod project_environment_inventory_api_uses_persisted_state {
         );
         assert!(!audit_text.contains("FLEETDEV"));
         assert!(!audit_text.contains("DEBUG=true"));
+    }
+}
+
+#[cfg(test)]
+pub mod deployment_truth_endpoints {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use serde_json::Value;
+    use tower::util::ServiceExt;
+
+    fn seed_failed_generation(root: &Path, generation: u64) {
+        use crate::storage::{
+            DiagnosticSummary, DiagnosticsStore, EnvironmentPaths, SnapshotState, SnapshotWriter,
+        };
+
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        let writer = SnapshotWriter::new(env.clone(), generation).unwrap();
+        writer
+            .write_artifact(
+                "build.json",
+                &format!(
+                    concat!(
+                        "{{\n",
+                        "  \"deployment_id\": \"dep-{generation}\",\n",
+                        "  \"image_ref\": \"forge/api:staging-gen-{generation}\",\n",
+                        "  \"source_ref\": \"main\",\n",
+                        "  \"commit_sha\": \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"\n",
+                        "}}\n"
+                    ),
+                    generation = generation,
+                ),
+            )
+            .unwrap();
+        writer
+            .finalize("api", "staging", SnapshotState::Failed)
+            .unwrap();
+        DiagnosticsStore::new(env, generation)
+            .write_summary(&DiagnosticSummary {
+                deployment_id: Some(format!("dep-{generation}")),
+                failure_stage: "validating_runtime".into(),
+                failure_reason: "http health probe failed".into(),
+                blocking_reason: Some("http health probe failed".into()),
+                container_name: format!("staging-api-gen-{generation}"),
+                failed_service_name: None,
+                blocking_service_name: None,
+                probe_target_host: Some("172.29.0.3".into()),
+                probe_target_port: Some(3000),
+                probe_target_path: Some("/health".into()),
+                restart_storm: false,
+                restart_policy: None,
+                restart_count_delta: None,
+                oom_killed: None,
+                last_exit_code: None,
+                exit_signal: None,
+                termination_reason: None,
+                cleanup_recorded: true,
+                dependency_graph_summary: None,
+                runtime_env_preview: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn seed_gateway_fallback_checkpoint(root: &Path) {
+        use crate::storage::{
+            ConvergenceCheckpointStore, EnvironmentPaths, PersistedEnvironmentCheckpoint,
+            RuntimeHealthState,
+        };
+
+        let env = EnvironmentPaths::new(root, "api", "staging");
+        ConvergenceCheckpointStore::new(env)
+            .save(&PersistedEnvironmentCheckpoint {
+                snapshot_version: 1,
+                schema_version: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                checkpointed_at_unix: 1779320530,
+                last_successful_convergence_unix: Some(1779320528),
+                last_convergence_duration_ms: 12,
+                last_convergence_generation: Some(7),
+                last_convergence_error: Some("application_route_not_active".into()),
+                active_generation: Some(7),
+                health_state: RuntimeHealthState::Degraded,
+                dependency_states: Default::default(),
+                breaker_states: Default::default(),
+                queue_depth_snapshot: 0,
+                node_id: "node-a".into(),
+                lease_epoch: 1,
+                convergence_owner: "node-a".into(),
+                readyz_reasons: vec![
+                    "Gateway reachable, but application route is not active.".into(),
+                ],
+                extra: Default::default(),
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deployment_history_endpoint_requires_auth() {
+        let app = router(build_state(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments/staging/deployments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn deployment_truth_endpoints_return_safe_metadata() {
+        let (state, root) = build_state_with_root(true);
+        seed_project_status_runtime(&root, 7);
+        seed_previous_project_generation(&root, 6);
+        seed_failed_generation(&root, 8);
+        seed_gateway_fallback_checkpoint(&root);
+        std::fs::write(
+            root.join("projects/api/environments/staging/generations/7/runtime_env_snapshot.json"),
+            concat!(
+                "{\n",
+                "  \"snapshot_version\": 1,\n",
+                "  \"project_id\": \"api\",\n",
+                "  \"environment\": \"staging\",\n",
+                "  \"generation\": 7,\n",
+                "  \"deployment_id\": \"dep-7\",\n",
+                "  \"source_environment\": \"staging\",\n",
+                "  \"entries\": {\n",
+                "    \"DATABASE_URL\": {\"source\": \"project_environment_secret\", \"value\": \"postgres://super-secret\", \"sensitive\": true, \"redacted\": false},\n",
+                "    \"FORGE_PROJECT_ID\": {\"source\": \"forge_generated\", \"value\": \"api\", \"sensitive\": false, \"redacted\": false}\n",
+                "  }\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+        let app = router(state);
+
+        let deployments = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments/staging/deployments")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deployments.status(), StatusCode::OK);
+        let deployments_body = to_bytes(deployments.into_body(), usize::MAX).await.unwrap();
+        let deployments_text = String::from_utf8(deployments_body.to_vec()).unwrap();
+        let deployments_json: Value = serde_json::from_str(&deployments_text).unwrap();
+        assert!(!deployments_text.contains("postgres://super-secret"));
+        assert!(!deployments_text.contains("Authorization"));
+        assert!(!deployments_text.contains("forge_session"));
+        assert!(!deployments_text.contains("Bearer "));
+        assert_eq!(deployments_json["data"]["entries"][0]["generation"], 8);
+        assert_eq!(
+            deployments_json["data"]["entries"][0]["failure_reason"],
+            "http health probe failed"
+        );
+        assert_eq!(
+            deployments_json["data"]["route_truth"]["fallback_detected"],
+            true
+        );
+
+        let generations = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments/staging/generations")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generations.status(), StatusCode::OK);
+        let generations_body = to_bytes(generations.into_body(), usize::MAX).await.unwrap();
+        let generations_text = String::from_utf8(generations_body.to_vec()).unwrap();
+        let generations_json: Value = serde_json::from_str(&generations_text).unwrap();
+        assert!(!generations_text.contains("postgres://super-secret"));
+        assert!(!generations_text.contains("DATABASE_URL"));
+        assert_eq!(generations_json["data"]["current_generation"], 7);
+        assert_eq!(generations_json["data"]["previous_generation"], 6);
+        assert!(
+            generations_json["data"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["generation"] == 7
+                    && entry["roles"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|role| role == "current"))
+        );
+        assert!(
+            generations_json["data"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["generation"] == 6
+                    && entry["roles"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|role| role == "rollback-safe"))
+        );
+        assert!(
+            generations_json["data"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["generation"] == 8
+                    && entry["failure_reason"] == "http health probe failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_truth_empty_state_returns_empty_lists() {
+        let (state, _root) = build_state_with_root(true);
+        let app = router(state);
+
+        let deployments = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments/staging/deployments")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deployments.status(), StatusCode::OK);
+        let body = to_bytes(deployments.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["entries"], serde_json::json!([]));
+
+        let generations = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/environments/staging/generations")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generations.status(), StatusCode::OK);
+        let body = to_bytes(generations.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["entries"], serde_json::json!([]));
     }
 }
 

@@ -1,24 +1,27 @@
 use crate::api::{
-    ErrorResponse, ProjectEnvironmentDetail, ProjectEnvironmentInventoryList,
-    ProjectEnvironmentReadinessSummary, ProjectEnvironmentRestoreSummary,
-    ProjectEnvironmentRollbackSummary, ProjectEnvironmentRuntimePolicySummary,
-    ProjectEnvironmentServiceRuntimePolicySummary, ProjectEnvironmentServiceSummary,
-    ProjectEnvironmentSummary, ProjectRecord, ProjectRegistrationRoutePreview,
-    ProjectUpsertRequest, RegisterProjectFromGitHubPreviewRequest,
+    DeploymentHistoryWebEntry, DeploymentHistoryWebResponse, EnvSnapshotLinkView, ErrorResponse,
+    GenerationTruthEntry, GenerationTruthResponse, ProjectEnvironmentDetail,
+    ProjectEnvironmentInventoryList, ProjectEnvironmentReadinessSummary,
+    ProjectEnvironmentRestoreSummary, ProjectEnvironmentRollbackSummary,
+    ProjectEnvironmentRuntimePolicySummary, ProjectEnvironmentServiceRuntimePolicySummary,
+    ProjectEnvironmentServiceSummary, ProjectEnvironmentSummary, ProjectRecord,
+    ProjectRegistrationRoutePreview, ProjectUpsertRequest, RegisterProjectFromGitHubPreviewRequest,
     RegisterProjectFromGitHubPreviewResponse, RegisterProjectFromGitHubRequest,
-    RegisterProjectFromGitHubResponse,
+    RegisterProjectFromGitHubResponse, RollbackEligibilityView, RouteTruthSummary,
 };
 use crate::backups::load_backup_restore_lineage;
 use crate::status::derive_environment_domain;
 use crate::storage::{
-    ConvergenceCheckpointStore, EnvironmentPaths, GenerationHistoryRecord, PersistedActivationMode,
-    PersistedEnvironmentCheckpoint, PersistedRuntimeInfo, RetentionStore, StorageError,
-    atomic_write, load_generation_build_info, load_generation_lifecycle,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    ConvergenceCheckpointStore, DiagnosticsStore, EnvironmentPaths, GenerationHistoryRecord,
+    PersistedActivationMode, PersistedEnvironmentCheckpoint, PersistedRuntimeInfo, RetentionStore,
+    StorageError, atomic_write, load_generation_build_info, load_generation_lifecycle,
+    load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    load_generation_snapshot_metadata,
 };
 use crate::topology::runtime_with_primary_service;
 use serde_json::Error as JsonError;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -227,6 +230,54 @@ impl ProjectRegistryStore {
         Ok(Some(ProjectEnvironmentInventoryList {
             project_id: project.project_id,
             environments,
+        }))
+    }
+
+    pub fn get_environment_deployments(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<Option<DeploymentHistoryWebResponse>, ProjectRegistryError> {
+        let Some(project) = self.get(project_id)? else {
+            return Ok(None);
+        };
+        let context = self.build_generation_truth_context(&project, environment)?;
+        Ok(Some(DeploymentHistoryWebResponse {
+            project_id: project.project_id.clone(),
+            environment: environment.to_string(),
+            route_truth: context.route_truth.clone(),
+            rollback_eligibility: context.rollback_eligibility.clone(),
+            entries: context
+                .generations
+                .iter()
+                .take(10)
+                .map(|generation| build_deployment_history_web_entry(&context, generation))
+                .collect(),
+        }))
+    }
+
+    pub fn get_environment_generations(
+        &self,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<Option<GenerationTruthResponse>, ProjectRegistryError> {
+        let Some(project) = self.get(project_id)? else {
+            return Ok(None);
+        };
+        let context = self.build_generation_truth_context(&project, environment)?;
+        Ok(Some(GenerationTruthResponse {
+            project_id: project.project_id.clone(),
+            environment: environment.to_string(),
+            current_generation: context.current_generation,
+            previous_generation: context.previous_generation,
+            route_truth: context.route_truth.clone(),
+            rollback_eligibility: context.rollback_eligibility.clone(),
+            entries: context
+                .generations
+                .iter()
+                .take(10)
+                .map(|generation| build_generation_truth_entry(&context, generation))
+                .collect(),
         }))
     }
 
@@ -740,6 +791,55 @@ impl ProjectRegistryStore {
             readiness_summary,
         })
     }
+
+    fn build_generation_truth_context(
+        &self,
+        project: &ProjectRecord,
+        environment: &str,
+    ) -> Result<GenerationTruthContext, ProjectRegistryError> {
+        let env = EnvironmentPaths::new(&self.root, &project.project_id, environment);
+        let current_generation = read_authoritative_generation(&env)?;
+        let previous_generation = read_optional_pointer(env.previous_pointer())?;
+        let latest_generation = latest_generation(&env)?;
+        let selected_generation = current_generation
+            .or(latest_generation)
+            .or(previous_generation);
+        let selected_runtime = selected_generation
+            .map(|generation| load_generation_runtime_info(&env, generation))
+            .transpose()?
+            .flatten()
+            .map(|runtime| runtime_with_primary_service(&runtime));
+        let retention = RetentionStore::new(env.clone()).read()?;
+        let retention_map = retention
+            .generations
+            .into_iter()
+            .map(|record| (record.generation, record))
+            .collect::<BTreeMap<_, _>>();
+        let checkpoint = ConvergenceCheckpointStore::new(env.clone()).load()?;
+        let domain = derive_environment_domain(&project.base_domain, environment);
+        let generations = generation_numbers_with_retention(&env, &retention_map)?
+            .into_iter()
+            .rev()
+            .map(|generation| {
+                load_generation_metadata(&env, generation, retention_map.get(&generation))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let route_truth = build_route_truth_summary(
+            &domain,
+            current_generation,
+            selected_runtime.as_ref(),
+            checkpoint.as_ref(),
+        );
+        let rollback_eligibility =
+            build_rollback_eligibility(previous_generation, current_generation, &generations);
+        Ok(GenerationTruthContext {
+            current_generation,
+            previous_generation,
+            route_truth,
+            rollback_eligibility,
+            generations,
+        })
+    }
 }
 
 fn build_service_summaries(
@@ -764,6 +864,519 @@ fn build_service_summaries(
             },
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct GenerationTruthContext {
+    current_generation: Option<u64>,
+    previous_generation: Option<u64>,
+    route_truth: RouteTruthSummary,
+    rollback_eligibility: RollbackEligibilityView,
+    generations: Vec<GenerationMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct GenerationMetadata {
+    generation: u64,
+    record: Option<GenerationHistoryRecord>,
+    lifecycle: Option<crate::storage::PersistedDeploymentLifecycle>,
+    build: Option<crate::storage::PersistedBuildInfo>,
+    runtime: Option<PersistedRuntimeInfo>,
+    snapshot: Option<crate::storage::PersistedSnapshotMetadata>,
+    runtime_env_key_count: Option<usize>,
+    runtime_env_exists: bool,
+    failure_stage: Option<String>,
+    failure_reason: Option<String>,
+}
+
+fn generation_numbers_with_retention(
+    env: &EnvironmentPaths,
+    retention: &BTreeMap<u64, GenerationHistoryRecord>,
+) -> Result<Vec<u64>, ProjectRegistryError> {
+    let mut generations = list_generation_numbers(env)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    generations.extend(retention.keys().copied());
+    Ok(generations.into_iter().collect())
+}
+
+fn list_generation_numbers(env: &EnvironmentPaths) -> Result<Vec<u64>, ProjectRegistryError> {
+    let generations_dir = env.generations_dir();
+    if !generations_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut generations = Vec::new();
+    for entry in fs::read_dir(generations_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(generation) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        generations.push(generation);
+    }
+    generations.sort_unstable();
+    Ok(generations)
+}
+
+fn load_generation_metadata(
+    env: &EnvironmentPaths,
+    generation: u64,
+    record: Option<&GenerationHistoryRecord>,
+) -> Result<GenerationMetadata, ProjectRegistryError> {
+    let diagnostics = DiagnosticsStore::new(env.clone(), generation);
+    let summary = diagnostics.read_summary()?;
+    let runtime_env_snapshot = load_generation_runtime_env_snapshot(env, generation)?;
+    Ok(GenerationMetadata {
+        generation,
+        record: record.cloned(),
+        lifecycle: load_generation_lifecycle(env, generation)?,
+        build: load_generation_build_info(env, generation)?,
+        runtime: load_generation_runtime_info(env, generation)?
+            .map(|runtime| runtime_with_primary_service(&runtime)),
+        snapshot: load_generation_snapshot_metadata(env, generation)?,
+        runtime_env_key_count: runtime_env_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.entries.len()),
+        runtime_env_exists: runtime_env_snapshot.is_some(),
+        failure_stage: summary.as_ref().map(|value| value.failure_stage.clone()),
+        failure_reason: summary.map(|value| value.failure_reason),
+    })
+}
+
+fn build_deployment_history_web_entry(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+) -> DeploymentHistoryWebEntry {
+    let lifecycle_state = generation_lifecycle_label(metadata);
+    let route_active = route_active_for_generation(context, metadata);
+    let safe_to_report_live_url = safe_to_report_live_url(context, metadata, route_active);
+    DeploymentHistoryWebEntry {
+        deployment_id: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.deployment_id.clone())
+            .or_else(|| {
+                metadata
+                    .build
+                    .as_ref()
+                    .map(|build| build.deployment_id.clone())
+            }),
+        generation: metadata.generation,
+        state: deployment_state_label(metadata),
+        lifecycle_state: lifecycle_state.clone(),
+        status_label: deployment_status_label(metadata, route_active, safe_to_report_live_url),
+        source_ref: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.source_ref.clone())
+            .or_else(|| {
+                metadata
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.source_ref.clone())
+            }),
+        commit_sha: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.commit_sha.clone())
+            .or_else(|| {
+                metadata
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.commit_sha.clone())
+            }),
+        started_at_unix: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.created_at_unix),
+        completed_at_unix: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.promoted_at_unix.or(record.finalized_at_unix))
+            .or_else(|| {
+                metadata
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.finalized_at_unix)
+            }),
+        route: context.route_truth.domain.clone(),
+        route_active,
+        health_summary: Some(deployment_health_summary(context, metadata, route_active)),
+        failure_stage: metadata.failure_stage.clone(),
+        failure_reason: metadata.failure_reason.clone(),
+        safe_to_report_live_url,
+        recommended_next_action: recommended_next_action(metadata, &lifecycle_state, route_active),
+    }
+}
+
+fn build_generation_truth_entry(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+) -> GenerationTruthEntry {
+    GenerationTruthEntry {
+        generation: metadata.generation,
+        roles: generation_roles(context, metadata),
+        lifecycle: generation_lifecycle_label(metadata),
+        route_state: route_state_for_generation(context, metadata),
+        service_count: metadata
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.services.len())
+            .unwrap_or(0),
+        env_snapshot: env_snapshot_link(context, metadata),
+        runtime_policy_summary: runtime_policy_summary(metadata.runtime.as_ref()),
+        created_at_unix: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.created_at_unix),
+        finalized_at_unix: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.finalized_at_unix)
+            .or_else(|| {
+                metadata
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.finalized_at_unix)
+            }),
+        promoted_at_unix: metadata
+            .record
+            .as_ref()
+            .and_then(|record| record.promoted_at_unix),
+        failure_reason: metadata.failure_reason.clone(),
+    }
+}
+
+fn build_route_truth_summary(
+    domain: &str,
+    current_generation: Option<u64>,
+    runtime: Option<&PersistedRuntimeInfo>,
+    checkpoint: Option<&PersistedEnvironmentCheckpoint>,
+) -> RouteTruthSummary {
+    let route_expected = route_for_runtime(runtime, domain).is_some();
+    let fallback_detected = checkpoint.map(|value| checkpoint_indicates_fallback(Some(value)));
+    let route_active = if !route_expected {
+        Some(false)
+    } else {
+        checkpoint.map(|value| {
+            !checkpoint_indicates_fallback(Some(value))
+                && value.active_generation == current_generation
+        })
+    };
+    let app_route_healthy = if !route_expected {
+        Some(false)
+    } else {
+        checkpoint.map(|value| {
+            !checkpoint_indicates_fallback(Some(value))
+                && value.active_generation == current_generation
+                && runtime_health_state(&value.health_state) == "healthy"
+        })
+    };
+    let gateway_message = if fallback_detected == Some(true) {
+        Some("Gateway fallback".into())
+    } else {
+        None
+    };
+    let detail = if fallback_detected == Some(true) {
+        Some("Application route is not active.".into())
+    } else {
+        checkpoint
+            .and_then(|value| value.readyz_reasons.first().cloned())
+            .filter(|value| !value.trim().is_empty())
+    };
+    RouteTruthSummary {
+        domain: Some(domain.to_string()),
+        route_expected,
+        route_active,
+        fallback_detected,
+        app_route_healthy,
+        gateway_message,
+        detail,
+    }
+}
+
+fn build_rollback_eligibility(
+    previous_generation: Option<u64>,
+    current_generation: Option<u64>,
+    generations: &[GenerationMetadata],
+) -> RollbackEligibilityView {
+    let Some(previous_generation) = previous_generation else {
+        return RollbackEligibilityView {
+            state: if current_generation.is_some() {
+                "not_eligible".into()
+            } else {
+                "unknown".into()
+            },
+            generation: None,
+            message: if current_generation.is_some() {
+                "Not eligible: no previous generation retained".into()
+            } else {
+                "Unknown: metadata unavailable".into()
+            },
+        };
+    };
+    let Some(metadata) = generations
+        .iter()
+        .find(|generation| generation.generation == previous_generation)
+    else {
+        return RollbackEligibilityView {
+            state: "unknown".into(),
+            generation: Some(previous_generation),
+            message: "Unknown: metadata unavailable".into(),
+        };
+    };
+    if generation_failed(metadata) {
+        return RollbackEligibilityView {
+            state: "not_eligible".into(),
+            generation: Some(previous_generation),
+            message: format!("Not eligible: previous generation {previous_generation} failed"),
+        };
+    }
+    RollbackEligibilityView {
+        state: "eligible".into(),
+        generation: Some(previous_generation),
+        message: format!("Eligible: previous generation {previous_generation} is available"),
+    }
+}
+
+fn generation_roles(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+) -> Vec<String> {
+    let mut roles = Vec::new();
+    if context.current_generation == Some(metadata.generation) {
+        roles.push("current".into());
+    }
+    if context.previous_generation == Some(metadata.generation) {
+        roles.push("previous".into());
+        if !generation_failed(metadata) {
+            roles.push("rollback-safe".into());
+        }
+    }
+    if generation_failed(metadata) {
+        roles.push("failed".into());
+    }
+    if metadata
+        .record
+        .as_ref()
+        .is_some_and(|record| record.retained)
+    {
+        roles.push("retained".into());
+    }
+    if metadata
+        .record
+        .as_ref()
+        .is_some_and(|record| record.eligible_for_gc)
+    {
+        roles.push("gc-eligible".into());
+    }
+    if metadata
+        .record
+        .as_ref()
+        .is_some_and(|record| record.missing_artifacts)
+    {
+        roles.push("cleaned".into());
+    }
+    roles
+}
+
+fn generation_lifecycle_label(metadata: &GenerationMetadata) -> String {
+    if let Some(lifecycle) = metadata.lifecycle.as_ref() {
+        return lifecycle.state.as_str().to_string();
+    }
+    if metadata
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.state == "healthy")
+    {
+        return "promoted".into();
+    }
+    if generation_failed(metadata) {
+        return "failed".into();
+    }
+    "candidate".into()
+}
+
+fn generation_failed(metadata: &GenerationMetadata) -> bool {
+    metadata.lifecycle.as_ref().is_some_and(|lifecycle| {
+        lifecycle.state == crate::storage::DeploymentLifecycleState::Failed
+    }) || metadata
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.state == "failed")
+        || metadata.failure_reason.is_some()
+}
+
+fn route_active_for_generation(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+) -> Option<bool> {
+    if context.current_generation == Some(metadata.generation) {
+        return context.route_truth.route_active;
+    }
+    metadata
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.activation.as_ref())
+        .map(|_| false)
+}
+
+fn route_state_for_generation(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+) -> String {
+    if context.current_generation == Some(metadata.generation) {
+        if context.route_truth.fallback_detected == Some(true) {
+            return "gateway_fallback".into();
+        }
+        return match context.route_truth.route_active {
+            Some(true) => "active".into(),
+            Some(false) if context.route_truth.route_expected => "inactive".into(),
+            Some(false) => "not_required".into(),
+            None => "unknown".into(),
+        };
+    }
+    if route_for_runtime(metadata.runtime.as_ref(), "").is_some() {
+        "inactive".into()
+    } else {
+        "not_required".into()
+    }
+}
+
+fn env_snapshot_link(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+) -> Option<EnvSnapshotLinkView> {
+    let interesting = context.current_generation == Some(metadata.generation)
+        || context.previous_generation == Some(metadata.generation);
+    if !interesting {
+        return None;
+    }
+    Some(EnvSnapshotLinkView {
+        exists: metadata.runtime_env_exists,
+        key_count: metadata.runtime_env_key_count,
+        source: "sealed generation snapshot".into(),
+        copy: "Rollback restores this generation's sealed env snapshot.".into(),
+    })
+}
+
+fn runtime_policy_summary(runtime: Option<&PersistedRuntimeInfo>) -> String {
+    let Some(runtime) = runtime else {
+        return "Unknown".into();
+    };
+    let max_retries = runtime
+        .runtime_policy
+        .max_retries
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "default".into());
+    format!(
+        "restart={} retries={} services={}",
+        runtime.runtime_policy.restart_policy,
+        max_retries,
+        runtime.services.len()
+    )
+}
+
+fn deployment_state_label(metadata: &GenerationMetadata) -> String {
+    if metadata
+        .record
+        .as_ref()
+        .is_some_and(|record| record.missing_artifacts)
+    {
+        return "cleaned".into();
+    }
+    if generation_failed(metadata) {
+        return "failed".into();
+    }
+    generation_lifecycle_label(metadata)
+}
+
+fn deployment_status_label(
+    metadata: &GenerationMetadata,
+    route_active: Option<bool>,
+    safe_to_report_live_url: Option<bool>,
+) -> String {
+    if safe_to_report_live_url == Some(true) {
+        return "live".into();
+    }
+    if generation_failed(metadata) {
+        return "failed".into();
+    }
+    if metadata.lifecycle.as_ref().is_some_and(|lifecycle| {
+        lifecycle.state == crate::storage::DeploymentLifecycleState::Promoted
+    }) && route_active == Some(false)
+    {
+        return "route_pending".into();
+    }
+    deployment_state_label(metadata)
+}
+
+fn deployment_health_summary(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+    route_active: Option<bool>,
+) -> String {
+    if context.current_generation == Some(metadata.generation)
+        && context.route_truth.fallback_detected == Some(true)
+    {
+        return "Gateway fallback detected; application route is not active.".into();
+    }
+    if generation_failed(metadata) {
+        return metadata
+            .failure_reason
+            .clone()
+            .unwrap_or_else(|| "Deployment failed.".into());
+    }
+    if route_active == Some(true) {
+        return "Route active.".into();
+    }
+    if route_active == Some(false) {
+        return "Route inactive.".into();
+    }
+    "Partial metadata available.".into()
+}
+
+fn safe_to_report_live_url(
+    context: &GenerationTruthContext,
+    metadata: &GenerationMetadata,
+    route_active: Option<bool>,
+) -> Option<bool> {
+    if context.current_generation != Some(metadata.generation) {
+        return Some(false);
+    }
+    Some(
+        generation_lifecycle_label(metadata) == "promoted"
+            && route_active == Some(true)
+            && context.route_truth.fallback_detected != Some(true)
+            && context.route_truth.app_route_healthy == Some(true),
+    )
+}
+
+fn recommended_next_action(
+    metadata: &GenerationMetadata,
+    lifecycle_state: &str,
+    route_active: Option<bool>,
+) -> String {
+    if generation_failed(metadata) {
+        return "Inspect failure reason and diagnostics.".into();
+    }
+    if lifecycle_state == "warming" || lifecycle_state == "validating" {
+        return "Wait for validation and route activation.".into();
+    }
+    if lifecycle_state == "promoted" && route_active == Some(false) {
+        return "Application route is not active yet.".into();
+    }
+    if lifecycle_state == "promoted" && route_active == Some(true) {
+        return "Live".into();
+    }
+    "Review generation truth and route state.".into()
 }
 
 fn build_runtime_policy_summary(

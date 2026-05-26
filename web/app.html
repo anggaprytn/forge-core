@@ -311,6 +311,78 @@
             <div id="deploy-tracking" class="env-preview-result" hidden></div>
           </article>
 
+          <article class="detail-panel panel-surface" aria-labelledby="deployment-truth-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Deployment Truth</p>
+                <h2 id="deployment-truth-title">Read-only deployment history</h2>
+              </div>
+              <span id="deployment-truth-chip" class="status-chip stale">Idle</span>
+            </div>
+
+            <div class="env-toolbar">
+              <label class="search-field env-search" for="history-environment-select">
+                <span>Environment</span>
+                <select id="history-environment-select">
+                  <option value="staging">staging</option>
+                  <option value="production">production</option>
+                  <option value="development">development</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="env-preview-copy">
+              <p>Read-only only. No rollback, retry, delete, or mutation controls are exposed here.</p>
+              <p>Uses persisted deployment, generation, checkpoint, and diagnostics metadata only.</p>
+            </div>
+
+            <div id="deployment-truth-state" class="inline-state">Select a project and environment to inspect deployment truth.</div>
+
+            <div id="deployment-truth-panels" class="truth-grid" hidden>
+              <section class="truth-panel">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Route Truth</p>
+                    <h3>Expected route versus cached outcome</h3>
+                  </div>
+                </div>
+                <div id="route-truth-result" class="env-preview-result"></div>
+              </section>
+
+              <section class="truth-panel">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Rollback Eligibility</p>
+                    <h3>Operator guidance only</h3>
+                  </div>
+                </div>
+                <div id="rollback-eligibility-result" class="env-preview-result"></div>
+              </section>
+
+              <section class="truth-panel">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Deployment History</p>
+                    <h3>Recent deployment attempts</h3>
+                  </div>
+                  <span id="deployment-history-count-chip" class="status-chip">0 entries</span>
+                </div>
+                <div id="deployment-history-result" class="env-preview-result"></div>
+              </section>
+
+              <section class="truth-panel">
+                <div class="section-head compact">
+                  <div>
+                    <p class="eyebrow">Generation Truth</p>
+                    <h3>Current, previous, failed, retained</h3>
+                  </div>
+                  <span id="generation-truth-count-chip" class="status-chip">0 generations</span>
+                </div>
+                <div id="generation-truth-result" class="env-preview-result"></div>
+              </section>
+            </div>
+          </article>
+
           <article class="detail-panel panel-surface" aria-labelledby="signals-title">
             <div class="section-head">
               <div>

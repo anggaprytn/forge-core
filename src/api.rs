@@ -846,6 +846,117 @@ pub struct DeploymentHistoryResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteTruthSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub route_expected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_route_healthy: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackEligibilityView {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvSnapshotLinkView {
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_count: Option<usize>,
+    pub source: String,
+    pub copy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentHistoryWebEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
+    pub generation: u64,
+    pub state: String,
+    pub lifecycle_state: String,
+    pub status_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_to_report_live_url: Option<bool>,
+    pub recommended_next_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentHistoryWebResponse {
+    pub project_id: String,
+    pub environment: String,
+    pub route_truth: RouteTruthSummary,
+    pub rollback_eligibility: RollbackEligibilityView,
+    #[serde(default)]
+    pub entries: Vec<DeploymentHistoryWebEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationTruthEntry {
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    pub lifecycle: String,
+    pub route_state: String,
+    pub service_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_snapshot: Option<EnvSnapshotLinkView>,
+    pub runtime_policy_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationTruthResponse {
+    pub project_id: String,
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_generation: Option<u64>,
+    pub route_truth: RouteTruthSummary,
+    pub rollback_eligibility: RollbackEligibilityView,
+    #[serde(default)]
+    pub entries: Vec<GenerationTruthEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupArchiveFileRecord {
     pub path: String,
     pub size_bytes: u64,
