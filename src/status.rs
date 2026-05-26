@@ -30,22 +30,25 @@ use crate::runtime::{
     RoutingRuntimeError,
 };
 use crate::runtime_env::restore_runtime_env;
-use crate::runtime_env::{GENERATED_FORGE_ENV_KEYS, render_snapshot_value};
+use crate::runtime_env::{
+    GENERATED_FORGE_ENV_KEYS, ensure_not_reserved_entry, render_snapshot_value,
+};
 use crate::secrets::{SecretStore, seal_value, unseal_value};
 use crate::storage::{
     ControlPlaneSnapshotStore, ConvergenceCheckpointStore, DeploymentLifecycleState,
     DiagnosticsStore, EnvStore, EnvironmentPaths, GcStore, GenerationHistoryRecord,
     NodeMetadataStore, PersistedActivationMode, PersistedBuildInfo, PersistedDeploymentLifecycle,
-    PersistedDesiredEnvConfig, PersistedDesiredEnvEntry, PersistedEnvAuditDiffEntry,
-    PersistedEnvAuditEntry, PersistedEnvAuditSummary, PersistedProbeHistory, PersistedProbeType,
-    PersistedPromotionSummary, PersistedResolvedRuntime, PersistedRuntimeEnvSnapshot,
-    PersistedRuntimeInfo, PersistedRuntimePolicy, PersistedRuntimeUsageSnapshot,
-    PersistedServiceRuntimeInfo, PersistedServiceState, PersistedSnapshotMetadata,
-    PersistedTerminationInfo, PersistedValidationSummary, PersistedVolumeRetention, PointerStore,
-    RetentionMetadata, RetentionStore, StorageError, current_unix_timestamp,
-    load_generation_build_info, load_generation_lifecycle, load_generation_probe_history,
-    load_generation_resolved_runtime, load_generation_runtime_env_snapshot,
-    load_generation_runtime_info, load_generation_snapshot_metadata,
+    PersistedDesiredEnvConfig, PersistedDesiredEnvDeletedKey, PersistedDesiredEnvEntry,
+    PersistedEnvAuditDiffEntry, PersistedEnvAuditEntry, PersistedEnvAuditSummary,
+    PersistedProbeHistory, PersistedProbeType, PersistedPromotionSummary, PersistedResolvedRuntime,
+    PersistedRuntimeEnvSnapshot, PersistedRuntimeInfo, PersistedRuntimePolicy,
+    PersistedRuntimeUsageSnapshot, PersistedServiceRuntimeInfo, PersistedServiceState,
+    PersistedSnapshotMetadata, PersistedTerminationInfo, PersistedValidationSummary,
+    PersistedVolumeRetention, PointerStore, RetentionMetadata, RetentionStore, StorageError,
+    current_unix_timestamp, load_generation_build_info, load_generation_lifecycle,
+    load_generation_probe_history, load_generation_resolved_runtime,
+    load_generation_runtime_env_snapshot, load_generation_runtime_info,
+    load_generation_snapshot_metadata,
 };
 use crate::topology::runtime_with_primary_service;
 use crate::upgrade::read_recent_events;
@@ -1406,12 +1409,20 @@ pub fn load_project_environment_env_report(
 }
 
 #[derive(Debug, Clone)]
-struct EnvironmentInventorySnapshot {
+struct EnvironmentInventorySourceSnapshot {
     source_kind: String,
     source_label: String,
     generation: Option<u64>,
     deployment_id: Option<String>,
     values: BTreeMap<String, EnvironmentInventoryValue>,
+}
+
+#[derive(Debug, Clone)]
+struct EnvironmentInventorySnapshot {
+    source_kind: String,
+    source_label: String,
+    configured: Option<EnvironmentInventorySourceSnapshot>,
+    deployed: Option<EnvironmentInventorySourceSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -1424,6 +1435,7 @@ struct EnvironmentInventoryValue {
 struct EvaluatedEnvironmentChanges {
     response: EnvPreviewEnvironmentResponse,
     desired_values: BTreeMap<String, DesiredEnvValue>,
+    deleted_keys: BTreeMap<String, String>,
     audit_diff: Vec<EnvPreviewDiffEntry>,
     touched: bool,
 }
@@ -1493,7 +1505,12 @@ pub fn load_project_env_inventory_report(
     for env_name in &environments {
         let snapshot =
             load_environment_inventory_snapshot(storage_root, secret_store, project_id, env_name)?;
-        keys.extend(snapshot.values.keys().cloned());
+        if let Some(configured) = snapshot.configured.as_ref() {
+            keys.extend(configured.values.keys().cloned());
+        }
+        if let Some(deployed) = snapshot.deployed.as_ref() {
+            keys.extend(deployed.values.keys().cloned());
+        }
         snapshots.push((env_name.clone(), snapshot));
     }
 
@@ -1502,13 +1519,34 @@ pub fn load_project_env_inventory_report(
         .map(|key| {
             let mut cells = BTreeMap::new();
             for (env_name, snapshot) in &snapshots {
-                let exists = snapshot.values.contains_key(&key);
-                let value = snapshot
-                    .values
-                    .get(&key)
-                    .map(|entry| entry.masked.clone())
+                let configured = snapshot
+                    .configured
+                    .as_ref()
+                    .and_then(|value| value.values.get(&key));
+                let deployed = snapshot
+                    .deployed
+                    .as_ref()
+                    .and_then(|value| value.values.get(&key));
+                let configured_exists = configured.is_some();
+                let deployed_exists = deployed.is_some();
+                let configured_value = configured.map(|value| value.masked.clone());
+                let deployed_value = deployed.map(|value| value.masked.clone());
+                let value = configured_value
+                    .clone()
+                    .or_else(|| deployed_value.clone())
                     .unwrap_or_else(|| "missing".into());
-                cells.insert(env_name.clone(), EnvInventoryCell { exists, value });
+                let exists = configured_exists || deployed_exists;
+                cells.insert(
+                    env_name.clone(),
+                    EnvInventoryCell {
+                        exists,
+                        value,
+                        configured_exists,
+                        configured_value,
+                        deployed_exists,
+                        deployed_value,
+                    },
+                );
             }
             EnvInventoryVariable {
                 key,
@@ -1523,12 +1561,31 @@ pub fn load_project_env_inventory_report(
             environment: env_name.clone(),
             source_kind: snapshot.source_kind.clone(),
             source_label: snapshot.source_label.clone(),
-            generation: snapshot.generation,
-            deployment_id: snapshot.deployment_id.clone(),
+            configured_source_label: snapshot
+                .configured
+                .as_ref()
+                .map(|value| value.source_label.clone()),
+            deployed_source_label: snapshot
+                .deployed
+                .as_ref()
+                .map(|value| value.source_label.clone()),
+            generation: snapshot
+                .deployed
+                .as_ref()
+                .and_then(|value| value.generation),
+            deployment_id: snapshot
+                .deployed
+                .as_ref()
+                .and_then(|value| value.deployment_id.clone()),
         })
         .collect::<Vec<_>>();
 
     let source_kind = if snapshots
+        .iter()
+        .all(|(_, snapshot)| snapshot.source_kind == "configured_and_deployed")
+    {
+        "configured_and_deployed".to_string()
+    } else if snapshots
         .iter()
         .all(|(_, snapshot)| snapshot.source_kind == SEALED_GENERATION_SNAPSHOT_SOURCE)
     {
@@ -1547,6 +1604,9 @@ pub fn load_project_env_inventory_report(
         "mixed".into()
     };
     let source_label = match source_kind.as_str() {
+        "configured_and_deployed" => {
+            "Configured value for next deployment and last deployed value".into()
+        }
         SEALED_GENERATION_SNAPSHOT_SOURCE => "Current sealed generation snapshot".into(),
         LATEST_CONFIGURED_ENV_STORE_SOURCE => "Latest configured env store".into(),
         UNKNOWN_ENV_SOURCE => "Unknown source".into(),
@@ -1554,14 +1614,41 @@ pub fn load_project_env_inventory_report(
     };
     let partial_metadata = snapshots
         .iter()
-        .any(|(_, snapshot)| snapshot.source_kind == SEALED_GENERATION_SNAPSHOT_SOURCE);
+        .any(|(_, snapshot)| snapshot.deployed.is_some());
+    let partial_metadata_notice = if snapshots
+        .iter()
+        .all(|(_, snapshot)| snapshot.configured.is_some())
+        && snapshots
+            .iter()
+            .all(|(_, snapshot)| snapshot.deployed.is_some())
+    {
+        Some(
+            "Configured values will apply on the next deployment. Deployed values reflect the latest deployed generation."
+                .to_string(),
+        )
+    } else if snapshots
+        .iter()
+        .all(|(_, snapshot)| snapshot.configured.is_some())
+    {
+        Some("These values will apply on the next deployment.".to_string())
+    } else if snapshots
+        .iter()
+        .all(|(_, snapshot)| snapshot.deployed.is_some())
+    {
+        Some(
+            "These values reflect the latest deployed generation, not unapplied future configuration."
+                .to_string(),
+        )
+    } else {
+        partial_metadata.then(|| PARTIAL_METADATA_NOTICE.to_string())
+    };
 
     Ok(EnvInventoryResponse {
         project_id: project_id.to_string(),
         source_kind,
         source_label,
         partial_metadata,
-        partial_metadata_notice: partial_metadata.then(|| PARTIAL_METADATA_NOTICE.to_string()),
+        partial_metadata_notice,
         environments,
         services: Vec::new(),
         total_variables: variables.len(),
@@ -1594,7 +1681,7 @@ pub fn load_project_env_preview_report(
     let mut partial_metadata = false;
 
     for (environment, input) in requested {
-        let snapshot = load_environment_inventory_snapshot(
+        let snapshot = load_environment_inventory_baseline_snapshot(
             storage_root,
             secret_store,
             project_id,
@@ -1616,12 +1703,12 @@ pub fn load_project_env_preview_report(
     })
 }
 
-fn load_environment_inventory_snapshot(
+fn load_environment_inventory_baseline_snapshot(
     storage_root: &Path,
     secret_store: &SecretStore,
     project_id: &str,
     environment: &str,
-) -> Result<EnvironmentInventorySnapshot, ProjectStatusError> {
+) -> Result<EnvironmentInventorySourceSnapshot, ProjectStatusError> {
     let env = EnvironmentPaths::new(storage_root, project_id, environment);
     env.ensure_exists()?;
 
@@ -1671,9 +1758,9 @@ fn load_environment_inventory_snapshot(
             }
         }
 
-        return Ok(EnvironmentInventorySnapshot {
+        return Ok(EnvironmentInventorySourceSnapshot {
             source_kind: SEALED_GENERATION_SNAPSHOT_SOURCE.into(),
-            source_label: "Current sealed generation snapshot".into(),
+            source_label: "Sealed generation snapshot".into(),
             generation: Some(snapshot.generation),
             deployment_id: Some(snapshot.deployment_id),
             values,
@@ -1700,7 +1787,7 @@ fn load_environment_inventory_snapshot(
                     }),
             );
         }
-        return Ok(EnvironmentInventorySnapshot {
+        return Ok(EnvironmentInventorySourceSnapshot {
             source_kind: LATEST_CONFIGURED_ENV_STORE_SOURCE.into(),
             source_label: "Latest configured env store".into(),
             generation: None,
@@ -1709,7 +1796,7 @@ fn load_environment_inventory_snapshot(
         });
     }
 
-    Ok(EnvironmentInventorySnapshot {
+    Ok(EnvironmentInventorySourceSnapshot {
         source_kind: UNKNOWN_ENV_SOURCE.into(),
         source_label: "Unknown source".into(),
         generation: generation,
@@ -1718,11 +1805,42 @@ fn load_environment_inventory_snapshot(
     })
 }
 
+fn load_environment_inventory_snapshot(
+    storage_root: &Path,
+    secret_store: &SecretStore,
+    project_id: &str,
+    environment: &str,
+) -> Result<EnvironmentInventorySnapshot, ProjectStatusError> {
+    let configured = load_desired_env_inventory_snapshot(storage_root, project_id, environment)?;
+    let deployed =
+        load_deployed_env_inventory_snapshot(storage_root, secret_store, project_id, environment)?;
+
+    let source_kind = match (configured.is_some(), deployed.is_some()) {
+        (true, true) => "configured_and_deployed".to_string(),
+        (true, false) => LATEST_CONFIGURED_ENV_STORE_SOURCE.into(),
+        (false, true) => SEALED_GENERATION_SNAPSHOT_SOURCE.into(),
+        (false, false) => UNKNOWN_ENV_SOURCE.into(),
+    };
+    let source_label = match (configured.is_some(), deployed.is_some()) {
+        (true, true) => "Configured value for next deployment and last deployed value".into(),
+        (true, false) => "Latest configured env store".into(),
+        (false, true) => "Sealed generation snapshot".into(),
+        (false, false) => "Unknown source".into(),
+    };
+
+    Ok(EnvironmentInventorySnapshot {
+        source_kind,
+        source_label,
+        configured,
+        deployed,
+    })
+}
+
 fn load_desired_env_inventory_snapshot(
     storage_root: &Path,
     project_id: &str,
     environment: &str,
-) -> Result<Option<EnvironmentInventorySnapshot>, ProjectStatusError> {
+) -> Result<Option<EnvironmentInventorySourceSnapshot>, ProjectStatusError> {
     let store = EnvStore::new(storage_root);
     let Some(config) = store.load_desired_environment(project_id, environment)? else {
         return Ok(None);
@@ -1740,13 +1858,73 @@ fn load_desired_env_inventory_snapshot(
         );
     }
 
-    Ok(Some(EnvironmentInventorySnapshot {
+    Ok(Some(EnvironmentInventorySourceSnapshot {
         source_kind: LATEST_CONFIGURED_ENV_STORE_SOURCE.into(),
         source_label: "Latest configured env store".into(),
         generation: None,
         deployment_id: None,
         values,
     }))
+}
+
+fn load_deployed_env_inventory_snapshot(
+    storage_root: &Path,
+    secret_store: &SecretStore,
+    project_id: &str,
+    environment: &str,
+) -> Result<Option<EnvironmentInventorySourceSnapshot>, ProjectStatusError> {
+    let env = EnvironmentPaths::new(storage_root, project_id, environment);
+    env.ensure_exists()?;
+
+    let generation = load_environment_active_generation(&env)?;
+    let snapshot = generation
+        .map(|value| load_generation_runtime_env_snapshot(&env, value))
+        .transpose()?
+        .flatten();
+    let resolved = generation
+        .map(|value| load_generation_resolved_runtime(&env, value))
+        .transpose()?
+        .flatten();
+    let secret_listing = secret_store
+        .list_environment_secrets(project_id, environment)
+        .map_err(secret_store_error)?;
+    let secret_keys = secret_listing
+        .secrets
+        .into_iter()
+        .map(|entry| entry.key)
+        .collect::<BTreeSet<_>>();
+
+    if let Some(snapshot) = snapshot {
+        let mut values = BTreeMap::new();
+        let mut keys = snapshot.entries.keys().cloned().collect::<BTreeSet<_>>();
+        keys.extend(secret_keys);
+        if let Some(resolved) = resolved.as_ref() {
+            keys.extend(resolved.entries.keys().cloned());
+        }
+
+        for key in keys {
+            if let Some(masked) = resolve_inventory_masked_value(
+                secret_store,
+                project_id,
+                environment,
+                &key,
+                snapshot.entries.get(&key),
+                resolved.as_ref().and_then(|value| value.entries.get(&key)),
+            )? {
+                values.insert(key, masked);
+            }
+        }
+
+        return Ok(Some(EnvironmentInventorySourceSnapshot {
+            source_kind: SEALED_GENERATION_SNAPSHOT_SOURCE.into(),
+            source_label: "Sealed generation snapshot".into(),
+            generation: Some(snapshot.generation),
+            deployment_id: Some(snapshot.deployment_id),
+            values,
+        }));
+    }
+
+    Ok(None)
 }
 
 fn resolve_inventory_masked_value(
@@ -1842,7 +2020,7 @@ struct PreviewChange {
 fn evaluate_environment_changes(
     environment: &str,
     input: &str,
-    snapshot: EnvironmentInventorySnapshot,
+    snapshot: EnvironmentInventorySourceSnapshot,
 ) -> EvaluatedEnvironmentChanges {
     let mut errors = Vec::new();
     let parsed = parse_preview_input(input, &mut errors);
@@ -1870,8 +2048,16 @@ fn evaluate_environment_changes(
     let mut updated = Vec::new();
     let mut deleted = Vec::new();
     let mut unchanged = Vec::new();
+    let mut deleted_keys = BTreeMap::new();
 
     for change in parsed {
+        if let Err(err) = ensure_not_reserved_entry(&change.key, &change.normalized_key) {
+            errors.push(EnvPreviewError {
+                line: change.line,
+                reason: err.to_string(),
+            });
+            continue;
+        }
         let existing = current_by_key.get(&change.normalized_key);
         match change.kind {
             PreviewChangeKind::Set(value) => {
@@ -1904,6 +2090,7 @@ fn evaluate_environment_changes(
                             value,
                         },
                     );
+                    deleted_keys.remove(&change.normalized_key);
                 } else {
                     added.push(EnvPreviewDiffEntry {
                         key: change.key.clone(),
@@ -1918,6 +2105,7 @@ fn evaluate_environment_changes(
                             value,
                         },
                     );
+                    deleted_keys.remove(&change.normalized_key);
                 }
             }
             PreviewChangeKind::Delete => {
@@ -1929,14 +2117,18 @@ fn evaluate_environment_changes(
                         action: "deleted".into(),
                     });
                 } else {
+                    let deleted_key = change.key.clone();
                     unchanged.push(EnvPreviewDiffEntry {
                         key: change.key,
                         before_masked: "missing".into(),
                         after_masked: "missing".into(),
                         action: "unchanged".into(),
                     });
+                    deleted_keys.insert(change.normalized_key.clone(), deleted_key);
+                    continue;
                 }
                 desired_values.remove(&change.normalized_key);
+                deleted_keys.insert(change.normalized_key.clone(), change.key.clone());
             }
         }
     }
@@ -1959,6 +2151,7 @@ fn evaluate_environment_changes(
             errors,
         },
         desired_values,
+        deleted_keys,
         audit_diff,
         touched,
     }
@@ -1987,7 +2180,7 @@ pub fn apply_project_env_changes(
     ];
     let mut evaluations = Vec::with_capacity(requested.len());
     for (environment, input) in requested {
-        let snapshot = load_environment_inventory_snapshot(
+        let snapshot = load_environment_inventory_baseline_snapshot(
             storage_root,
             secret_store,
             project_id,
@@ -2003,8 +2196,27 @@ pub fn apply_project_env_changes(
         .iter()
         .any(|(_, evaluation)| !evaluation.response.valid)
     {
+        let reasons = evaluations
+            .iter()
+            .flat_map(|(_, evaluation)| {
+                evaluation
+                    .response
+                    .errors
+                    .iter()
+                    .map(|error| error.reason.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         return Err(ProjectStatusError::InvalidEnvChangeRequest(
-            "invalid environment changes; fix preview errors before applying".into(),
+            if reasons.is_empty() {
+                "invalid environment changes; fix preview errors before applying".into()
+            } else {
+                format!(
+                    "invalid environment changes; fix preview errors before applying: {}",
+                    reasons.join("; ")
+                )
+            },
         ));
     }
 
@@ -2025,6 +2237,15 @@ pub fn apply_project_env_changes(
             })
             .collect::<Result<Vec<_>, ProjectStatusError>>()?;
         entries.sort_by(|left, right| left.normalized_key.cmp(&right.normalized_key));
+        let mut deleted_keys = evaluation
+            .deleted_keys
+            .iter()
+            .map(|(normalized_key, key)| PersistedDesiredEnvDeletedKey {
+                key: key.clone(),
+                normalized_key: normalized_key.clone(),
+            })
+            .collect::<Vec<_>>();
+        deleted_keys.sort_by(|left, right| left.normalized_key.cmp(&right.normalized_key));
 
         store.write_desired_environment(&PersistedDesiredEnvConfig {
             snapshot_version: 1,
@@ -2032,6 +2253,7 @@ pub fn apply_project_env_changes(
             environment: environment.clone(),
             updated_at_unix: now,
             entries,
+            deleted_keys,
         })?;
 
         if evaluation.touched {
@@ -3310,6 +3532,7 @@ fn runtime_env_source_name(source: &crate::storage::PersistedRuntimeEnvSource) -
         crate::storage::PersistedRuntimeEnvSource::ProjectEnvironmentSecret => {
             "project_environment_secret"
         }
+        crate::storage::PersistedRuntimeEnvSource::DesiredEnvConfig => "desired_env_config",
         crate::storage::PersistedRuntimeEnvSource::DeployTimeOverride => "deploy_time_override",
         crate::storage::PersistedRuntimeEnvSource::ForgeGenerated => "forge_generated",
         crate::storage::PersistedRuntimeEnvSource::SystemRuntimeReserved => {
@@ -6154,6 +6377,36 @@ mod tests {
     }
 
     #[test]
+    fn env_apply_rejects_reserved_forge_keys() {
+        let root = test_root("env-apply-rejects-reserved-forge-keys");
+        register_project(&root, "api", "api.example.com");
+        let store = SecretStore::new(root.join("secrets")).unwrap();
+
+        let err = apply_project_env_changes(
+            &root,
+            &store,
+            "api",
+            &crate::api::EnvApplyRequest {
+                changes: crate::api::EnvPreviewChanges {
+                    development: "FORGE_PROJECT_ID=bad\n-FORGE_ENVIRONMENT\n".into(),
+                    staging: String::new(),
+                    production: String::new(),
+                },
+                preview_token: None,
+            },
+            Some("octocat"),
+        )
+        .unwrap_err();
+
+        match err {
+            ProjectStatusError::InvalidEnvChangeRequest(message) => {
+                assert!(message.contains("reserved Forge runtime key"))
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     fn env_apply_persists_desired_env_and_masked_audit_without_mutating_snapshots() {
         let root =
             test_root("env-apply-persists-desired-env-and-masked-audit-without-mutating-snapshots");
@@ -6186,6 +6439,8 @@ mod tests {
         let snapshot_before =
             fs::read_to_string(env.generation_dir(7).join("runtime_env_snapshot.json")).unwrap();
         let current_before = fs::read_to_string(env.current_pointer()).unwrap();
+        fs::write(env.previous_pointer(), "6\n").unwrap();
+        let previous_before = fs::read_to_string(env.previous_pointer()).unwrap();
         let promoted_before = fs::read_to_string(env.promoted_pointer()).unwrap();
 
         let store = SecretStore::new(root.join("secrets")).unwrap();
@@ -6234,6 +6489,8 @@ mod tests {
             unseal_value(&desired.entries[3].sealed_value).unwrap(),
             "abcd"
         );
+        assert_eq!(desired.deleted_keys.len(), 1);
+        assert_eq!(desired.deleted_keys[0].key, "OLD_TOKEN");
 
         let inventory = load_project_env_inventory_report(&root, &store, "api", None).unwrap();
         let development_source = inventory
@@ -6241,9 +6498,14 @@ mod tests {
             .iter()
             .find(|entry| entry.environment == "development")
             .unwrap();
+        assert_eq!(development_source.source_kind, "configured_and_deployed");
         assert_eq!(
-            development_source.source_kind,
-            LATEST_CONFIGURED_ENV_STORE_SOURCE
+            development_source.configured_source_label.as_deref(),
+            Some("Latest configured env store")
+        );
+        assert_eq!(
+            development_source.deployed_source_label.as_deref(),
+            Some("Sealed generation snapshot")
         );
 
         let audit = load_project_env_audit_report(&root, "api").unwrap();
@@ -6268,9 +6530,11 @@ mod tests {
         let snapshot_after =
             fs::read_to_string(env.generation_dir(7).join("runtime_env_snapshot.json")).unwrap();
         let current_after = fs::read_to_string(env.current_pointer()).unwrap();
+        let previous_after = fs::read_to_string(env.previous_pointer()).unwrap();
         let promoted_after = fs::read_to_string(env.promoted_pointer()).unwrap();
         assert_eq!(snapshot_before, snapshot_after);
         assert_eq!(current_before, current_after);
+        assert_eq!(previous_before, previous_after);
         assert_eq!(promoted_before, promoted_after);
     }
 

@@ -26,7 +26,10 @@ use crate::runtime::{
     CreateVolumeRequest, DockerRuntime, DockerRuntimeError, ProbeError, ProbeRuntime,
     RouteInspection, RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError, VolumeMountRequest,
 };
-use crate::runtime_env::{RuntimeEnvMetadata, build_runtime_env_artifacts};
+use crate::runtime_env::{
+    RuntimeEnvError, RuntimeEnvMetadata, build_runtime_env_artifacts,
+    load_desired_runtime_env_config,
+};
 use crate::secrets::{SecretError, SecretResolution, SecretStore};
 use crate::status::derive_environment_domain;
 use crate::storage::{
@@ -55,6 +58,7 @@ pub enum DeploymentError {
     InvalidInspection(String),
     ValidationFailed(&'static str),
     MissingSecret(String),
+    InvalidDesiredEnvConfig(String),
     RollbackUnavailable,
 }
 
@@ -111,6 +115,7 @@ impl Display for DeploymentError {
             Self::InvalidInspection(err) => write!(f, "{err}"),
             Self::ValidationFailed(err) => write!(f, "{err}"),
             Self::MissingSecret(err) => write!(f, "{err}"),
+            Self::InvalidDesiredEnvConfig(err) => write!(f, "{err}"),
             Self::RollbackUnavailable => write!(f, "rollback target unavailable"),
         }
     }
@@ -134,6 +139,16 @@ fn sanitize_volume_component(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn deployment_error_from_runtime_env(err: RuntimeEnvError) -> DeploymentError {
+    match err {
+        RuntimeEnvError::Secret(err) => DeploymentError::Secret(err),
+        RuntimeEnvError::Storage(err) => DeploymentError::Storage(err),
+        RuntimeEnvError::ReservedKey(key) => DeploymentError::InvalidDesiredEnvConfig(format!(
+            "reserved Forge runtime key cannot be configured or deleted: {key}"
+        )),
+    }
 }
 
 fn stateful_volume_name(
@@ -634,6 +649,37 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             .as_ref()
             .map(|config| config.environment().clone())
             .unwrap_or_default();
+        let desired_env = match load_desired_runtime_env_config(
+            &self.storage_root,
+            &record.project_id,
+            &record.environment,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env: env.clone(),
+                        generation,
+                        events: EventStore::new(env.clone(), generation),
+                        diagnostics: DiagnosticsStore::new(env.clone(), generation),
+                        lifecycle_store: LifecycleStore::new(env.clone(), generation),
+                        writer: SnapshotWriter::new(env.clone(), generation)?,
+                    },
+                    "runtime_env",
+                    &message,
+                    container_name.clone(),
+                    None,
+                    None,
+                    FailureSummaryDetails::default(),
+                    &[],
+                    &[],
+                    CleanupRecord::skipped_failed_generation(&message),
+                )?;
+                return Err(deployment_error_from_runtime_env(err));
+            }
+        };
         let runtime_env = match build_runtime_env_artifacts(
             &RuntimeEnvMetadata {
                 project_id: record.project_id.clone(),
@@ -646,6 +692,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             },
             &forge_yaml_values,
             &runtime_secrets,
+            &desired_env,
             &BTreeMap::new(),
         ) {
             Ok(runtime_env) => runtime_env,
@@ -671,7 +718,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     &[],
                     CleanupRecord::skipped_failed_generation(&message),
                 )?;
-                return Err(err.into());
+                return Err(deployment_error_from_runtime_env(err));
             }
         };
         let redacted_env_preview = runtime_env.redacted_preview.clone();
@@ -1479,6 +1526,37 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                 return Err(err);
             }
         };
+        let desired_env = match load_desired_runtime_env_config(
+            &self.storage_root,
+            &record.project_id,
+            &record.environment,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let message = err.to_string();
+                self.record_preparation_failure(
+                    record,
+                    &DeploymentArtifacts {
+                        env,
+                        generation,
+                        events,
+                        diagnostics,
+                        lifecycle_store,
+                        writer,
+                    },
+                    "runtime_env",
+                    &message,
+                    default_container_name,
+                    None,
+                    Some(dependency_graph_summary.clone()),
+                    FailureSummaryDetails::default(),
+                    &[],
+                    &[],
+                    CleanupRecord::skipped_failed_generation(&message),
+                )?;
+                return Err(deployment_error_from_runtime_env(err));
+            }
+        };
         let runtime_env = match build_runtime_env_artifacts(
             &RuntimeEnvMetadata {
                 project_id: record.project_id.clone(),
@@ -1491,6 +1569,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
             },
             config.environment(),
             &runtime_secrets,
+            &desired_env,
             &BTreeMap::new(),
         ) {
             Ok(runtime_env) => runtime_env,
@@ -1516,7 +1595,7 @@ impl<'a, D: DockerRuntime, P: ProbeRuntime, R: RoutingRuntime> DeploymentExecuto
                     &[],
                     CleanupRecord::skipped_failed_generation(&message),
                 )?;
-                return Err(err.into());
+                return Err(deployment_error_from_runtime_env(err));
             }
         };
         let redacted_env_preview = runtime_env.redacted_preview.clone();
@@ -7464,6 +7543,12 @@ pub mod git_backed_rollback_status_correctness {
     fn rollback_restores_historical_env_snapshot() {
         let root = test_root("rollback-restores-historical-env-snapshot");
         register_project(&root, "api", "api.example.com");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
         write_git_generation(
             &root,
             "api",
@@ -7481,6 +7566,12 @@ pub mod git_backed_rollback_status_correctness {
             SnapshotState::Healthy,
             "release",
             "bbb222",
+        );
+        crate::deployments::runtime_environment_snapshots::write_desired_env(
+            &root,
+            "production",
+            &[("V75_TEST_KEY", "hello-v75")],
+            &[],
         );
         let env = EnvironmentPaths::new(&root, "api", "production");
         let pointers = PointerStore::new(env.clone());
@@ -7535,6 +7626,12 @@ pub mod git_backed_rollback_status_correctness {
                 .values
                 .iter()
                 .any(|entry| entry.key == "FORGE_COMMIT_SHA" && entry.value == "aaa111")
+        );
+        assert!(
+            !report
+                .values
+                .iter()
+                .any(|entry| entry.key == "V75_TEST_KEY")
         );
     }
 
@@ -8158,6 +8255,10 @@ pub mod runtime_environment_snapshots {
     use crate::docker::DockerCliRuntime;
     use crate::docker::RecordingCommandRunner;
     use crate::status::{load_project_environment_env_report, load_project_environment_status};
+    use crate::storage::{
+        EnvStore, PersistedDesiredEnvConfig, PersistedDesiredEnvDeletedKey,
+        PersistedDesiredEnvEntry,
+    };
     use crate::storage::{load_generation_resolved_runtime, load_generation_runtime_env_snapshot};
     use std::fs;
 
@@ -8416,6 +8517,42 @@ pub mod runtime_environment_snapshots {
         .execute_next()
         .unwrap();
         docker
+    }
+
+    pub(crate) fn write_desired_env(
+        root: &std::path::Path,
+        environment: &str,
+        entries: &[(&str, &str)],
+        deleted_keys: &[&str],
+    ) {
+        let mut persisted_entries = entries
+            .iter()
+            .map(|(key, value)| PersistedDesiredEnvEntry {
+                key: (*key).to_string(),
+                normalized_key: key.to_ascii_lowercase(),
+                sealed_value: crate::secrets::seal_value(value).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        persisted_entries.sort_by(|left, right| left.normalized_key.cmp(&right.normalized_key));
+        let mut persisted_deleted_keys = deleted_keys
+            .iter()
+            .map(|key| PersistedDesiredEnvDeletedKey {
+                key: (*key).to_string(),
+                normalized_key: key.to_ascii_lowercase(),
+            })
+            .collect::<Vec<_>>();
+        persisted_deleted_keys
+            .sort_by(|left, right| left.normalized_key.cmp(&right.normalized_key));
+        EnvStore::new(root)
+            .write_desired_environment(&PersistedDesiredEnvConfig {
+                snapshot_version: 1,
+                project_id: "api".into(),
+                environment: environment.into(),
+                updated_at_unix: 1,
+                entries: persisted_entries,
+                deleted_keys: persisted_deleted_keys,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -8896,6 +9033,252 @@ pub mod runtime_environment_snapshots {
         let create_env = docker.runner.envs[1].clone();
         assert_eq!(create_env["APP_MODE"], "secret-mode");
         assert_eq!(create_env["FORGE_PROJECT_ID"], "api");
+    }
+
+    #[test]
+    fn desired_env_is_consumed_by_next_deployment_snapshot() {
+        let root = test_root("desired-env-is-consumed-by-next-deployment-snapshot");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        write_desired_env(
+            &root,
+            "production",
+            &[("APP_MODE", "desired-mode"), ("EMPTY_VALUE", "")],
+            &[],
+        );
+
+        let docker = execute_with_runtime_env(&root);
+        let create_env = docker.runner.envs[1].clone();
+        assert_eq!(create_env["APP_MODE"], "desired-mode");
+        assert_eq!(create_env["EMPTY_VALUE"], "");
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let snapshot = load_generation_runtime_env_snapshot(&env, 1)
+            .unwrap()
+            .unwrap();
+        let resolved = load_generation_resolved_runtime(&env, 1).unwrap().unwrap();
+        assert_eq!(
+            snapshot.entries["APP_MODE"].source,
+            crate::storage::PersistedRuntimeEnvSource::DesiredEnvConfig
+        );
+        assert_eq!(
+            resolved.entries["APP_MODE"].value.as_deref(),
+            Some("desired-mode")
+        );
+        assert_eq!(snapshot.resolution_order[2], "desired_env_config");
+    }
+
+    #[test]
+    fn desired_env_does_not_mutate_historical_snapshot_and_applies_to_next_generation() {
+        let root = test_root(
+            "desired-env-does-not-mutate-historical-snapshot-and-applies-to-next-generation",
+        );
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.to_path_buf()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("aaa111".into()),
+            })
+            .unwrap();
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            success_outputs(1)
+                .into_iter()
+                .chain(success_outputs(2))
+                .collect(),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = StickyRoutingRuntime {
+            inspection: RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            },
+        };
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let generation_one_snapshot_path = env.generation_dir(1).join("runtime_env_snapshot.json");
+        let generation_one_snapshot_before =
+            fs::read_to_string(&generation_one_snapshot_path).unwrap();
+
+        write_desired_env(&root, "production", &[("V75_TEST_KEY", "hello-v75")], &[]);
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-2".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.to_path_buf()),
+                source_ref: Some("release".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("bbb222".into()),
+            })
+            .unwrap();
+
+        DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap();
+
+        let generation_one_snapshot_after =
+            fs::read_to_string(&generation_one_snapshot_path).unwrap();
+        let generation_two_snapshot = load_generation_runtime_env_snapshot(&env, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            generation_one_snapshot_before,
+            generation_one_snapshot_after
+        );
+        assert!(
+            !load_generation_runtime_env_snapshot(&env, 1)
+                .unwrap()
+                .unwrap()
+                .entries
+                .contains_key("V75_TEST_KEY")
+        );
+        assert_eq!(
+            generation_two_snapshot.entries["V75_TEST_KEY"]
+                .value
+                .as_deref(),
+            Some("hello-v75")
+        );
+    }
+
+    #[test]
+    fn desired_env_deletion_removes_key_from_next_deployment() {
+        let root = test_root("desired-env-deletion-removes-key-from-next-deployment");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        write_desired_env(
+            &root,
+            "production",
+            &[("APP_MODE", "configured")],
+            &["API_BASE_URL"],
+        );
+
+        let docker = execute_with_runtime_env(&root);
+        let create_env = docker.runner.envs[1].clone();
+        assert_eq!(create_env["APP_MODE"], "configured");
+        assert!(!create_env.contains_key("API_BASE_URL"));
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        let resolved = load_generation_resolved_runtime(&env, 1).unwrap().unwrap();
+        assert!(!resolved.entries.contains_key("API_BASE_URL"));
+    }
+
+    #[test]
+    fn desired_env_rejects_reserved_forge_override() {
+        let root = test_root("desired-env-rejects-reserved-forge-override");
+        register_project(&root, "api", "api.example.com");
+        write_env_forge_yaml(&root, "");
+        unsafe {
+            std::env::set_var(
+                "FORGE_MASTER_KEY",
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            );
+        }
+        write_desired_env(&root, "production", &[("FORGE_PROJECT_ID", "bad")], &[]);
+
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queue
+            .enqueue(DeploymentRecord {
+                deployment_id: "dep-1".into(),
+                project_id: "api".into(),
+                environment: "production".into(),
+                intent: "deploy".into(),
+                source_path: Some(root.to_path_buf()),
+                source_ref: Some("main".into()),
+                repo_url: Some("https://github.com/example/api.git".into()),
+                commit_sha: Some("abc123".into()),
+            })
+            .unwrap();
+        let mut docker =
+            DockerCliRuntime::new(RecordingCommandRunner::with_outputs(success_outputs(1)));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = StickyRoutingRuntime {
+            inspection: RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: true,
+                verification_url: None,
+                verification_host: None,
+                verification_status_code: None,
+                verification_response_body: None,
+                health_checks_enabled: false,
+            },
+        };
+
+        let err = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy::default(),
+        )
+        .execute_next()
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("reserved Forge runtime key cannot be configured or deleted")
+        );
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        assert!(
+            !env.generation_dir(1)
+                .join("runtime_env_snapshot.json")
+                .exists()
+        );
     }
 
     #[test]

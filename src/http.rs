@@ -7996,6 +7996,78 @@ pub mod project_environment_inventory_api_uses_persisted_state {
     }
 
     #[tokio::test]
+    async fn env_inventory_exposes_configured_and_deployed_labels() {
+        let (state, root) = build_state_with_root(true);
+        seed_env_inventory_fixture(&root);
+        crate::storage::EnvStore::new(&root)
+            .write_desired_environment(&crate::storage::PersistedDesiredEnvConfig {
+                snapshot_version: 1,
+                project_id: "api".into(),
+                environment: "staging".into(),
+                updated_at_unix: 1,
+                entries: vec![crate::storage::PersistedDesiredEnvEntry {
+                    key: "APP_NAME".into(),
+                    normalized_key: "app_name".into(),
+                    sealed_value: crate::secrets::seal_value("Stage Next").unwrap(),
+                }],
+                deleted_keys: vec![crate::storage::PersistedDesiredEnvDeletedKey {
+                    key: "SERVER_PORT".into(),
+                    normalized_key: "server_port".into(),
+                }],
+            })
+            .unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/api/projects/api/env/staging")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["source_label"],
+            "Configured value for next deployment and last deployed value"
+        );
+        assert_eq!(
+            json["data"]["partial_metadata_notice"],
+            "Configured values will apply on the next deployment. Deployed values reflect the latest deployed generation."
+        );
+        let source = &json["data"]["environment_sources"][0];
+        assert_eq!(source["source_kind"], "configured_and_deployed");
+        assert_eq!(
+            source["configured_source_label"],
+            "Latest configured env store"
+        );
+        assert_eq!(
+            source["deployed_source_label"],
+            "Sealed generation snapshot"
+        );
+        let app_name = json["data"]["variables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "APP_NAME")
+            .unwrap();
+        assert_eq!(
+            app_name["environments"]["staging"]["configured_value"],
+            "Sta*****xt"
+        );
+        assert_eq!(
+            app_name["environments"]["staging"]["deployed_value"],
+            "FLE*****AG"
+        );
+    }
+
+    #[tokio::test]
     async fn env_inventory_environment_endpoint_supports_bearer_auth() {
         let (state, root) = build_state_with_root(true);
         seed_env_inventory_fixture(&root);

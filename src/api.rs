@@ -520,6 +520,14 @@ pub struct EnvironmentVariableReport {
 pub struct EnvInventoryCell {
     pub exists: bool,
     pub value: String,
+    #[serde(default)]
+    pub configured_exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_value: Option<String>,
+    #[serde(default)]
+    pub deployed_exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployed_value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,6 +541,10 @@ pub struct EnvInventoryEnvironmentSource {
     pub environment: String,
     pub source_kind: String,
     pub source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_source_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployed_source_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

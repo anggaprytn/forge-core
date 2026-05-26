@@ -703,6 +703,7 @@ impl PersistedDeploymentLifecycle {
 pub enum PersistedRuntimeEnvSource {
     ForgeYaml,
     ProjectEnvironmentSecret,
+    DesiredEnvConfig,
     DeployTimeOverride,
     ForgeGenerated,
     SystemRuntimeReserved,
@@ -1254,6 +1255,8 @@ pub struct PersistedDesiredEnvConfig {
     pub updated_at_unix: u64,
     #[serde(default)]
     pub entries: Vec<PersistedDesiredEnvEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_keys: Vec<PersistedDesiredEnvDeletedKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1261,6 +1264,12 @@ pub struct PersistedDesiredEnvEntry {
     pub key: String,
     pub normalized_key: String,
     pub sealed_value: SealedValueRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDesiredEnvDeletedKey {
+    pub key: String,
+    pub normalized_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

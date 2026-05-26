@@ -1298,6 +1298,16 @@ components:
           type: boolean
         value:
           type: string
+        configured_exists:
+          type: boolean
+        configured_value:
+          type: string
+          nullable: true
+        deployed_exists:
+          type: boolean
+        deployed_value:
+          type: string
+          nullable: true
     EnvInventoryVariable:
       type: object
       required: [key, environments]
@@ -1318,6 +1328,12 @@ components:
           type: string
         source_label:
           type: string
+        configured_source_label:
+          type: string
+          nullable: true
+        deployed_source_label:
+          type: string
+          nullable: true
         generation:
           type: integer
           format: int64

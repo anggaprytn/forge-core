@@ -550,8 +550,23 @@ function renderEnvInventory(inventory) {
       const value = document.createElement("p");
       value.className = `env-value${cell.exists ? "" : " missing"}`;
       value.textContent = text(cell.value, "missing");
-
       wrapper.append(presence, value);
+
+      if (cell.configured_exists || cell.deployed_exists) {
+        if (cell.configured_exists) {
+          const configured = document.createElement("p");
+          configured.className = "env-value";
+          configured.textContent = `Next deploy: ${text(cell.configured_value, "missing")}`;
+          wrapper.appendChild(configured);
+        }
+        if (cell.deployed_exists) {
+          const deployed = document.createElement("p");
+          deployed.className = "env-value";
+          deployed.textContent = `Last deployed: ${text(cell.deployed_value, "missing")}`;
+          wrapper.appendChild(deployed);
+        }
+      }
+
       td.appendChild(wrapper);
       tr.appendChild(td);
     }

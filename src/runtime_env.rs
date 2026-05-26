@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::{Display, Formatter};
 
 use crate::secrets::{SealedValueRecord, SecretError, SecretResolution, seal_value};
 use crate::storage::{
-    PersistedResolvedRuntime, PersistedResolvedRuntimeEntry, PersistedRuntimeEnvEntry,
-    PersistedRuntimeEnvSnapshot, PersistedRuntimeEnvSource, PersistedSecretReference,
+    EnvStore, PersistedDesiredEnvDeletedKey, PersistedResolvedRuntime,
+    PersistedResolvedRuntimeEntry, PersistedRuntimeEnvEntry, PersistedRuntimeEnvSnapshot,
+    PersistedRuntimeEnvSource, PersistedSecretReference, StorageError,
 };
 
 pub const GENERATED_FORGE_ENV_KEYS: [&str; 7] = [
@@ -20,9 +22,9 @@ pub const GENERATED_FORGE_ENV_KEYS: [&str; 7] = [
 pub const RUNTIME_ENV_RESOLUTION_ORDER: [&str; 5] = [
     "forge_yml",
     "project_environment_secret",
+    "desired_env_config",
     "deploy_time_override",
     "forge_generated",
-    "system_runtime_reserved",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,40 @@ pub struct RuntimeEnvMetadata {
     pub domain: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum RuntimeEnvError {
+    Secret(SecretError),
+    Storage(StorageError),
+    ReservedKey(String),
+}
+
+impl Display for RuntimeEnvError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Secret(err) => write!(f, "{err}"),
+            Self::Storage(err) => write!(f, "{err}"),
+            Self::ReservedKey(key) => write!(
+                f,
+                "reserved Forge runtime key cannot be configured or deleted: {key}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeEnvError {}
+
+impl From<SecretError> for RuntimeEnvError {
+    fn from(value: SecretError) -> Self {
+        Self::Secret(value)
+    }
+}
+
+impl From<StorageError> for RuntimeEnvError {
+    fn from(value: StorageError) -> Self {
+        Self::Storage(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeEnvValue {
     value: String,
@@ -54,12 +90,19 @@ struct RuntimeEnvValue {
     sensitive: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DesiredRuntimeEnvConfig {
+    pub values: BTreeMap<String, String>,
+    pub deleted_keys: BTreeMap<String, String>,
+}
+
 pub fn build_runtime_env_artifacts(
     metadata: &RuntimeEnvMetadata,
     forge_yaml_values: &BTreeMap<String, String>,
     secret_values: &[SecretResolution],
+    desired_env: &DesiredRuntimeEnvConfig,
     deploy_time_overrides: &BTreeMap<String, String>,
-) -> Result<RuntimeEnvArtifacts, SecretError> {
+) -> Result<RuntimeEnvArtifacts, RuntimeEnvError> {
     let generated_forge_vars = generated_forge_vars(metadata);
     let mut values = BTreeMap::new();
 
@@ -74,6 +117,12 @@ pub fn build_runtime_env_artifacts(
         &metadata.environment,
         secret_values,
     );
+    apply_plain_layer(
+        &mut values,
+        &desired_env.values,
+        PersistedRuntimeEnvSource::DesiredEnvConfig,
+    );
+    apply_deleted_keys(&mut values, &desired_env.deleted_keys);
     apply_plain_layer(
         &mut values,
         deploy_time_overrides,
@@ -194,6 +243,38 @@ pub fn generated_forge_vars(metadata: &RuntimeEnvMetadata) -> BTreeMap<String, S
     ])
 }
 
+pub fn load_desired_runtime_env_config(
+    storage_root: &std::path::Path,
+    project_id: &str,
+    environment: &str,
+) -> Result<DesiredRuntimeEnvConfig, RuntimeEnvError> {
+    let Some(config) =
+        EnvStore::new(storage_root).load_desired_environment(project_id, environment)?
+    else {
+        return Ok(DesiredRuntimeEnvConfig::default());
+    };
+
+    let mut values = BTreeMap::new();
+    for entry in &config.entries {
+        ensure_not_reserved_entry(entry.key.as_str(), entry.normalized_key.as_str())?;
+        values.insert(
+            entry.key.clone(),
+            crate::secrets::unseal_value(&entry.sealed_value)?,
+        );
+    }
+
+    let mut deleted_keys = BTreeMap::new();
+    for entry in &config.deleted_keys {
+        ensure_not_reserved_entry(entry.key.as_str(), entry.normalized_key.as_str())?;
+        deleted_keys.insert(entry.key.clone(), entry.normalized_key.clone());
+    }
+
+    Ok(DesiredRuntimeEnvConfig {
+        values,
+        deleted_keys,
+    })
+}
+
 pub fn render_snapshot_value(entry: &PersistedRuntimeEnvEntry) -> String {
     if entry.redacted {
         "<secret>".into()
@@ -255,6 +336,18 @@ fn apply_plain_layer(
     }
 }
 
+fn apply_deleted_keys(
+    target: &mut BTreeMap<String, RuntimeEnvValue>,
+    deleted_keys: &BTreeMap<String, String>,
+) {
+    if deleted_keys.is_empty() {
+        return;
+    }
+
+    let deleted = deleted_keys.values().cloned().collect::<BTreeSet<_>>();
+    target.retain(|key, _| !deleted.contains(&key.to_ascii_lowercase()));
+}
+
 fn apply_secret_layer(
     target: &mut BTreeMap<String, RuntimeEnvValue>,
     project_id: &str,
@@ -296,5 +389,21 @@ pub fn restore_runtime_env(
     Ok(restored)
 }
 
+pub fn is_reserved_forge_env_key(key: &str) -> bool {
+    GENERATED_FORGE_ENV_KEYS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(key))
+}
+
+pub fn ensure_not_reserved_entry(key: &str, normalized_key: &str) -> Result<(), RuntimeEnvError> {
+    if is_reserved_forge_env_key(key) || is_reserved_forge_env_key(normalized_key) {
+        return Err(RuntimeEnvError::ReservedKey(key.to_string()));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn _assert_sealed_value_record_is_used(_: &SealedValueRecord) {}
+
+#[allow(dead_code)]
+fn _assert_persisted_desired_env_deleted_key_is_used(_: &PersistedDesiredEnvDeletedKey) {}
