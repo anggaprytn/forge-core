@@ -12,8 +12,9 @@ use crate::backups::load_backup_restore_lineage;
 use crate::status::derive_environment_domain;
 use crate::storage::{
     ConvergenceCheckpointStore, EnvironmentPaths, GenerationHistoryRecord, PersistedActivationMode,
-    PersistedRuntimeInfo, RetentionStore, StorageError, atomic_write, load_generation_build_info,
-    load_generation_lifecycle, load_generation_runtime_info, load_generation_snapshot_metadata,
+    PersistedEnvironmentCheckpoint, PersistedRuntimeInfo, RetentionStore, StorageError,
+    atomic_write, load_generation_build_info, load_generation_lifecycle,
+    load_generation_runtime_info, load_generation_snapshot_metadata,
 };
 use crate::topology::runtime_with_primary_service;
 use serde_json::Error as JsonError;
@@ -654,15 +655,24 @@ impl ProjectRegistryStore {
                 .cloned()
         });
         let domain = derive_environment_domain(&project.base_domain, environment);
-        let route = route_for_runtime(selected_runtime.as_ref(), &domain);
-        let last_deployment_status = selected_lifecycle
-            .as_ref()
-            .map(|lifecycle| lifecycle.state.as_str().to_string())
-            .or_else(|| {
-                selected_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.state.clone())
-            });
+        let checkpoint = ConvergenceCheckpointStore::new(env.clone()).load()?;
+        let route = route_label_for_environment(
+            current_generation,
+            route_for_runtime(selected_runtime.as_ref(), &domain),
+            checkpoint.as_ref(),
+        );
+        let last_deployment_status = if current_generation.is_none() {
+            Some("not_deployed".into())
+        } else {
+            selected_lifecycle
+                .as_ref()
+                .map(|lifecycle| lifecycle.state.as_str().to_string())
+                .or_else(|| {
+                    selected_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.state.clone())
+                })
+        };
         let last_deployment_timestamp = selected_snapshot
             .as_ref()
             .map(|snapshot| snapshot.finalized_at_unix)
@@ -711,15 +721,7 @@ impl ProjectRegistryStore {
             selected_generation,
         ));
         let runtime_policy = selected_runtime.as_ref().map(build_runtime_policy_summary);
-        let readiness_summary =
-            ConvergenceCheckpointStore::new(env.clone())
-                .load()?
-                .map(|checkpoint| ProjectEnvironmentReadinessSummary {
-                    health_state: runtime_health_state(&checkpoint.health_state),
-                    active_generation: checkpoint.active_generation,
-                    last_successful_convergence_unix: checkpoint.last_successful_convergence_unix,
-                    reasons: checkpoint.readyz_reasons,
-                });
+        let readiness_summary = readiness_summary_for_environment(current_generation, checkpoint);
 
         Ok(ProjectEnvironmentDetail {
             environment: environment.to_string(),
@@ -808,9 +810,61 @@ fn build_rollback_summary(
         None => ProjectEnvironmentRollbackSummary {
             eligible: false,
             target_generation: None,
-            reason: "no active generation is available yet".into(),
+            reason: "Not eligible: no current generation".into(),
         },
     }
+}
+
+fn readiness_summary_for_environment(
+    current_generation: Option<u64>,
+    checkpoint: Option<PersistedEnvironmentCheckpoint>,
+) -> Option<ProjectEnvironmentReadinessSummary> {
+    if current_generation.is_none() {
+        return Some(ProjectEnvironmentReadinessSummary {
+            health_state: "not_deployed".into(),
+            active_generation: None,
+            last_successful_convergence_unix: checkpoint
+                .as_ref()
+                .and_then(|value| value.last_successful_convergence_unix),
+            reasons: vec![
+                "Environment has not been deployed yet.".into(),
+                "No active generation for this environment.".into(),
+            ],
+        });
+    }
+    checkpoint.map(|checkpoint| ProjectEnvironmentReadinessSummary {
+        health_state: runtime_health_state(&checkpoint.health_state),
+        active_generation: checkpoint.active_generation,
+        last_successful_convergence_unix: checkpoint.last_successful_convergence_unix,
+        reasons: checkpoint.readyz_reasons,
+    })
+}
+
+fn route_label_for_environment(
+    current_generation: Option<u64>,
+    runtime_route: Option<String>,
+    checkpoint: Option<&PersistedEnvironmentCheckpoint>,
+) -> Option<String> {
+    if current_generation.is_none() {
+        return Some("Route not assigned".into());
+    }
+    if checkpoint_indicates_fallback(checkpoint) {
+        return Some("Gateway fallback".into());
+    }
+    runtime_route.or_else(|| Some("Route not assigned".into()))
+}
+
+fn checkpoint_indicates_fallback(checkpoint: Option<&PersistedEnvironmentCheckpoint>) -> bool {
+    checkpoint
+        .and_then(|value| value.last_convergence_error.as_deref())
+        .is_some_and(|code| {
+            matches!(
+                code,
+                "route_fallback_served"
+                    | "application_route_not_active"
+                    | "gateway_fallback_response"
+            )
+        })
 }
 
 fn route_for_runtime(runtime: Option<&PersistedRuntimeInfo>, domain: &str) -> Option<String> {
@@ -1387,6 +1441,77 @@ mod tests {
 
         let actual = store.get("api").unwrap().unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn undeployed_environment_reports_not_deployed_semantics() {
+        let root = test_root("undeployed-environment-reports-not-deployed-semantics");
+        let store = ProjectRegistryStore::new(&root);
+        store.upsert(request("api"), None).unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+
+        let project = store.get_inventory("api").unwrap().unwrap();
+        let environment = project
+            .environments
+            .into_iter()
+            .find(|entry| entry.environment == "production")
+            .unwrap();
+
+        assert_eq!(environment.current_generation, None);
+        assert_eq!(environment.previous_generation, None);
+        assert_eq!(environment.route.as_deref(), Some("Route not assigned"));
+        assert_eq!(
+            environment.last_deployment_status.as_deref(),
+            Some("not_deployed")
+        );
+        let readiness = environment.readiness_summary.unwrap();
+        assert_eq!(readiness.health_state, "not_deployed");
+        assert!(
+            readiness
+                .reasons
+                .contains(&"No active generation for this environment.".into())
+        );
+    }
+
+    #[test]
+    fn environment_summary_reports_gateway_fallback_from_checkpoint() {
+        let root = test_root("environment-summary-reports-gateway-fallback");
+        let store = ProjectRegistryStore::new(&root);
+        store.upsert(request("api"), None).unwrap();
+
+        let env = EnvironmentPaths::new(&root, "api", "production");
+        env.ensure_exists().unwrap();
+        atomic_write(env.current_pointer(), b"7\n").unwrap();
+        ConvergenceCheckpointStore::new(env.clone())
+            .save(&PersistedEnvironmentCheckpoint {
+                project_id: "api".into(),
+                environment: "production".into(),
+                active_generation: Some(7),
+                health_state: crate::storage::RuntimeHealthState::Degraded,
+                last_convergence_error: Some("route_fallback_served".into()),
+                readyz_reasons: vec![
+                    "Gateway reachable, but application route is not active.".into(),
+                ],
+                ..PersistedEnvironmentCheckpoint::default()
+            })
+            .unwrap();
+
+        let project = store.get_inventory("api").unwrap().unwrap();
+        let environment = project
+            .environments
+            .into_iter()
+            .find(|entry| entry.environment == "production")
+            .unwrap();
+
+        assert_eq!(environment.route.as_deref(), Some("Gateway fallback"));
+        let readiness = environment.readiness_summary.unwrap();
+        assert_eq!(readiness.health_state, "degraded");
+        assert_eq!(
+            readiness.reasons.first().map(String::as_str),
+            Some("Gateway reachable, but application route is not active.")
+        );
     }
 
     #[test]

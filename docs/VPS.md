@@ -127,7 +127,7 @@ Example `/etc/caddy/Caddyfile`:
 }
 
 :80 {
-	respond "caddy ready" 200
+	respond "Forge route not assigned" 200
 }
 ```
 

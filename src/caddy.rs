@@ -4,6 +4,9 @@ use std::time::Duration;
 
 use reqwest::header::HOST;
 
+use crate::gateway_fallback::{
+    FALLBACK_HEADER_NAME, ROUTE_STATE_HEADER_NAME, detect_from_headers_and_body,
+};
 use crate::runtime::{RouteInspection, RouteUpdateRequest, RoutingRuntime, RoutingRuntimeError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,13 +261,37 @@ impl CaddyApiRuntime {
         ) {
             Ok(response) => {
                 let status = response.status();
+                let fallback_header = response
+                    .headers()
+                    .get(FALLBACK_HEADER_NAME)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned);
+                let route_state_header = response
+                    .headers()
+                    .get(ROUTE_STATE_HEADER_NAME)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned);
                 let body = response.text().ok();
+                let fallback = detect_from_headers_and_body(
+                    fallback_header.as_deref(),
+                    route_state_header.as_deref(),
+                    body.as_deref(),
+                );
                 ActivationVerification {
-                    verified: status.is_success(),
+                    verified: status.is_success() && fallback.is_none(),
                     url: Some(url.to_string()),
                     host: domain.map(ToOwned::to_owned),
                     status_code: Some(status.as_u16()),
-                    response_body: body,
+                    response_body: match (body, fallback) {
+                        (Some(body), Some(fallback)) if body.trim().is_empty() => {
+                            Some(fallback.summary())
+                        }
+                        (Some(body), Some(fallback)) => {
+                            Some(format!("{}; {}", fallback.summary(), body))
+                        }
+                        (body, None) => body,
+                        (None, Some(fallback)) => Some(fallback.summary()),
+                    },
                 }
             }
             Err(err) => ActivationVerification {
@@ -508,6 +535,7 @@ fn path_pattern_matches(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway_fallback::fallback_response_body;
 
     fn proxy_route(id: &str, host: Option<&str>) -> serde_json::Value {
         let request = RouteUpdateRequest {
@@ -586,6 +614,24 @@ mod tests {
                 .verification_response_body
                 .as_deref()
                 .is_some_and(|body| body.contains("shadowed"))
+        );
+    }
+
+    #[test]
+    fn route_activation_verification_rejects_fallback_body() {
+        let result = ActivationVerification {
+            verified: false,
+            url: Some("https://app.example.com/health".into()),
+            host: Some("app.example.com".into()),
+            status_code: Some(200),
+            response_body: Some(fallback_response_body(None)),
+        };
+        assert!(!result.verified);
+        assert!(
+            result
+                .response_body
+                .as_deref()
+                .is_some_and(|body| body.contains("Forge route not assigned"))
         );
     }
 }

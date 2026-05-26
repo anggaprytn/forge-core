@@ -2258,9 +2258,15 @@ where
                 let Some(generation) = runtime_state.active_generation else {
                     continue;
                 };
-                if runtime_state.last_error_code.as_deref()
-                    == Some("route_activation_verification_failed")
-                {
+                if matches!(
+                    runtime_state.last_error_code.as_deref(),
+                    Some(
+                        "route_activation_verification_failed"
+                            | "route_fallback_served"
+                            | "application_route_not_active"
+                            | "gateway_fallback_response"
+                    )
+                ) {
                     if let Some(reason) = self.resolve_active_route_failure_readyz_reason(
                         &env,
                         &project_id,
@@ -2301,6 +2307,10 @@ where
             .read_summary()
             .ok()
             .flatten();
+        let marker = runtime_state
+            .last_error_code
+            .clone()
+            .unwrap_or_else(|| "route_activation_verification_failed".into());
         let route_check = self.active_route_failure_state(env, project_id, environment, generation);
         match route_check {
             RouteFailureState::Resolved => {
@@ -2314,7 +2324,7 @@ where
                 active: true,
                 unresolved: true,
                 source: "runtime_state_cache".into(),
-                marker: "route_activation_verification_failed".into(),
+                marker: marker.clone(),
                 message,
                 last_checked_unix: Some(now_unix),
                 cache_age_ms: 0,
@@ -2344,7 +2354,7 @@ where
                             active: true,
                             unresolved: true,
                             source: "runtime_state_cache".into(),
-                            marker: "route_activation_verification_failed".into(),
+                            marker: marker.clone(),
                             message,
                             last_checked_unix: Some(now_unix),
                             cache_age_ms: 0,
@@ -2367,7 +2377,7 @@ where
                     active: true,
                     unresolved: true,
                     source: "runtime_state_cache".into(),
-                    marker: "route_activation_verification_failed".into(),
+                    marker,
                     message,
                     last_checked_unix: Some(now_unix),
                     cache_age_ms: 0,
@@ -2877,7 +2887,15 @@ fn clear_resolved_route_failure_marker(
     let runtime_store = RuntimeStateStore::new(env.clone());
     let mut runtime_state = runtime_store.load()?;
     if runtime_state.active_generation != Some(generation)
-        || runtime_state.last_error_code.as_deref() != Some("route_activation_verification_failed")
+        || !matches!(
+            runtime_state.last_error_code.as_deref(),
+            Some(
+                "route_activation_verification_failed"
+                    | "route_fallback_served"
+                    | "application_route_not_active"
+                    | "gateway_fallback_response"
+            )
+        )
     {
         return Ok(());
     }

@@ -23,6 +23,7 @@ use crate::api::{
 use crate::backups::load_backup_restore_lineage;
 use crate::events::EventRecord;
 use crate::forge_yaml::load_optional_forge_yaml;
+use crate::gateway_fallback::detect_from_body;
 use crate::manifest::load_optional_manifest;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{PersistentQueue, QueueError};
@@ -895,8 +896,7 @@ where
     let route_active = truth
         .route_details
         .as_ref()
-        .and_then(|details| details.inspection.as_ref())
-        .is_some();
+        .is_some_and(RouteStatusDetails::route_active);
     let route_matches = truth
         .route_details
         .as_ref()
@@ -931,13 +931,8 @@ where
             || latest_failed_without_promotion)
     {
         "failed"
-    } else if truth.current_generation.is_none()
-        && truth.active_generation.is_none()
-        && truth.latest_snapshot.is_none()
-        && truth.promoted_runtime.is_none()
-        && truth.promoted_build.is_none()
-    {
-        "missing"
+    } else if truth.current_generation.is_none() && truth.active_generation.is_none() {
+        "not_deployed"
     } else {
         "degraded"
     };
@@ -1107,7 +1102,7 @@ where
     let route = if let Some(details) = truth.route_details.as_ref() {
         RouteDiagnostics {
             route_required: details.route_required(),
-            route_active: details.inspection.is_some(),
+            route_active: details.route_active(),
             matches_expected: details.matches_truth() && truth.promoted_generation_issue.is_none(),
             current_target: details
                 .inspection
@@ -1128,7 +1123,10 @@ where
             current_target: None,
             expected_target: None,
             domain: Some(status.domain.clone()),
-            mismatch_reason: truth.promoted_generation_issue.clone(),
+            mismatch_reason: truth.promoted_generation_issue.clone().or_else(|| {
+                (truth.active_generation.is_none() && truth.current_generation.is_none())
+                    .then(|| "No active generation for this environment.".into())
+            }),
         }
     };
 
@@ -3481,6 +3479,8 @@ fn service_route_status<R: RoutingRuntime>(
     };
     if details.matches_truth() {
         "active".into()
+    } else if details.fallback_detection().is_some() {
+        "gateway_fallback".into()
     } else if details.inspection.is_some() {
         "mismatch".into()
     } else {
@@ -3514,8 +3514,7 @@ fn build_environment_status_from_truth(
     let route_active = truth
         .route_details
         .as_ref()
-        .and_then(|details| details.inspection.as_ref())
-        .is_some();
+        .is_some_and(RouteStatusDetails::route_active);
     let route_matches = truth
         .route_details
         .as_ref()
@@ -3555,13 +3554,8 @@ fn build_environment_status_from_truth(
             || latest_failed_without_promotion)
     {
         "failed"
-    } else if truth.current_generation.is_none()
-        && truth.active_generation.is_none()
-        && truth.latest_generation.is_none()
-        && truth.promoted_runtime.is_none()
-        && truth.promoted_build.is_none()
-    {
-        "missing"
+    } else if truth.current_generation.is_none() && truth.active_generation.is_none() {
+        "not_deployed"
     } else {
         "degraded"
     };
@@ -4389,8 +4383,19 @@ impl RouteStatusDetails {
         let Some(expected_target) = self.expected_target.as_deref() else {
             return false;
         };
-        inspection.active_target == expected_target
+        inspection.activation_verified
+            && inspection.active_target == expected_target
             && inspection.domain.as_deref() == Some(self.expected_domain.as_str())
+    }
+
+    fn route_active(&self) -> bool {
+        self.route_required && self.matches_truth()
+    }
+
+    fn fallback_detection(&self) -> Option<crate::gateway_fallback::GatewayFallbackDetection> {
+        self.inspection.as_ref().and_then(|inspection| {
+            detect_from_body(inspection.verification_response_body.as_deref())
+        })
     }
 
     fn mismatch_reason(&self) -> Option<String> {
@@ -4400,6 +4405,12 @@ impl RouteStatusDetails {
         let Some(inspection) = &self.inspection else {
             return Some("route missing".into());
         };
+        if let Some(detection) = self.fallback_detection() {
+            return Some(detection.message.into());
+        }
+        if !inspection.activation_verified {
+            return Some("Gateway reachable, but application route is not active.".into());
+        }
         match self.expected_target.as_deref() {
             Some(expected) if inspection.active_target != expected => Some(format!(
                 "route target mismatch: current={} expected={expected}",
@@ -5544,7 +5555,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(status.status, "degraded");
-        assert!(status.route_active);
+        assert!(!status.route_active);
     }
 
     #[test]
@@ -5630,8 +5641,8 @@ mod tests {
     }
 
     #[test]
-    fn status_handles_missing_generation_gracefully() {
-        let root = test_root("handles-missing-generation-gracefully");
+    fn status_handles_undeployed_environment_gracefully() {
+        let root = test_root("handles-undeployed-environment-gracefully");
         register_project(&root, "api", "api.example.com");
 
         let mut docker = StubDockerRuntime::default();
@@ -5647,7 +5658,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(status.status, "missing");
+        assert_eq!(status.status, "not_deployed");
         assert_eq!(status.active_generation, None);
         assert!(!status.container_running);
         assert!(!status.route_active);
@@ -7828,6 +7839,59 @@ mod tests {
         );
         assert_eq!(status.status, "degraded");
         assert_eq!(diagnostics.status, "degraded");
+    }
+
+    #[test]
+    fn status_and_diagnostics_report_gateway_fallback_as_not_active_route() {
+        let root = test_root("status-and-diagnostics-report-gateway-fallback");
+        register_project(&root, "api", "api.example.com");
+        write_generation(&root, 7);
+
+        let fallback_route = RouteInspection {
+            activation_verified: false,
+            verification_status_code: Some(200),
+            verification_response_body: Some(crate::gateway_fallback::fallback_response_body(None)),
+            ..healthy_route()
+        };
+        let mut status_docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut status_routing = StubRoutingRuntime {
+            inspection: Some(fallback_route.clone()),
+        };
+        let status = load_project_environment_status(
+            &root,
+            None,
+            &mut status_docker,
+            &mut status_routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        let mut diagnose_docker = StubDockerRuntime {
+            inspection: Some(healthy_container(7)),
+        };
+        let mut diagnose_routing = StubRoutingRuntime {
+            inspection: Some(fallback_route),
+        };
+        let diagnostics = load_environment_diagnostics(
+            &root,
+            None,
+            &mut diagnose_docker,
+            &mut diagnose_routing,
+            "api",
+            "staging",
+        )
+        .unwrap();
+
+        assert_eq!(status.status, "degraded");
+        assert!(!status.route_active);
+        assert!(!diagnostics.route.route_active);
+        assert_eq!(
+            diagnostics.route.mismatch_reason.as_deref(),
+            Some("Gateway reachable, but application route is not active.")
+        );
     }
 
     #[test]

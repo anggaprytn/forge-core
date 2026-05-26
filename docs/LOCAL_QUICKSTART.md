@@ -19,7 +19,7 @@ Example minimal Caddy config for local use:
 }
 
 :80 {
-	respond "caddy ready" 200
+	respond "Forge route not assigned" 200
 }
 ```
 

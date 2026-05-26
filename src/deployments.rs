@@ -13,6 +13,7 @@ use crate::forge_yaml::{
     ForgeRuntimePolicy, ForgeServiceConfig, ForgeStateConfig, ForgeYamlConfig,
     load_optional_forge_yaml,
 };
+use crate::gateway_fallback::detect_from_body;
 use crate::manifest::{ManifestError, SecretReference, load_optional_manifest};
 use crate::metrics::registry as metrics_registry;
 use crate::projects::ProjectRegistryStore;
@@ -4874,9 +4875,10 @@ fn validate_route_activation(
         ));
     }
     if !inspection.activation_verified {
-        return Err(DeploymentError::ValidationFailed(
-            "route activation verification failed",
-        ));
+        let failure_reason = detect_from_body(context.verification_response_body.as_deref())
+            .map(|detection| detection.code)
+            .unwrap_or("route activation verification failed");
+        return Err(DeploymentError::ValidationFailed(failure_reason));
     }
     if inspection.active_target != context.upstream_target {
         return Err(DeploymentError::ValidationFailed("route target mismatch"));
@@ -5291,7 +5293,7 @@ pub mod validation_probe_retries {
     fn tcp_probe_retries_until_container_listens() {
         let root = test_root("tcp-probe-retries-until-container-listens");
         let source_root = root.join("source");
-        write_forge_yaml(&source_root, 500);
+        write_forge_yaml(&source_root, 1_000);
         let queue = PersistentQueue::new(root.join("queue")).unwrap();
         queue
             .enqueue(DeploymentRecord {
@@ -10962,6 +10964,7 @@ pub mod route_activation_failure_diagnostics {
     use super::*;
     use crate::docker::DockerCliRuntime;
     use crate::docker::RecordingCommandRunner;
+    use crate::gateway_fallback::fallback_response_body;
     use std::fs;
 
     #[test]
@@ -11093,6 +11096,62 @@ pub mod route_activation_failure_diagnostics {
         .unwrap();
         assert!(artifact.contains(FORGE_MANAGED_DOCKER_NETWORK));
         assert!(artifact.contains("Caddy is attached to docker network"));
+    }
+
+    #[test]
+    fn route_activation_failure_classifies_gateway_fallback() {
+        let root = test_root("route-activation-failure-classifies-gateway-fallback");
+        register_project(&root, "api", "api.example.com");
+        let queue = PersistentQueue::new(root.join("queue")).unwrap();
+        queued_record(&queue);
+        let mut docker = DockerCliRuntime::new(RecordingCommandRunner::with_outputs(
+            networked_success_outputs_with_network(1, &[("forge-net", "172.18.0.2")]),
+        ));
+        let mut probes = TestProbeRuntime {
+            tcp_ok: true,
+            http_ok: true,
+        };
+        let mut routing = TestRoutingRuntime {
+            updates: Vec::new(),
+            inspections: vec![RouteInspection {
+                subtree_id: "forge:api:production".into(),
+                active_target: "172.18.0.2:3000".into(),
+                domain: Some("api.example.com".into()),
+                activation_verified: false,
+                verification_url: Some("https://api.example.com/health".into()),
+                verification_host: Some("api.example.com".into()),
+                verification_status_code: Some(200),
+                verification_response_body: Some(fallback_response_body(None)),
+                health_checks_enabled: false,
+            }],
+        };
+
+        let result = DeploymentExecutor::new(
+            &root,
+            &queue,
+            &mut docker,
+            &mut probes,
+            &mut routing,
+            ValidationPolicy {
+                tcp_required: true,
+                http_health_path: Some("/health".into()),
+                activation: ActivationMode::Http {
+                    internal_port: 3000,
+                },
+                ..ValidationPolicy::default()
+            },
+        )
+        .with_execution_config(ExecutionConfig {
+            context_path: root.clone(),
+            dockerfile_path: root.join("Dockerfile"),
+            network_name: Some("forge-net".into()),
+        })
+        .execute_next();
+
+        assert!(matches!(
+            result,
+            Err(DeploymentError::ValidationFailed("route_fallback_served"))
+        ));
     }
 }
 

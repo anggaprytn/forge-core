@@ -13,6 +13,9 @@ use forge_core::convergence::{ActiveTruth, ConvergenceEngine, TickInput};
 use forge_core::deployments::{
     ActivationMode, DeploymentError, DeploymentExecutor, ValidationPolicy,
 };
+use forge_core::gateway_fallback::{
+    FALLBACK_HEADER_NAME, FALLBACK_TITLE, ROUTE_STATE_HEADER_NAME, fallback_static_response_config,
+};
 use forge_core::queue::{DeploymentRecord, PersistentQueue};
 use forge_core::runtime::{
     BuildImageRequest, ContainerInspection, CreateContainerRequest, DockerRuntime,
@@ -565,11 +568,7 @@ impl CaddyHarness {
         routes.push(serde_json::json!({
             "@id": "forge:ready",
             "terminal": true,
-            "handle": [{
-                "handler": "static_response",
-                "status_code": 200,
-                "body": "forge caddy ready"
-            }]
+            "handle": [fallback_static_response_config(None)]
         }));
 
         let client = reqwest::blocking::Client::new();
@@ -599,6 +598,39 @@ impl CaddyHarness {
         }
         panic!("dockerized caddy did not become ready in time");
     }
+}
+
+#[test]
+fn caddy_integration_ready_placeholder_exposes_fallback_markers() {
+    let _guard = integration_lock();
+    let Some(harness) = CaddyHarness::start("ready-placeholder-markers") else {
+        return;
+    };
+    harness.install_ready_placeholder();
+
+    let response = reqwest::blocking::get(harness.public_url(""))
+        .expect("ready placeholder should be reachable");
+    let body = response.text().expect("body should decode");
+    assert!(body.contains(FALLBACK_TITLE));
+    assert!(body.contains("forge-route-state"));
+    assert!(!body.contains("forge caddy ready"));
+
+    let response = reqwest::blocking::get(harness.public_url(""))
+        .expect("ready placeholder should be reachable");
+    assert_eq!(
+        response
+            .headers()
+            .get(FALLBACK_HEADER_NAME)
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(ROUTE_STATE_HEADER_NAME)
+            .and_then(|value| value.to_str().ok()),
+        Some("fallback")
+    );
 }
 
 impl Drop for CaddyHarness {

@@ -2469,13 +2469,22 @@ fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> Strin
         status.container_ip.as_deref().unwrap_or("unknown")
     ));
     output.push_str("Routing:\n");
-    output.push_str(&format!("  Route Active: {}\n", status.route_active));
+    output.push_str(&format!(
+        "  Route Active: {}\n",
+        if status.status == "not_deployed" {
+            "Not assigned".into()
+        } else {
+            status.route_active.to_string()
+        }
+    ));
     output.push_str(&format!(
         "  Probe Path: {}\n",
         status.probe_path.as_deref().unwrap_or("unknown")
     ));
     if let Some(state) = status.lifecycle_state.as_ref() {
         output.push_str(&format!("  Lifecycle State: {}\n", state.as_str()));
+    } else if status.status == "not_deployed" {
+        output.push_str("  Lifecycle State: not_deployed\n");
     }
     if status.lifecycle_state.is_some() || status.retention_role.is_some() {
         output.push_str(&format!(

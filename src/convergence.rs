@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::backups::scan_backup_gc_actions;
 use crate::events::EventRecord;
+use crate::gateway_fallback::detect_from_body;
 use crate::projects::ProjectRegistryStore;
 use crate::queue::{DeploymentRecord, PersistentQueue};
 use crate::route_truth::resolve_route_target;
@@ -143,7 +144,15 @@ fn clear_resolved_route_repair_state(
     let runtime_store = RuntimeStateStore::new(env.clone());
     let mut runtime_state = runtime_store.load()?;
     if runtime_state.active_generation != Some(generation)
-        || runtime_state.last_error_code.as_deref() != Some("route_activation_verification_failed")
+        || !matches!(
+            runtime_state.last_error_code.as_deref(),
+            Some(
+                "route_activation_verification_failed"
+                    | "route_fallback_served"
+                    | "application_route_not_active"
+                    | "gateway_fallback_response"
+            )
+        )
     {
         return Ok(());
     }
@@ -2562,6 +2571,12 @@ fn record_route_repair_degraded_state(
 
     let runtime_store = RuntimeStateStore::new(env.clone());
     let mut runtime_state = runtime_store.load()?;
+    let last_error_code = match failure_reason {
+        "route_fallback_served" | "application_route_not_active" | "gateway_fallback_response" => {
+            failure_reason
+        }
+        _ => "route_activation_verification_failed",
+    };
     runtime_state.active_generation = Some(generation);
     runtime_state.health_state = RuntimeHealthState::Degraded;
     runtime_state
@@ -2572,7 +2587,7 @@ fn record_route_repair_degraded_state(
     } else {
         "route_repair_failed".into()
     };
-    runtime_state.last_error_code = Some("route_activation_verification_failed".into());
+    runtime_state.last_error_code = Some(last_error_code.into());
     runtime_store.save(&runtime_state)?;
 
     let events = EventStore::new(env.clone(), generation);
@@ -3821,8 +3836,15 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
         || !route.activation_verified
         || route.health_checks_enabled
     {
+        let error = if !route.activation_verified {
+            detect_from_body(route.verification_response_body.as_deref())
+                .map(|detection| detection.code.to_string())
+                .unwrap_or_else(|| "route activation verification failed".into())
+        } else {
+            "route activation verification failed".into()
+        };
         return Err(RouteRepairFailure {
-            message: "route activation verification failed".into(),
+            message: error.clone(),
             artifact: serde_json::json!({
                 "route_id": subtree_id,
                 "domain": domain,
@@ -3835,7 +3857,7 @@ fn ensure_http_route_matches_generation<RtR: RoutingRuntime>(
                 "activation_verified": route.activation_verified,
                 "health_checks_enabled": route.health_checks_enabled,
                 "network_name": preferred_network,
-                "error": "route activation verification failed",
+                "error": error,
             }),
         });
     }

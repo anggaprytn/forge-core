@@ -146,7 +146,7 @@ function toneFromHealthState(value) {
   if (health === "degraded" || health === "failed" || health === "unhealthy") {
     return "warn";
   }
-  if (health === "unavailable" || health === "missing") {
+  if (health === "not_deployed" || health === "unavailable" || health === "missing" || health === "unknown") {
     return "stale";
   }
   return "";
@@ -859,15 +859,20 @@ function environmentCard(environment) {
   name.textContent = text(environment.environment);
   const route = document.createElement("p");
   route.className = "environment-route";
-  route.textContent = text(environment.route, "Route not set");
+  route.textContent = text(environment.route, "Route not assigned");
   title.append(name, route);
 
   const chip = document.createElement("span");
   chip.className = `status-chip${tone ? ` ${tone}` : ""}`;
-  chip.textContent = text(
-    environment.readiness_summary && environment.readiness_summary.health_state,
-    environment.last_deployment_status || "Unknown",
-  );
+  const healthState = lower(environment.readiness_summary && environment.readiness_summary.health_state);
+  chip.textContent = healthState === "not_deployed"
+    ? "Not deployed"
+    : healthState === "degraded" && lower(environment.route).includes("gateway fallback")
+      ? "Gateway fallback"
+      : text(
+          environment.readiness_summary && environment.readiness_summary.health_state,
+          environment.last_deployment_status || "Unknown",
+        );
 
   header.append(title, chip);
   card.appendChild(header);
@@ -876,7 +881,13 @@ function environmentCard(environment) {
   facts.className = "environment-facts";
   appendMeta(facts, "Current", environment.current_generation === null || environment.current_generation === undefined ? "None" : `Gen ${environment.current_generation}`);
   appendMeta(facts, "Previous", environment.previous_generation === null || environment.previous_generation === undefined ? "None" : `Gen ${environment.previous_generation}`);
-  appendMeta(facts, "Deploy", text(environment.last_deployment_status));
+  appendMeta(
+    facts,
+    "Deploy",
+    lower(environment.last_deployment_status) === "not_deployed"
+      ? "Not deployed"
+      : text(environment.last_deployment_status),
+  );
   appendMeta(
     facts,
     "Last success",
@@ -891,7 +902,11 @@ function environmentCard(environment) {
     : [];
   const note = document.createElement("p");
   note.className = "environment-note";
-  note.textContent = reasons.length ? reasons[0] : "No additional readiness notes.";
+  note.textContent = reasons.length
+    ? reasons[0]
+    : lower(environment.route).includes("gateway fallback")
+      ? "Gateway is reachable, app route is not serving yet."
+      : "No additional readiness notes.";
   card.appendChild(note);
 
   return card;

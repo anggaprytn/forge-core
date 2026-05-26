@@ -11,6 +11,7 @@ pub mod docker;
 pub mod doctor;
 pub mod events;
 pub mod forge_yaml;
+pub mod gateway_fallback;
 pub mod github;
 pub mod http;
 pub mod invariants;

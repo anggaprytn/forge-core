@@ -24,6 +24,7 @@ use forge_core::deployments::{
     ActivationMode, DeploymentError, DeploymentExecutor, ExecutionConfig, ValidationPolicy,
 };
 use forge_core::docker::{DockerCliRuntime, ProcessCommandRunner};
+use forge_core::gateway_fallback::fallback_static_response_config;
 use forge_core::github::GitHubWebhookConfig;
 use forge_core::http::{ControlPlane, HttpState, IdempotencyStore, WebAuthState, router};
 use forge_core::probes::DockerNetworkProbeRuntime;
@@ -1748,11 +1749,7 @@ impl E2eHarness {
         routes.push(serde_json::json!({
             "@id": "forge:ready",
             "terminal": true,
-            "handle": [{
-                "handler": "static_response",
-                "status_code": 200,
-                "body": "forge caddy ready"
-            }]
+            "handle": [fallback_static_response_config(None)]
         }));
 
         let response = self
