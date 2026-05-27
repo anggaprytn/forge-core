@@ -1074,6 +1074,66 @@ fn manifest_validate_accepts_generated_compose_contract() {
 }
 
 #[test]
+fn compose_app_redis_fixture_covers_golden_path_conversion() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compose-app-redis");
+
+    let detect = run_cli_in_dir(&fixture, &["compose", "detect", "--from", "."]);
+    assert!(detect.status.success(), "{detect:?}");
+    let detect_body = String::from_utf8_lossy(&detect.stdout);
+    assert!(detect_body.contains("Services found: app, redis"));
+    assert!(detect_body.contains("Likely public service candidates: app"));
+    assert!(detect_body.contains("Likely internal dependency services: redis"));
+
+    let preview = run_cli_in_dir(&fixture, &["compose", "preview", "docker-compose.yml"]);
+    assert!(preview.status.success(), "{preview:?}");
+    let preview_body = String::from_utf8_lossy(&preview.stdout);
+    assert!(preview_body.contains("environment keys: REDIS_URL"));
+    assert!(preview_body.contains("Required env keys: REDIS_URL"));
+    assert!(preview_body.contains("Import REDIS_URL into Forge Env Manager before deploying."));
+    assert!(preview_body.contains("Inferred public service: app"));
+    assert!(preview_body.contains("Inferred internal services: redis"));
+    assert!(preview_body.contains("expose: true"));
+    assert!(preview_body.contains("expose: false"));
+    assert!(preview_body.contains("path: /health"));
+    assert!(!preview_body.contains("redis://redis:6379"));
+
+    let root = test_root("compose-app-redis-golden-path");
+    fs::copy(
+        fixture.join("docker-compose.yml"),
+        root.join("docker-compose.yml"),
+    )
+    .unwrap();
+    fs::copy(fixture.join("Dockerfile"), root.join("Dockerfile")).unwrap();
+    fs::copy(fixture.join("server.py"), root.join("server.py")).unwrap();
+    let convert = run_cli_in_dir(
+        &root,
+        &[
+            "compose",
+            "convert",
+            "docker-compose.yml",
+            "--out",
+            "forge.yml",
+        ],
+    );
+    assert!(convert.status.success(), "{convert:?}");
+    let generated = fs::read_to_string(root.join("forge.yml")).unwrap();
+    assert!(generated.contains("app:"));
+    assert!(generated.contains("redis:"));
+    assert!(generated.contains("expose: true"));
+    assert!(generated.contains("expose: false"));
+    assert!(generated.contains("depends_on:"));
+    assert!(generated.contains("- redis"));
+    assert!(generated.contains("image: redis:7-alpine"));
+    assert!(!generated.contains("REDIS_URL"));
+    assert!(!generated.contains("redis://redis:6379"));
+
+    let validate = run_cli_in_dir(&root, &["manifest", "validate", "--from", "."]);
+    assert!(validate.status.success(), "{validate:?}");
+    assert!(String::from_utf8_lossy(&validate.stdout).contains("forge.yml is valid"));
+}
+
+#[test]
 fn cli_config_env_vars_override_saved_config() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
@@ -1908,6 +1968,25 @@ fn agent_verify_env_fallback_state_stays_not_safe_to_report() {
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["fallback_detected"], true);
     assert_eq!(json["safe_to_report_live_url"], false);
+}
+
+#[test]
+fn diagnose_redis_connection_refused_suggests_dependency_checks() {
+    let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let (url, _server) = spawn_server_sequence(
+        requests.clone(),
+        vec![
+            r#"{"data":{"project_id":"api","environment":"production","status":"failed","active_generation":4,"last_deployment_id":"dep-4","container":{"running":true},"route":{"route_required":true,"route_active":false,"matches_expected":false,"domain":"api.example.com"},"startup_order":["redis","app"],"services":[{"service_id":"app","role":"exposed","depends_on":["redis"],"dns_aliases":["app"],"container_name":"production-api-app-gen-4","running":true,"internal_port":3000,"route":"none","health":"failed","failure_reason":"Redis ECONNREFUSED redis:6379","logs_tail":["redis connect failed"]},{"service_id":"redis","role":"internal","depends_on":[],"dns_aliases":["redis"],"container_name":"production-api-redis-gen-4","running":false,"route":"none","health":"failed","logs_tail":[]}],"recent_failures":[{"deployment_id":"dep-4","generation":4,"failure_stage":"validating_runtime","failure_reason":"Redis ECONNREFUSED redis:6379","diagnostics_source":"projects/api/environments/production/generations/4/diagnostics"}],"likely_failure_stage":"validating_runtime"}}"#,
+        ],
+    );
+
+    let output = run_cli(&url, &["diagnose", "api", "production"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("verify REDIS_URL is configured"));
+    assert!(body.contains("verify Redis service is internal and reachable as redis:6379"));
+    assert!(body.contains("verify app depends_on redis"));
+    assert!(body.contains("verify Redis service started"));
 }
 
 fn run_cli(url: &str, args: &[&str]) -> std::process::Output {

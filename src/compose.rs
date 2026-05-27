@@ -56,6 +56,7 @@ pub struct ComposePreview {
     pub services: Vec<ComposeServicePreview>,
     pub public_candidates: Vec<String>,
     pub internal_services: Vec<String>,
+    pub required_env_keys: Vec<String>,
     pub unsupported_fields: Vec<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
@@ -150,6 +151,7 @@ pub fn preview_compose(path: &Path) -> Result<ComposePreview, ComposeError> {
         services: analysis.services,
         public_candidates: analysis.public_candidates,
         internal_services: analysis.internal_services,
+        required_env_keys: analysis.required_env_keys,
         unsupported_fields: analysis.unsupported_fields,
         warnings: analysis.warnings,
         errors: analysis.errors,
@@ -210,6 +212,12 @@ pub fn explain_compose(path: &Path) -> Result<String, ComposeError> {
             preview.internal_services.join(", ")
         ));
     }
+    if !preview.required_env_keys.is_empty() {
+        lines.push(format!(
+            "Required env keys: {}",
+            preview.required_env_keys.join(", ")
+        ));
+    }
     lines.push(
         "Environment values are never copied into forge.yml. Import keys into Forge Env Manager."
             .into(),
@@ -240,6 +248,7 @@ struct ComposeAnalysis {
     services: Vec<ComposeServicePreview>,
     public_candidates: Vec<String>,
     internal_services: Vec<String>,
+    required_env_keys: Vec<String>,
     unsupported_fields: Vec<String>,
     warnings: Vec<String>,
     errors: Vec<String>,
@@ -298,6 +307,7 @@ fn analyze_compose(path: &Path) -> Result<ComposeAnalysis, ComposeError> {
     let mut services = Vec::new();
     let mut public_candidates = Vec::new();
     let mut internal_services = Vec::new();
+    let mut required_env_keys = BTreeSet::new();
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let mut unsupported_fields = BTreeSet::new();
@@ -330,6 +340,9 @@ fn analyze_compose(path: &Path) -> Result<ComposeAnalysis, ComposeError> {
             ServiceClassification::Internal => internal_services.push(service.service_id.clone()),
             ServiceClassification::Ambiguous => {}
         }
+        for key in &service.environment_keys {
+            required_env_keys.insert(key.clone());
+        }
         services.push(service);
     }
 
@@ -348,6 +361,7 @@ fn analyze_compose(path: &Path) -> Result<ComposeAnalysis, ComposeError> {
         services,
         public_candidates,
         internal_services,
+        required_env_keys: required_env_keys.into_iter().collect(),
         unsupported_fields: unsupported_fields.into_iter().collect(),
         warnings,
         errors,
@@ -605,6 +619,9 @@ fn parse_environment(
         }
     }
     if !keys.is_empty() {
+        if keys.contains("REDIS_URL") {
+            warnings.push("Import REDIS_URL into Forge Env Manager before deploying.".into());
+        }
         warnings.push(format!(
             "service `{service_id}` defines environment variables. Import these keys into Forge Env Manager: {}",
             keys.iter().cloned().collect::<Vec<_>>().join(", ")
@@ -862,7 +879,7 @@ fn extract_http_health_path(command: &str) -> Option<String> {
                 url = &url[offset..];
             }
             let end = url.find(char::is_whitespace).unwrap_or(url.len());
-            let path = &url[..end];
+            let path = url[..end].trim_end_matches(|ch| matches!(ch, '\'' | '"' | ')' | ','));
             if path.starts_with('/') {
                 return Some(path.to_string());
             }

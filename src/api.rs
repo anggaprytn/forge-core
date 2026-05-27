@@ -1577,6 +1577,8 @@ pub struct WebDeployEnvPreviewSummary {
     pub source: String,
     #[serde(default)]
     pub missing_required_secrets: Vec<String>,
+    #[serde(default)]
+    pub configured_required_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1588,6 +1590,12 @@ pub struct WebDeployComposeSummary {
     pub services: Vec<String>,
     #[serde(default)]
     pub public_candidates: Vec<String>,
+    #[serde(default)]
+    pub internal_services: Vec<String>,
+    #[serde(default)]
+    pub required_env_keys: Vec<String>,
+    #[serde(default)]
+    pub unsupported_fields: Vec<String>,
     pub contract_copy: String,
     pub preview_command: String,
     pub convert_command: String,

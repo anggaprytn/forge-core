@@ -3391,6 +3391,14 @@ fn render_compose_preview(preview: &ComposePreview) -> String {
             preview.internal_services.join(", ")
         }
     ));
+    output.push_str(&format!(
+        "Required env keys: {}\n",
+        if preview.required_env_keys.is_empty() {
+            "none".into()
+        } else {
+            preview.required_env_keys.join(", ")
+        }
+    ));
     if !preview.unsupported_fields.is_empty() {
         output.push_str("Unsupported or warn-only fields:\n");
         for field in &preview.unsupported_fields {
@@ -3554,6 +3562,9 @@ fn render_services_section(services: &[ServiceRuntimeStatus], include_logs: bool
         }
         if let Some(reason) = service.failure_reason.as_deref() {
             output.push_str(&format!("    failure_reason: {reason}\n"));
+            for hint in dependency_failure_hints(service, reason) {
+                output.push_str(&format!("    suggested_check: {hint}\n"));
+            }
         }
         if !service.volumes.is_empty() {
             output.push_str("    volumes:\n");
@@ -3580,6 +3591,32 @@ fn render_services_section(services: &[ServiceRuntimeStatus], include_logs: bool
         output.push('\n');
     }
     output
+}
+
+fn dependency_failure_hints(
+    service: &ServiceRuntimeStatus,
+    failure_reason: &str,
+) -> Vec<&'static str> {
+    let reason = failure_reason.to_ascii_lowercase();
+    let mentions_redis = reason.contains("redis")
+        || service
+            .depends_on
+            .iter()
+            .any(|dependency| dependency == "redis")
+        || service.dns_aliases.iter().any(|alias| alias == "redis");
+    let connection_refused = reason.contains("econnrefused")
+        || reason.contains("connection refused")
+        || reason.contains("os error 111")
+        || reason.contains("os error 61");
+    if mentions_redis && connection_refused {
+        return vec![
+            "verify REDIS_URL is configured",
+            "verify Redis service is internal and reachable as redis:6379",
+            "verify app depends_on redis",
+            "verify Redis service started",
+        ];
+    }
+    Vec::new()
 }
 
 fn render_project_environment_status(status: &ProjectEnvironmentStatus) -> String {

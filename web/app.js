@@ -1590,6 +1590,7 @@ function renderDeployPreview(preview) {
     `Ref: ${text(preview.git_ref)}`,
     `Commit: ${text(preview.commit_sha, "unresolved")}`,
     `Route: ${text(preview.route && preview.route.domain)}`,
+    "Source contract: forge.yml",
     `Services: ${(preview.manifest && preview.manifest.services || []).join(", ") || "none"}`,
     `Exposed services: ${(preview.manifest && preview.manifest.exposed_services || []).join(", ") || "none"}`,
     `Healthchecks: ${(preview.manifest && preview.manifest.healthchecks || []).map((entry) => `${entry.service_id}:${entry.path}`).join(", ") || "none"}`,
@@ -1610,11 +1611,22 @@ function renderDeployPreview(preview) {
     container.appendChild(item);
   }
 
+  if (preview.env && Array.isArray(preview.env.configured_required_keys) && preview.env.configured_required_keys.length) {
+    const item = document.createElement("p");
+    item.className = "env-preview-summary";
+    item.textContent = `Configured required env keys: ${preview.env.configured_required_keys.join(", ")}`;
+    container.appendChild(item);
+  }
+
   if (preview.compose && preview.compose.detected) {
     const composeLines = [
+      "Compose origin: detected in repository",
       `Compose file detected: ${text(preview.compose.compose_file)}`,
       `Compose services: ${(preview.compose.services || []).join(", ") || "none"}`,
       `Compose public candidates: ${(preview.compose.public_candidates || []).join(", ") || "none"}`,
+      `Compose internal services: ${(preview.compose.internal_services || []).join(", ") || "none"}`,
+      `Required env keys: ${(preview.compose.required_env_keys || []).join(", ") || "none"}`,
+      `Unsupported Compose fields: ${(preview.compose.unsupported_fields || []).join(", ") || "none"}`,
       text(preview.compose.contract_copy),
       `Preview conversion: ${text(preview.compose.preview_command)}`,
       `Generate forge.yml: ${text(preview.compose.convert_command)}`,
