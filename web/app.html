@@ -280,6 +280,7 @@
             <div class="env-preview-copy">
               <p>Web deploys use the registered Git repository and selected ref. Local path deploys remain CLI-only.</p>
               <p>Preflight is required. Deploy uses the existing queue, deployment FSM, validation, route activation, and promotion flow.</p>
+              <p>If a repo only has docker-compose.yml, preflight will flag it. Compose is input only; Forge still deploys forge.yml.</p>
             </div>
 
             <div class="deploy-center-grid">

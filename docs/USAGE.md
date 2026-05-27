@@ -495,6 +495,33 @@ If you need to reset your configuration, use the `--force` flag:
 forge init --force
 ```
 
+### Docker Compose Import Preview
+
+Compose is onboarding input only. Forge still requires `forge.yml` as the deployment contract.
+
+```bash
+forge compose detect --from .
+forge compose preview docker-compose.yml
+forge compose convert docker-compose.yml --out forge.yml
+forge manifest validate --from .
+```
+
+Supported Compose subset:
+- `services`
+- `build` as a string context or `{ context, dockerfile }`
+- `image`
+- `ports` in `"3000:3000"` and `"3000"` forms
+- `environment` in list or map form
+- `depends_on` in list form and basic object form
+- `healthcheck` basic command parsing when it maps cleanly to an HTTP path
+- `command`
+- `restart`
+
+Compose import warnings:
+- host ports are ignored because Forge routes by domain and uses the container port
+- environment variable values are never copied into `forge.yml`; only keys are reported so you can import them into Forge Env Manager
+- unsupported fields are reported and dropped during conversion
+
 ---
 
 # Basic Deployment Flow

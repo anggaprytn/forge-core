@@ -4,10 +4,11 @@ use std::path::Path;
 use serde_yaml::Value as YamlValue;
 
 use crate::api::{
-    ErrorResponse, WebDeployEnvPreviewSummary, WebDeployHealthcheckSummary,
-    WebDeployManifestSummary, WebDeployPreviewRequest, WebDeployPreviewResponse,
-    WebDeployRouteSummary,
+    ErrorResponse, WebDeployComposeSummary, WebDeployEnvPreviewSummary,
+    WebDeployHealthcheckSummary, WebDeployManifestSummary, WebDeployPreviewRequest,
+    WebDeployPreviewResponse, WebDeployRouteSummary,
 };
+use crate::compose::detect_compose;
 use crate::forge_yaml::load_optional_forge_yaml;
 use crate::manifest::load_optional_manifest;
 use crate::projects::ProjectRegistryStore;
@@ -76,6 +77,7 @@ pub fn build_web_deploy_preview(
 
     let mut warnings = Vec::new();
     let mut errors = detect_preview_errors(source_path, project_id);
+    let compose_detection = detect_compose(source_path).ok();
 
     let forge_yaml = match load_optional_forge_yaml(source_path, project_id) {
         Ok(Some(config)) => Some(config),
@@ -88,6 +90,43 @@ pub fn build_web_deploy_preview(
             None
         }
     };
+
+    let compose = compose_detection
+        .as_ref()
+        .and_then(|detection| detection.selected_file.as_ref().map(|path| (detection, path)))
+        .map(|(detection, path)| {
+            let compose_file = path
+                .strip_prefix(source_path)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            WebDeployComposeSummary {
+            detected: true,
+            compose_file: Some(compose_file.clone()),
+            services: detection.services.clone(),
+            public_candidates: detection.public_candidates.clone(),
+            contract_copy: if forge_yaml.is_some() {
+                "forge.yml remains the Forge runtime contract. Compose input is informational only.".into()
+            } else {
+                "Compose file detected. Compose is input only. Generate and commit forge.yml before deploying through Forge.".into()
+            },
+            preview_command: format!("forge compose preview {compose_file}"),
+            convert_command: format!("forge compose convert {compose_file} --out forge.yml"),
+        }
+        });
+    if let Some(compose) = compose.as_ref() {
+        if forge_yaml.is_some() {
+            warnings.push(format!(
+                "forge.yml will be used as the Forge contract. Compose file also detected at {}.",
+                compose.compose_file.as_deref().unwrap_or("compose file")
+            ));
+        } else {
+            warnings.push(format!(
+                "Compose file detected at {}. Preview conversion and generate forge.yml before deploying.",
+                compose.compose_file.as_deref().unwrap_or("compose file")
+            ));
+        }
+    }
 
     let manifest = match load_optional_manifest(source_path) {
         Ok(value) => value,
@@ -203,6 +242,7 @@ pub fn build_web_deploy_preview(
             source: "latest configured env store".into(),
             missing_required_secrets,
         },
+        compose,
         warnings,
         errors,
     })
@@ -413,6 +453,66 @@ mod tests {
         assert_eq!(preview.git_ref, "main");
         assert_eq!(preview.repo_url, remote.to_string_lossy());
         assert_eq!(preview.manifest.exposed_services, vec!["api"]);
+    }
+
+    #[test]
+    fn preview_reports_compose_detection_when_forge_yml_is_missing() {
+        let root = test_root("preview-detects-compose");
+        let (remote, _commit_sha) = create_git_repo(&root);
+        fs::write(
+            remote.join("docker-compose.yml"),
+            concat!(
+                "services:\n",
+                "  app:\n",
+                "    build: .\n",
+                "    ports:\n",
+                "      - \"3000:3000\"\n",
+                "  redis:\n",
+                "    image: redis:alpine\n",
+            ),
+        )
+        .unwrap();
+        git_test(&remote, &["add", "docker-compose.yml"]);
+        git_test(&remote, &["commit", "-m", "add compose"]);
+        ProjectRegistryStore::new(&root)
+            .upsert(
+                ProjectUpsertRequest {
+                    project_id: Some("api".into()),
+                    repo_url: remote.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    base_domain: Some("api.example.com".into()),
+                },
+                None,
+            )
+            .unwrap();
+        let secret_store = SecretStore::new(root.join("secrets")).unwrap();
+
+        let preview = build_web_deploy_preview(
+            &root,
+            &secret_store,
+            "api",
+            &WebDeployPreviewRequest {
+                environment: "production".into(),
+                git_ref: "main".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(!preview.valid);
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|error| error.contains("forge.yml is missing"))
+        );
+        let compose = preview.compose.expect("compose summary");
+        assert!(compose.detected);
+        assert_eq!(compose.compose_file.as_deref(), Some("docker-compose.yml"));
+        assert_eq!(compose.services, vec!["app", "redis"]);
+        assert_eq!(compose.public_candidates, vec!["app"]);
+        assert!(compose.contract_copy.contains("Compose file detected"));
+        assert!(compose.preview_command.contains("forge compose preview"));
+        assert!(compose.convert_command.contains("forge compose convert"));
     }
 
     fn test_root(name: &str) -> PathBuf {

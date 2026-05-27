@@ -20,6 +20,10 @@ use forge_core::api::{
     TokenCreateRequest, TokenCreateResponse, TokenListResponse, TokenRevokeResponse,
 };
 use forge_core::caddy::CaddyApiRuntime;
+use forge_core::compose::{
+    ComposeDetection, ComposeError, ComposePreview, ServiceClassification, compose_file_names,
+    convert_compose, detect_compose, explain_compose, preview_compose,
+};
 use forge_core::config::DaemonConfig;
 use forge_core::convergence::ActiveDeploymentDecider;
 use forge_core::convergence::garbage_collect;
@@ -93,6 +97,11 @@ where
             | Command::Bench { .. }
             | Command::Gc { .. }
             | Command::Init { .. }
+            | Command::ComposeDetect { .. }
+            | Command::ComposePreview { .. }
+            | Command::ComposeConvert { .. }
+            | Command::ComposeExplain { .. }
+            | Command::ManifestValidate { .. }
             | Command::Login { .. }
             | Command::Logout
             | Command::WhoAmI
@@ -141,6 +150,32 @@ where
             daemon_runner(command)?
         }
         Command::Init { force } => init_project_config(force)?,
+        Command::ComposeDetect { source_path } => {
+            print!("{}", render_compose_detect(&detect_compose(&source_path)?));
+        }
+        Command::ComposePreview { compose_file } => {
+            print!(
+                "{}",
+                render_compose_preview(&preview_compose(&compose_file)?)
+            );
+        }
+        Command::ComposeConvert {
+            compose_file,
+            out_path,
+            force,
+        } => {
+            let rendered = convert_compose(&compose_file, out_path.as_deref(), force)?;
+            if out_path.is_none() {
+                print!("{rendered}");
+            }
+        }
+        Command::ComposeExplain { compose_file } => {
+            print!("{}\n", explain_compose(&compose_file)?);
+        }
+        Command::ManifestValidate { source_path } => {
+            validate_manifest_at_path(&source_path)?;
+            println!("forge.yml is valid");
+        }
         Command::Login { server_url } => run_login(server_url)?,
         Command::Logout => run_logout()?,
         Command::WhoAmI => run_whoami(&parsed)?,
@@ -1099,6 +1134,12 @@ impl Display for CliError {
 
 impl std::error::Error for CliError {}
 
+impl From<ComposeError> for CliError {
+    fn from(value: ComposeError) -> Self {
+        Self::Usage(value.to_string())
+    }
+}
+
 #[derive(Debug)]
 struct ParsedArgs {
     base_url: Option<String>,
@@ -1127,6 +1168,23 @@ enum Command {
     Daemon(DaemonCommand),
     Init {
         force: bool,
+    },
+    ComposeDetect {
+        source_path: PathBuf,
+    },
+    ComposePreview {
+        compose_file: PathBuf,
+    },
+    ComposeConvert {
+        compose_file: PathBuf,
+        out_path: Option<PathBuf>,
+        force: bool,
+    },
+    ComposeExplain {
+        compose_file: PathBuf,
+    },
+    ManifestValidate {
+        source_path: PathBuf,
     },
     Login {
         server_url: String,
@@ -1537,6 +1595,21 @@ fn parse_command(
         })),
         [cmd] if cmd == "init" => Ok(Command::Init { force: false }),
         [cmd, flag] if cmd == "init" && flag == "--force" => Ok(Command::Init { force: true }),
+        [group, action, rest @ ..] if group == "compose" && action == "detect" => {
+            parse_compose_detect_command(rest)
+        }
+        [group, action, rest @ ..] if group == "compose" && action == "preview" => {
+            parse_compose_preview_command(rest)
+        }
+        [group, action, rest @ ..] if group == "compose" && action == "convert" => {
+            parse_compose_convert_command(rest)
+        }
+        [group, action, rest @ ..] if group == "compose" && action == "explain" => {
+            parse_compose_explain_command(rest)
+        }
+        [group, action, rest @ ..] if group == "manifest" && action == "validate" => {
+            parse_manifest_validate_command(rest)
+        }
         [cmd, server_url] if cmd == "login" => Ok(Command::Login {
             server_url: server_url.clone(),
         }),
@@ -1679,6 +1752,11 @@ fn usage() -> String {
         "  --metrics-url <URL>      Override doctor metrics URL",
         "",
         "Commands:",
+        "  compose detect [--from <path>]",
+        "  compose preview <compose-file>",
+        "  compose convert <compose-file> [--out <path>] [--force]",
+        "  compose explain <compose-file>",
+        "  manifest validate [--from <path>]",
         "  deploy <project_id> <environment> [--ref <ref>] [--from <path>]",
         "  status <deployment_id>",
         "  status [--json] <project_id> <environment>",
@@ -1722,12 +1800,88 @@ fn usage() -> String {
         "  version",
         "",
         "Examples:",
+        "  forge compose detect --from .",
+        "  forge compose preview docker-compose.yml",
+        "  forge compose convert docker-compose.yml --out forge.yml",
+        "  forge manifest validate --from .",
         "  forge deploy api production --ref main",
         "  forge status api production",
         "  forge logs dep-1234567890",
         "  forge agent verify-deploy dep-1234567890",
     ]
     .join("\n")
+}
+
+fn parse_compose_detect_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [] => Ok(Command::ComposeDetect {
+            source_path: PathBuf::from("."),
+        }),
+        [flag, path] if flag == "--from" => Ok(Command::ComposeDetect {
+            source_path: PathBuf::from(path),
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_compose_preview_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [compose_file] => Ok(Command::ComposePreview {
+            compose_file: PathBuf::from(compose_file),
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_compose_convert_command(args: &[String]) -> Result<Command, CliError> {
+    let Some(compose_file) = args.first() else {
+        return Err(CliError::Usage(usage()));
+    };
+    let mut out_path = None;
+    let mut force = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage(
+                        "compose convert requires --out <path>".into(),
+                    ));
+                };
+                out_path = Some(PathBuf::from(value));
+            }
+            "--force" => force = true,
+            _ => return Err(CliError::Usage(usage())),
+        }
+        index += 1;
+    }
+    Ok(Command::ComposeConvert {
+        compose_file: PathBuf::from(compose_file),
+        out_path,
+        force,
+    })
+}
+
+fn parse_compose_explain_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [compose_file] => Ok(Command::ComposeExplain {
+            compose_file: PathBuf::from(compose_file),
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
+}
+
+fn parse_manifest_validate_command(args: &[String]) -> Result<Command, CliError> {
+    match args {
+        [] => Ok(Command::ManifestValidate {
+            source_path: PathBuf::from("."),
+        }),
+        [flag, path] if flag == "--from" => Ok(Command::ManifestValidate {
+            source_path: PathBuf::from(path),
+        }),
+        _ => Err(CliError::Usage(usage())),
+    }
 }
 
 fn parse_agent_command(args: &[String]) -> Result<Command, CliError> {
@@ -1877,6 +2031,7 @@ fn build_agent_guide(
             format!(
                 "If local changes are intentional and not pushed yet, use `forge deploy {project_id} {environment} --from .`."
             ),
+            "If the repo starts from docker-compose.yml, run `forge compose preview docker-compose.yml`, then `forge compose convert docker-compose.yml --out forge.yml`, then `forge manifest validate --from .`. Compose is input only; Forge deploys forge.yml.".into(),
             "If the public URL shows the Forge fallback, do not claim success until route_active is true and the fallback marker is gone.".into(),
         ],
         default_branch,
@@ -3113,6 +3268,202 @@ fn default_init_config() -> &'static str {
         "    path: /health\n",
         "    expect_status: 200\n",
     )
+}
+
+fn render_compose_detect(detection: &ComposeDetection) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Search root: {}\n",
+        detection.search_root.display()
+    ));
+    if detection.detected_files.is_empty() {
+        output.push_str(&format!(
+            "No Compose file detected. Checked: {}\n",
+            compose_file_names().join(", ")
+        ));
+        return output;
+    }
+    output.push_str("Detected files:\n");
+    for path in &detection.detected_files {
+        output.push_str(&format!("  - {}\n", path.display()));
+    }
+    if !detection.services.is_empty() {
+        output.push_str(&format!(
+            "Services found: {}\n",
+            detection.services.join(", ")
+        ));
+    }
+    if !detection.public_candidates.is_empty() {
+        output.push_str(&format!(
+            "Likely public service candidates: {}\n",
+            detection.public_candidates.join(", ")
+        ));
+    }
+    if !detection.internal_services.is_empty() {
+        output.push_str(&format!(
+            "Likely internal dependency services: {}\n",
+            detection.internal_services.join(", ")
+        ));
+    }
+    if !detection.warnings.is_empty() {
+        output.push_str("Warnings:\n");
+        for warning in &detection.warnings {
+            output.push_str(&format!("  - {warning}\n"));
+        }
+    }
+    output
+}
+
+fn render_compose_preview(preview: &ComposePreview) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Compose file: {}\n",
+        preview.compose_file.display()
+    ));
+    output.push_str(&format!("Derived project name: {}\n", preview.project_name));
+    output.push_str("Parsed services:\n");
+    for service in &preview.services {
+        output.push_str(&format!("  - {}\n", service.service_id));
+        if let Some(build) = service.build.as_ref() {
+            output.push_str(&format!(
+                "    build: context={} dockerfile={}\n",
+                build.context,
+                build.dockerfile.as_deref().unwrap_or("Dockerfile")
+            ));
+        }
+        if let Some(image) = service.image.as_deref() {
+            output.push_str(&format!("    image: {image}\n"));
+        }
+        if !service.ports.is_empty() {
+            output.push_str(&format!(
+                "    ports: {}\n",
+                service
+                    .ports
+                    .iter()
+                    .map(|port| port.raw.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !service.depends_on.is_empty() {
+            output.push_str(&format!(
+                "    depends_on: {}\n",
+                service.depends_on.join(", ")
+            ));
+        }
+        if !service.environment_keys.is_empty() {
+            output.push_str(&format!(
+                "    environment keys: {}\n",
+                service.environment_keys.join(", ")
+            ));
+        }
+        if let Some(healthcheck) = service.healthcheck.as_deref() {
+            output.push_str(&format!("    healthcheck: {healthcheck}\n"));
+        }
+        if let Some(command) = service.command.as_deref() {
+            output.push_str(&format!("    command: {command}\n"));
+        }
+        if let Some(restart) = service.restart.as_deref() {
+            output.push_str(&format!("    restart: {restart}\n"));
+        }
+        output.push_str(&format!(
+            "    inferred role: {}\n",
+            match service.classification {
+                ServiceClassification::PublicCandidate => "public candidate",
+                ServiceClassification::Internal => "internal",
+                ServiceClassification::Ambiguous => "ambiguous",
+            }
+        ));
+    }
+    output.push_str(&format!(
+        "Inferred public service: {}\n",
+        if preview.public_candidates.is_empty() {
+            "none".into()
+        } else {
+            preview.public_candidates.join(", ")
+        }
+    ));
+    output.push_str(&format!(
+        "Inferred internal services: {}\n",
+        if preview.internal_services.is_empty() {
+            "none".into()
+        } else {
+            preview.internal_services.join(", ")
+        }
+    ));
+    if !preview.unsupported_fields.is_empty() {
+        output.push_str("Unsupported or warn-only fields:\n");
+        for field in &preview.unsupported_fields {
+            output.push_str(&format!("  - {field}\n"));
+        }
+    }
+    if let Some(generated) = preview.generated_forge_yaml.as_deref() {
+        output.push_str("Forge conversion preview:\n");
+        output.push_str(generated);
+    }
+    if !preview.warnings.is_empty() {
+        output.push_str("Warnings:\n");
+        for warning in &preview.warnings {
+            output.push_str(&format!("  - {warning}\n"));
+        }
+    }
+    if !preview.errors.is_empty() {
+        output.push_str("Errors:\n");
+        for error in &preview.errors {
+            output.push_str(&format!("  - {error}\n"));
+        }
+    }
+    output
+}
+
+fn validate_manifest_at_path(source_path: &Path) -> Result<(), CliError> {
+    let manifest_path = if source_path.is_dir() {
+        source_path.join("forge.yml")
+    } else {
+        source_path.to_path_buf()
+    };
+    let root = manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let raw = fs::read_to_string(&manifest_path).map_err(|err| CliError::Usage(err.to_string()))?;
+    let yaml = serde_yaml::from_str::<serde_yaml::Value>(&raw)
+        .map_err(|err| CliError::Usage(format!("invalid forge.yml: {err}")))?;
+    let expected_project_id = yaml
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::String("name".into())))
+        .and_then(serde_yaml::Value::as_str)
+        .ok_or_else(|| CliError::Usage("forge.yml name is required".into()))?;
+    let (validation_root, cleanup_root) =
+        if manifest_path.file_name().and_then(|value| value.to_str()) == Some("forge.yml") {
+            (root, None)
+        } else {
+            let temp_root = std::env::temp_dir().join(format!(
+                "forge-manifest-validate-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|value| value.as_nanos())
+                    .unwrap_or_default()
+            ));
+            fs::create_dir_all(&temp_root).map_err(|err| CliError::Usage(err.to_string()))?;
+            fs::write(temp_root.join("forge.yml"), &raw)
+                .map_err(|err| CliError::Usage(err.to_string()))?;
+            (temp_root.clone(), Some(temp_root))
+        };
+    let result = match forge_core::forge_yaml::load_optional_forge_yaml(
+        &validation_root,
+        expected_project_id,
+    ) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(CliError::Usage("forge.yml is missing".into())),
+        Err(err) => Err(CliError::Usage(err.to_string())),
+    };
+    if let Some(temp_root) = cleanup_root {
+        let _ = fs::remove_file(temp_root.join("forge.yml"));
+        let _ = fs::remove_dir(temp_root);
+    }
+    result
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

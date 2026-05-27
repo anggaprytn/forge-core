@@ -6265,6 +6265,7 @@ pub mod app_page_preserves_auth_gate {
         assert!(body.contains("Run Preflight"));
         assert!(body.contains("Confirm Deploy"));
         assert!(body.contains("Local path deploys remain CLI-only"));
+        assert!(body.contains("Compose is input only"));
         assert!(!body.contains("test-session-secret"));
         assert!(!body.contains("FORGE_SESSION_SECRET"));
         assert!(!body.contains("FORGE_GITHUB_OAUTH_CLIENT_SECRET"));
@@ -6373,6 +6374,8 @@ pub mod app_js_ships_safe_error_states {
             "Select a project, choose an environment, enter a Git ref, then run preflight."
         ));
         assert!(body.contains("No deploy button enabled before valid preflight."));
+        assert!(body.contains("Preview conversion:"));
+        assert!(body.contains("Generate forge.yml:"));
     }
 }
 
@@ -6438,6 +6441,7 @@ pub mod app_assets_ship_calm_readiness_copy {
         assert!(
             app_html.contains("Web deploys use the registered Git repository and selected ref.")
         );
+        assert!(app_html.contains("Compose is input only"));
     }
 }
 

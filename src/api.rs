@@ -1539,6 +1539,8 @@ pub struct WebDeployPreviewResponse {
     pub manifest: WebDeployManifestSummary,
     pub route: WebDeployRouteSummary,
     pub env: WebDeployEnvPreviewSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose: Option<WebDeployComposeSummary>,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
@@ -1575,6 +1577,20 @@ pub struct WebDeployEnvPreviewSummary {
     pub source: String,
     #[serde(default)]
     pub missing_required_secrets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDeployComposeSummary {
+    pub detected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_file: Option<String>,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub public_candidates: Vec<String>,
+    pub contract_copy: String,
+    pub preview_command: String,
+    pub convert_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

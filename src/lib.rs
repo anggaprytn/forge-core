@@ -3,6 +3,7 @@ pub mod auth;
 pub mod backups;
 pub mod bootstrap;
 pub mod caddy;
+pub mod compose;
 pub mod config;
 pub mod convergence;
 pub mod daemon;

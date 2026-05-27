@@ -1384,6 +1384,9 @@ components:
           $ref: '#/components/schemas/WebDeployRouteSummary'
         env:
           $ref: '#/components/schemas/WebDeployEnvPreviewSummary'
+        compose:
+          nullable: true
+          $ref: '#/components/schemas/WebDeployComposeSummary'
         warnings:
           type: array
           items:
@@ -1392,6 +1395,35 @@ components:
           type: array
           items:
             type: string
+    WebDeployComposeSummary:
+      type: object
+      required:
+        - detected
+        - services
+        - public_candidates
+        - contract_copy
+        - preview_command
+        - convert_command
+      properties:
+        detected:
+          type: boolean
+        compose_file:
+          type: string
+          nullable: true
+        services:
+          type: array
+          items:
+            type: string
+        public_candidates:
+          type: array
+          items:
+            type: string
+        contract_copy:
+          type: string
+        preview_command:
+          type: string
+        convert_command:
+          type: string
     WebDeployManifestSummary:
       type: object
       required: [name, schema_version, services, exposed_services, healthchecks]

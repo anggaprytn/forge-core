@@ -884,6 +884,196 @@ fn init_output_is_valid_yaml() {
 }
 
 #[test]
+fn compose_detect_finds_docker_compose_file() {
+    let root = test_root("cli-compose-detect-docker-compose");
+    fs::write(root.join("docker-compose.yml"), compose_app_redis_fixture()).unwrap();
+
+    let output = run_cli_in_dir(&root, &["compose", "detect", "--from", "."]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("docker-compose.yml"));
+    assert!(body.contains("Services found: app, redis"));
+    assert!(body.contains("Likely public service candidates: app"));
+    assert!(body.contains("Likely internal dependency services: redis"));
+}
+
+#[test]
+fn compose_detect_finds_compose_yaml_variants() {
+    for name in ["compose.yml", "compose.yaml"] {
+        let root = test_root(&format!("cli-compose-detect-{name}"));
+        fs::write(root.join(name), compose_app_redis_fixture()).unwrap();
+        let output = run_cli_in_dir(&root, &["compose", "detect", "--from", "."]);
+        assert!(output.status.success(), "{output:?}");
+        let body = String::from_utf8_lossy(&output.stdout);
+        assert!(body.contains(name));
+    }
+}
+
+#[test]
+fn compose_preview_summarizes_conversion_without_leaking_env_values() {
+    let root = test_root("cli-compose-preview");
+    fs::write(root.join("docker-compose.yml"), compose_app_redis_fixture()).unwrap();
+
+    let output = run_cli_in_dir(&root, &["compose", "preview", "docker-compose.yml"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("Parsed services:"));
+    assert!(body.contains("environment keys: REDIS_URL, SECRET_TOKEN"));
+    assert!(body.contains("Inferred public service: app"));
+    assert!(body.contains("Inferred internal services: redis"));
+    assert!(body.contains("Forge conversion preview:"));
+    assert!(body.contains("expose: true"));
+    assert!(body.contains("expose: false"));
+    assert!(body.contains("path: /health"));
+    assert!(!body.contains("super-secret"));
+    assert!(!body.contains("redis://redis:6379"));
+}
+
+#[test]
+fn compose_preview_warns_when_host_port_is_ignored() {
+    let root = test_root("cli-compose-preview-host-port");
+    fs::write(
+        root.join("docker-compose.yml"),
+        concat!(
+            "services:\n",
+            "  app:\n",
+            "    build: .\n",
+            "    ports:\n",
+            "      - \"8080:3000\"\n",
+        ),
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(&root, &["compose", "preview", "docker-compose.yml"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("host port 8080 is ignored"));
+    assert!(body.contains("port: 3000"));
+}
+
+#[test]
+fn compose_preview_reports_multiple_public_candidates() {
+    let root = test_root("cli-compose-preview-multiple-public");
+    fs::write(
+        root.join("docker-compose.yml"),
+        concat!(
+            "services:\n",
+            "  app:\n",
+            "    build: .\n",
+            "    ports:\n",
+            "      - \"3000:3000\"\n",
+            "  admin:\n",
+            "    build: .\n",
+            "    ports:\n",
+            "      - \"8080:8080\"\n",
+        ),
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(&root, &["compose", "preview", "docker-compose.yml"]);
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("multiple public service candidates"));
+}
+
+#[test]
+fn compose_convert_writes_valid_forge_yaml() {
+    let root = test_root("cli-compose-convert");
+    fs::write(root.join("docker-compose.yml"), compose_app_redis_fixture()).unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "compose",
+            "convert",
+            "docker-compose.yml",
+            "--out",
+            "forge.generated.yml",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+
+    let rendered = fs::read_to_string(root.join("forge.generated.yml")).unwrap();
+    assert!(rendered.contains("type: web"));
+    assert!(rendered.contains("app:"));
+    assert!(rendered.contains("redis:"));
+    assert!(rendered.contains("expose: true"));
+    assert!(rendered.contains("expose: false"));
+    assert!(!rendered.contains("super-secret"));
+    assert!(!rendered.contains("redis://redis:6379"));
+}
+
+#[test]
+fn compose_convert_refuses_to_overwrite_existing_forge_yml_without_force() {
+    let root = test_root("cli-compose-convert-refuses-overwrite");
+    fs::write(root.join("docker-compose.yml"), compose_app_redis_fixture()).unwrap();
+    fs::write(root.join("forge.yml"), "keep-me\n").unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "compose",
+            "convert",
+            "docker-compose.yml",
+            "--out",
+            "forge.yml",
+        ],
+    );
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("forge.yml")).unwrap(),
+        "keep-me\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("forge.yml already exists"));
+    assert!(stderr.contains("--force"));
+}
+
+#[test]
+fn compose_convert_force_overwrites_existing_forge_yml() {
+    let root = test_root("cli-compose-convert-force");
+    fs::write(root.join("docker-compose.yml"), compose_app_redis_fixture()).unwrap();
+    fs::write(root.join("forge.yml"), "keep-me\n").unwrap();
+
+    let output = run_cli_in_dir(
+        &root,
+        &[
+            "compose",
+            "convert",
+            "docker-compose.yml",
+            "--out",
+            "forge.yml",
+            "--force",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let rendered = fs::read_to_string(root.join("forge.yml")).unwrap();
+    assert!(rendered.contains("expose: true"));
+    assert!(rendered.contains("image: redis:alpine"));
+}
+
+#[test]
+fn manifest_validate_accepts_generated_compose_contract() {
+    let root = test_root("cli-manifest-validate-generated-compose");
+    fs::write(root.join("docker-compose.yml"), compose_app_redis_fixture()).unwrap();
+    let convert = run_cli_in_dir(
+        &root,
+        &[
+            "compose",
+            "convert",
+            "docker-compose.yml",
+            "--out",
+            "forge.yml",
+        ],
+    );
+    assert!(convert.status.success(), "{convert:?}");
+
+    let output = run_cli_in_dir(&root, &["manifest", "validate", "--from", "."]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("forge.yml is valid"));
+}
+
+#[test]
 fn cli_config_env_vars_override_saved_config() {
     let requests = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let (url, _server) = spawn_server(
@@ -1574,6 +1764,9 @@ fn agent_guide_prints_protocol_without_writing_files_by_default() {
     assert!(body.contains("Do not claim success from deployment_id status alone."));
     assert!(body.contains("forge deploy forge-redis-fullstack-test production --ref main"));
     assert!(body.contains("--ref main reads forge.yml from the remote Git ref/commit."));
+    assert!(body.contains("forge compose preview docker-compose.yml"));
+    assert!(body.contains("forge compose convert docker-compose.yml --out forge.yml"));
+    assert!(body.contains("forge manifest validate --from ."));
     assert_eq!(
         fs::read_to_string(&agents_path).unwrap(),
         "existing instructions\n"
@@ -1599,6 +1792,8 @@ fn agent_guide_markdown_output_works() {
     assert!(body.contains("# Forge AI Agent Deployment Guide"));
     assert!(body.contains("## Success Criteria"));
     assert!(body.contains("`--from .` reads `forge.yml` from the local working directory."));
+    assert!(body.contains("`forge compose preview docker-compose.yml`"));
+    assert!(body.contains("`forge manifest validate --from .`"));
 }
 
 #[test]
@@ -1834,6 +2029,29 @@ fn spawn_server_sequence(
         }
     });
     (url, handle)
+}
+
+fn compose_app_redis_fixture() -> &'static str {
+    concat!(
+        "services:\n",
+        "  app:\n",
+        "    build:\n",
+        "      context: .\n",
+        "      dockerfile: Dockerfile\n",
+        "    ports:\n",
+        "      - \"3000:3000\"\n",
+        "    depends_on:\n",
+        "      - redis\n",
+        "    environment:\n",
+        "      REDIS_URL: redis://redis:6379\n",
+        "      SECRET_TOKEN: super-secret\n",
+        "    healthcheck:\n",
+        "      test: [\"CMD\", \"curl\", \"-f\", \"http://localhost:3000/health\"]\n",
+        "  redis:\n",
+        "    image: redis:alpine\n",
+        "    ports:\n",
+        "      - \"6379\"\n",
+    )
 }
 
 fn test_root(name: &str) -> PathBuf {

@@ -1610,6 +1610,23 @@ function renderDeployPreview(preview) {
     container.appendChild(item);
   }
 
+  if (preview.compose && preview.compose.detected) {
+    const composeLines = [
+      `Compose file detected: ${text(preview.compose.compose_file)}`,
+      `Compose services: ${(preview.compose.services || []).join(", ") || "none"}`,
+      `Compose public candidates: ${(preview.compose.public_candidates || []).join(", ") || "none"}`,
+      text(preview.compose.contract_copy),
+      `Preview conversion: ${text(preview.compose.preview_command)}`,
+      `Generate forge.yml: ${text(preview.compose.convert_command)}`,
+    ];
+    composeLines.forEach((line) => {
+      const item = document.createElement("p");
+      item.className = "env-preview-summary";
+      item.textContent = line;
+      container.appendChild(item);
+    });
+  }
+
   (preview.warnings || []).forEach((message) => {
     const item = document.createElement("p");
     item.className = "env-preview-summary";
